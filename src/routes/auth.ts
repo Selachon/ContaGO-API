@@ -37,7 +37,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
     return res.status(400).json(response);
   }
 
-  const user = getUserByEmail(email.toLowerCase().trim());
+  const user = await getUserByEmail(email.toLowerCase().trim());
   if (!user) {
     // Mensaje genérico para no revelar si el usuario existe
     const response: AuthResponse = { ok: false, message: "Credenciales incorrectas" };
@@ -57,7 +57,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
   };
 
   const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
-  const purchasedTools = getUserPurchases(user.id);
+  const purchasedTools = await getUserPurchases(user.id);
 
   const response: AuthResponse = {
     ok: true,
@@ -103,7 +103,7 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
     return res.status(400).json(response);
   }
 
-  const existing = getUserByEmail(email.toLowerCase().trim());
+  const existing = await getUserByEmail(email.toLowerCase().trim());
   if (existing) {
     const response: AuthResponse = { ok: false, message: "El email ya está registrado" };
     return res.status(400).json(response);
@@ -141,7 +141,7 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
 // ============================================
 // GET /auth/me (verificar token)
 // ============================================
-router.get("/me", (req: Request, res: Response) => {
+router.get("/me", async (req: Request, res: Response) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer ")) {
     return res.status(401).json({ ok: false, message: "Token no proporcionado" });
@@ -151,13 +151,13 @@ router.get("/me", (req: Request, res: Response) => {
 
   try {
     const payload = jwt.verify(token, getJwtSecret()) as JWTPayload;
-    const user = getUserByEmail(payload.email);
+    const user = await getUserByEmail(payload.email);
 
     if (!user) {
       return res.status(401).json({ ok: false, message: "Usuario no encontrado" });
     }
 
-    const purchasedTools = getUserPurchases(user.id);
+    const purchasedTools = await getUserPurchases(user.id);
 
     return res.json({
       ok: true,

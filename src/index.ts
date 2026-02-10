@@ -4,7 +4,7 @@ import cors from "cors";
 import helmet from "helmet";
 import authRoutes from "./routes/auth.js";
 import dianRoutes from "./routes/dian.js";
-import { seedAdminUser } from "./services/database.js";
+import { connectMongo, seedAdminUser } from "./services/database.js";
 
 // ============================================
 // Validar variables de entorno obligatorias
@@ -57,7 +57,8 @@ app.get("/", (_req, res) => {
 // ============================================
 // Startup
 // ============================================
-seedAdminUser()
+connectMongo()
+  .then(seedAdminUser)
   .then(() => {
     app.listen(PORT, () => {
       console.log(`ContaGO API running on port ${PORT}`);
@@ -65,6 +66,6 @@ seedAdminUser()
     });
   })
   .catch((err) => {
-    console.error("Error seeding admin user:", err);
+    console.error("Error inicializando la API:", err);
     process.exit(1);
   });

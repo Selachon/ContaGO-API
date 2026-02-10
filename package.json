@@ -8,7 +8,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "migrate:sqlite-mongo": "tsx scripts/migrateSqliteToMongo.ts"
   },
   "keywords": [
     "contago",
@@ -26,6 +27,7 @@
     "express": "^4.21.0",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
+    "mongodb": "^7.1.0",
     "puppeteer": "^23.5.0",
     "uuid": "^10.0.0"
   },

@@ -18,6 +18,10 @@ services:
         sync: false # Set manually: https://contago.com.co,https://www.contago.com.co
       - key: JWT_SECRET
         generateValue: true
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        sync: false
       - key: PUPPETEER_EXECUTABLE_PATH
         value: /usr/bin/chromium-browser
     # Render includes Chromium for Puppeteer automatically

@@ -1,5 +1,5 @@
 export interface User {
-  id: number;
+  id: string;
   email: string;
   name: string;
   password_hash: string;
@@ -9,13 +9,13 @@ export interface User {
 
 export interface UserPurchase {
   id: number;
-  user_id: number;
+  user_id: string;
   tool_id: string;
   purchased_at: string;
 }
 
 export interface JWTPayload {
-  userId: number;
+  userId: string;
   email: string;
   isAdmin: boolean;
 }
@@ -25,7 +25,7 @@ export interface AuthResponse {
   message?: string;
   token?: string;
   user?: {
-    id: number;
+    id: string;
     email: string;
     name: string;
     isAdmin: boolean;

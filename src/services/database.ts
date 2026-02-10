@@ -1,34 +1,60 @@
-import Database, { type Database as DatabaseType } from "better-sqlite3";
 import bcrypt from "bcrypt";
-import path from "path";
-import { fileURLToPath } from "url";
-import type { User, UserPurchase } from "../types/auth.js";
+import { MongoClient, type Db, type Collection, ObjectId } from "mongodb";
+import type { User } from "../types/auth.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.join(__dirname, "../../data.db");
+interface UserRecord {
+  _id: ObjectId;
+  email: string;
+  name: string;
+  password_hash: string;
+  is_admin: boolean;
+  purchasedTools: string[];
+  created_at: string;
+  legacyId?: number;
+}
 
-const db: DatabaseType = new Database(DB_PATH);
+type NewUserRecord = Omit<UserRecord, "_id">;
 
-// Inicializar tablas
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE NOT NULL,
-    name TEXT NOT NULL,
-    password_hash TEXT NOT NULL,
-    is_admin INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-  );
+let client: MongoClient | null = null;
+let db: Db | null = null;
 
-  CREATE TABLE IF NOT EXISTS user_purchases (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    tool_id TEXT NOT NULL,
-    purchased_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users(id),
-    UNIQUE(user_id, tool_id)
-  );
-`);
+function usersCollection(): Collection<UserRecord> {
+  if (!db) {
+    throw new Error("MongoDB no está conectado");
+  }
+  return db.collection<UserRecord>("users");
+}
+
+export async function connectMongo(): Promise<void> {
+  const uri = process.env.MONGODB_URI;
+  const dbName = process.env.MONGODB_DB;
+
+  if (!uri) {
+    throw new Error("MONGODB_URI no está definido");
+  }
+
+  client = new MongoClient(uri);
+  await client.connect();
+
+  db = dbName ? client.db(dbName) : client.db();
+
+  // Índices
+  const users = usersCollection();
+  await users.createIndex({ email: 1 }, { unique: true });
+  await users.createIndex({ legacyId: 1 });
+}
+
+function mapUser(record: UserRecord | null): User | null {
+  if (!record) return null;
+  return {
+    id: record._id.toString(),
+    email: record.email,
+    name: record.name,
+    password_hash: record.password_hash,
+    is_admin: record.is_admin,
+    created_at: record.created_at,
+  };
+}
 
 // ============================================
 // User functions
@@ -42,25 +68,36 @@ export async function createUser(
 ): Promise<User | null> {
   try {
     const hash = await bcrypt.hash(password, 10);
-    const stmt = db.prepare(
-      "INSERT INTO users (email, name, password_hash, is_admin) VALUES (?, ?, ?, ?)"
-    );
-    const result = stmt.run(email, name, hash, isAdmin ? 1 : 0);
-    return getUserById(result.lastInsertRowid as number);
+    const record: NewUserRecord = {
+      email: email.toLowerCase().trim(),
+      name: name.trim(),
+      password_hash: hash,
+      is_admin: isAdmin,
+      purchasedTools: [],
+      created_at: new Date().toISOString(),
+    };
+
+    const result = await usersCollection().insertOne(record as unknown as UserRecord);
+    return mapUser({ ...record, _id: result.insertedId } as UserRecord);
   } catch (err) {
     console.error("Error creating user:", err);
     return null;
   }
 }
 
-export function getUserById(id: number): User | null {
-  const stmt = db.prepare("SELECT * FROM users WHERE id = ?");
-  return stmt.get(id) as User | null;
+export async function getUserById(id: string): Promise<User | null> {
+  try {
+    const oid = new ObjectId(id);
+    const record = await usersCollection().findOne({ _id: oid });
+    return mapUser(record);
+  } catch {
+    return null;
+  }
 }
 
-export function getUserByEmail(email: string): User | null {
-  const stmt = db.prepare("SELECT * FROM users WHERE email = ?");
-  return stmt.get(email) as User | null;
+export async function getUserByEmail(email: string): Promise<User | null> {
+  const record = await usersCollection().findOne({ email: email.toLowerCase().trim() });
+  return mapUser(record);
 }
 
 export async function verifyPassword(user: User, password: string): Promise<boolean> {
@@ -71,29 +108,37 @@ export async function verifyPassword(user: User, password: string): Promise<bool
 // Purchase functions
 // ============================================
 
-export function getUserPurchases(userId: number): string[] {
-  const stmt = db.prepare("SELECT tool_id FROM user_purchases WHERE user_id = ?");
-  const rows = stmt.all(userId) as Array<{ tool_id: string }>;
-  return rows.map((r) => r.tool_id);
+export async function getUserPurchases(userId: string): Promise<string[]> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne({ _id: oid }, { projection: { purchasedTools: 1 } });
+    return record?.purchasedTools || [];
+  } catch {
+    return [];
+  }
 }
 
-export function addPurchase(userId: number, toolId: string): boolean {
+export async function addPurchase(userId: string, toolId: string): Promise<boolean> {
   try {
-    const stmt = db.prepare(
-      "INSERT OR IGNORE INTO user_purchases (user_id, tool_id) VALUES (?, ?)"
+    const oid = new ObjectId(userId);
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      { $addToSet: { purchasedTools: toolId } }
     );
-    stmt.run(userId, toolId);
-    return true;
+    return result.modifiedCount > 0;
   } catch {
     return false;
   }
 }
 
-export function hasPurchase(userId: number, toolId: string): boolean {
-  const stmt = db.prepare(
-    "SELECT 1 FROM user_purchases WHERE user_id = ? AND tool_id = ?"
-  );
-  return stmt.get(userId, toolId) !== undefined;
+export async function hasPurchase(userId: string, toolId: string): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne({ _id: oid, purchasedTools: toolId });
+    return !!record;
+  } catch {
+    return false;
+  }
 }
 
 // ============================================
@@ -110,14 +155,16 @@ export async function seedAdminUser(): Promise<void> {
     return;
   }
 
-  const existing = getUserByEmail(adminEmail);
+  const existing = await getUserByEmail(adminEmail);
 
   if (!existing) {
     console.log(`Creating admin user: ${adminEmail}`);
     await createUser(adminEmail, adminName, adminPassword, true);
   } else if (!existing.is_admin) {
-    const stmt = db.prepare("UPDATE users SET is_admin = 1 WHERE email = ?");
-    stmt.run(adminEmail);
+    await usersCollection().updateOne(
+      { email: adminEmail.toLowerCase().trim() },
+      { $set: { is_admin: true } }
+    );
     console.log(`Promoted ${adminEmail} to admin.`);
   }
 }
