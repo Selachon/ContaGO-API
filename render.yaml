@@ -28,7 +28,5 @@ services:
         sync: false
       - key: MONGODB_DB
         sync: false
-      - key: PUPPETEER_EXECUTABLE_PATH
-        value: /usr/bin/chromium-browser
     # Render includes Chromium for Puppeteer automatically
     # See: https://render.com/docs/puppeteer

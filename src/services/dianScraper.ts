@@ -142,8 +142,13 @@ export async function extractDocumentIds(
 }
 
 function resolveExecutablePath(): string | null {
+  const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
+  if (envPath && !fs.existsSync(envPath)) {
+    delete process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
   const candidates = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
+    envPath,
     "/usr/bin/chromium-browser",
     "/usr/bin/chromium",
     "/usr/bin/google-chrome",
