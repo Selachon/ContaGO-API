@@ -145,7 +145,12 @@ async function applyDateFilter(page: Page, startDate: string, endDate: string): 
     const rangeInput = await page.$(
       "#dashboard-report-range input, " +
       "input[placeholder*='Rango'], " +
-      "input[aria-label*='Rango']"
+      "input[aria-label*='Rango'], " +
+      "input[placeholder*='Fecha'], " +
+      "input[aria-label*='Fecha'], " +
+      "input[name*='date'], " +
+      "input[name*='fecha'], " +
+      "input[id*='range']"
     );
 
     if (rangeInput) {
@@ -162,9 +167,16 @@ async function applyDateFilter(page: Page, startDate: string, endDate: string): 
     }
 
     // Intentar click en botón 'Buscar'
-    const buscarBtn = await page.$x("//button[contains(., 'Buscar')]");
-    if (buscarBtn.length > 0) {
-      await (buscarBtn[0] as any).click();
+    const clicked = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const btn = buttons.find((b) => b.textContent?.trim().includes("Buscar"));
+      if (btn) {
+        (btn as HTMLElement).click();
+        return true;
+      }
+      return false;
+    });
+    if (clicked) {
       await delay(450);
     }
   } catch (err) {

@@ -6,44 +6,57 @@ import {
   getUserPurchases,
   verifyPassword,
 } from "../services/database.js";
+import { rateLimit } from "../middleware/rateLimit.js";
 import type { AuthResponse, JWTPayload } from "../types/auth.js";
 
 const router = Router();
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-in-production";
+
+function getJwtSecret(): string {
+  // Garantizado por la validación en index.ts
+  return process.env.JWT_SECRET!;
+}
+
+// Validación básica de email
+function isValidEmail(email: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
 
 // ============================================
-// POST /auth/login
+// POST /auth/login (rate limited: 10 intentos / 15 min)
 // ============================================
-router.post("/login", async (req: Request, res: Response) => {
+router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: Response) => {
   const { email, password } = req.body;
 
-  if (!email || !password) {
+  if (!email || !password || typeof email !== "string" || typeof password !== "string") {
     const response: AuthResponse = { ok: false, message: "Email y contraseña requeridos" };
     return res.status(400).json(response);
   }
 
-  const user = getUserByEmail(email);
+  if (!isValidEmail(email)) {
+    const response: AuthResponse = { ok: false, message: "Email no válido" };
+    return res.status(400).json(response);
+  }
+
+  const user = getUserByEmail(email.toLowerCase().trim());
   if (!user) {
-    const response: AuthResponse = { ok: false, message: "Usuario no encontrado" };
+    // Mensaje genérico para no revelar si el usuario existe
+    const response: AuthResponse = { ok: false, message: "Credenciales incorrectas" };
     return res.status(401).json(response);
   }
 
   const valid = await verifyPassword(user, password);
   if (!valid) {
-    const response: AuthResponse = { ok: false, message: "Contraseña incorrecta" };
+    const response: AuthResponse = { ok: false, message: "Credenciales incorrectas" };
     return res.status(401).json(response);
   }
 
-  // Crear JWT
   const payload: JWTPayload = {
     userId: user.id,
     email: user.email,
     isAdmin: !!user.is_admin,
   };
 
-  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
-
-  // Obtener herramientas compradas
+  const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
   const purchasedTools = getUserPurchases(user.id);
 
   const response: AuthResponse = {
@@ -62,36 +75,53 @@ router.post("/login", async (req: Request, res: Response) => {
 });
 
 // ============================================
-// POST /auth/register
+// POST /auth/register (rate limited: 5 intentos / 15 min)
 // ============================================
-router.post("/register", async (req: Request, res: Response) => {
+router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res: Response) => {
   const { email, password, name } = req.body;
 
-  if (!email || !password || !name) {
+  if (
+    !email || !password || !name ||
+    typeof email !== "string" || typeof password !== "string" || typeof name !== "string"
+  ) {
     const response: AuthResponse = { ok: false, message: "Email, nombre y contraseña requeridos" };
     return res.status(400).json(response);
   }
 
-  const existing = getUserByEmail(email);
+  if (!isValidEmail(email)) {
+    const response: AuthResponse = { ok: false, message: "Email no válido" };
+    return res.status(400).json(response);
+  }
+
+  if (password.length < 8) {
+    const response: AuthResponse = { ok: false, message: "La contraseña debe tener al menos 8 caracteres" };
+    return res.status(400).json(response);
+  }
+
+  if (name.trim().length < 2) {
+    const response: AuthResponse = { ok: false, message: "El nombre es demasiado corto" };
+    return res.status(400).json(response);
+  }
+
+  const existing = getUserByEmail(email.toLowerCase().trim());
   if (existing) {
     const response: AuthResponse = { ok: false, message: "El email ya está registrado" };
     return res.status(400).json(response);
   }
 
-  const user = await createUser(email, name, password);
+  const user = await createUser(email.toLowerCase().trim(), name.trim(), password);
   if (!user) {
     const response: AuthResponse = { ok: false, message: "Error al crear usuario" };
     return res.status(500).json(response);
   }
 
-  // Crear JWT
   const payload: JWTPayload = {
     userId: user.id,
     email: user.email,
     isAdmin: !!user.is_admin,
   };
 
-  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: "7d" });
+  const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
 
   const response: AuthResponse = {
     ok: true,
@@ -120,7 +150,7 @@ router.get("/me", (req: Request, res: Response) => {
   const token = authHeader.slice(7);
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
+    const payload = jwt.verify(token, getJwtSecret()) as JWTPayload;
     const user = getUserByEmail(payload.email);
 
     if (!user) {

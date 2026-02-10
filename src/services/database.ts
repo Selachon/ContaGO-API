@@ -1,4 +1,4 @@
-import Database from "better-sqlite3";
+import Database, { type Database as DatabaseType } from "better-sqlite3";
 import bcrypt from "bcrypt";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -7,7 +7,7 @@ import type { User, UserPurchase } from "../types/auth.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, "../../data.db");
 
-const db = new Database(DB_PATH);
+const db: DatabaseType = new Database(DB_PATH);
 
 // Inicializar tablas
 db.exec(`
@@ -48,7 +48,6 @@ export async function createUser(
     const result = stmt.run(email, name, hash, isAdmin ? 1 : 0);
     return getUserById(result.lastInsertRowid as number);
   } catch (err) {
-    // Email duplicado u otro error
     console.error("Error creating user:", err);
     return null;
   }
@@ -98,21 +97,28 @@ export function hasPurchase(userId: number, toolId: string): boolean {
 }
 
 // ============================================
-// Seed admin user
+// Seed admin user (env-based, no hardcoded password)
 // ============================================
 
 export async function seedAdminUser(): Promise<void> {
-  const adminEmail = "info@contago.com.co";
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  const adminName = process.env.ADMIN_NAME || "Admin";
+
+  if (!adminEmail || !adminPassword) {
+    console.log("ADMIN_EMAIL / ADMIN_PASSWORD not set - skipping admin seed.");
+    return;
+  }
+
   const existing = getUserByEmail(adminEmail);
-  
+
   if (!existing) {
-    console.log("Creating admin user: info@contago.com.co");
-    // Password temporal - cambiar en producción
-    await createUser(adminEmail, "ContaGO Admin", "ContaGO2024!", true);
+    console.log(`Creating admin user: ${adminEmail}`);
+    await createUser(adminEmail, adminName, adminPassword, true);
   } else if (!existing.is_admin) {
-    // Asegurar que sea admin
     const stmt = db.prepare("UPDATE users SET is_admin = 1 WHERE email = ?");
     stmt.run(adminEmail);
+    console.log(`Promoted ${adminEmail} to admin.`);
   }
 }
 

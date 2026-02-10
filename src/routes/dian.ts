@@ -7,6 +7,8 @@ import { v4 as uuidv4 } from "uuid";
 import { extractDocumentIds, progressTracker } from "../services/dianScraper.js";
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
+import { requireAuth } from "../middleware/auth.js";
+import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import type { DownloadRequest, ProgressData } from "../types/dian.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,16 +21,51 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 
 const router = Router();
 
+// Auth middleware para rutas POST/GET normales
+router.use((req, res, next) => {
+  // SSE progress endpoint: acepta token como query param (EventSource no soporta headers)
+  if (req.path.startsWith("/progress/") && req.query.token) {
+    req.headers.authorization = `Bearer ${req.query.token}`;
+  }
+  requireAuth(req, res, next);
+});
+
+// ============================================
+// Limpieza periódica del progressTracker (TTL: 15 min)
+// ============================================
+const PROGRESS_TTL_MS = 15 * 60 * 1000;
+const progressTimestamps = new Map<string, number>();
+
+function setProgress(uid: string, data: ProgressData): void {
+  progressTracker.set(uid, data);
+  progressTimestamps.set(uid, Date.now());
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [uid, ts] of progressTimestamps) {
+    if (now - ts > PROGRESS_TTL_MS) {
+      progressTracker.delete(uid);
+      progressTimestamps.delete(uid);
+    }
+  }
+}, 60_000);
+
 // ============================================
 // GET /dian/progress/:uid (SSE)
 // ============================================
 router.get("/progress/:uid", (req: Request, res: Response) => {
   const { uid } = req.params;
 
+  // Validar formato uid
+  if (!uid || !/^[a-zA-Z0-9_-]+$/.test(uid)) {
+    return res.status(400).json({ status: "error", detalle: "uid inválido" });
+  }
+
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // Para nginx/proxies
+  res.setHeader("X-Accel-Buffering", "no");
 
   const timeoutSeconds = 600;
   const startTime = Date.now();
@@ -67,24 +104,33 @@ router.get("/progress/:uid", (req: Request, res: Response) => {
 // ============================================
 // POST /dian/download-documents
 // ============================================
-router.post("/download-documents", async (req: Request, res: Response) => {
+router.post("/download-documents", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as DownloadRequest;
   const { token_url, start_date, end_date, session_uid } = body;
 
-  if (!token_url) {
-    return res.status(400).json({ status: "error", detalle: "token_url es requerido" });
+  // Validar fechas si se proporcionan
+  if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
+    return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
+  }
+  if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
+    return res.status(400).json({ status: "error", detalle: "end_date debe tener formato YYYY-MM-DD" });
   }
 
   const uid = session_uid || uuidv4();
-  progressTracker.set(uid, { step: "Iniciando...", current: 0, total: 1 });
+  setProgress(uid, { step: "Iniciando...", current: 0, total: 1 });
+
+  // Directorio único para esta sesión
+  const sessionDir = uuidv4();
+  const tempDir = path.join(DOWNLOADS_DIR, sessionDir);
+  const zipPath = path.join(DOWNLOADS_DIR, `${sessionDir}-final.zip`);
 
   try {
     // Extraer lista de documentos
-    progressTracker.set(uid, { step: "Extrayendo lista de documentos...", current: 0, total: 1 });
+    setProgress(uid, { step: "Extrayendo lista de documentos...", current: 0, total: 1 });
     const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, uid);
 
     if (documents.length === 0) {
-      progressTracker.set(uid, {
+      setProgress(uid, {
         step: "Error",
         current: 0,
         total: 0,
@@ -97,11 +143,9 @@ router.post("/download-documents", async (req: Request, res: Response) => {
     }
 
     const totalDocs = documents.length;
-    progressTracker.set(uid, { step: "Iniciando descargas...", current: 0, total: totalDocs });
+    setProgress(uid, { step: "Iniciando descargas...", current: 0, total: totalDocs });
 
     // Crear directorio temporal
-    const tempUid = uuidv4();
-    const tempDir = path.join(DOWNLOADS_DIR, tempUid);
     fs.mkdirSync(tempDir, { recursive: true });
 
     // Descargar cada documento
@@ -112,7 +156,6 @@ router.post("/download-documents", async (req: Request, res: Response) => {
       const doc = documents[i];
       const docId = doc.id;
 
-      // Construir nombre: NIT - NúmeroDocumento.zip
       const left = sanitizeFilename(doc.nit) || "SinNIT";
       const right = sanitizeFilename(doc.docnum) || docId;
       let filename = `${left} - ${right}.zip`;
@@ -125,7 +168,7 @@ router.post("/download-documents", async (req: Request, res: Response) => {
       const destPath = path.join(tempDir, filename);
 
       try {
-        progressTracker.set(uid, {
+        setProgress(uid, {
           step: `Descargando ${i + 1} de ${totalDocs}`,
           current: i + 1,
           total: totalDocs,
@@ -135,7 +178,7 @@ router.post("/download-documents", async (req: Request, res: Response) => {
         console.log(`Descargado ${docId} -> ${filename}`);
       } catch (err) {
         console.error(`Error descargando ${docId}:`, err);
-        progressTracker.set(uid, {
+        setProgress(uid, {
           step: `Error descargando ${i + 1} (${docId})`,
           current: i + 1,
           total: totalDocs,
@@ -148,14 +191,13 @@ router.post("/download-documents", async (req: Request, res: Response) => {
     const startLabel = formatSpanishLabel(start_date) || "Desde";
     const endLabel = formatSpanishLabel(end_date) || "Hasta";
     const zipName = `${startLabel} - ${endLabel}.zip`;
-    const zipPath = path.join(DOWNLOADS_DIR, `${tempUid}-final.zip`);
 
     await createZip(tempDir, zipPath);
 
-    // Limpiar directorio temporal
+    // Limpiar directorio temporal inmediatamente
     fs.rmSync(tempDir, { recursive: true, force: true });
 
-    progressTracker.set(uid, { step: "Completado", current: totalDocs, total: totalDocs });
+    setProgress(uid, { step: "Completado", current: totalDocs, total: totalDocs });
 
     // Enviar archivo
     res.setHeader("Content-Type", "application/zip");
@@ -165,19 +207,30 @@ router.post("/download-documents", async (req: Request, res: Response) => {
     fileStream.pipe(res);
 
     fileStream.on("end", () => {
-      // Limpiar ZIP después de enviar
+      // Limpiar solo el ZIP de esta sesión
       setTimeout(() => {
         fs.unlink(zipPath, () => {});
       }, 5000);
+
+      // Limpiar progress después de un rato
+      setTimeout(() => {
+        progressTracker.delete(uid);
+        progressTimestamps.delete(uid);
+      }, 30_000);
     });
   } catch (err) {
     console.error("Error en download-documents:", err);
-    progressTracker.set(uid, {
+    setProgress(uid, {
       step: "Error",
       current: 0,
       total: 0,
       detalle: String(err),
     });
+
+    // Limpiar archivos de esta sesión en caso de error
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    try { fs.unlinkSync(zipPath); } catch {}
+
     return res.status(500).json({ status: "error", detalle: String(err) });
   }
 });
@@ -194,16 +247,24 @@ async function downloadFile(
     .map(([k, v]) => `${k}=${v}`)
     .join("; ");
 
-  const response = await fetch(url, {
-    headers: { Cookie: cookieHeader },
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
+  try {
+    const response = await fetch(url, {
+      headers: { Cookie: cookieHeader },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const buffer = await response.arrayBuffer();
+    fs.writeFileSync(destPath, Buffer.from(buffer));
+  } finally {
+    clearTimeout(timeout);
   }
-
-  const buffer = await response.arrayBuffer();
-  fs.writeFileSync(destPath, Buffer.from(buffer));
 }
 
 // ============================================
