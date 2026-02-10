@@ -144,6 +144,7 @@ export async function extractDocumentIds(
 function resolveExecutablePath(): string | null {
   const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
   if (envPath && !fs.existsSync(envPath)) {
+    // Limpiar env si apunta a un binario que no existe
     delete process.env.PUPPETEER_EXECUTABLE_PATH;
   }
 
@@ -157,9 +158,14 @@ function resolveExecutablePath(): string | null {
 
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
+      // Asegurar que Puppeteer no intente usar un path inválido del env
+      process.env.PUPPETEER_EXECUTABLE_PATH = candidate;
       return candidate;
     }
   }
+
+  // Si no hay binario del sistema, borrar para que Puppeteer use el descargado
+  delete process.env.PUPPETEER_EXECUTABLE_PATH;
 
   return null;
 }
