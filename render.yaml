@@ -1,0 +1,24 @@
+# Render Blueprint for ContaGO API
+# Deploy via: https://dashboard.render.com/blueprints
+
+services:
+  - type: web
+    name: contago-api
+    runtime: node
+    region: oregon
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8000
+      - key: CORS_ORIGIN
+        sync: false # Set manually: https://contago.com.co,https://www.contago.com.co
+      - key: JWT_SECRET
+        generateValue: true
+      - key: PUPPETEER_EXECUTABLE_PATH
+        value: /usr/bin/chromium-browser
+    # Render includes Chromium for Puppeteer automatically
+    # See: https://render.com/docs/puppeteer
