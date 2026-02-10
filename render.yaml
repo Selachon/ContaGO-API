@@ -7,7 +7,7 @@ services:
     runtime: node
     region: oregon
     plan: starter
-    buildCommand: npm install && npm run build
+    buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
     envVars:
       - key: NODE_ENV
@@ -18,6 +18,12 @@ services:
         sync: false # Set manually: https://contago.com.co,https://www.contago.com.co
       - key: JWT_SECRET
         generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_NAME
+        sync: false
       - key: MONGODB_URI
         sync: false
       - key: MONGODB_DB

@@ -1,5 +1,21 @@
-# Dockerfile for ContaGO API (Render)
-# Use this if you need more control over the build process
+# Dockerfile for ContaGO API
+
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies (incl. dev for build)
+RUN npm ci
+
+# Copy source
+COPY tsconfig.json ./
+COPY src ./src
+
+# Build TypeScript
+RUN npm run build
 
 FROM node:20-slim
 
@@ -23,11 +39,15 @@ RUN apt-get update && apt-get install -y \
     libxfixes3 \
     libxrandr2 \
     xdg-utils \
+    python3 \
+    make \
+    g++ \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Puppeteer to use installed Chromium
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+ENV NODE_ENV=production
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
@@ -35,17 +55,16 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install production dependencies
+RUN npm ci --omit=dev
 
-# Copy source
-COPY . .
-
-# Build TypeScript
-RUN npm run build
+# Copy build output
+COPY --from=builder /app/dist ./dist
 
 # Expose port
 EXPOSE 8000
 
+USER node
+
 # Start server
-CMD ["npm", "start"]
+CMD ["node", "dist/index.js"]

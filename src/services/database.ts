@@ -13,7 +13,6 @@ interface UserRecord {
   legacyId?: number;
 }
 
-type NewUserRecord = Omit<UserRecord, "_id">;
 
 let client: MongoClient | null = null;
 let db: Db | null = null;
@@ -68,7 +67,8 @@ export async function createUser(
 ): Promise<User | null> {
   try {
     const hash = await bcrypt.hash(password, 10);
-    const record: NewUserRecord = {
+    const record: UserRecord = {
+      _id: new ObjectId(),
       email: email.toLowerCase().trim(),
       name: name.trim(),
       password_hash: hash,
@@ -77,8 +77,8 @@ export async function createUser(
       created_at: new Date().toISOString(),
     };
 
-    const result = await usersCollection().insertOne(record as unknown as UserRecord);
-    return mapUser({ ...record, _id: result.insertedId } as UserRecord);
+    await usersCollection().insertOne(record);
+    return mapUser(record);
   } catch (err) {
     console.error("Error creating user:", err);
     return null;
