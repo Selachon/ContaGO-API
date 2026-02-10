@@ -142,6 +142,10 @@ export async function extractDocumentIds(
 }
 
 function resolveExecutablePath(): string | null {
+  if (!process.env.PUPPETEER_CACHE_DIR) {
+    process.env.PUPPETEER_CACHE_DIR = `${process.cwd()}/.cache/puppeteer`;
+  }
+
   const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
   if (envPath && !fs.existsSync(envPath)) {
     // Limpiar env si apunta a un binario que no existe

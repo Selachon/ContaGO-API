@@ -7,7 +7,7 @@ services:
     runtime: node
     region: oregon
     plan: starter
-    buildCommand: npm install --include=dev && npx puppeteer browsers install chrome && npm run build
+    buildCommand: npm install && npm run build
     startCommand: npm start
     envVars:
       - key: NODE_ENV
@@ -28,7 +28,5 @@ services:
         sync: false
       - key: MONGODB_DB
         sync: false
-      - key: PUPPETEER_CACHE_DIR
-        value: /opt/render/project/src/.cache/puppeteer
     # Render includes Chromium for Puppeteer automatically
     # See: https://render.com/docs/puppeteer
