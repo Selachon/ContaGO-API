@@ -2,6 +2,9 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
+import puppeteer from "puppeteer";
+import fs from "fs";
+import { execSync } from "child_process";
 import authRoutes from "./routes/auth.js";
 import dianRoutes from "./routes/dian.js";
 import { connectMongo, seedAdminUser } from "./services/database.js";
@@ -54,10 +57,30 @@ app.get("/", (_req, res) => {
   res.json({ status: "ok", service: "ContaGO API" });
 });
 
+async function ensurePuppeteer(): Promise<void> {
+  const isRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_HOSTNAME);
+  if (!isRender) return;
+
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR || "/opt/render/.cache/puppeteer";
+  process.env.PUPPETEER_CACHE_DIR = cacheDir;
+
+  const execPath = puppeteer.executablePath();
+  if (execPath && fs.existsSync(execPath)) {
+    return;
+  }
+
+  console.log("Chromium no encontrado. Instalando via Puppeteer...");
+  execSync("npx puppeteer browsers install chrome", {
+    stdio: "inherit",
+    env: process.env,
+  });
+}
+
 // ============================================
 // Startup
 // ============================================
-connectMongo()
+ensurePuppeteer()
+  .then(connectMongo)
   .then(seedAdminUser)
   .then(() => {
     app.listen(PORT, () => {
