@@ -1,4 +1,5 @@
 import puppeteer, { Browser, Page, Cookie } from "puppeteer";
+import fs from "fs";
 import type { DocumentInfo, ProgressData } from "../types/dian.js";
 
 // Progress tracker compartido
@@ -31,6 +32,8 @@ export async function extractDocumentIds(
   let browser: Browser | null = null;
 
   try {
+    const executablePath = resolveExecutablePath();
+
     browser = await puppeteer.launch({
       headless: true,
       args: [
@@ -39,8 +42,7 @@ export async function extractDocumentIds(
         "--disable-dev-shm-usage",
         "--disable-gpu",
       ],
-      // En Render, usar el chromium del sistema
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      executablePath: executablePath || undefined,
     });
 
     const page = await browser.newPage();
@@ -137,6 +139,24 @@ export async function extractDocumentIds(
       await browser.close();
     }
   }
+}
+
+function resolveExecutablePath(): string | null {
+  const candidates = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+  ].filter(Boolean) as string[];
+
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
 }
 
 async function applyDateFilter(page: Page, startDate: string, endDate: string): Promise<void> {
