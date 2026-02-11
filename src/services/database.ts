@@ -9,6 +9,7 @@ interface UserRecord {
   password_hash: string;
   is_admin: boolean;
   purchasedTools: string[];
+  nits: string[];
   created_at: string;
   legacyId?: number;
 }
@@ -51,6 +52,7 @@ function mapUser(record: UserRecord | null): User | null {
     name: record.name,
     password_hash: record.password_hash,
     is_admin: record.is_admin,
+    nits: record.nits || [],
     created_at: record.created_at,
   };
 }
@@ -63,7 +65,8 @@ export async function createUser(
   email: string,
   name: string,
   password: string,
-  isAdmin = false
+  isAdmin = false,
+  nits: string[] = []
 ): Promise<User | null> {
   try {
     const hash = await bcrypt.hash(password, 10);
@@ -74,6 +77,7 @@ export async function createUser(
       password_hash: hash,
       is_admin: isAdmin,
       purchasedTools: [],
+      nits,
       created_at: new Date().toISOString(),
     };
 
@@ -142,6 +146,20 @@ export async function hasPurchase(userId: string, toolId: string): Promise<boole
 }
 
 // ============================================
+// NIT functions
+// ============================================
+
+export async function getUserNits(userId: string): Promise<string[]> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne({ _id: oid }, { projection: { nits: 1 } });
+    return record?.nits || [];
+  } catch {
+    return [];
+  }
+}
+
+// ============================================
 // Seed admin user (env-based, no hardcoded password)
 // ============================================
 
@@ -149,6 +167,9 @@ export async function seedAdminUser(): Promise<void> {
   const adminEmail = process.env.ADMIN_EMAIL;
   const adminPassword = process.env.ADMIN_PASSWORD;
   const adminName = process.env.ADMIN_NAME || "Admin";
+  const adminNits = process.env.ADMIN_NITS
+    ? process.env.ADMIN_NITS.split(",").map((n) => n.trim()).filter(Boolean)
+    : [];
 
   if (!adminEmail || !adminPassword) {
     console.log("ADMIN_EMAIL / ADMIN_PASSWORD not set - skipping admin seed.");
@@ -159,13 +180,21 @@ export async function seedAdminUser(): Promise<void> {
 
   if (!existing) {
     console.log(`Creating admin user: ${adminEmail}`);
-    await createUser(adminEmail, adminName, adminPassword, true);
-  } else if (!existing.is_admin) {
-    await usersCollection().updateOne(
-      { email: adminEmail.toLowerCase().trim() },
-      { $set: { is_admin: true } }
-    );
-    console.log(`Promoted ${adminEmail} to admin.`);
+    await createUser(adminEmail, adminName, adminPassword, true, adminNits);
+  } else {
+    // Ensure admin flag and sync NITs from env
+    const updates: Record<string, unknown> = {};
+    if (!existing.is_admin) updates.is_admin = true;
+    if (adminNits.length > 0) updates.nits = adminNits;
+
+    if (Object.keys(updates).length > 0) {
+      await usersCollection().updateOne(
+        { email: adminEmail.toLowerCase().trim() },
+        { $set: updates }
+      );
+      if (updates.is_admin) console.log(`Promoted ${adminEmail} to admin.`);
+      if (updates.nits) console.log(`Updated NITs for ${adminEmail}: ${adminNits.join(", ")}`);
+    }
   }
 }
 

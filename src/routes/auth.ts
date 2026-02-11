@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import {
   createUser,
   getUserByEmail,
+  getUserNits,
   getUserPurchases,
   verifyPassword,
 } from "../services/database.js";
@@ -57,7 +58,10 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
   };
 
   const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
-  const purchasedTools = await getUserPurchases(user.id);
+  const [purchasedTools, nits] = await Promise.all([
+    getUserPurchases(user.id),
+    getUserNits(user.id),
+  ]);
 
   const response: AuthResponse = {
     ok: true,
@@ -68,6 +72,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
       name: user.name,
       isAdmin: !!user.is_admin,
       purchasedTools,
+      nits,
     },
   };
 
@@ -132,6 +137,7 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
       name: user.name,
       isAdmin: !!user.is_admin,
       purchasedTools: [],
+      nits: [],
     },
   };
 
@@ -157,7 +163,10 @@ router.get("/me", async (req: Request, res: Response) => {
       return res.status(401).json({ ok: false, message: "Usuario no encontrado" });
     }
 
-    const purchasedTools = await getUserPurchases(user.id);
+    const [purchasedTools, nits] = await Promise.all([
+      getUserPurchases(user.id),
+      getUserNits(user.id),
+    ]);
 
     return res.json({
       ok: true,
@@ -167,6 +176,7 @@ router.get("/me", async (req: Request, res: Response) => {
         name: user.name,
         isAdmin: !!user.is_admin,
         purchasedTools,
+        nits,
       },
     });
   } catch {

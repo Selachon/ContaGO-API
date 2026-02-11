@@ -9,6 +9,7 @@ import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
 import { requireAuth } from "../middleware/auth.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
+import { getUserNits } from "../services/database.js";
 import type { DownloadRequest, ProgressData } from "../types/dian.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -141,6 +142,43 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
         detalle: "No se encontraron documentos en el rango seleccionado.",
       });
     }
+
+    // ── NIT access control ──────────────────────────────
+    // Admins bypass NIT restriction; regular users can only
+    // download documents whose NIT is in their allowed list.
+    if (!req.user?.isAdmin) {
+      const allowedNits = await getUserNits(req.user!.userId);
+
+      if (allowedNits.length === 0) {
+        setProgress(uid, {
+          step: "Error",
+          current: 0,
+          total: 0,
+          detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
+        });
+        return res.status(403).json({
+          status: "error",
+          detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
+        });
+      }
+
+      const docNits = [...new Set(documents.map((d) => d.nit).filter(Boolean))];
+      const unauthorized = docNits.filter((nit) => !allowedNits.includes(nit));
+
+      if (unauthorized.length > 0) {
+        setProgress(uid, {
+          step: "Error",
+          current: 0,
+          total: 0,
+          detalle: `No tienes acceso a los NIT: ${unauthorized.join(", ")}`,
+        });
+        return res.status(403).json({
+          status: "error",
+          detalle: `No tienes acceso a los NIT: ${unauthorized.join(", ")}`,
+        });
+      }
+    }
+    // ────────────────────────────────────────────────────
 
     const totalDocs = documents.length;
     setProgress(uid, { step: "Iniciando descargas...", current: 0, total: totalDocs });

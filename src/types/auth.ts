@@ -4,6 +4,7 @@ export interface User {
   name: string;
   password_hash: string;
   is_admin: boolean;
+  nits: string[];
   created_at: string;
 }
 
@@ -30,5 +31,6 @@ export interface AuthResponse {
     name: string;
     isAdmin: boolean;
     purchasedTools: string[];
+    nits: string[];
   };
 }
