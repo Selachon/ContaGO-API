@@ -7,6 +7,7 @@ import {
   getUserPurchases,
   verifyPassword,
 } from "../services/database.js";
+import { requireAuth } from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import type { AuthResponse, JWTPayload } from "../types/auth.js";
 
@@ -138,6 +139,101 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
       isAdmin: !!user.is_admin,
       purchasedTools: [],
       nits: [],
+    },
+  };
+
+  return res.status(201).json(response);
+});
+
+// ============================================
+// POST /auth/admin/create-user (admin only)
+// ============================================
+router.post("/admin/create-user", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) {
+    const response: AuthResponse = { ok: false, message: "No autorizado" };
+    return res.status(403).json(response);
+  }
+
+  const { email, password, name, isAdmin, nits, purchasedTools } = req.body;
+
+  if (
+    !email || !password || !name ||
+    typeof email !== "string" || typeof password !== "string" || typeof name !== "string"
+  ) {
+    const response: AuthResponse = { ok: false, message: "Email, nombre y contraseña requeridos" };
+    return res.status(400).json(response);
+  }
+
+  if (!isValidEmail(email)) {
+    const response: AuthResponse = { ok: false, message: "Email no válido" };
+    return res.status(400).json(response);
+  }
+
+  if (password.length < 8) {
+    const response: AuthResponse = { ok: false, message: "La contraseña debe tener al menos 8 caracteres" };
+    return res.status(400).json(response);
+  }
+
+  if (name.trim().length < 2) {
+    const response: AuthResponse = { ok: false, message: "El nombre es demasiado corto" };
+    return res.status(400).json(response);
+  }
+
+  const normalizedNits = Array.isArray(nits)
+    ? nits
+    : typeof nits === "string"
+      ? [nits]
+      : [];
+
+  const cleanNits = Array.from(new Set(
+    normalizedNits
+      .filter((nit) => typeof nit === "string")
+      .map((nit) => nit.trim())
+      .filter(Boolean)
+  ));
+
+  const normalizedTools = Array.isArray(purchasedTools)
+    ? purchasedTools
+    : typeof purchasedTools === "string"
+      ? [purchasedTools]
+      : [];
+
+  const cleanTools = Array.from(new Set(
+    normalizedTools
+      .filter((tool) => typeof tool === "string")
+      .map((tool) => tool.trim())
+      .filter(Boolean)
+  ));
+
+  const existing = await getUserByEmail(email.toLowerCase().trim());
+  if (existing) {
+    const response: AuthResponse = { ok: false, message: "El email ya está registrado" };
+    return res.status(400).json(response);
+  }
+
+  const user = await createUser(
+    email.toLowerCase().trim(),
+    name.trim(),
+    password,
+    !!isAdmin,
+    cleanNits,
+    cleanTools
+  );
+
+  if (!user) {
+    const response: AuthResponse = { ok: false, message: "Error al crear usuario" };
+    return res.status(500).json(response);
+  }
+
+  const response: AuthResponse = {
+    ok: true,
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      isAdmin: !!user.is_admin,
+      purchasedTools: cleanTools,
+      nits: cleanNits,
     },
   };
 

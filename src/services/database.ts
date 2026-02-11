@@ -66,7 +66,8 @@ export async function createUser(
   name: string,
   password: string,
   isAdmin = false,
-  nits: string[] = []
+  nits: string[] = [],
+  purchasedTools: string[] = []
 ): Promise<User | null> {
   try {
     const hash = await bcrypt.hash(password, 10);
@@ -76,7 +77,7 @@ export async function createUser(
       name: name.trim(),
       password_hash: hash,
       is_admin: isAdmin,
-      purchasedTools: [],
+      purchasedTools,
       nits,
       created_at: new Date().toISOString(),
     };
