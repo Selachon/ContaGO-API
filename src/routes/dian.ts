@@ -120,6 +120,61 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   const uid = session_uid || uuidv4();
   setProgress(uid, { step: "Iniciando...", current: 0, total: 1 });
 
+  // ── NIT access control (rk param in token_url) ───────
+  // Admins bypass NIT restriction; regular users can only
+  // download documents for their allowed NIT(s).
+  if (!req.user?.isAdmin) {
+    const allowedNits = await getUserNits(req.user!.userId);
+    if (allowedNits.length === 0) {
+      setProgress(uid, {
+        step: "Error",
+        current: 0,
+        total: 0,
+        detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
+      });
+      return res.status(403).json({
+        status: "error",
+        detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
+      });
+    }
+
+    let tokenNit = "";
+    try {
+      const parsed = new URL(token_url);
+      tokenNit = parsed.searchParams.get("rk")?.trim() || "";
+    } catch {
+      // token_url ya fue validada por validateDianUrl, pero protegemos el parse
+      tokenNit = "";
+    }
+
+    if (!tokenNit) {
+      setProgress(uid, {
+        step: "Error",
+        current: 0,
+        total: 0,
+        detalle: "El token_url no contiene rk (NIT).",
+      });
+      return res.status(400).json({
+        status: "error",
+        detalle: "El token_url no contiene rk (NIT).",
+      });
+    }
+
+    if (!allowedNits.includes(tokenNit)) {
+      setProgress(uid, {
+        step: "Error",
+        current: 0,
+        total: 0,
+        detalle: `No tienes acceso al NIT ${tokenNit}`,
+      });
+      return res.status(403).json({
+        status: "error",
+        detalle: `No tienes acceso al NIT ${tokenNit}`,
+      });
+    }
+  }
+  // ────────────────────────────────────────────────────
+
   // Directorio único para esta sesión
   const sessionDir = uuidv4();
   const tempDir = path.join(DOWNLOADS_DIR, sessionDir);
@@ -142,43 +197,6 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
         detalle: "No se encontraron documentos en el rango seleccionado.",
       });
     }
-
-    // ── NIT access control ──────────────────────────────
-    // Admins bypass NIT restriction; regular users can only
-    // download documents whose NIT is in their allowed list.
-    if (!req.user?.isAdmin) {
-      const allowedNits = await getUserNits(req.user!.userId);
-
-      if (allowedNits.length === 0) {
-        setProgress(uid, {
-          step: "Error",
-          current: 0,
-          total: 0,
-          detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
-        });
-        return res.status(403).json({
-          status: "error",
-          detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
-        });
-      }
-
-      const docNits = [...new Set(documents.map((d) => d.nit).filter(Boolean))];
-      const unauthorized = docNits.filter((nit) => !allowedNits.includes(nit));
-
-      if (unauthorized.length > 0) {
-        setProgress(uid, {
-          step: "Error",
-          current: 0,
-          total: 0,
-          detalle: `No tienes acceso a los NIT: ${unauthorized.join(", ")}`,
-        });
-        return res.status(403).json({
-          status: "error",
-          detalle: `No tienes acceso a los NIT: ${unauthorized.join(", ")}`,
-        });
-      }
-    }
-    // ────────────────────────────────────────────────────
 
     const totalDocs = documents.length;
     setProgress(uid, { step: "Iniciando descargas...", current: 0, total: totalDocs });
