@@ -14,6 +14,7 @@ import type { DownloadRequest, ProgressData } from "../types/dian.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
+const MAX_DOCUMENTS_PER_REQUEST = Number(process.env.DIAN_MAX_DOCUMENTS || 300);
 
 // Asegurar que existe el directorio de descargas
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -22,14 +23,8 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 
 const router = Router();
 
-// Auth middleware para rutas POST/GET normales
-router.use((req, res, next) => {
-  // SSE progress endpoint: acepta token como query param (EventSource no soporta headers)
-  if (req.path.startsWith("/progress/") && req.query.token) {
-    req.headers.authorization = `Bearer ${req.query.token}`;
-  }
-  requireAuth(req, res, next);
-});
+// Auth middleware para todas las rutas DIAN
+router.use(requireAuth);
 
 // ============================================
 // Limpieza periódica del progressTracker (TTL: 15 min)
@@ -198,6 +193,19 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
       });
     }
 
+    if (documents.length > MAX_DOCUMENTS_PER_REQUEST) {
+      setProgress(uid, {
+        step: "Error",
+        current: 0,
+        total: 0,
+        detalle: `Se excedió el máximo permitido por solicitud (${MAX_DOCUMENTS_PER_REQUEST}).`,
+      });
+      return res.status(413).json({
+        status: "error",
+        detalle: `Demasiados documentos para una sola solicitud. Máximo: ${MAX_DOCUMENTS_PER_REQUEST}`,
+      });
+    }
+
     const totalDocs = documents.length;
     setProgress(uid, { step: "Iniciando descargas...", current: 0, total: totalDocs });
 
@@ -238,7 +246,7 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
           step: `Error descargando ${i + 1} (${docId})`,
           current: i + 1,
           total: totalDocs,
-          detalle: String(err),
+          detalle: "No se pudo descargar uno de los documentos.",
         });
       }
     }
@@ -280,14 +288,14 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
       step: "Error",
       current: 0,
       total: 0,
-      detalle: String(err),
+      detalle: "Ocurrió un error procesando la solicitud.",
     });
 
     // Limpiar archivos de esta sesión en caso de error
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
     try { fs.unlinkSync(zipPath); } catch {}
 
-    return res.status(500).json({ status: "error", detalle: String(err) });
+    return res.status(500).json({ status: "error", detalle: "Error interno al procesar la descarga." });
   }
 });
 

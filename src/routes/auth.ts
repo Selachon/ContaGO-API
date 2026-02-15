@@ -7,11 +7,19 @@ import {
   getUserPurchases,
   verifyPassword,
 } from "../services/database.js";
-import { requireAuth } from "../middleware/auth.js";
+import {
+  AUTH_COOKIE_NAME,
+  getAuthCookieClearOptions,
+  getAuthCookieOptions,
+  getRequestToken,
+  requireAuth,
+} from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import type { AuthResponse, JWTPayload } from "../types/auth.js";
 
 const router = Router();
+
+const ALLOW_PUBLIC_REGISTER = process.env.ALLOW_PUBLIC_REGISTER === "true";
 
 function getJwtSecret(): string {
   // Garantizado por la validación en index.ts
@@ -66,7 +74,6 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
 
   const response: AuthResponse = {
     ok: true,
-    token,
     user: {
       id: user.id,
       email: user.email,
@@ -77,6 +84,8 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
     },
   };
 
+  res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
+
   return res.json(response);
 });
 
@@ -84,6 +93,14 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
 // POST /auth/register (rate limited: 5 intentos / 15 min)
 // ============================================
 router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res: Response) => {
+  if (!ALLOW_PUBLIC_REGISTER) {
+    const response: AuthResponse = {
+      ok: false,
+      message: "Registro público deshabilitado. Solicita acceso al equipo de ContaGO.",
+    };
+    return res.status(403).json(response);
+  }
+
   const { email, password, name } = req.body;
 
   if (
@@ -131,7 +148,6 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
 
   const response: AuthResponse = {
     ok: true,
-    token,
     user: {
       id: user.id,
       email: user.email,
@@ -142,7 +158,14 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
     },
   };
 
+  res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
+
   return res.status(201).json(response);
+});
+
+router.post("/logout", (_req: Request, res: Response) => {
+  res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+  return res.json({ ok: true });
 });
 
 // ============================================
@@ -244,18 +267,17 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
 // GET /auth/me (verificar token)
 // ============================================
 router.get("/me", async (req: Request, res: Response) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer ")) {
+  const token = getRequestToken(req);
+  if (!token) {
     return res.status(401).json({ ok: false, message: "Token no proporcionado" });
   }
-
-  const token = authHeader.slice(7);
 
   try {
     const payload = jwt.verify(token, getJwtSecret()) as JWTPayload;
     const user = await getUserByEmail(payload.email);
 
     if (!user) {
+      res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
       return res.status(401).json({ ok: false, message: "Usuario no encontrado" });
     }
 
@@ -276,6 +298,7 @@ router.get("/me", async (req: Request, res: Response) => {
       },
     });
   } catch {
+    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
     return res.status(401).json({ ok: false, message: "Token inválido" });
   }
 });
