@@ -74,6 +74,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
 
   const response: AuthResponse = {
     ok: true,
+    token,
     user: {
       id: user.id,
       email: user.email,
@@ -148,6 +149,7 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
 
   const response: AuthResponse = {
     ok: true,
+    token,
     user: {
       id: user.id,
       email: user.email,

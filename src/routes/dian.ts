@@ -24,7 +24,14 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 const router = Router();
 
 // Auth middleware para todas las rutas DIAN
-router.use(requireAuth);
+// EventSource no permite headers personalizados, por eso aceptamos
+// token por query param solo en el endpoint de progreso.
+router.use((req, res, next) => {
+  if (req.path.startsWith("/progress/") && typeof req.query.token === "string") {
+    req.headers.authorization = `Bearer ${req.query.token}`;
+  }
+  requireAuth(req, res, next);
+});
 
 // ============================================
 // Limpieza periódica del progressTracker (TTL: 15 min)
