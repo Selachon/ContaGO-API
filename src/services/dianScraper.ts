@@ -84,26 +84,6 @@ export async function extractDocumentIds(
     const allDocuments: DocumentInfo[] = [];
     const seenIds = new Set<string>();
     let pageIndex = 0;
-    let consecutiveEmptyPages = 0;
-    const MAX_EMPTY_PAGES = 2;
-
-    // Debug: capturar info de la tabla
-    const tableInfo = await page.evaluate(() => {
-      const table = document.querySelector("#tableDocuments, table.dataTable, table");
-      const rows = document.querySelectorAll("#tableDocuments tbody tr, table.dataTable tbody tr");
-      const emptyRow = document.querySelector("tr.dataTables_empty, td.dataTables_empty");
-      const infoText = document.querySelector(".dataTables_info, #tableDocuments_info")?.textContent || "";
-      
-      return {
-        tableExists: !!table,
-        rowCount: rows.length,
-        hasEmptyIndicator: !!emptyRow,
-        emptyText: emptyRow?.textContent || "",
-        infoText,
-        firstRowHtml: rows[0]?.innerHTML?.substring(0, 200) || "N/A"
-      };
-    });
-    console.log("Estado inicial de tabla:", JSON.stringify(tableInfo));
 
     while (true) {
       pageIndex++;
@@ -113,37 +93,15 @@ export async function extractDocumentIds(
         total: Math.max(allDocuments.length + 5, 10),
       });
 
-      await delay(300);
+      await delay(250);
 
-      // Verificar si tabla vacía con múltiples selectores
-      const isEmpty = await page.evaluate(() => {
-        const emptyRow = document.querySelector("tr.dataTables_empty, td.dataTables_empty");
-        const noDataText = document.body.innerText.includes("No hay datos disponibles") ||
-                          document.body.innerText.includes("No data available") ||
-                          document.body.innerText.includes("No se encontraron");
-        const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
-        return (!!emptyRow || noDataText) && rows.length === 0;
-      });
-      
-      if (isEmpty) {
-        console.log(`Página ${pageIndex}: tabla vacía detectada`);
-        break;
-      }
+      // Verificar si tabla vacía
+      const isEmpty = await page.$("tr.dataTables_empty");
+      if (isEmpty) break;
 
       // Extraer documentos de la página actual
       const newDocs = await extractDocsFromPage(page, seenIds);
-      
-      if (newDocs.length === 0) {
-        consecutiveEmptyPages++;
-        console.log(`Página ${pageIndex}: 0 nuevos docs (consecutivos vacíos: ${consecutiveEmptyPages})`);
-        if (consecutiveEmptyPages >= MAX_EMPTY_PAGES) {
-          console.log("Deteniendo: demasiadas páginas consecutivas sin documentos nuevos");
-          break;
-        }
-      } else {
-        consecutiveEmptyPages = 0;
-        allDocuments.push(...newDocs);
-      }
+      allDocuments.push(...newDocs);
 
       updateProgress({
         current: allDocuments.length,
@@ -154,10 +112,7 @@ export async function extractDocumentIds(
 
       // Intentar ir a la siguiente página
       const hasNext = await goToNextPage(page);
-      if (!hasNext) {
-        console.log("No hay más páginas");
-        break;
-      }
+      if (!hasNext) break;
 
       // Esperar a que cambie la tabla
       await waitForTableChange(page, seenIds);
@@ -221,96 +176,44 @@ function resolveExecutablePath(): string | null {
 
 async function applyDateFilter(page: Page, startDate: string, endDate: string): Promise<void> {
   try {
-    // Convertir YYYY-MM-DD a YYYY/MM/DD (formato que usa la DIAN)
-    const formatToDian = (dateStr: string): string => {
-      return dateStr.replace(/-/g, "/");
-    };
-
-    const sDate = formatToDian(startDate);
-    const eDate = formatToDian(endDate);
-    const rangoCompleto = `${sDate} - ${eDate}`;
-
-    console.log(`Aplicando filtro de fechas: ${rangoCompleto}`);
-
-    // Intentar encontrar el input de rango de fechas con selectores más específicos
+    // Intentar encontrar el input de rango de fechas
     const rangeInput = await page.$(
       "#dashboard-report-range input, " +
-      "#dashboard-report-range, " +
       "input[placeholder*='Rango'], " +
       "input[aria-label*='Rango'], " +
-      ".daterangepicker-input, " +
-      "input.form-control[name*='date'], " +
-      "input[id*='range'], " +
-      "input[id*='date']"
+      "input[placeholder*='Fecha'], " +
+      "input[aria-label*='Fecha'], " +
+      "input[name*='date'], " +
+      "input[name*='fecha'], " +
+      "input[id*='range']"
     );
 
     if (rangeInput) {
-      console.log("Input de rango encontrado, escribiendo fechas...");
-      
-      // Limpiar el campo primero
-      await rangeInput.click({ clickCount: 3 });
-      await page.keyboard.press("Backspace");
-      await delay(100);
-      
-      // Escribir el rango
-      await rangeInput.type(rangoCompleto, { delay: 50 });
+      const sDate = startDate.replace(/-/g, "/");
+      const eDate = endDate.replace(/-/g, "/");
+      const rangoCompleto = `${sDate} - ${eDate}`;
+
+      await rangeInput.click({ clickCount: 3 }); // Seleccionar todo
+      await rangeInput.type(rangoCompleto);
       await page.keyboard.press("Enter");
-      await delay(800);
+      await delay(450);
     } else {
-      console.log("No se encontró input de rango directo. Intentando con daterangepicker...");
-      
-      // Intentar hacer click en el div del daterangepicker para abrirlo
-      const dateRangeDiv = await page.$("#dashboard-report-range");
-      if (dateRangeDiv) {
-        await dateRangeDiv.click();
-        await delay(500);
-        
-        // Buscar inputs de fecha inicio y fin dentro del picker
-        const startInput = await page.$(".daterangepicker .drp-calendar.left input, .daterangepicker input[name='daterangepicker_start']");
-        const endInput = await page.$(".daterangepicker .drp-calendar.right input, .daterangepicker input[name='daterangepicker_end']");
-        
-        if (startInput && endInput) {
-          await startInput.click({ clickCount: 3 });
-          await startInput.type(sDate);
-          await endInput.click({ clickCount: 3 });
-          await endInput.type(eDate);
-          
-          // Click en Apply/Aplicar
-          const applyBtn = await page.$(".daterangepicker .applyBtn, .daterangepicker button.btn-primary");
-          if (applyBtn) {
-            await applyBtn.click();
-            await delay(500);
-          }
-        }
-      } else {
-        console.log("No se encontró daterangepicker div.");
-      }
+      console.log("No se encontró input de rango - continuando sin escribir fechas.");
     }
 
-    // Intentar click en botón 'Buscar' o 'Filtrar'
+    // Intentar click en botón 'Buscar'
     const clicked = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], a.btn"));
-      const btn = buttons.find((b) => {
-        const text = b.textContent?.trim().toLowerCase() || "";
-        return text.includes("buscar") || text.includes("filtrar") || text.includes("aplicar");
-      });
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const btn = buttons.find((b) => b.textContent?.trim().includes("Buscar"));
       if (btn) {
         (btn as HTMLElement).click();
         return true;
       }
       return false;
     });
-    
     if (clicked) {
-      console.log("Botón de búsqueda clickeado");
-      await delay(800);
-    } else {
-      console.log("No se encontró botón de búsqueda explícito");
+      await delay(450);
     }
-
-    // Esperar a que la tabla se actualice
-    await delay(1000);
-    
   } catch (err) {
     console.error("Error aplicando rango de fechas:", err);
   }
@@ -318,36 +221,16 @@ async function applyDateFilter(page: Page, startDate: string, endDate: string): 
 
 async function waitForTableLoad(page: Page): Promise<void> {
   try {
-    console.log("Esperando carga de tabla...");
-    
     // Esperar a que desaparezca el overlay de procesamiento
     try {
-      const processingVisible = await page.$("#tableDocuments_processing:not([style*='display: none'])");
-      if (processingVisible) {
-        console.log("Overlay de procesamiento detectado, esperando...");
-        await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 30000 });
-        console.log("Overlay de procesamiento oculto");
-      }
+      await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 5000 });
+      await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 20000 });
     } catch {
-      // Overlay no detectado
+      // Overlay no detectado, esperar filas directamente
+      await page.waitForSelector("table#tableDocuments tbody tr", { timeout: 6000 }).catch(() => {});
     }
-    
-    // Esperar a que aparezcan filas en la tabla
-    try {
-      await page.waitForSelector(
-        "table#tableDocuments tbody tr, table.dataTable tbody tr, #tableDocuments tbody tr",
-        { timeout: 15000 }
-      );
-      console.log("Filas de tabla detectadas");
-    } catch {
-      console.log("No se detectaron filas en la tabla después de esperar");
-    }
-    
-    // Esperar un poco más para asegurar que los datos estén completos
-    await delay(500);
-    
   } catch (err) {
-    console.log("Error en waitForTableLoad:", err);
+    console.log("Espera resultados:", err);
   }
 }
 
