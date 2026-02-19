@@ -81,31 +81,56 @@ export async function extractDocumentIds(
     
     // Esperar a que la tabla se actualice con 100 registros
     try {
-      await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 2000 });
-      await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
+      await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 3000 });
+      await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 20000 });
     } catch {
-      await delay(1500);
+      // Si no aparece el processing, esperar más tiempo
+      await delay(2000);
     }
-    await delay(500);
+    // Espera adicional para asegurar que la tabla está completamente cargada
+    await delay(1000);
 
     // 6) Extracción con paginación
     const allDocuments: DocumentInfo[] = [];
     const seenIds = new Set<string>();
     let pageIndex = 0;
 
+    // Obtener total esperado de la info de paginación
+    const expectedTotal = await page.evaluate(() => {
+      const info = document.querySelector("#tableDocuments_info, .dataTables_info");
+      const text = info?.textContent || "";
+      // Buscar patrón "de X registros" o "of X entries"
+      const match = text.match(/de\s+([\d,.]+)\s+registros|of\s+([\d,.]+)\s+entries/i);
+      if (match) {
+        const num = (match[1] || match[2]).replace(/[,.]/g, "");
+        return parseInt(num, 10) || 0;
+      }
+      return 0;
+    });
+    console.log(`Total esperado según paginación: ${expectedTotal}`);
+
     while (true) {
       pageIndex++;
       updateProgress({
         step: `Extrayendo lista (página ${pageIndex})...`,
         current: allDocuments.length,
-        total: Math.max(allDocuments.length + 5, 10),
+        total: expectedTotal || Math.max(allDocuments.length + 5, 10),
       });
 
-      await delay(400);
+      await delay(500);
+
+      // Contar filas visibles antes de extraer
+      const visibleRows = await page.evaluate(() => {
+        return document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)").length;
+      });
+      console.log(`Página ${pageIndex} - filas visibles: ${visibleRows}`);
 
       // Verificar si tabla vacía
       const isEmpty = await page.$("tr.dataTables_empty");
-      if (isEmpty) break;
+      if (isEmpty) {
+        console.log(`Página ${pageIndex} - tabla vacía, terminando`);
+        break;
+      }
 
       // Extraer documentos de la página actual
       const newDocs = await extractDocsFromPage(page, seenIds);
@@ -113,14 +138,23 @@ export async function extractDocumentIds(
 
       updateProgress({
         current: allDocuments.length,
-        total: allDocuments.length,
+        total: expectedTotal || allDocuments.length,
       });
 
-      console.log(`Página ${pageIndex} - nuevos IDs: ${newDocs.length}, acumulados: ${allDocuments.length}`);
+      console.log(`Página ${pageIndex} - extraídos: ${newDocs.length}, acumulados: ${allDocuments.length}/${expectedTotal}`);
+
+      // Verificar si ya tenemos todos
+      if (expectedTotal > 0 && allDocuments.length >= expectedTotal) {
+        console.log(`Alcanzado el total esperado (${expectedTotal}), terminando`);
+        break;
+      }
 
       // Intentar ir a la siguiente página
       const hasNext = await goToNextPage(page);
-      if (!hasNext) break;
+      if (!hasNext) {
+        console.log(`No hay más páginas disponibles, terminando`);
+        break;
+      }
 
       // Esperar a que cambie la tabla
       await waitForTableChange(page, seenIds);
@@ -373,16 +407,37 @@ async function goToNextPage(page: Page): Promise<boolean> {
 
     if (isDisabled) return false;
 
+    // Guardar el número de página actual antes de hacer click
+    const currentPageNum = await page.evaluate(() => {
+      const active = document.querySelector("#tableDocuments_paginate .paginate_button.current, .paginate_button.active");
+      return active?.textContent?.trim() || "0";
+    });
+
     await nextBtn.click();
     
-    // Esperar a que la tabla muestre el indicador de procesamiento y luego desaparezca
+    // Esperar a que cambie el número de página activa
+    const startTime = Date.now();
+    while (Date.now() - startTime < 10000) {
+      const newPageNum = await page.evaluate(() => {
+        const active = document.querySelector("#tableDocuments_paginate .paginate_button.current, .paginate_button.active");
+        return active?.textContent?.trim() || "0";
+      });
+      
+      if (newPageNum !== currentPageNum) {
+        break;
+      }
+      await delay(200);
+    }
+    
+    // Esperar a que el processing indicator desaparezca
     try {
-      await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 2000 });
       await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
     } catch {
-      // Si no aparece el processing, esperar un tiempo prudente
-      await delay(1000);
+      // Continuar de todos modos
     }
+    
+    // Espera adicional para que la tabla se estabilice
+    await delay(800);
     
     return true;
   } catch {
@@ -391,15 +446,25 @@ async function goToNextPage(page: Page): Promise<boolean> {
 }
 
 async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<void> {
+  // Primero esperar a que el processing indicator desaparezca
+  try {
+    await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
+  } catch {
+    // Si no hay processing indicator, continuar
+  }
+  
+  // Esperar un momento para que la tabla se estabilice
+  await delay(800);
+  
+  // Luego verificar que hay nuevos IDs
   const startTime = Date.now();
-  const timeout = 12000;
+  const timeout = 10000;
 
   while (Date.now() - startTime < timeout) {
     const hasNewIds = await page.evaluate((seen) => {
       const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
       
       for (const row of rows) {
-        // Buscar trackId en elementos de la fila
         const elements = row.querySelectorAll(
           ".download-document, .download-support-document, .download-eventos, " +
           ".download-equivalente-document, .download-individual-payroll, " +
@@ -423,10 +488,15 @@ async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<voi
       return false;
     }, Array.from(seenIds));
 
-    if (hasNewIds) return;
+    if (hasNewIds) {
+      // Esperar un poco más para asegurar que toda la tabla cargó
+      await delay(500);
+      return;
+    }
     await delay(300);
   }
 
+  // Timeout alcanzado, esperar un poco más por si acaso
   await delay(500);
 }
 
