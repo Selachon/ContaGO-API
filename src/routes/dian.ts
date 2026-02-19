@@ -4,6 +4,8 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import archiver from "archiver";
 import { v4 as uuidv4 } from "uuid";
+import JSZip from "jszip";
+import { PDFDocument } from "pdf-lib";
 import { extractDocumentIds, progressTracker } from "../services/dianScraper.js";
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
@@ -109,7 +111,7 @@ router.get("/progress/:uid", (req: Request, res: Response) => {
 // ============================================
 router.post("/download-documents", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as DownloadRequest;
-  const { token_url, start_date, end_date, session_uid } = body;
+  const { token_url, start_date, end_date, session_uid, consolidate_pdf } = body;
 
   // Validar fechas si se proporcionan
   if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
@@ -262,6 +264,98 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
     const startLabel = formatSpanishLabel(start_date) || "Desde";
     const endLabel = formatSpanishLabel(end_date) || "Hasta";
     const zipName = `${startLabel} - ${endLabel}.zip`;
+
+    // ── Consolidación de PDFs (solo si el usuario lo solicitó) ──
+    if (consolidate_pdf) {
+      try {
+        setProgress(uid, {
+          step: "Consolidando PDFs...",
+          current: 0,
+          total: 1,
+        });
+
+        const zipFiles = fs.readdirSync(tempDir).filter((f) => f.endsWith(".zip"));
+        const allPdfBuffers: { name: string; buffer: Buffer }[] = [];
+
+        // Extraer PDFs de cada ZIP individual
+        for (let z = 0; z < zipFiles.length; z++) {
+          setProgress(uid, {
+            step: `Extrayendo PDFs del documento ${z + 1} de ${zipFiles.length}...`,
+            current: z + 1,
+            total: zipFiles.length,
+          });
+
+          const zipFilePath = path.join(tempDir, zipFiles[z]);
+          const zipData = fs.readFileSync(zipFilePath);
+          const zip = await JSZip.loadAsync(zipData);
+
+          const pdfEntries = Object.keys(zip.files).filter(
+            (name) => name.toLowerCase().endsWith(".pdf") && !zip.files[name].dir
+          );
+
+          for (const pdfName of pdfEntries) {
+            const pdfBuffer = await zip.files[pdfName].async("nodebuffer");
+            allPdfBuffers.push({ name: `${zipFiles[z]}/${pdfName}`, buffer: pdfBuffer });
+          }
+        }
+
+        if (allPdfBuffers.length > 0) {
+          setProgress(uid, {
+            step: `Combinando ${allPdfBuffers.length} PDFs en uno solo...`,
+            current: 0,
+            total: allPdfBuffers.length,
+          });
+
+          const mergedPdf = await PDFDocument.create();
+
+          for (let p = 0; p < allPdfBuffers.length; p++) {
+            setProgress(uid, {
+              step: `Agregando PDF ${p + 1} de ${allPdfBuffers.length} al consolidado...`,
+              current: p + 1,
+              total: allPdfBuffers.length,
+            });
+
+            try {
+              const srcDoc = await PDFDocument.load(allPdfBuffers[p].buffer, {
+                ignoreEncryption: true,
+              });
+              const pages = await mergedPdf.copyPages(srcDoc, srcDoc.getPageIndices());
+              for (const page of pages) {
+                mergedPdf.addPage(page);
+              }
+            } catch (pdfErr) {
+              console.error(`No se pudo agregar PDF: ${allPdfBuffers[p].name}`, pdfErr);
+              // Continúa con los demás PDFs sin romper el proceso
+            }
+          }
+
+          const consolidatedName = `Consolidado ${startLabel} - ${endLabel}.pdf`;
+          const mergedBytes = await mergedPdf.save();
+          fs.writeFileSync(path.join(tempDir, consolidatedName), Buffer.from(mergedBytes));
+
+          setProgress(uid, {
+            step: `Consolidado creado (${mergedPdf.getPageCount()} paginas)`,
+            current: allPdfBuffers.length,
+            total: allPdfBuffers.length,
+          });
+
+          console.log(
+            `PDF consolidado: ${consolidatedName} (${mergedPdf.getPageCount()} páginas, ${allPdfBuffers.length} PDFs)`
+          );
+        } else {
+          console.log("Consolidación solicitada pero no se encontraron PDFs en los ZIPs.");
+        }
+      } catch (consolidateErr) {
+        console.error("Error durante la consolidación de PDFs:", consolidateErr);
+        // No rompemos el flujo principal: el ZIP sale sin el consolidado
+        setProgress(uid, {
+          step: "Advertencia: no se pudo crear el PDF consolidado",
+          current: 0,
+          total: 0,
+        });
+      }
+    }
+    // ── Fin consolidación ──
 
     await createZip(tempDir, zipPath);
 

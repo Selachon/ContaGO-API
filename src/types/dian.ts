@@ -3,6 +3,7 @@ export interface DownloadRequest {
   start_date?: string;
   end_date?: string;
   session_uid?: string;
+  consolidate_pdf?: boolean;
 }
 
 export interface DocumentInfo {
