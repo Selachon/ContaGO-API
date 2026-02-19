@@ -221,10 +221,9 @@ function resolveExecutablePath(): string | null {
 
 async function applyDateFilter(page: Page, startDate: string, endDate: string): Promise<void> {
   try {
-    // Convertir YYYY-MM-DD a DD/MM/YYYY (formato que usa la DIAN)
+    // Convertir YYYY-MM-DD a YYYY/MM/DD (formato que usa la DIAN)
     const formatToDian = (dateStr: string): string => {
-      const [year, month, day] = dateStr.split("-");
-      return `${day}/${month}/${year}`;
+      return dateStr.replace(/-/g, "/");
     };
 
     const sDate = formatToDian(startDate);
