@@ -78,7 +78,15 @@ export async function extractDocumentIds(
     // 5) Cambiar a mostrar 100 registros por página
     updateProgress({ step: "Optimizando vista (100 registros)..." });
     await setPageLength(page, 100);
-    await delay(1100);
+    
+    // Esperar a que la tabla se actualice con 100 registros
+    try {
+      await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 2000 });
+      await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
+    } catch {
+      await delay(1500);
+    }
+    await delay(500);
 
     // 6) Extracción con paginación
     const allDocuments: DocumentInfo[] = [];
@@ -93,7 +101,7 @@ export async function extractDocumentIds(
         total: Math.max(allDocuments.length + 5, 10),
       });
 
-      await delay(250);
+      await delay(400);
 
       // Verificar si tabla vacía
       const isEmpty = await page.$("tr.dataTables_empty");
@@ -323,6 +331,16 @@ async function goToNextPage(page: Page): Promise<boolean> {
     if (isDisabled) return false;
 
     await nextBtn.click();
+    
+    // Esperar a que la tabla muestre el indicador de procesamiento y luego desaparezca
+    try {
+      await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 2000 });
+      await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
+    } catch {
+      // Si no aparece el processing, esperar un tiempo prudente
+      await delay(1000);
+    }
+    
     return true;
   } catch {
     return false;
@@ -331,7 +349,7 @@ async function goToNextPage(page: Page): Promise<boolean> {
 
 async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<void> {
   const startTime = Date.now();
-  const timeout = 6000;
+  const timeout = 12000; // Aumentado a 12 segundos
 
   while (Date.now() - startTime < timeout) {
     const hasNewIds = await page.evaluate((seen) => {
@@ -350,10 +368,11 @@ async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<voi
     }, Array.from(seenIds));
 
     if (hasNewIds) return;
-    await delay(250);
+    await delay(300);
   }
 
-  await delay(200);
+  // Espera adicional para asegurar carga completa
+  await delay(500);
 }
 
 function delay(ms: number): Promise<void> {
