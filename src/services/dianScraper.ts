@@ -75,11 +75,11 @@ export async function extractDocumentIds(
     updateProgress({ step: "Cargando resultados..." });
     await waitForTableLoad(page);
 
-    // 5) Cambiar a mostrar 100 registros por página
-    updateProgress({ step: "Optimizando vista (100 registros)..." });
-    await setPageLength(page, 100);
+    // 5) Cambiar a mostrar 50 registros por página (100 causa datos incompletos en DIAN)
+    updateProgress({ step: "Optimizando vista (50 registros)..." });
+    await setPageLength(page, 50);
     
-    // Esperar a que la tabla se actualice con 100 registros
+    // Esperar a que la tabla se actualice con 50 registros
     try {
       await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 3000 });
       await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 20000 });
@@ -87,8 +87,9 @@ export async function extractDocumentIds(
       // Si no aparece el processing, esperar más tiempo
       await delay(2000);
     }
-    // Espera adicional para asegurar que la tabla está completamente cargada
-    await delay(1000);
+    
+    // Esperar a que la tabla tenga todas las filas esperadas
+    await waitForFullTableLoad(page, 50);
 
     // 6) Extracción con paginación
     const allDocuments: DocumentInfo[] = [];
@@ -156,8 +157,9 @@ export async function extractDocumentIds(
         break;
       }
 
-      // Esperar a que cambie la tabla
+      // Esperar a que cambie la tabla y tenga todas las filas
       await waitForTableChange(page, seenIds);
+      await waitForFullTableLoad(page, 50);
     }
 
     // Obtener cookies para las descargas
@@ -274,6 +276,52 @@ async function waitForTableLoad(page: Page): Promise<void> {
   } catch (err) {
     console.log("Espera resultados:", err);
   }
+}
+
+/**
+ * Espera a que la tabla tenga el número esperado de filas según la info de paginación.
+ * Esto es crítico porque DIAN a veces devuelve datos parciales en las respuestas AJAX.
+ */
+async function waitForFullTableLoad(page: Page, pageLength: number): Promise<void> {
+  const maxWait = 15000;
+  const startTime = Date.now();
+  
+  while (Date.now() - startTime < maxWait) {
+    const { expectedRows, actualRows } = await page.evaluate(() => {
+      const info = document.querySelector("#tableDocuments_info, .dataTables_info");
+      const text = info?.textContent || "";
+      
+      // Buscar patrón "del X al Y de Z registros" 
+      // Ejemplo: "Mostrando del 1 al 50 de 172 registros"
+      const match = text.match(/del\s+(\d+)\s+al\s+(\d+)\s+de\s+([\d,.]+)/i);
+      
+      let expected = 0;
+      if (match) {
+        const from = parseInt(match[1], 10);
+        const to = parseInt(match[2], 10);
+        expected = to - from + 1;
+      }
+      
+      const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
+      return { expectedRows: expected, actualRows: rows.length };
+    });
+    
+    if (expectedRows > 0 && actualRows >= expectedRows) {
+      console.log(`Tabla completamente cargada: ${actualRows}/${expectedRows} filas`);
+      return;
+    }
+    
+    // También verificar si tenemos el máximo de filas esperado (pageLength)
+    if (actualRows >= pageLength) {
+      console.log(`Tabla cargada con ${actualRows} filas (máximo por página)`);
+      return;
+    }
+    
+    console.log(`Esperando filas: ${actualRows}/${expectedRows || pageLength}`);
+    await delay(500);
+  }
+  
+  console.log("Timeout esperando carga completa de tabla, continuando...");
 }
 
 async function setPageLength(page: Page, length: number): Promise<void> {
