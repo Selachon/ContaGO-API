@@ -35,16 +35,23 @@ const router = Router();
 // Job tracker para background jobs
 // ============================================
 interface JobData {
-  status: "pending" | "processing" | "completed" | "error";
+  status: "pending" | "processing" | "completed" | "error" | "cancelled";
   progress: ProgressData;
   zipPath?: string;
   zipName?: string;
   error?: string;
   createdAt: number;
   completedAt?: number;
+  tempDir?: string; // Para limpieza en cancelación
 }
 
 const jobTracker = new Map<string, JobData>();
+
+// Helper para verificar si el job fue cancelado
+function isJobCancelled(jobId: string): boolean {
+  const job = jobTracker.get(jobId);
+  return job?.status === "cancelled";
+}
 
 // Auth middleware para todas las rutas DIAN
 // EventSource no permite headers personalizados, por eso aceptamos
@@ -227,6 +234,49 @@ router.get("/job-download/:jobId", (req: Request, res: Response) => {
 });
 
 // ============================================
+// POST /dian/job-cancel/:jobId - Cancelar job en progreso
+// ============================================
+router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
+  const { jobId } = req.params;
+
+  if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+  }
+
+  const job = jobTracker.get(jobId);
+  if (!job) {
+    return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  }
+
+  if (job.status === "completed" || job.status === "cancelled") {
+    return res.status(400).json({ 
+      status: "error", 
+      detalle: `Job ya está ${job.status}` 
+    });
+  }
+
+  // Marcar como cancelado
+  job.status = "cancelled";
+  setProgress(jobId, { step: "Cancelado", current: 0, total: 0, detalle: "Operación cancelada por el usuario" });
+
+  // Limpiar archivos temporales si existen
+  if (job.tempDir && fs.existsSync(job.tempDir)) {
+    try {
+      fs.rmSync(job.tempDir, { recursive: true, force: true });
+    } catch {}
+  }
+  if (job.zipPath && fs.existsSync(job.zipPath)) {
+    try {
+      fs.unlinkSync(job.zipPath);
+    } catch {}
+  }
+
+  console.log(`[${jobId}] Job cancelado por el usuario`);
+
+  res.json({ status: "cancelled", message: "Job cancelado exitosamente" });
+});
+
+// ============================================
 // POST /dian/download-documents - Inicia job en background
 // ============================================
 router.post("/download-documents", validateDianUrl, async (req: Request, res: Response) => {
@@ -323,11 +373,27 @@ async function processDownloadJob(
   const sessionDir = uuidv4();
   const tempDir = path.join(DOWNLOADS_DIR, sessionDir);
   const zipPath = path.join(DOWNLOADS_DIR, `${sessionDir}-final.zip`);
+  
+  // Guardar tempDir en el job para limpieza en cancelación
+  job.tempDir = tempDir;
+  job.zipPath = zipPath;
 
   try {
+    // Verificar cancelación antes de empezar
+    if (isJobCancelled(jobId)) {
+      console.log(`[${jobId}] Job cancelado antes de iniciar`);
+      return;
+    }
+
     // Extraer lista de documentos
     setProgress(jobId, { step: "Extrayendo lista de documentos...", current: 0, total: 1 });
     const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, jobId);
+
+    // Verificar cancelación después de extraer
+    if (isJobCancelled(jobId)) {
+      console.log(`[${jobId}] Job cancelado después de extraer documentos`);
+      return;
+    }
 
     if (documents.length === 0) {
       job.status = "error";
@@ -356,6 +422,13 @@ async function processDownloadJob(
     let errorCount = 0;
 
     for (let i = 0; i < documents.length; i++) {
+      // Verificar cancelación en cada iteración
+      if (isJobCancelled(jobId)) {
+        console.log(`[${jobId}] Job cancelado durante descarga (${i}/${totalDocs})`);
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+        return;
+      }
+
       const doc = documents[i];
       const docId = doc.id;
 
@@ -387,6 +460,13 @@ async function processDownloadJob(
       }
     }
 
+    // Verificar cancelación antes de crear ZIP
+    if (isJobCancelled(jobId)) {
+      console.log(`[${jobId}] Job cancelado antes de crear ZIP`);
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+      return;
+    }
+
     // Verificar que al menos se descargó algo
     if (successCount === 0) {
       job.status = "error";
@@ -402,7 +482,7 @@ async function processDownloadJob(
     const zipName = `${startLabel} - ${endLabel}.zip`;
 
     // ── Consolidación de PDFs (solo si el usuario lo solicitó) ──
-    if (consolidate_pdf) {
+    if (consolidate_pdf && !isJobCancelled(jobId)) {
       try {
         setProgress(jobId, {
           step: "Consolidando PDFs...",
@@ -415,6 +495,13 @@ async function processDownloadJob(
 
         // Extraer PDFs de cada ZIP individual
         for (let z = 0; z < zipFiles.length; z++) {
+          // Verificar cancelación
+          if (isJobCancelled(jobId)) {
+            console.log(`[${jobId}] Job cancelado durante extracción de PDFs`);
+            try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+            return;
+          }
+
           setProgress(jobId, {
             step: `Extrayendo PDFs del documento ${z + 1} de ${zipFiles.length}...`,
             current: z + 1,
@@ -435,7 +522,7 @@ async function processDownloadJob(
           }
         }
 
-        if (allPdfBuffers.length > 0) {
+        if (allPdfBuffers.length > 0 && !isJobCancelled(jobId)) {
           setProgress(jobId, {
             step: `Combinando ${allPdfBuffers.length} PDFs en uno solo...`,
             current: 0,
@@ -445,6 +532,13 @@ async function processDownloadJob(
           const mergedPdf = await PDFDocument.create();
 
           for (let p = 0; p < allPdfBuffers.length; p++) {
+            // Verificar cancelación cada 10 PDFs
+            if (p % 10 === 0 && isJobCancelled(jobId)) {
+              console.log(`[${jobId}] Job cancelado durante consolidación de PDFs`);
+              try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+              return;
+            }
+
             setProgress(jobId, {
               step: `Agregando PDF ${p + 1} de ${allPdfBuffers.length} al consolidado...`,
               current: p + 1,
