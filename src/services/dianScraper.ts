@@ -277,26 +277,69 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
   const items = await page.evaluate(() => {
     const results: Array<{ id: string; docnum: string; nit: string }> = [];
     
-    const buttons = document.querySelectorAll(
-      ".download-document, .download-support-document, .download-eventos, " +
-      ".download-equivalente-document, .download-individual-payroll, " +
-      "a[href*='DownloadZipFiles'], a[data-trackid], button[data-trackid]"
-    );
-
-    for (const btn of buttons) {
-      let trackId = btn.id || btn.getAttribute("data-trackid") || btn.getAttribute("data-id");
+    // Obtener todas las filas de la tabla (excluyendo la fila vacía)
+    const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
+    
+    for (const row of rows) {
+      let trackId: string | null = null;
       
-      if (!trackId) {
-        const href = btn.getAttribute("href") || "";
-        const match = href.match(/trackId=([A-Za-z0-9-]+)/);
-        if (match) trackId = match[1];
+      // Método 1: Buscar en botones/links de descarga dentro de la fila
+      const downloadElements = row.querySelectorAll(
+        ".download-document, .download-support-document, .download-eventos, " +
+        ".download-equivalente-document, .download-individual-payroll, " +
+        "a[href*='DownloadZipFiles'], a[href*='trackId'], " +
+        "[data-trackid], [data-id], [id^='doc-'], [id*='track']"
+      );
+      
+      for (const el of downloadElements) {
+        trackId = el.id || 
+                  el.getAttribute("data-trackid") || 
+                  el.getAttribute("data-id") ||
+                  el.getAttribute("data-track-id");
+        
+        if (!trackId) {
+          const href = el.getAttribute("href") || "";
+          const match = href.match(/trackId=([A-Za-z0-9-]+)/i);
+          if (match) trackId = match[1];
+        }
+        
+        if (trackId) break;
       }
-
+      
+      // Método 2: Buscar en cualquier elemento de la fila con atributos de tracking
+      if (!trackId) {
+        const anyWithTrack = row.querySelector("[data-trackid], [data-id], [data-track-id]");
+        if (anyWithTrack) {
+          trackId = anyWithTrack.getAttribute("data-trackid") || 
+                    anyWithTrack.getAttribute("data-id") ||
+                    anyWithTrack.getAttribute("data-track-id");
+        }
+      }
+      
+      // Método 3: Buscar en la propia fila
+      if (!trackId) {
+        trackId = row.getAttribute("data-trackid") || 
+                  row.getAttribute("data-id") ||
+                  row.id;
+      }
+      
+      // Método 4: Buscar en cualquier href dentro de la fila
+      if (!trackId) {
+        const links = row.querySelectorAll("a[href]");
+        for (const link of links) {
+          const href = link.getAttribute("href") || "";
+          const match = href.match(/trackId=([A-Za-z0-9-]+)/i);
+          if (match) {
+            trackId = match[1];
+            break;
+          }
+        }
+      }
+      
       if (!trackId) continue;
-
-      // Obtener info de la fila
-      const row = btn.closest("tr");
-      const tds = row?.querySelectorAll("td") || [];
+      
+      // Obtener info de las celdas
+      const tds = row.querySelectorAll("td");
       const docnum = tds[4]?.textContent?.trim() || "";
       const nit = tds[6]?.textContent?.trim() || "";
 
@@ -349,19 +392,32 @@ async function goToNextPage(page: Page): Promise<boolean> {
 
 async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<void> {
   const startTime = Date.now();
-  const timeout = 12000; // Aumentado a 12 segundos
+  const timeout = 12000;
 
   while (Date.now() - startTime < timeout) {
     const hasNewIds = await page.evaluate((seen) => {
-      const buttons = document.querySelectorAll(
-        ".download-document, .download-support-document, .download-eventos, " +
-        ".download-equivalente-document, .download-individual-payroll"
-      );
-
-      for (const btn of buttons) {
-        const tid = btn.id || btn.getAttribute("data-trackid") || btn.getAttribute("data-id");
-        if (tid && !seen.includes(tid)) {
-          return true;
+      const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
+      
+      for (const row of rows) {
+        // Buscar trackId en elementos de la fila
+        const elements = row.querySelectorAll(
+          ".download-document, .download-support-document, .download-eventos, " +
+          ".download-equivalente-document, .download-individual-payroll, " +
+          "[data-trackid], [data-id], a[href*='trackId']"
+        );
+        
+        for (const el of elements) {
+          let tid = el.id || el.getAttribute("data-trackid") || el.getAttribute("data-id");
+          
+          if (!tid) {
+            const href = el.getAttribute("href") || "";
+            const match = href.match(/trackId=([A-Za-z0-9-]+)/i);
+            if (match) tid = match[1];
+          }
+          
+          if (tid && !seen.includes(tid)) {
+            return true;
+          }
         }
       }
       return false;
@@ -371,7 +427,6 @@ async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<voi
     await delay(300);
   }
 
-  // Espera adicional para asegurar carga completa
   await delay(500);
 }
 
