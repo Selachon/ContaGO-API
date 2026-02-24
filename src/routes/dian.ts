@@ -318,7 +318,14 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
       });
     }
 
-    if (!allowedNits.includes(tokenNit)) {
+    // Normalizar NITs: quitar guiones, espacios, y comparar solo dígitos
+    const normalizeNit = (nit: string) => nit.replace(/[-\s]/g, "").trim();
+    const normalizedTokenNit = normalizeNit(tokenNit);
+    const normalizedAllowed = allowedNits.map(normalizeNit);
+    
+    console.log(`[NIT Check] User: ${req.user!.userId}, Token NIT: "${tokenNit}" -> "${normalizedTokenNit}", Allowed: [${allowedNits.join(", ")}] -> [${normalizedAllowed.join(", ")}]`);
+
+    if (!normalizedAllowed.includes(normalizedTokenNit)) {
       return res.status(403).json({
         status: "error",
         detalle: `No tienes acceso al NIT ${tokenNit}`,
