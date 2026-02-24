@@ -112,7 +112,12 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
       return res.status(400).json({ status: "error", detalle: "El token_url no contiene rk (NIT)." });
     }
 
-    if (!allowedNits.includes(tokenNit)) {
+    // Normalizar NITs: quitar guiones, espacios, y comparar solo dígitos
+    const normalizeNit = (nit: string) => nit.replace(/[-\s]/g, "").trim();
+    const normalizedTokenNit = normalizeNit(tokenNit);
+    const normalizedAllowed = allowedNits.map(normalizeNit);
+
+    if (!normalizedAllowed.includes(normalizedTokenNit)) {
       return res.status(403).json({ status: "error", detalle: `No tienes acceso al NIT ${tokenNit}` });
     }
   }

@@ -102,19 +102,19 @@ export async function generateExcelFile(
     row.alignment = { vertical: "middle", wrapText: true };
   });
 
-  // Formato condicional para CUFEs duplicados
-  const cufeColIndex = includeDriveColumn ? 10 : 9; // J o I
+  // Formato condicional para CUFEs duplicados (excluyendo "N/A")
   const cufeColLetter = includeDriveColumn ? "J" : "I";
   const lastRow = worksheet.rowCount;
 
   if (lastRow > 1) {
     // ExcelJS no soporta duplicateValues directamente, usamos fórmula COUNTIF
+    // La fórmula excluye "N/A" de la detección de duplicados
     worksheet.addConditionalFormatting({
       ref: `${cufeColLetter}2:${cufeColLetter}${lastRow}`,
       rules: [
         {
           type: "expression",
-          formulae: [`COUNTIF($${cufeColLetter}$2:$${cufeColLetter}$${lastRow},${cufeColLetter}2)>1`],
+          formulae: [`AND(${cufeColLetter}2<>"N/A",COUNTIF($${cufeColLetter}$2:$${cufeColLetter}$${lastRow},${cufeColLetter}2)>1)`],
           priority: 1,
           style: {
             fill: {
