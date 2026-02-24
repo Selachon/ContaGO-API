@@ -1,6 +1,7 @@
 import bcrypt from "bcrypt";
 import { MongoClient, type Db, type Collection, ObjectId } from "mongodb";
 import type { User } from "../types/auth.js";
+import type { GoogleDriveConfig } from "../types/dianExcel.js";
 
 interface UserRecord {
   _id: ObjectId;
@@ -12,6 +13,7 @@ interface UserRecord {
   nits: string[];
   created_at: string;
   legacyId?: number;
+  google_drive?: GoogleDriveConfig;
 }
 
 
@@ -157,6 +159,106 @@ export async function getUserNits(userId: string): Promise<string[]> {
     return record?.nits || [];
   } catch {
     return [];
+  }
+}
+
+// ============================================
+// Seed admin user (env-based, no hardcoded password)
+// ============================================
+
+// ============================================
+// Google Drive functions
+// ============================================
+
+export async function getUserGoogleDrive(userId: string): Promise<GoogleDriveConfig | null> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne(
+      { _id: oid },
+      { projection: { google_drive: 1 } }
+    );
+    return record?.google_drive || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateUserGoogleDrive(
+  userId: string,
+  driveConfig: GoogleDriveConfig
+): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      {
+        $set: {
+          google_drive: driveConfig,
+        },
+      }
+    );
+    return result.modifiedCount > 0 || result.matchedCount > 0;
+  } catch (err) {
+    console.error("Error actualizando Google Drive config:", err);
+    return false;
+  }
+}
+
+export async function updateUserDriveTokens(
+  userId: string,
+  encryptedAccessToken: string,
+  tokenExpiry: string
+): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      {
+        $set: {
+          "google_drive.encrypted_access_token": encryptedAccessToken,
+          "google_drive.token_expiry": tokenExpiry,
+          "google_drive.last_used": new Date().toISOString(),
+        },
+      }
+    );
+    return result.modifiedCount > 0;
+  } catch {
+    return false;
+  }
+}
+
+export async function updateUserDriveFolder(
+  userId: string,
+  folderId: string,
+  folderName: string
+): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      {
+        $set: {
+          "google_drive.folder_id": folderId,
+          "google_drive.folder_name": folderName,
+        },
+      }
+    );
+    return result.modifiedCount > 0;
+  } catch {
+    return false;
+  }
+}
+
+export async function removeUserGoogleDrive(userId: string): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      { $unset: { google_drive: "" } }
+    );
+    return result.modifiedCount > 0;
+  } catch {
+    return false;
   }
 }
 

@@ -7,6 +7,8 @@ import fs from "fs";
 import { execSync } from "child_process";
 import authRoutes from "./routes/auth.js";
 import dianRoutes from "./routes/dian.js";
+import dianExcelRoutes from "./routes/dianExcel.js";
+import googleAuthRoutes from "./routes/googleAuth.js";
 import { connectMongo, seedAdminUser } from "./services/database.js";
 
 // ============================================
@@ -50,7 +52,9 @@ app.use(express.json({ limit: "1mb" }));
 // Routes
 // ============================================
 app.use("/auth", authRoutes);
+app.use("/auth/google", googleAuthRoutes);
 app.use("/dian", dianRoutes);
+app.use("/dian-excel", dianExcelRoutes);
 
 // Health check
 app.get("/", (_req, res) => {
