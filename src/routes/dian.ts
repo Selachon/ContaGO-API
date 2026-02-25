@@ -37,6 +37,7 @@ const router = Router();
 interface JobData {
   status: "pending" | "processing" | "completed" | "error" | "cancelled";
   progress: ProgressData;
+  userId: string;
   zipPath?: string;
   zipName?: string;
   error?: string;
@@ -55,14 +56,9 @@ function isJobCancelled(jobId: string): boolean {
 
 // Auth middleware para todas las rutas DIAN
 // EventSource no permite headers personalizados, por eso aceptamos
-// token por query param solo en el endpoint de progreso y job-status.
+// token por query param solo en el endpoint SSE de progreso.
 router.use((req, res, next) => {
-  if (
-    (req.path.startsWith("/progress/") || 
-     req.path.startsWith("/job-status/") || 
-     req.path.startsWith("/job-download/")) &&
-    typeof req.query.token === "string"
-  ) {
+  if (req.path.startsWith("/progress/") && typeof req.query.token === "string") {
     req.headers.authorization = `Bearer ${req.query.token}`;
   }
   requireAuth(req, res, next);
@@ -178,6 +174,10 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
   }
 
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
+  }
+
   res.json({
     status: job.status,
     progress: job.progress,
@@ -199,6 +199,10 @@ router.get("/job-download/:jobId", (req: Request, res: Response) => {
   const job = jobTracker.get(jobId);
   if (!job) {
     return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  }
+
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
   }
 
   if (job.status !== "completed") {
@@ -246,6 +250,10 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   const job = jobTracker.get(jobId);
   if (!job) {
     return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  }
+
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
   }
 
   if (job.status === "completed" || job.status === "cancelled") {
@@ -331,6 +339,7 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   const job: JobData = {
     status: "pending",
     progress: { step: "Iniciando...", current: 0, total: 1 },
+    userId: req.user!.userId,
     createdAt: Date.now(),
   };
   jobTracker.set(jobId, job);

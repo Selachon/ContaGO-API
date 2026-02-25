@@ -16,6 +16,15 @@ import {
 
 const router = Router();
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 /**
  * GET /auth/google/status
  * Verifica si el usuario tiene Google Drive vinculado
@@ -63,6 +72,21 @@ router.get("/authorize", requireAuth, (req: Request, res: Response) => {
 });
 
 /**
+ * POST /auth/google/authorize-url
+ * Devuelve la URL de autorización para abrirla en popup sin exponer token en query string.
+ */
+router.post("/authorize-url", requireAuth, (req: Request, res: Response) => {
+  try {
+    const state = Buffer.from(JSON.stringify({ userId: req.user!.userId })).toString("base64");
+    const authUrl = getAuthUrl(state);
+    res.json({ ok: true, authUrl });
+  } catch (err) {
+    console.error("Error generando URL de autorización:", err);
+    res.status(500).json({ ok: false, message: "No se pudo iniciar la autorización con Google." });
+  }
+});
+
+/**
  * GET /auth/google/callback
  * Callback de Google OAuth, intercambia código por tokens
  */
@@ -71,6 +95,7 @@ router.get("/callback", async (req: Request, res: Response) => {
 
   // HTML de respuesta (se mostrará en el popup)
   const sendResponse = (success: boolean, message: string) => {
+    const safeMessage = escapeHtml(message || "");
     const color = success ? "#22c55e" : "#ef4444";
     const bgColor = success ? "#f0fdf4" : "#fef2f2";
     const icon = success ? "✓" : "✗";
@@ -126,7 +151,7 @@ router.get("/callback", async (req: Request, res: Response) => {
   <div class="container">
     <div class="icon">${icon}</div>
     <h2>${success ? "Google Drive Conectado" : "Error de Conexión"}</h2>
-    <p>${message}</p>
+    <p>${safeMessage}</p>
     <div class="note">Ya puedes cerrar esta ventana</div>
   </div>
 </body>

@@ -43,14 +43,8 @@ function setProgress(jobId: string, data: Partial<ExcelJobData["progress"]>): vo
   }
 }
 
-// Auth middleware - acepta token en query para download
+// Auth middleware
 router.use((req, res, next) => {
-  if (
-    (req.path.startsWith("/job-status/") || req.path.startsWith("/download/")) &&
-    typeof req.query.token === "string"
-  ) {
-    req.headers.authorization = `Bearer ${req.query.token}`;
-  }
   requireAuth(req, res, next);
 });
 
@@ -165,6 +159,10 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
   }
 
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
+  }
+
   res.json({
     status: job.status,
     progress: job.progress,
@@ -188,6 +186,10 @@ router.get("/download/:jobId", (req: Request, res: Response) => {
   const job = jobTracker.get(jobId);
   if (!job) {
     return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  }
+
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
   }
 
   if (job.status !== "completed") {
@@ -240,6 +242,10 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   const job = jobTracker.get(jobId);
   if (!job) {
     return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  }
+
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
   }
 
   if (job.status === "completed" || job.status === "cancelled") {
