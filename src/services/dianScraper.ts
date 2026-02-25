@@ -246,20 +246,43 @@ async function applyDateFilter(page: Page, startDate: string, endDate: string): 
     }
 
     // Intentar click en botón 'Buscar'
-    const clicked = await page.evaluate(() => {
-      const buttons = Array.from(document.querySelectorAll("button"));
-      const btn = buttons.find((b) => b.textContent?.trim().includes("Buscar"));
-      if (btn) {
-        (btn as HTMLElement).click();
-        return true;
+    // Usar Promise.race para manejar navegación que destruye el contexto
+    try {
+      const clickPromise = page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll("button"));
+        const btn = buttons.find((b) => b.textContent?.trim().includes("Buscar"));
+        if (btn) {
+          (btn as HTMLElement).click();
+          return true;
+        }
+        return false;
+      });
+      
+      // Esperar click o timeout corto (la navegación puede interrumpir)
+      const clicked = await Promise.race([
+        clickPromise,
+        delay(2000).then(() => false)
+      ]);
+      
+      if (clicked) {
+        // Esperar a que la tabla se recargue después del click
+        await delay(500);
+        await waitForTableLoad(page);
       }
-      return false;
-    });
-    if (clicked) {
-      await delay(450);
+    } catch (navErr: unknown) {
+      // Si el contexto fue destruido por navegación, es esperado - continuar
+      const errMsg = navErr instanceof Error ? navErr.message : String(navErr);
+      if (errMsg.includes("context was destroyed") || errMsg.includes("navigation")) {
+        console.log("Navegación detectada después de aplicar filtro de fechas - esperando recarga...");
+        await delay(1000);
+        await waitForTableLoad(page);
+      } else {
+        throw navErr;
+      }
     }
   } catch (err) {
     console.error("Error aplicando rango de fechas:", err);
+    // No relanzar - continuar con la extracción aunque falle el filtro
   }
 }
 
