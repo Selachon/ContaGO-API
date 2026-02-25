@@ -2,7 +2,7 @@ import puppeteer, { Browser, Page, Cookie } from "puppeteer";
 import fs from "fs";
 import type { DocumentInfo, ProgressData } from "../types/dian.js";
 
-// Progress tracker compartido
+// Estado de progreso compartido entre scraper y rutas de consulta.
 export const progressTracker: Map<string, ProgressData> = new Map();
 
 interface ExtractionResult {
@@ -11,8 +11,7 @@ interface ExtractionResult {
 }
 
 /**
- * Extrae IDs de documentos de la DIAN usando Puppeteer
- * Traducido de Python/Selenium a TypeScript/Puppeteer
+ * Extrae ids de documentos DIAN y cookies de sesion para descargas posteriores.
  */
 export async function extractDocumentIds(
   tokenUrl: string,
@@ -48,15 +47,15 @@ export async function extractDocumentIds(
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Timeout generoso para conexiones lentas
+    // Timeout alto para ambientes con latencia variable.
     page.setDefaultTimeout(60000);
 
-    // 1) Acceso inicial con token
+    // 1) Acceso inicial con token_url.
     updateProgress({ step: "Accediendo con token..." });
     await page.goto(tokenUrl, { waitUntil: "networkidle2" });
     await delay(1000);
 
-    // 2) Ir a la sección Recibidos
+    // 2) Navegar al listado de documentos recibidos.
     updateProgress({ step: "Navegando a documentos recibidos..." });
     await page.goto("https://catalogo-vpfe.dian.gov.co/Document/Received", {
       waitUntil: "networkidle2",
@@ -65,42 +64,42 @@ export async function extractDocumentIds(
 
     updateProgress({ step: "Extrayendo lista (iniciando)...", current: 0, total: 0 });
 
-    // 3) Aplicar filtros de fecha si vienen
+    // 3) Aplicar filtro solo cuando hay rango completo.
     if (startDate && endDate) {
       updateProgress({ step: "Aplicando rango de fechas..." });
       await applyDateFilter(page, startDate, endDate);
     }
 
-    // 4) Esperar a que carguen resultados
+    // 4) Esperar render inicial de la tabla.
     updateProgress({ step: "Cargando resultados..." });
     await waitForTableLoad(page);
 
-    // 5) Cambiar a mostrar 50 registros por página (100 causa datos incompletos en DIAN)
+    // 5) Forzar 50 filas/pagina; 100 ha mostrado respuestas parciales en DIAN.
     updateProgress({ step: "Optimizando vista (50 registros)..." });
     await setPageLength(page, 50);
     
-    // Esperar a que la tabla se actualice con 50 registros
+    // Espera la recarga de DataTables tras cambiar longitud.
     try {
       await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 3000 });
       await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 20000 });
     } catch {
-      // Si no aparece el processing, esperar más tiempo
+      // Fallback cuando el indicador no aparece.
       await delay(2000);
     }
     
-    // Esperar a que la tabla tenga todas las filas esperadas
+    // Confirmar que la pagina actual cargo completa.
     await waitForFullTableLoad(page, 50);
 
-    // 6) Extracción con paginación
+    // 6) Extraer con paginacion deduplicando por trackId.
     const allDocuments: DocumentInfo[] = [];
     const seenIds = new Set<string>();
     let pageIndex = 0;
 
-    // Obtener total esperado de la info de paginación
+    // Total reportado por DataTables para estimar progreso.
     const expectedTotal = await page.evaluate(() => {
       const info = document.querySelector("#tableDocuments_info, .dataTables_info");
       const text = info?.textContent || "";
-      // Buscar patrón "de X registros" o "of X entries"
+      // Soporta texto en espanol o ingles.
       const match = text.match(/de\s+([\d,.]+)\s+registros|of\s+([\d,.]+)\s+entries/i);
       if (match) {
         const num = (match[1] || match[2]).replace(/[,.]/g, "");
@@ -120,20 +119,20 @@ export async function extractDocumentIds(
 
       await delay(500);
 
-      // Contar filas visibles antes de extraer
+      // Diagnostico rapido de filas visibles en esta pagina.
       const visibleRows = await page.evaluate(() => {
         return document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)").length;
       });
       console.log(`Página ${pageIndex} - filas visibles: ${visibleRows}`);
 
-      // Verificar si tabla vacía
+      // Corta cuando DataTables marca tabla vacia.
       const isEmpty = await page.$("tr.dataTables_empty");
       if (isEmpty) {
         console.log(`Página ${pageIndex} - tabla vacía, terminando`);
         break;
       }
 
-      // Extraer documentos de la página actual
+      // Extrae ids desde selectores alternos por variaciones de DIAN.
       const newDocs = await extractDocsFromPage(page, seenIds);
       allDocuments.push(...newDocs);
 
@@ -144,25 +143,25 @@ export async function extractDocumentIds(
 
       console.log(`Página ${pageIndex} - extraídos: ${newDocs.length}, acumulados: ${allDocuments.length}/${expectedTotal}`);
 
-      // Verificar si ya tenemos todos
+      // Finaliza si se alcanzo el total esperado.
       if (expectedTotal > 0 && allDocuments.length >= expectedTotal) {
         console.log(`Alcanzado el total esperado (${expectedTotal}), terminando`);
         break;
       }
 
-      // Intentar ir a la siguiente página
+      // Avanza de pagina si hay boton Next habilitado.
       const hasNext = await goToNextPage(page);
       if (!hasNext) {
         console.log(`No hay más páginas disponibles, terminando`);
         break;
       }
 
-      // Esperar a que cambie la tabla y tenga todas las filas
+      // Espera cambio real de pagina antes de continuar.
       await waitForTableChange(page, seenIds);
       await waitForFullTableLoad(page, 50);
     }
 
-    // Obtener cookies para las descargas
+    // Reutiliza cookies del navegador para las descargas HTTP.
     const cookies = await page.cookies();
     const cookieMap: Record<string, string> = {};
     for (const c of cookies) {
@@ -192,7 +191,7 @@ function resolveExecutablePath(): string | null {
 
   const envPath = process.env.PUPPETEER_EXECUTABLE_PATH;
   if (envPath && !fs.existsSync(envPath)) {
-    // Limpiar env si apunta a un binario que no existe
+    // Evita que Puppeteer falle por un binario inexistente en env.
     delete process.env.PUPPETEER_EXECUTABLE_PATH;
   }
 
@@ -206,13 +205,13 @@ function resolveExecutablePath(): string | null {
 
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
-      // Asegurar que Puppeteer no intente usar un path inválido del env
+      // Fija un ejecutable valido para todos los launches siguientes.
       process.env.PUPPETEER_EXECUTABLE_PATH = candidate;
       return candidate;
     }
   }
 
-  // Si no hay binario del sistema, borrar para que Puppeteer use el descargado
+  // Si no hay binario del sistema, usar el gestionado por Puppeteer.
   delete process.env.PUPPETEER_EXECUTABLE_PATH;
 
   return null;
@@ -220,7 +219,7 @@ function resolveExecutablePath(): string | null {
 
 async function applyDateFilter(page: Page, startDate: string, endDate: string): Promise<void> {
   try {
-    // Intentar encontrar el input de rango de fechas
+    // Seleccion flexible para cambios menores en el DOM de DIAN.
     const rangeInput = await page.$(
       "#dashboard-report-range input, " +
       "input[placeholder*='Rango'], " +
@@ -245,8 +244,7 @@ async function applyDateFilter(page: Page, startDate: string, endDate: string): 
       console.log("No se encontró input de rango - continuando sin escribir fechas.");
     }
 
-    // Intentar click en botón 'Buscar'
-    // Usar Promise.race para manejar navegación que destruye el contexto
+    // Click en Buscar con manejo de navegacion que puede invalidar el contexto.
     try {
       const clickPromise = page.evaluate(() => {
         const buttons = Array.from(document.querySelectorAll("button"));
@@ -258,19 +256,19 @@ async function applyDateFilter(page: Page, startDate: string, endDate: string): 
         return false;
       });
       
-      // Esperar click o timeout corto (la navegación puede interrumpir)
+      // Timeout corto para no bloquear si no existe boton compatible.
       const clicked = await Promise.race([
         clickPromise,
         delay(2000).then(() => false)
       ]);
       
       if (clicked) {
-        // Esperar a que la tabla se recargue después del click
+        // La accion puede disparar recarga parcial o completa.
         await delay(500);
         await waitForTableLoad(page);
       }
     } catch (navErr: unknown) {
-      // Si el contexto fue destruido por navegación, es esperado - continuar
+      // "context was destroyed" es esperado cuando hay navegacion.
       const errMsg = navErr instanceof Error ? navErr.message : String(navErr);
       if (errMsg.includes("context was destroyed") || errMsg.includes("navigation")) {
         console.log("Navegación detectada después de aplicar filtro de fechas - esperando recarga...");
@@ -282,18 +280,18 @@ async function applyDateFilter(page: Page, startDate: string, endDate: string): 
     }
   } catch (err) {
     console.error("Error aplicando rango de fechas:", err);
-    // No relanzar - continuar con la extracción aunque falle el filtro
+    // El filtro es opcional; se prioriza retornar datos disponibles.
   }
 }
 
 async function waitForTableLoad(page: Page): Promise<void> {
   try {
-    // Esperar a que desaparezca el overlay de procesamiento
+    // DataTables usa este overlay durante recargas.
     try {
       await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 5000 });
       await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 20000 });
     } catch {
-      // Overlay no detectado, esperar filas directamente
+      // Fallback cuando el overlay no se renderiza.
       await page.waitForSelector("table#tableDocuments tbody tr", { timeout: 6000 }).catch(() => {});
     }
   } catch (err) {
@@ -302,8 +300,8 @@ async function waitForTableLoad(page: Page): Promise<void> {
 }
 
 /**
- * Espera a que la tabla tenga el número esperado de filas según la info de paginación.
- * Esto es crítico porque DIAN a veces devuelve datos parciales en las respuestas AJAX.
+ * Espera a que la tabla alcance las filas esperadas segun paginacion.
+ * DIAN puede entregar respuestas AJAX parciales; este guard reduce faltantes.
  */
 async function waitForFullTableLoad(page: Page, pageLength: number): Promise<void> {
   const maxWait = 15000;
@@ -314,8 +312,7 @@ async function waitForFullTableLoad(page: Page, pageLength: number): Promise<voi
       const info = document.querySelector("#tableDocuments_info, .dataTables_info");
       const text = info?.textContent || "";
       
-      // Buscar patrón "del X al Y de Z registros" 
-      // Ejemplo: "Mostrando del 1 al 50 de 172 registros"
+      // Ejemplo esperado: "Mostrando del 1 al 50 de 172 registros".
       const match = text.match(/del\s+(\d+)\s+al\s+(\d+)\s+de\s+([\d,.]+)/i);
       
       let expected = 0;
@@ -334,7 +331,7 @@ async function waitForFullTableLoad(page: Page, pageLength: number): Promise<voi
       return;
     }
     
-    // También verificar si tenemos el máximo de filas esperado (pageLength)
+    // Fallback: aceptar pagina llena aunque no haya texto parseable.
     if (actualRows >= pageLength) {
       console.log(`Tabla cargada con ${actualRows} filas (máximo por página)`);
       return;
@@ -349,7 +346,7 @@ async function waitForFullTableLoad(page: Page, pageLength: number): Promise<voi
 
 async function setPageLength(page: Page, length: number): Promise<void> {
   try {
-    // Intentar encontrar el select de longitud de página
+    // Primero intenta el select nativo de DataTables.
     const selectHandle = await page.$(
       "select[name='tableDocuments_length'], " +
       "#tableDocuments_length select, " +
@@ -360,7 +357,7 @@ async function setPageLength(page: Page, length: number): Promise<void> {
       await selectHandle.select(length.toString());
       await delay(500);
     } else {
-      // Fallback: usar DataTables API directamente
+      // Fallback cuando el select no esta visible o cambia de id.
       await page.evaluate((len) => {
         try {
           const $ = (window as any).$;
@@ -382,13 +379,13 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
   const items = await page.evaluate(() => {
     const results: Array<{ id: string; docnum: string; nit: string }> = [];
     
-    // Obtener todas las filas de la tabla (excluyendo la fila vacía)
+    // Excluye la fila placeholder de DataTables.
     const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
     
     for (const row of rows) {
       let trackId: string | null = null;
       
-      // Método 1: Buscar en botones/links de descarga dentro de la fila
+      // Metodo 1: botones/enlaces de descarga en la fila.
       const downloadElements = row.querySelectorAll(
         ".download-document, .download-support-document, .download-eventos, " +
         ".download-equivalente-document, .download-individual-payroll, " +
@@ -411,7 +408,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
         if (trackId) break;
       }
       
-      // Método 2: Buscar en cualquier elemento de la fila con atributos de tracking
+      // Metodo 2: atributos de tracking en otros elementos de la fila.
       if (!trackId) {
         const anyWithTrack = row.querySelector("[data-trackid], [data-id], [data-track-id]");
         if (anyWithTrack) {
@@ -421,14 +418,14 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
         }
       }
       
-      // Método 3: Buscar en la propia fila
+      // Metodo 3: atributos en el tr.
       if (!trackId) {
         trackId = row.getAttribute("data-trackid") || 
                   row.getAttribute("data-id") ||
                   row.id;
       }
       
-      // Método 4: Buscar en cualquier href dentro de la fila
+      // Metodo 4: parseo de trackId desde hrefs internos.
       if (!trackId) {
         const links = row.querySelectorAll("a[href]");
         for (const link of links) {
@@ -443,7 +440,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
       
       if (!trackId) continue;
       
-      // Obtener info de las celdas
+      // Columnas esperadas de numero de documento y NIT.
       const tds = row.querySelectorAll("td");
       const docnum = tds[4]?.textContent?.trim() || "";
       const nit = tds[6]?.textContent?.trim() || "";
@@ -478,7 +475,7 @@ async function goToNextPage(page: Page): Promise<boolean> {
 
     if (isDisabled) return false;
 
-    // Guardar el número de página actual antes de hacer click
+    // Permite confirmar que realmente avanzo de pagina.
     const currentPageNum = await page.evaluate(() => {
       const active = document.querySelector("#tableDocuments_paginate .paginate_button.current, .paginate_button.active");
       return active?.textContent?.trim() || "0";
@@ -486,7 +483,7 @@ async function goToNextPage(page: Page): Promise<boolean> {
 
     await nextBtn.click();
     
-    // Esperar a que cambie el número de página activa
+    // Espera activa hasta detectar nuevo numero de pagina.
     const startTime = Date.now();
     while (Date.now() - startTime < 10000) {
       const newPageNum = await page.evaluate(() => {
@@ -500,14 +497,14 @@ async function goToNextPage(page: Page): Promise<boolean> {
       await delay(200);
     }
     
-    // Esperar a que el processing indicator desaparezca
+    // Espera fin de recarga si el indicador aparece.
     try {
       await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
     } catch {
-      // Continuar de todos modos
+      // Si no aparece, seguir con espera de estabilizacion.
     }
     
-    // Espera adicional para que la tabla se estabilice
+    // Margen corto para evitar lecturas sobre DOM intermedio.
     await delay(800);
     
     return true;
@@ -517,17 +514,17 @@ async function goToNextPage(page: Page): Promise<boolean> {
 }
 
 async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<void> {
-  // Primero esperar a que el processing indicator desaparezca
+  // Espera fin de recarga cuando DataTables lo reporta.
   try {
     await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
   } catch {
-    // Si no hay processing indicator, continuar
+    // Si no hay indicador, continuar con verificacion por ids.
   }
   
-  // Esperar un momento para que la tabla se estabilice
+  // Margen corto antes de inspeccionar filas.
   await delay(800);
   
-  // Luego verificar que hay nuevos IDs
+  // Verifica que los ids visibles no sean la misma pagina previa.
   const startTime = Date.now();
   const timeout = 10000;
 
@@ -560,14 +557,14 @@ async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<voi
     }, Array.from(seenIds));
 
     if (hasNewIds) {
-      // Esperar un poco más para asegurar que toda la tabla cargó
+      // Margen adicional para reducir lecturas parciales.
       await delay(500);
       return;
     }
     await delay(300);
   }
 
-  // Timeout alcanzado, esperar un poco más por si acaso
+  // Ultimo margen de seguridad antes de continuar.
   await delay(500);
 }
 

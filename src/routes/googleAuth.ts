@@ -27,7 +27,7 @@ function escapeHtml(value: string): string {
 
 /**
  * GET /auth/google/status
- * Verifica si el usuario tiene Google Drive vinculado
+ * Retorna el estado de vinculacion de Google Drive del usuario autenticado.
  */
 router.get("/status", requireAuth, async (req: Request, res: Response) => {
   try {
@@ -47,11 +47,11 @@ router.get("/status", requireAuth, async (req: Request, res: Response) => {
 
 /**
  * GET /auth/google/authorize
- * Redirige al usuario a la pantalla de consentimiento de Google
+ * Redirige al consentimiento de Google OAuth.
  */
 router.get("/authorize", requireAuth, (req: Request, res: Response) => {
   try {
-    // Guardar userId en state para recuperarlo en callback
+    // El userId viaja en state para vincular el callback con el usuario correcto.
     const state = Buffer.from(JSON.stringify({ userId: req.user!.userId })).toString("base64");
     const authUrl = getAuthUrl(state);
 
@@ -73,7 +73,7 @@ router.get("/authorize", requireAuth, (req: Request, res: Response) => {
 
 /**
  * POST /auth/google/authorize-url
- * Devuelve la URL de autorización para abrirla en popup sin exponer token en query string.
+ * Devuelve la URL OAuth para abrir en popup sin exponer token de sesion en query string.
  */
 router.post("/authorize-url", requireAuth, (req: Request, res: Response) => {
   try {
@@ -88,12 +88,12 @@ router.post("/authorize-url", requireAuth, (req: Request, res: Response) => {
 
 /**
  * GET /auth/google/callback
- * Callback de Google OAuth, intercambia código por tokens
+ * Callback OAuth: valida state, intercambia codigo y guarda tokens cifrados.
  */
 router.get("/callback", async (req: Request, res: Response) => {
   const { code, state, error } = req.query;
 
-  // HTML de respuesta (se mostrará en el popup)
+  // La UI del popup se renderiza con mensaje escapado para evitar inyeccion HTML.
   const sendResponse = (success: boolean, message: string) => {
     const safeMessage = escapeHtml(message || "");
     const color = success ? "#22c55e" : "#ef4444";
@@ -158,13 +158,13 @@ router.get("/callback", async (req: Request, res: Response) => {
 </html>`);
   };
 
-  // Error de Google
+  // Errores devueltos por Google (cancelacion o denegacion de permisos).
   if (error) {
     console.error("Error de Google OAuth:", error);
     return sendResponse(false, "La autorización fue cancelada o denegada.");
   }
 
-  // Validar código y state
+  // Validaciones basicas para evitar callbacks incompletos.
   if (!code || typeof code !== "string") {
     return sendResponse(false, "No se recibió código de autorización.");
   }
@@ -174,7 +174,7 @@ router.get("/callback", async (req: Request, res: Response) => {
   }
 
   try {
-    // Decodificar state para obtener userId
+    // Recupera el userId enviado al iniciar OAuth.
     const stateData = JSON.parse(Buffer.from(state, "base64").toString("utf8"));
     const userId = stateData.userId;
 
@@ -182,16 +182,16 @@ router.get("/callback", async (req: Request, res: Response) => {
       return sendResponse(false, "Sesión inválida.");
     }
 
-    // Intercambiar código por tokens
+    // Intercambia codigo por tokens de acceso y refresh.
     const { accessToken, refreshToken, expiryDate } = await exchangeCodeForTokens(code);
 
-    // Obtener email del usuario de Google
+    // Se guarda email para referencia operativa en soporte.
     const userEmail = await getGoogleUserEmail(accessToken);
 
-    // Encriptar tokens
+    // Nunca persistir tokens en texto plano.
     const encryptedTokens = encryptDriveTokens(accessToken, refreshToken);
 
-    // Crear configuración inicial
+    // Configuracion base de la integracion por usuario.
     const driveConfig = {
       encrypted_access_token: encryptedTokens.encrypted_access_token,
       encrypted_refresh_token: encryptedTokens.encrypted_refresh_token,
@@ -203,11 +203,11 @@ router.get("/callback", async (req: Request, res: Response) => {
       user_email: userEmail,
     };
 
-    // Obtener o crear carpeta (esto también valida que los tokens funcionan)
+    // Crear/obtener carpeta tambien valida la vigencia de tokens.
     const folderId = await getOrCreateFolder(driveConfig);
     driveConfig.folder_id = folderId;
 
-    // Guardar en base de datos
+    // Persistir integracion activa.
     await updateUserGoogleDrive(userId, driveConfig);
 
     console.log(`Google Drive conectado para usuario ${userId}`);
@@ -223,7 +223,7 @@ router.get("/callback", async (req: Request, res: Response) => {
 
 /**
  * POST /auth/google/disconnect
- * Desconecta Google Drive del usuario
+ * Revoca acceso en Google y elimina la vinculacion local.
  */
 router.post("/disconnect", requireAuth, async (req: Request, res: Response) => {
   try {
@@ -234,10 +234,10 @@ router.post("/disconnect", requireAuth, async (req: Request, res: Response) => {
       return res.status(400).json({ status: "error", detalle: "Google Drive no está conectado" });
     }
 
-    // Revocar tokens en Google
+    // Revocar primero para evitar dejar permisos activos en Google.
     await revokeAccess(driveConfig);
 
-    // Eliminar de la base de datos
+    // Borrar configuracion local despues de revocar.
     await removeUserGoogleDrive(userId);
 
     console.log(`Google Drive desconectado para usuario ${userId}`);

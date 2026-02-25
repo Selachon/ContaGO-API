@@ -16,24 +16,22 @@ import type { DownloadRequest, ProgressData } from "../types/dian.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
-// Sin límite estricto - permitir descargas grandes
+// Limite alto configurable para soportar lotes grandes.
 const MAX_DOCUMENTS_PER_REQUEST = Number(process.env.DIAN_MAX_DOCUMENTS || 2000);
-// Configuración de reintentos
+// Reintentos para descargas puntuales con fallas transitorias.
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
-// TTL para jobs completados (1 hora)
+// TTL de jobs (incluye artefactos en disco) para evitar acumulacion.
 const JOB_TTL_MS = 60 * 60 * 1000;
 
-// Asegurar que existe el directorio de descargas
+// Crear carpeta de trabajo al iniciar el proceso.
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
 
 const router = Router();
 
-// ============================================
-// Job tracker para background jobs
-// ============================================
+// Estado en memoria de jobs asincronos de descarga.
 interface JobData {
   status: "pending" | "processing" | "completed" | "error" | "cancelled";
   progress: ProgressData;
@@ -43,20 +41,19 @@ interface JobData {
   error?: string;
   createdAt: number;
   completedAt?: number;
-  tempDir?: string; // Para limpieza en cancelación
+  tempDir?: string; // Se usa para limpieza temprana al cancelar.
 }
 
 const jobTracker = new Map<string, JobData>();
 
-// Helper para verificar si el job fue cancelado
+// Evita trabajo innecesario cuando el usuario cancela.
 function isJobCancelled(jobId: string): boolean {
   const job = jobTracker.get(jobId);
   return job?.status === "cancelled";
 }
 
-// Auth middleware para todas las rutas DIAN
-// EventSource no permite headers personalizados, por eso aceptamos
-// token por query param solo en el endpoint SSE de progreso.
+// EventSource no permite headers custom; solo /progress/:uid acepta token por query.
+// El resto de rutas exige Authorization en header.
 router.use((req, res, next) => {
   if (req.path.startsWith("/progress/") && typeof req.query.token === "string") {
     req.headers.authorization = `Bearer ${req.query.token}`;
@@ -64,9 +61,7 @@ router.use((req, res, next) => {
   requireAuth(req, res, next);
 });
 
-// ============================================
-// Limpieza periódica del progressTracker y jobs (TTL)
-// ============================================
+// Limpieza periodica de progreso y jobs vencidos por TTL.
 const PROGRESS_TTL_MS = 15 * 60 * 1000;
 const progressTimestamps = new Map<string, number>();
 
@@ -74,18 +69,18 @@ function setProgress(uid: string, data: ProgressData): void {
   progressTracker.set(uid, data);
   progressTimestamps.set(uid, Date.now());
   
-  // También actualizar el job si existe
+  // Mantiene sincronizado el estado que consume el endpoint de polling.
   const job = jobTracker.get(uid);
   if (job) {
     job.progress = data;
   }
 }
 
-// Limpieza cada minuto
+// Ejecuta limpieza cada minuto para limitar uso de memoria y disco.
 setInterval(() => {
   const now = Date.now();
   
-  // Limpiar progress tracker
+  // El progreso efimero expira antes que el job completo.
   for (const [uid, ts] of progressTimestamps) {
     if (now - ts > PROGRESS_TTL_MS) {
       progressTracker.delete(uid);
@@ -93,11 +88,11 @@ setInterval(() => {
     }
   }
   
-  // Limpiar jobs completados/error antiguos y sus archivos
+  // Remueve jobs expirados y su ZIP asociado, si existe.
   for (const [jobId, job] of jobTracker) {
     const age = now - job.createdAt;
     if (age > JOB_TTL_MS) {
-      // Limpiar archivo ZIP si existe
+      // El ZIP puede seguir presente si no se descargo o hubo error.
       if (job.zipPath && fs.existsSync(job.zipPath)) {
         try {
           fs.unlinkSync(job.zipPath);
@@ -109,13 +104,11 @@ setInterval(() => {
   }
 }, 60_000);
 
-// ============================================
-// GET /dian/progress/:uid (SSE) - Mantener para compatibilidad
-// ============================================
+// SSE legado para clientes antiguos; el flujo principal usa polling por jobId.
 router.get("/progress/:uid", (req: Request, res: Response) => {
   const { uid } = req.params;
 
-  // Validar formato uid
+  // Evita entradas arbitrarias en identificadores usados en memoria.
   if (!uid || !/^[a-zA-Z0-9_-]+$/.test(uid)) {
     return res.status(400).json({ status: "error", detalle: "uid inválido" });
   }
@@ -159,9 +152,7 @@ router.get("/progress/:uid", (req: Request, res: Response) => {
   });
 });
 
-// ============================================
-// GET /dian/job-status/:jobId - Polling para estado del job
-// ============================================
+// Polling de estado para clientes que no usan SSE.
 router.get("/job-status/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
@@ -174,6 +165,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
   }
 
+  // Solo el duenio del job (o admin) puede consultar su estado.
   if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
     return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
   }
@@ -186,9 +178,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
   });
 });
 
-// ============================================
-// GET /dian/job-download/:jobId - Descargar ZIP cuando esté listo
-// ============================================
+// Descarga del ZIP final una vez el job termina.
 router.get("/job-download/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
@@ -223,7 +213,7 @@ router.get("/job-download/:jobId", (req: Request, res: Response) => {
   fileStream.pipe(res);
 
   fileStream.on("end", () => {
-    // Limpiar archivo después de descarga exitosa (con delay)
+    // Se retrasa el borrado para evitar carreras con clientes lentos.
     setTimeout(() => {
       if (job.zipPath && fs.existsSync(job.zipPath)) {
         try {
@@ -237,9 +227,7 @@ router.get("/job-download/:jobId", (req: Request, res: Response) => {
   });
 });
 
-// ============================================
-// POST /dian/job-cancel/:jobId - Cancelar job en progreso
-// ============================================
+// Cancelacion explicita del job y limpieza temprana de artefactos.
 router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
@@ -263,11 +251,11 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
     });
   }
 
-  // Marcar como cancelado
+  // Señal para que el worker salga en el siguiente checkpoint.
   job.status = "cancelled";
   setProgress(jobId, { step: "Cancelado", current: 0, total: 0, detalle: "Operación cancelada por el usuario" });
 
-  // Limpiar archivos temporales si existen
+  // Limpieza inmediata para liberar disco aun si el worker sigue cerrando.
   if (job.tempDir && fs.existsSync(job.tempDir)) {
     try {
       fs.rmSync(job.tempDir, { recursive: true, force: true });
@@ -284,14 +272,12 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   res.json({ status: "cancelled", message: "Job cancelado exitosamente" });
 });
 
-// ============================================
-// POST /dian/download-documents - Inicia job en background
-// ============================================
+// Crea un job asincrono y devuelve jobId de inmediato.
 router.post("/download-documents", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as DownloadRequest;
   const { token_url, start_date, end_date, session_uid, consolidate_pdf } = body;
 
-  // Validar fechas si se proporcionan
+  // Se valida formato para evitar errores en filtros de DIAN.
   if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
     return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
   }
@@ -301,7 +287,7 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
 
   const jobId = session_uid || uuidv4();
   
-  // ── NIT access control (rk param in token_url) ───────
+  // Control de acceso por NIT: se valida rk del token_url contra NITs autorizados.
   if (!req.user?.isAdmin) {
     const allowedNits = await getUserNits(req.user!.userId);
     if (allowedNits.length === 0) {
@@ -333,9 +319,8 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
       });
     }
   }
-  // ────────────────────────────────────────────────────
 
-  // Crear job entry
+  // Registrar job antes de responder para que polling/SSE lo encuentren.
   const job: JobData = {
     status: "pending",
     progress: { step: "Iniciando...", current: 0, total: 1 },
@@ -345,14 +330,14 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   jobTracker.set(jobId, job);
   setProgress(jobId, job.progress);
 
-  // Responder inmediatamente con el jobId
+  // Respuesta no bloqueante: el procesamiento corre en background.
   res.json({
     status: "accepted",
     jobId,
     message: "Descarga iniciada en background. Usa /dian/job-status/:jobId para consultar el progreso.",
   });
 
-  // Ejecutar descarga en background (no await)
+  // No usar await para no retener la conexion HTTP.
   processDownloadJob(jobId, token_url, start_date, end_date, consolidate_pdf).catch((err) => {
     console.error(`Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
@@ -364,9 +349,7 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   });
 });
 
-// ============================================
-// Background job processor
-// ============================================
+// Worker principal de descarga, consolidacion opcional y empaquetado final.
 async function processDownloadJob(
   jobId: string,
   token_url: string,
@@ -383,22 +366,22 @@ async function processDownloadJob(
   const tempDir = path.join(DOWNLOADS_DIR, sessionDir);
   const zipPath = path.join(DOWNLOADS_DIR, `${sessionDir}-final.zip`);
   
-  // Guardar tempDir en el job para limpieza en cancelación
+  // Se guarda para permitir limpieza desde endpoint de cancelacion.
   job.tempDir = tempDir;
   job.zipPath = zipPath;
 
   try {
-    // Verificar cancelación antes de empezar
+    // Primer checkpoint de cancelacion.
     if (isJobCancelled(jobId)) {
       console.log(`[${jobId}] Job cancelado antes de iniciar`);
       return;
     }
 
-    // Extraer lista de documentos
+    // Paso 1: obtener ids y cookies de sesion DIAN.
     setProgress(jobId, { step: "Extrayendo lista de documentos...", current: 0, total: 1 });
     const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, jobId);
 
-    // Verificar cancelación después de extraer
+    // Checkpoint tras la operacion mas costosa del scraper.
     if (isJobCancelled(jobId)) {
       console.log(`[${jobId}] Job cancelado después de extraer documentos`);
       return;
@@ -421,17 +404,17 @@ async function processDownloadJob(
     const totalDocs = documents.length;
     setProgress(jobId, { step: "Iniciando descargas...", current: 0, total: totalDocs });
 
-    // Crear directorio temporal
+    // Carpeta temporal por job para aislar artefactos.
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // Descargar cada documento
+    // Descarga individual por documento, con tolerancia a errores parciales.
     const baseUrl = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
     const usedNames = new Set<string>();
     let successCount = 0;
     let errorCount = 0;
 
     for (let i = 0; i < documents.length; i++) {
-      // Verificar cancelación en cada iteración
+      // Checkpoint por iteracion para cancelacion reactiva.
       if (isJobCancelled(jobId)) {
         console.log(`[${jobId}] Job cancelado durante descarga (${i}/${totalDocs})`);
         try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
@@ -465,18 +448,18 @@ async function processDownloadJob(
       } catch (err) {
         errorCount++;
         console.error(`[${jobId}] Error descargando ${docId}:`, err);
-        // Continuar con los demás documentos
+        // Se registra error y se continua con el resto del lote.
       }
     }
 
-    // Verificar cancelación antes de crear ZIP
+    // Evita trabajo adicional si el usuario cancelo al final de la descarga.
     if (isJobCancelled(jobId)) {
       console.log(`[${jobId}] Job cancelado antes de crear ZIP`);
       try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
       return;
     }
 
-    // Verificar que al menos se descargó algo
+    // Si no hay exitos, no se genera ZIP vacio.
     if (successCount === 0) {
       job.status = "error";
       job.error = "No se pudo descargar ningún documento.";
@@ -485,12 +468,12 @@ async function processDownloadJob(
       return;
     }
 
-    // Crear ZIP final
+    // Nombre de salida legible para el usuario.
     const startLabel = formatSpanishLabel(start_date) || "Desde";
     const endLabel = formatSpanishLabel(end_date) || "Hasta";
     const zipName = `${startLabel} - ${endLabel}.zip`;
 
-    // ── Consolidación de PDFs (solo si el usuario lo solicitó) ──
+    // Consolidacion opcional: agrega un PDF combinado sin eliminar los ZIP individuales.
     if (consolidate_pdf && !isJobCancelled(jobId)) {
       try {
         setProgress(jobId, {
@@ -502,9 +485,9 @@ async function processDownloadJob(
         const zipFiles = fs.readdirSync(tempDir).filter((f) => f.endsWith(".zip"));
         const allPdfBuffers: { name: string; buffer: Buffer }[] = [];
 
-        // Extraer PDFs de cada ZIP individual
+        // Recorre cada ZIP descargado y acumula PDFs internos.
         for (let z = 0; z < zipFiles.length; z++) {
-          // Verificar cancelación
+          // Checkpoint durante extraccion de PDFs.
           if (isJobCancelled(jobId)) {
             console.log(`[${jobId}] Job cancelado durante extracción de PDFs`);
             try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
@@ -541,7 +524,7 @@ async function processDownloadJob(
           const mergedPdf = await PDFDocument.create();
 
           for (let p = 0; p < allPdfBuffers.length; p++) {
-            // Verificar cancelación cada 10 PDFs
+            // Checkpoint cada 10 PDFs para balancear costo y capacidad de cancelacion.
             if (p % 10 === 0 && isJobCancelled(jobId)) {
               console.log(`[${jobId}] Job cancelado durante consolidación de PDFs`);
               try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
@@ -577,18 +560,17 @@ async function processDownloadJob(
         }
       } catch (consolidateErr) {
         console.error(`[${jobId}] Error durante la consolidación:`, consolidateErr);
-        // No rompemos el flujo principal
+        // La consolidacion es opcional; fallar aqui no invalida el ZIP final.
       }
     }
-    // ── Fin consolidación ──
 
     setProgress(jobId, { step: "Creando archivo ZIP final...", current: totalDocs, total: totalDocs });
     await createZip(tempDir, zipPath);
 
-    // Limpiar directorio temporal
+    // El artefacto final ya quedo en zipPath.
     fs.rmSync(tempDir, { recursive: true, force: true });
 
-    // Marcar job como completado
+    // Estado final consumido por polling y descarga.
     job.status = "completed";
     job.zipPath = zipPath;
     job.zipName = zipName;
@@ -607,15 +589,13 @@ async function processDownloadJob(
     job.error = (err as Error).message || "Error interno";
     setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: job.error });
 
-    // Limpiar archivos
+    // Mejor esfuerzo de limpieza ante error fatal.
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
     try { fs.unlinkSync(zipPath); } catch {}
   }
 }
 
-// ============================================
-// Helper: descargar archivo con cookies y reintentos
-// ============================================
+// Descarga un ZIP de DIAN reutilizando cookies de sesion y backoff exponencial.
 async function downloadFile(
   url: string,
   destPath: string,
@@ -629,7 +609,7 @@ async function downloadFile(
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const controller = new AbortController();
-    // Timeout más generoso: 60 segundos
+    // Timeout alto para documentos pesados en enlaces inestables.
     const timeout = setTimeout(() => controller.abort(), 60_000);
 
     try {
@@ -645,13 +625,13 @@ async function downloadFile(
       const buffer = await response.arrayBuffer();
       fs.writeFileSync(destPath, Buffer.from(buffer));
       clearTimeout(timeout);
-      return; // Éxito, salir
+      return; // Exito
     } catch (err) {
       clearTimeout(timeout);
       lastError = err as Error;
       
       if (attempt < MAX_RETRIES) {
-        // Backoff exponencial: 2s, 4s, 8s...
+        // Backoff exponencial para reducir presion sobre DIAN y la red.
         const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
         console.log(`Reintento ${attempt}/${MAX_RETRIES} para ${url} en ${delay}ms`);
         await new Promise((r) => setTimeout(r, delay));
@@ -662,9 +642,7 @@ async function downloadFile(
   throw lastError || new Error("Descarga fallida después de reintentos");
 }
 
-// ============================================
-// Helper: crear ZIP
-// ============================================
+// Empaqueta el directorio temporal en un unico ZIP.
 function createZip(sourceDir: string, destPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const output = fs.createWriteStream(destPath);

@@ -21,14 +21,14 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
 const JOB_TTL_MS = 60 * 60 * 1000; // 1 hora
 
-// Crear directorio de descargas
+// Crea carpeta de trabajo al iniciar el proceso.
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 }
 
 const router = Router();
 
-// Job tracker
+// Estado en memoria de jobs de exportacion.
 const jobTracker = new Map<string, ExcelJobData>();
 
 function isJobCancelled(jobId: string): boolean {
@@ -43,17 +43,17 @@ function setProgress(jobId: string, data: Partial<ExcelJobData["progress"]>): vo
   }
 }
 
-// Auth middleware
+// Todas las rutas requieren sesion autenticada.
 router.use((req, res, next) => {
   requireAuth(req, res, next);
 });
 
-// Limpieza periódica
+// Limpieza periodica de jobs expirados y artefactos locales.
 setInterval(() => {
   const now = Date.now();
   for (const [jobId, job] of jobTracker) {
     if (now - job.createdAt > JOB_TTL_MS) {
-      // Limpiar archivos
+      // Mejor esfuerzo de limpieza.
       if (job.excelPath && fs.existsSync(job.excelPath)) {
         try { fs.unlinkSync(job.excelPath); } catch {}
       }
@@ -66,14 +66,12 @@ setInterval(() => {
   }
 }, 60_000);
 
-// ============================================
-// POST /dian-excel/generate
-// ============================================
+// Crea un job asincrono de extraccion y generacion de Excel.
 router.post("/generate", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as ExcelGenerateRequest;
   const { token_url, start_date, end_date, session_uid } = body;
 
-  // Validar fechas
+  // Se valida formato para filtros consistentes en DIAN.
   if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
     return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
   }
@@ -84,7 +82,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   const jobId = session_uid || uuidv4();
   const userId = req.user!.userId;
 
-  // Control de acceso por NIT
+  // Control de acceso por NIT usando rk del token_url.
   if (!req.user?.isAdmin) {
     const allowedNits = await getUserNits(userId);
     if (allowedNits.length === 0) {
@@ -106,7 +104,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
       return res.status(400).json({ status: "error", detalle: "El token_url no contiene rk (NIT)." });
     }
 
-    // Normalizar NITs: quitar guiones, espacios, y comparar solo dígitos
+    // Normaliza formato para evitar falsos rechazos por guiones o espacios.
     const normalizeNit = (nit: string) => nit.replace(/[-\s]/g, "").trim();
     const normalizedTokenNit = normalizeNit(tokenNit);
     const normalizedAllowed = allowedNits.map(normalizeNit);
@@ -116,7 +114,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
     }
   }
 
-  // Crear job
+  // Registrar job antes de responder para habilitar polling inmediato.
   const job: ExcelJobData = {
     status: "pending",
     progress: { step: "Iniciando...", current: 0, total: 1 },
@@ -125,14 +123,14 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   };
   jobTracker.set(jobId, job);
 
-  // Responder inmediatamente
+  // Respuesta no bloqueante; el trabajo corre en background.
   res.json({
     status: "accepted",
     jobId,
     message: "Generación de Excel iniciada. Usa /dian-excel/job-status/:jobId para consultar el progreso.",
   });
 
-  // Procesar en background
+  // No usar await para no retener la conexion HTTP.
   processExcelJob(jobId, token_url, start_date, end_date, userId).catch((err) => {
     console.error(`[Excel] Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
@@ -144,9 +142,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   });
 });
 
-// ============================================
-// GET /dian-excel/job-status/:jobId
-// ============================================
+// Polling de estado del job.
 router.get("/job-status/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
@@ -159,6 +155,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
   }
 
+  // Solo el duenio del job (o admin) puede ver su estado.
   if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
     return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
   }
@@ -173,9 +170,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
   });
 });
 
-// ============================================
-// GET /dian-excel/download/:jobId
-// ============================================
+// Descarga del Excel cuando el job ya finalizo.
 router.get("/download/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
@@ -216,7 +211,7 @@ router.get("/download/:jobId", (req: Request, res: Response) => {
   fileStream.pipe(res);
 
   fileStream.on("end", () => {
-    // Limpiar después de descarga
+    // Delay corto para evitar carreras con clientes lentos.
     setTimeout(() => {
       if (job.excelPath && fs.existsSync(job.excelPath)) {
         try { fs.unlinkSync(job.excelPath); } catch {}
@@ -229,9 +224,7 @@ router.get("/download/:jobId", (req: Request, res: Response) => {
   });
 });
 
-// ============================================
-// POST /dian-excel/job-cancel/:jobId
-// ============================================
+// Cancelacion explicita del job y limpieza temprana.
 router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
@@ -255,7 +248,7 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   job.status = "cancelled";
   setProgress(jobId, { step: "Cancelado", detalle: "Operación cancelada por el usuario" });
 
-  // Limpiar archivos
+  // Limpieza inmediata aun si el worker sigue cerrando.
   if (job.tempDir && fs.existsSync(job.tempDir)) {
     try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch {}
   }
@@ -267,9 +260,7 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   res.json({ status: "cancelled", message: "Job cancelado exitosamente" });
 });
 
-// ============================================
-// Background processor
-// ============================================
+// Worker principal: extrae facturas, parsea PDFs y genera Excel.
 async function processExcelJob(
   jobId: string,
   tokenUrl: string,
@@ -291,7 +282,7 @@ async function processExcelJob(
   try {
     if (isJobCancelled(jobId)) return;
 
-    // 1. Extraer lista de documentos
+    // 1) Extraer ids y cookies de sesion desde DIAN.
     setProgress(jobId, { step: "Extrayendo lista de documentos...", current: 0, total: 1 });
     const { documents, cookies } = await extractDocumentIds(tokenUrl, startDate, endDate, jobId);
 
@@ -316,17 +307,17 @@ async function processExcelJob(
 
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // 2. Obtener config de Google Drive (si está vinculado)
+    // 2) Cargar config de Drive para subir PDFs si el usuario lo habilito.
     const driveConfig = await getUserGoogleDrive(userId);
     const hasDrive = !!driveConfig;
 
-    // Callback para actualizar tokens refrescados
+    // Persiste token refrescado para evitar vencimientos en jobs largos.
     const onTokenRefresh = async (newAccessToken: string, expiryDate: number) => {
       const encryptedToken = encryptToken(newAccessToken);
       await updateUserDriveTokens(userId, encryptedToken, new Date(expiryDate).toISOString());
     };
 
-    // 3. Procesar cada documento
+    // 3) Procesar cada documento de forma independiente.
     const invoices: InvoiceData[] = [];
     let successCount = 0;
     let errorCount = 0;
@@ -345,24 +336,24 @@ async function processExcelJob(
       });
 
       try {
-        // 3.1 Descargar ZIP
+        // 3.1) Descargar ZIP del trackId.
         const zipBuffer = await downloadZipFile(doc.id, cookies);
 
-        // 3.2 Extraer PDF del ZIP
+        // 3.2) Extraer primer PDF disponible del ZIP.
         const { pdfBuffer, pdfFilename } = await extractPdfFromZip(zipBuffer);
 
         if (!pdfBuffer) {
           throw new Error("No se encontró PDF en el ZIP");
         }
 
-        // 3.3 Parsear datos del PDF
+        // 3.3) Extraer datos estructurados del PDF.
         const invoiceData = await extractInvoiceData(pdfBuffer, {
           id: doc.id,
           nit: doc.nit,
           docnum: doc.docnum,
         });
 
-        // 3.4 Subir a Drive si está vinculado
+        // 3.4) Subir PDF a Drive de forma opcional.
         let driveUrl: string | undefined;
         if (hasDrive && driveConfig) {
           try {
@@ -397,7 +388,7 @@ async function processExcelJob(
         errorCount++;
         console.error(`[Excel] Error procesando ${doc.docnum}:`, err);
 
-        // Agregar fila con error
+        // Mantiene trazabilidad del documento fallido dentro del Excel.
         invoices.push({
           entityType: "N/A",
           issueDate: "N/A",
@@ -421,15 +412,15 @@ async function processExcelJob(
       return;
     }
 
-    // 4. Generar Excel
+    // 4) Generar archivo final.
     setProgress(jobId, { step: "Generando archivo Excel...", current: totalDocs, total: totalDocs });
 
     await generateExcelFile(invoices, excelPath, hasDrive);
 
-    // Limpiar temp
+    // Limpia artefactos temporales una vez generado el Excel.
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
 
-    // 5. Marcar completado
+    // 5) Publicar estado final para polling/descarga.
     job.status = "completed";
     job.excelName = generateExcelFilename(startDate, endDate);
     job.completedAt = Date.now();
@@ -454,9 +445,7 @@ async function processExcelJob(
   }
 }
 
-// ============================================
 // Helpers
-// ============================================
 
 async function downloadZipFile(
   trackId: string,
@@ -507,7 +496,7 @@ async function extractPdfFromZip(
 ): Promise<{ pdfBuffer: Buffer | null; pdfFilename: string }> {
   const zip = await JSZip.loadAsync(zipBuffer);
 
-  // Buscar el primer PDF
+  // El ZIP DIAN suele incluir un unico PDF util para el parser.
   for (const [filename, file] of Object.entries(zip.files)) {
     if (!file.dir && filename.toLowerCase().endsWith(".pdf")) {
       const buffer = await file.async("nodebuffer");
