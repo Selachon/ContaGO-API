@@ -44,6 +44,7 @@ export interface ExcelJobData {
   tempDir?: string;
   invoicesProcessed?: number;
   invoicesFailed?: number;
+  invoicesSkipped?: number;
   userId?: string;
 }
 
