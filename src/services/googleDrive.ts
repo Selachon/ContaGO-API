@@ -226,18 +226,25 @@ export async function getOrCreateFolder(
   return await createFolder(drive, ROOT_FOLDER_NAME);
 }
 
-// Obtener o crear estructura de carpetas: Raíz/Año/Mes/NumFactura - NIT
+// Obtener o crear estructura de carpetas: Raíz/NIT Receptor/Año/Mes/NumFactura - NIT Emisor
 async function getOrCreateInvoiceFolder(
   drive: drive_v3.Drive,
   rootFolderId: string,
+  receiverNit: string,
   year: string,
   month: string,
   invoiceFolderName: string
 ): Promise<string> {
+  // NIT Receptor (solo NIT, sin razón social para evitar duplicados)
+  let receiverFolderId = await findFolderByName(drive, receiverNit, rootFolderId);
+  if (!receiverFolderId) {
+    receiverFolderId = await createFolder(drive, receiverNit, rootFolderId);
+  }
+
   // Año
-  let yearFolderId = await findFolderByName(drive, year, rootFolderId);
+  let yearFolderId = await findFolderByName(drive, year, receiverFolderId);
   if (!yearFolderId) {
-    yearFolderId = await createFolder(drive, year, rootFolderId);
+    yearFolderId = await createFolder(drive, year, receiverFolderId);
   }
 
   // Mes
@@ -246,7 +253,7 @@ async function getOrCreateInvoiceFolder(
     monthFolderId = await createFolder(drive, month, yearFolderId);
   }
 
-  // Carpeta de factura (NumFactura - NIT)
+  // Carpeta de factura (NumFactura - NIT Emisor)
   let invoiceFolderId = await findFolderByName(drive, invoiceFolderName, monthFolderId);
   if (!invoiceFolderId) {
     invoiceFolderId = await createFolder(drive, invoiceFolderName, monthFolderId);
@@ -281,7 +288,7 @@ async function findFileInFolder(
   }
 }
 
-// Verificar si una factura ya existe en Drive (estructura Año/Mes/NumFactura - NIT)
+// Verificar si una factura ya existe en Drive (estructura NIT Receptor/Año/Mes/NumFactura - NIT Emisor)
 export interface ExistingInvoiceFiles {
   pdfUrl?: string;
   xmlUrl?: string;
@@ -294,7 +301,8 @@ export async function checkInvoiceExistsInDrive(
   userId: string,
   issueDate: string, // Formato DD/MM/YYYY o YYYY-MM-DD
   docNumber: string,
-  nit: string,
+  issuerNit: string,
+  receiverNit: string,
   onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
 ): Promise<ExistingInvoiceFiles> {
   try {
@@ -303,10 +311,16 @@ export async function checkInvoiceExistsInDrive(
 
     // Parsear fecha
     const { year, monthName } = parseInvoiceDate(issueDate);
-    const invoiceFolderName = `${docNumber} - ${nit}`;
+    const invoiceFolderName = `${docNumber} - ${issuerNit}`;
 
-    // Verificar si existe la carpeta de la factura
-    const yearFolderId = await findFolderByName(drive, year, rootFolderId);
+    // Verificar si existe la carpeta del receptor (solo NIT)
+    const receiverFolderId = await findFolderByName(drive, receiverNit, rootFolderId);
+    if (!receiverFolderId) {
+      return { exists: false };
+    }
+
+    // Verificar si existe la carpeta del año
+    const yearFolderId = await findFolderByName(drive, year, receiverFolderId);
     if (!yearFolderId) {
       return { exists: false };
     }
@@ -382,7 +396,8 @@ export async function uploadInvoiceFilesToDrive(
   pdfBuffer: Buffer | null,
   xmlBuffer: Buffer | null,
   docNumber: string,
-  nit: string,
+  issuerNit: string,
+  receiverNit: string,
   issueDate: string, // Formato DD/MM/YYYY o YYYY-MM-DD
   driveConfig: GoogleDriveConfig,
   userId: string,
@@ -393,12 +408,13 @@ export async function uploadInvoiceFilesToDrive(
 
   // Parsear fecha para estructura de carpetas
   const { year, monthName } = parseInvoiceDate(issueDate);
-  const invoiceFolderName = `${docNumber} - ${nit}`;
+  const invoiceFolderName = `${docNumber} - ${issuerNit}`;
 
   // Obtener o crear estructura de carpetas
   const invoiceFolderId = await getOrCreateInvoiceFolder(
     drive,
     rootFolderId,
+    receiverNit,
     year,
     monthName,
     invoiceFolderName

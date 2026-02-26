@@ -1,18 +1,10 @@
 import { XMLParser } from "fast-xml-parser";
-import type { InvoiceData } from "../types/dianExcel.js";
+import type { InvoiceData, InvoiceLineItem } from "../types/dianExcel.js";
 
 interface DocInfo {
   id: string;
-  nit: string;
   docnum: string;
 }
-
-// Namespaces comunes en facturas electrónicas DIAN (UBL 2.1)
-const NAMESPACES = {
-  cbc: "urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2",
-  cac: "urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2",
-  fe: "http://www.dian.gov.co/contratos/facturaelectronica/v1",
-};
 
 /**
  * Extrae datos estructurados de un XML de factura electrónica DIAN (UBL 2.1)
@@ -27,7 +19,7 @@ export async function extractInvoiceDataFromXml(
     const parser = new XMLParser({
       ignoreAttributes: false,
       attributeNamePrefix: "@_",
-      removeNSPrefix: true, // Elimina prefijos de namespace para facilitar acceso
+      removeNSPrefix: true,
       parseAttributeValue: true,
       trimValues: true,
     });
@@ -42,44 +34,135 @@ export async function extractInvoiceDataFromXml(
 
     const isNotaCredito = !!parsed.CreditNote;
 
-    // Extraer datos principales
-    const issueDate = extractIssueDate(invoice);
+    // Extraer datos del emisor (AccountingSupplierParty)
     const supplierParty = invoice.AccountingSupplierParty?.Party;
-    const entityName = extractEntityName(supplierParty);
-    const entityType = detectEntityType(supplierParty);
+    const issuerNit = extractPartyNit(supplierParty);
+    const issuerName = extractPartyName(supplierParty);
+
+    // Extraer datos del receptor (AccountingCustomerParty)
+    const customerParty = invoice.AccountingCustomerParty?.Party;
+    const receiverNit = extractPartyNit(customerParty);
+    const receiverName = extractPartyName(customerParty);
+
+    // Extraer otros datos
+    const issueDate = extractIssueDate(invoice);
     const { subtotal, iva } = extractTotals(invoice);
     const concepts = extractConcepts(invoice);
+    const lineItems = extractLineItems(invoice);
     const cufe = extractCUFE(invoice);
 
     return {
-      entityType,
+      issuerNit,
+      issuerName,
+      receiverNit,
+      receiverName,
       issueDate,
-      entityName,
       subtotal,
       iva,
       concepts,
+      lineItems,
       documentType: isNotaCredito ? "Nota Crédito" : "Factura Electrónica",
       cufe,
       trackId: docInfo.id,
-      nit: docInfo.nit,
       docNumber: docInfo.docnum,
     };
   } catch (err) {
     console.error(`Error parseando XML ${docInfo.docnum}:`, err);
     return {
-      entityType: "N/A",
+      issuerNit: "N/A",
+      issuerName: "N/A",
+      receiverNit: "N/A",
+      receiverName: "N/A",
       issueDate: "N/A",
-      entityName: "N/A",
       subtotal: 0,
       iva: 0,
       concepts: "ERROR: No se pudo leer el XML",
+      lineItems: [],
       documentType: "N/A",
       cufe: "N/A",
       trackId: docInfo.id,
-      nit: docInfo.nit,
       docNumber: docInfo.docnum,
       error: (err as Error).message,
     };
+  }
+}
+
+/**
+ * Extrae NIT de un Party (PartyTaxScheme > CompanyID)
+ */
+function extractPartyNit(party: any): string {
+  if (!party) return "N/A";
+
+  try {
+    // Ruta principal: PartyTaxScheme > CompanyID
+    const partyTaxScheme = party.PartyTaxScheme;
+    if (partyTaxScheme) {
+      const taxScheme = Array.isArray(partyTaxScheme)
+        ? partyTaxScheme[0]
+        : partyTaxScheme;
+      const companyId = taxScheme?.CompanyID;
+      if (companyId) {
+        return String(getText(companyId));
+      }
+    }
+
+    // Fallback: PartyLegalEntity > CompanyID
+    const legalEntity = party.PartyLegalEntity;
+    if (legalEntity) {
+      const entity = Array.isArray(legalEntity) ? legalEntity[0] : legalEntity;
+      const companyId = entity?.CompanyID;
+      if (companyId) {
+        return String(getText(companyId));
+      }
+    }
+
+    return "N/A";
+  } catch {
+    return "N/A";
+  }
+}
+
+/**
+ * Extrae razón social de un Party (PartyName > Name)
+ */
+function extractPartyName(party: any): string {
+  if (!party) return "N/A";
+
+  try {
+    // Ruta principal: PartyName > Name
+    const partyName = party.PartyName;
+    if (partyName) {
+      const name = Array.isArray(partyName) ? partyName[0]?.Name : partyName.Name;
+      if (name) {
+        return cleanText(getText(name));
+      }
+    }
+
+    // Fallback: PartyLegalEntity > RegistrationName
+    const legalEntity = party.PartyLegalEntity;
+    if (legalEntity) {
+      const entity = Array.isArray(legalEntity) ? legalEntity[0] : legalEntity;
+      const regName = entity?.RegistrationName;
+      if (regName) {
+        return cleanText(getText(regName));
+      }
+    }
+
+    // Fallback: PartyTaxScheme > RegistrationName
+    const partyTaxScheme = party.PartyTaxScheme;
+    if (partyTaxScheme) {
+      const taxScheme = Array.isArray(partyTaxScheme)
+        ? partyTaxScheme[0]
+        : partyTaxScheme;
+      const regName = taxScheme?.RegistrationName;
+      if (regName) {
+        return cleanText(getText(regName));
+      }
+    }
+
+    return "N/A";
+  } catch {
+    return "N/A";
   }
 }
 
@@ -98,80 +181,6 @@ function extractIssueDate(invoice: any): string {
     }
 
     return String(issueDate);
-  } catch {
-    return "N/A";
-  }
-}
-
-/**
- * Extrae razón social del emisor (AccountingSupplierParty)
- */
-function extractEntityName(party: any): string {
-  if (!party) return "N/A";
-
-  try {
-    // Intentar PartyLegalEntity > RegistrationName (más confiable)
-    const legalEntity = party.PartyLegalEntity;
-    if (legalEntity) {
-      const regName = Array.isArray(legalEntity)
-        ? legalEntity[0]?.RegistrationName
-        : legalEntity.RegistrationName;
-      if (regName) {
-        return cleanText(getText(regName));
-      }
-    }
-
-    // Fallback: PartyName > Name
-    const partyName = party.PartyName;
-    if (partyName) {
-      const name = Array.isArray(partyName)
-        ? partyName[0]?.Name
-        : partyName.Name;
-      if (name) {
-        return cleanText(getText(name));
-      }
-    }
-
-    return "N/A";
-  } catch {
-    return "N/A";
-  }
-}
-
-/**
- * Detecta si es empresa o persona natural basado en datos del emisor
- */
-function detectEntityType(party: any): "EMPRESA" | "PN" | "N/A" {
-  if (!party) return "N/A";
-
-  try {
-    // En UBL DIAN, el tipo de persona está en PartyTaxScheme o en extensiones
-    const partyTaxScheme = party.PartyTaxScheme;
-
-    if (partyTaxScheme) {
-      const taxScheme = Array.isArray(partyTaxScheme)
-        ? partyTaxScheme[0]
-        : partyTaxScheme;
-
-      // TaxLevelCode puede indicar régimen (útil pero no determinante)
-      // CompanyID suele tener atributos con tipo de documento
-
-      const companyId = taxScheme?.CompanyID;
-      if (companyId) {
-        // Atributo schemeName puede ser "NIT" (empresa) o "CC" (persona natural)
-        const schemeName = companyId["@_schemeName"] || "";
-        if (/NIT/i.test(schemeName)) return "EMPRESA";
-        if (/CC|CE|TI|PA/i.test(schemeName)) return "PN";
-      }
-    }
-
-    // Fallback: analizar razón social por sufijos de empresa
-    const name = extractEntityName(party);
-    if (/\b(S\.?A\.?S\.?|S\.?A\.?|LTDA\.?|E\.?U\.?|SAS|LIMITADA)\b/i.test(name)) {
-      return "EMPRESA";
-    }
-
-    return "EMPRESA"; // Default
   } catch {
     return "N/A";
   }
@@ -198,18 +207,16 @@ function extractTotals(invoice: any): { subtotal: number; iva: number } {
       const taxTotalArr = Array.isArray(taxTotal) ? taxTotal : [taxTotal];
 
       for (const tax of taxTotalArr) {
-        // TaxSubtotal puede tener múltiples impuestos
         const taxSubtotal = tax.TaxSubtotal;
         if (taxSubtotal) {
           const subtotals = Array.isArray(taxSubtotal) ? taxSubtotal : [taxSubtotal];
 
           for (const sub of subtotals) {
-            // TaxCategory > TaxScheme > ID indica tipo de impuesto
             const taxSchemeId = sub.TaxCategory?.TaxScheme?.ID;
-            const taxId = getText(taxSchemeId);
+            const taxId = String(getText(taxSchemeId));
 
-            // "01" = IVA en nomenclatura DIAN
-            if (taxId === "01" || /IVA/i.test(taxId)) {
+            // "01" o "1" = IVA en nomenclatura DIAN
+            if (taxId === "01" || taxId === "1" || /IVA/i.test(taxId)) {
               iva += parseAmount(sub.TaxAmount);
             }
           }
@@ -229,34 +236,104 @@ function extractTotals(invoice: any): { subtotal: number; iva: number } {
 }
 
 /**
- * Extrae descripciones de los productos/servicios facturados
+ * Extrae descripciones de los 2 primeros items (InvoiceLine con ID 1 y 2)
  */
 function extractConcepts(invoice: any): string {
   try {
-    // InvoiceLine o CreditNoteLine contienen los ítems
+    const lineItems = extractLineItems(invoice);
+    const descriptions = lineItems
+      .slice(0, 2)
+      .map((item) => item.description)
+      .filter((desc) => !!desc && desc !== "N/A");
+
+    if (descriptions.length === 0) return "N/A";
+    return descriptions.join(", ");
+  } catch {
+    return "N/A";
+  }
+}
+
+/**
+ * Extrae líneas detalladas de la factura para la hoja "Detallado"
+ */
+function extractLineItems(invoice: any): InvoiceLineItem[] {
+  try {
     const lines = invoice.InvoiceLine || invoice.CreditNoteLine;
-    if (!lines) return "N/A";
+    if (!lines) return [];
 
     const linesArr = Array.isArray(lines) ? lines : [lines];
-    const descriptions: string[] = [];
 
-    for (const line of linesArr) {
-      // Item > Description o Item > Name
-      const item = line.Item;
-      if (item) {
-        let desc = getText(item.Description) || getText(item.Name);
-        if (desc && desc !== "N/A") {
-          desc = cleanDescription(desc);
-          if (!descriptions.some((d) => d.toLowerCase() === desc.toLowerCase())) {
-            descriptions.push(desc);
+    return linesArr.map((line: any, index: number) => {
+      const lineNumber = parseAmount(line.ID) || index + 1;
+      const quantity = parseAmount(line.InvoicedQuantity);
+      const unitPrice = parseAmount(line.Price?.PriceAmount);
+      const lineExtensionAmount = parseAmount(line.LineExtensionAmount);
+
+      let description = "";
+      const itemDesc = line.Item?.Description;
+      if (Array.isArray(itemDesc)) {
+        description = itemDesc.map((d) => getText(d)).filter(Boolean).join(" ");
+      } else {
+        description = getText(itemDesc);
+      }
+      description = cleanDescription(description.replace(/^\|+/, ""));
+
+      let discount = 0;
+      let surcharge = 0;
+      const allowanceCharge = line.AllowanceCharge;
+      if (allowanceCharge) {
+        const allowances = Array.isArray(allowanceCharge) ? allowanceCharge : [allowanceCharge];
+        for (const allowance of allowances) {
+          const amount = parseAmount(allowance.Amount);
+          const isCharge = String(getText(allowance.ChargeIndicator)).toLowerCase() === "true";
+          if (isCharge) surcharge += amount;
+          else discount += amount;
+        }
+      }
+
+      let ivaAmount = 0;
+      let ivaPercent = 0;
+      let incAmount = 0;
+      let incPercent = 0;
+
+      const taxTotals = line.TaxTotal ? (Array.isArray(line.TaxTotal) ? line.TaxTotal : [line.TaxTotal]) : [];
+      for (const taxTotal of taxTotals) {
+        const subtotals = taxTotal.TaxSubtotal
+          ? (Array.isArray(taxTotal.TaxSubtotal) ? taxTotal.TaxSubtotal : [taxTotal.TaxSubtotal])
+          : [];
+
+        for (const subtotal of subtotals) {
+          const taxId = String(getText(subtotal.TaxCategory?.TaxScheme?.ID));
+          const taxName = String(getText(subtotal.TaxCategory?.TaxScheme?.Name)).toUpperCase();
+          const taxAmount = parseAmount(subtotal.TaxAmount);
+          const taxPercent = parseAmount(subtotal.TaxCategory?.Percent);
+
+          if (taxId === "01" || taxId === "1" || taxName.includes("IVA")) {
+            ivaAmount += taxAmount;
+            ivaPercent = taxPercent || ivaPercent;
+          } else if (taxId === "04" || taxId === "4" || taxName.includes("INC")) {
+            incAmount += taxAmount;
+            incPercent = taxPercent || incPercent;
           }
         }
       }
-    }
 
-    return formatConcepts(descriptions);
+      return {
+        lineNumber,
+        description: description || "N/A",
+        quantity,
+        unitPrice,
+        discount,
+        surcharge,
+        ivaAmount,
+        ivaPercent,
+        incAmount,
+        incPercent,
+        totalUnitPrice: lineExtensionAmount,
+      };
+    });
   } catch {
-    return "N/A";
+    return [];
   }
 }
 
@@ -265,8 +342,6 @@ function extractConcepts(invoice: any): string {
  */
 function extractCUFE(invoice: any): string {
   try {
-    // UUID está en UBLExtensions > ExtensionContent > DianExtensions > InvoiceControl > UUID
-    // O directamente en el campo UUID del documento
     const uuid = invoice.UUID;
     if (uuid) {
       const cufe = getText(uuid);
@@ -304,36 +379,37 @@ function extractCUFE(invoice: any): string {
 // ============================================
 
 /**
- * Obtiene texto de un nodo XML (puede ser string o objeto con #text)
+ * Obtiene texto de un nodo XML (puede ser string, número, o objeto con #text)
  */
 function getText(node: any): string {
-  if (!node) return "";
+  if (node === null || node === undefined) return "";
   if (typeof node === "string") return node;
   if (typeof node === "number") return String(node);
-  if (node["#text"]) return String(node["#text"]);
+  if (typeof node === "object" && "#text" in node) return String(node["#text"]);
   return "";
 }
 
 /**
- * Parsea montos desde XML (pueden tener atributos de moneda)
+ * Parsea montos desde XML (pueden tener atributos de moneda o ser números directos)
  */
 function parseAmount(node: any): number {
+  if (typeof node === "number") return node;
+
+  if (node && typeof node === "object" && "#text" in node) {
+    if (typeof node["#text"] === "number") return node["#text"];
+  }
+
   const text = getText(node);
   if (!text) return 0;
 
-  // Limpiar y parsear
   const cleaned = text.replace(/[^\d.,\-]/g, "");
-
-  // Determinar formato
   const lastComma = cleaned.lastIndexOf(",");
   const lastDot = cleaned.lastIndexOf(".");
 
   let normalized = cleaned;
   if (lastComma > lastDot) {
-    // Formato europeo: 1.234,56
     normalized = cleaned.replace(/\./g, "").replace(",", ".");
   } else if (lastDot > lastComma) {
-    // Formato americano: 1,234.56
     normalized = cleaned.replace(/,/g, "");
   }
 
@@ -342,10 +418,10 @@ function parseAmount(node: any): number {
 }
 
 /**
- * Limpia texto de espacios extra y caracteres especiales
+ * Limpia texto de espacios extra
  */
 function cleanText(text: string): string {
-  return text.replace(/\s+/g, " ").trim().substring(0, 100);
+  return text.replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -354,27 +430,10 @@ function cleanText(text: string): string {
 function cleanDescription(text: string): string {
   let cleaned = text.replace(/\s+/g, " ").trim();
 
-  // Capitalizar primera letra
+  // Capitalizar primera letra, resto mantener
   if (cleaned.length > 0) {
-    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1).toLowerCase();
+    cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
   }
 
-  return cleaned.substring(0, 80);
-}
-
-/**
- * Formatea lista de conceptos para el Excel
- */
-function formatConcepts(concepts: string[]): string {
-  if (concepts.length === 0) return "N/A";
-
-  // Eliminar duplicados
-  const unique = [...new Set(concepts.map((c) => c.toLowerCase()))].map(
-    (c) => concepts.find((orig) => orig.toLowerCase() === c)!
-  );
-
-  if (unique.length === 1) return unique[0];
-  if (unique.length === 2) return unique.join(", ");
-
-  return `${unique.slice(0, 2).join(", ")}... (+${unique.length - 2} items mas)`;
+  return cleaned.substring(0, 100);
 }

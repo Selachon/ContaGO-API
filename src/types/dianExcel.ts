@@ -8,24 +8,45 @@ export interface ExcelGenerateRequest {
 }
 
 export interface InvoiceData {
-  // Datos extraídos del PDF
-  entityType: "EMPRESA" | "PN" | "N/A";
+  // Datos del emisor (quien emite la factura)
+  issuerNit: string;
+  issuerName: string;
+
+  // Datos del receptor (quien recibe la factura)
+  receiverNit: string;
+  receiverName: string;
+
+  // Datos de la factura
   issueDate: string;
-  entityName: string;
   subtotal: number;
   iva: number;
   concepts: string;
-  driveUrl?: string;
   documentType: "Factura Electrónica" | "Nota Crédito" | "N/A";
   cufe: string;
+  driveUrl?: string;
+
+  // Líneas de detalle de productos/servicios
+  lineItems: InvoiceLineItem[];
 
   // Metadata para procesamiento
   trackId: string;
-  nit: string;
   docNumber: string;
-  pdfBuffer?: Buffer;
   zipFilename: string;
   error?: string;
+}
+
+export interface InvoiceLineItem {
+  lineNumber: number;           // Nro.
+  description: string;          // Descripción
+  quantity: number;             // Cantidad
+  unitPrice: number;            // Precio unitario
+  discount: number;             // Descuento detalle
+  surcharge: number;            // Recargo detalle
+  ivaAmount: number;            // IVA (valor)
+  ivaPercent: number;           // % IVA
+  incAmount: number;            // INC (valor)
+  incPercent: number;           // % INC
+  totalUnitPrice: number;       // Precio unitario de venta
 }
 
 export interface ExcelJobData {

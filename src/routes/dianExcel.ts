@@ -366,7 +366,6 @@ async function processExcelJob(
         // 3.3) Extraer datos estructurados del XML (mas rapido y preciso que PDF).
         const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
           id: doc.id,
-          nit: doc.nit,
           docnum: doc.docnum,
         });
 
@@ -374,15 +373,19 @@ async function processExcelJob(
         let driveUrl: string | undefined;
         let wasSkipped = false;
 
-        if (hasDrive && driveConfig && invoiceData.issueDate && invoiceData.issueDate !== "N/A") {
+        const hasValidData = invoiceData.issueDate && invoiceData.issueDate !== "N/A" &&
+                             invoiceData.receiverNit && invoiceData.receiverNit !== "N/A";
+
+        if (hasDrive && driveConfig && hasValidData) {
           try {
-            // Verificar si ya existe en Drive antes de descargar/subir
+            // Verificar si ya existe en Drive antes de subir
             const existing = await checkInvoiceExistsInDrive(
               driveConfig,
               userId,
-              invoiceData.issueDate,
+              invoiceData.issueDate!,
               doc.docnum,
-              doc.nit,
+              invoiceData.issuerNit || doc.nit,
+              invoiceData.receiverNit!,
               onTokenRefresh
             );
 
@@ -398,8 +401,9 @@ async function processExcelJob(
                 pdfBuffer,
                 xmlBuffer,
                 doc.docnum,
-                doc.nit,
-                invoiceData.issueDate,
+                invoiceData.issuerNit || doc.nit,
+                invoiceData.receiverNit!,
+                invoiceData.issueDate!,
                 driveConfig,
                 userId,
                 onTokenRefresh
@@ -417,19 +421,21 @@ async function processExcelJob(
         }
 
         invoices.push({
-          entityType: invoiceData.entityType || "N/A",
+          issuerNit: invoiceData.issuerNit || "N/A",
+          issuerName: invoiceData.issuerName || "N/A",
+          receiverNit: invoiceData.receiverNit || "N/A",
+          receiverName: invoiceData.receiverName || "N/A",
           issueDate: invoiceData.issueDate || "N/A",
-          entityName: invoiceData.entityName || "N/A",
           subtotal: invoiceData.subtotal || 0,
           iva: invoiceData.iva || 0,
           concepts: invoiceData.concepts || "N/A",
+          lineItems: invoiceData.lineItems || [],
           documentType: invoiceData.documentType || "Factura Electrónica",
           cufe: invoiceData.cufe || "N/A",
           trackId: doc.id,
-          nit: doc.nit,
           docNumber: doc.docnum,
           driveUrl,
-          zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
+          zipFilename: `${invoiceData.issuerNit || doc.nit} - ${doc.docnum}.zip`,
         });
 
         successCount++;
@@ -441,16 +447,18 @@ async function processExcelJob(
 
         // Mantiene trazabilidad del documento fallido dentro del Excel.
         invoices.push({
-          entityType: "N/A",
+          issuerNit: doc.nit,
+          issuerName: "N/A",
+          receiverNit: "N/A",
+          receiverName: "N/A",
           issueDate: "N/A",
-          entityName: doc.docnum || "Desconocido",
           subtotal: 0,
           iva: 0,
           concepts: `ERROR: ${(err as Error).message}`,
+          lineItems: [],
           documentType: "N/A",
           cufe: "N/A",
           trackId: doc.id,
-          nit: doc.nit,
           docNumber: doc.docnum,
           zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
           error: (err as Error).message,
