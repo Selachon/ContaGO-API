@@ -376,11 +376,25 @@ async function setPageLength(page: Page, length: number): Promise<void> {
   }
 }
 
+// Tipos de documento que deben ser ignorados (no son facturas reales)
+const IGNORED_DOC_TYPES = [
+  "application response",
+  "applicationresponse",
+  "app response",
+  "respuesta de aplicación",
+  "respuesta aplicación",
+];
+
+function shouldIgnoreDocType(docType: string): boolean {
+  const normalized = docType.toLowerCase().trim();
+  return IGNORED_DOC_TYPES.some(ignored => normalized.includes(ignored));
+}
+
 async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<DocumentInfo[]> {
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate(() => {
-    const results: Array<{ id: string; docnum: string; nit: string }> = [];
+    const results: Array<{ id: string; docnum: string; nit: string; docType: string }> = [];
     
     // Excluye la fila placeholder de DataTables.
     const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
@@ -443,22 +457,42 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
       
       if (!trackId) continue;
       
-      // Columnas esperadas de numero de documento y NIT.
+      // Columnas de la tabla DIAN:
+      // 0: checkbox, 1: ?, 2: Tipo, 3: ?, 4: Número, 5: ?, 6: NIT
+      // El tipo de documento suele estar en la columna 2 o 3
       const tds = row.querySelectorAll("td");
+      const docType = tds[2]?.textContent?.trim() || tds[3]?.textContent?.trim() || "";
       const docnum = tds[4]?.textContent?.trim() || "";
       const nit = tds[6]?.textContent?.trim() || "";
 
-      results.push({ id: trackId, docnum, nit });
+      results.push({ id: trackId, docnum, nit, docType });
     }
 
     return results;
   });
 
+  let skippedCount = 0;
+  
   for (const item of items) {
     if (!seenIds.has(item.id)) {
+      // Filtrar Application Response y otros tipos no relevantes
+      if (shouldIgnoreDocType(item.docType)) {
+        skippedCount++;
+        continue;
+      }
+      
       seenIds.add(item.id);
-      docs.push(item);
+      docs.push({
+        id: item.id,
+        docnum: item.docnum,
+        nit: item.nit,
+        docType: item.docType,
+      });
     }
+  }
+  
+  if (skippedCount > 0) {
+    console.log(`  -> Omitidos ${skippedCount} documentos tipo "Application Response"`);
   }
 
   return docs;

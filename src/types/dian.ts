@@ -10,6 +10,7 @@ export interface DocumentInfo {
   id: string;
   docnum: string;
   nit: string;
+  docType?: string;
 }
 
 export interface ProgressData {
