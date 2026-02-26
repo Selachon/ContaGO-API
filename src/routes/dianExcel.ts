@@ -5,9 +5,15 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
 import { extractDocumentIds } from "../services/dianScraper.js";
-import { extractInvoiceData } from "../services/pdfParser.js";
+import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
-import { uploadPdfToDrive } from "../services/googleDrive.js";
+import {
+  uploadInvoiceFilesToDrive,
+  checkInvoiceExistsInDrive,
+  getOrCreateRootFolder,
+  type ExistingInvoiceFiles,
+  type UploadResult,
+} from "../services/googleDrive.js";
 import { encryptToken } from "../utils/encryption.js";
 import { requireAuth } from "../middleware/auth.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
@@ -127,7 +133,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   res.json({
     status: "accepted",
     jobId,
-    message: "Generación de Excel iniciada. Usa /dian-excel/job-status/:jobId para consultar el progreso.",
+    message: "Generacion de Excel iniciada. Usa /dian-excel/job-status/:jobId para consultar el progreso.",
   });
 
   // No usar await para no retener la conexion HTTP.
@@ -147,7 +153,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
   if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
-    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+    return res.status(400).json({ status: "error", detalle: "jobId invalido" });
   }
 
   const job = jobTracker.get(jobId);
@@ -167,6 +173,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     excelName: job.excelName,
     invoicesProcessed: job.invoicesProcessed,
     invoicesFailed: job.invoicesFailed,
+    invoicesSkipped: job.invoicesSkipped,
   });
 });
 
@@ -175,7 +182,7 @@ router.get("/download/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
   if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
-    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+    return res.status(400).json({ status: "error", detalle: "jobId invalido" });
   }
 
   const job = jobTracker.get(jobId);
@@ -229,7 +236,7 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
 
   if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
-    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+    return res.status(400).json({ status: "error", detalle: "jobId invalido" });
   }
 
   const job = jobTracker.get(jobId);
@@ -242,11 +249,11 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   }
 
   if (job.status === "completed" || job.status === "cancelled") {
-    return res.status(400).json({ status: "error", detalle: `Job ya está ${job.status}` });
+    return res.status(400).json({ status: "error", detalle: `Job ya esta ${job.status}` });
   }
 
   job.status = "cancelled";
-  setProgress(jobId, { step: "Cancelado", detalle: "Operación cancelada por el usuario" });
+  setProgress(jobId, { step: "Cancelado", detalle: "Operacion cancelada por el usuario" });
 
   // Limpieza inmediata aun si el worker sigue cerrando.
   if (job.tempDir && fs.existsSync(job.tempDir)) {
@@ -260,7 +267,7 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   res.json({ status: "cancelled", message: "Job cancelado exitosamente" });
 });
 
-// Worker principal: extrae facturas, parsea PDFs y genera Excel.
+// Worker principal: extrae facturas, parsea XMLs y genera Excel.
 async function processExcelJob(
   jobId: string,
   tokenUrl: string,
@@ -297,7 +304,7 @@ async function processExcelJob(
 
     if (documents.length > MAX_DOCUMENTS) {
       job.status = "error";
-      job.error = `Demasiados documentos (${documents.length}). Máximo: ${MAX_DOCUMENTS}`;
+      job.error = `Demasiados documentos (${documents.length}). Maximo: ${MAX_DOCUMENTS}`;
       setProgress(jobId, { step: "Error", detalle: job.error });
       return;
     }
@@ -307,7 +314,7 @@ async function processExcelJob(
 
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // 2) Cargar config de Drive para subir PDFs si el usuario lo habilito.
+    // 2) Cargar config de Drive para subir archivos si el usuario lo habilito.
     const driveConfig = await getUserGoogleDrive(userId);
     const hasDrive = !!driveConfig;
 
@@ -317,10 +324,20 @@ async function processExcelJob(
       await updateUserDriveTokens(userId, encryptedToken, new Date(expiryDate).toISOString());
     };
 
+    // Pre-crear carpeta raiz de Drive si es necesario
+    if (hasDrive && driveConfig) {
+      try {
+        await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
+      } catch (err) {
+        console.warn("[Excel] No se pudo pre-crear carpeta Drive:", err);
+      }
+    }
+
     // 3) Procesar cada documento de forma independiente.
     const invoices: InvoiceData[] = [];
     let successCount = 0;
     let errorCount = 0;
+    let skippedCount = 0;
 
     for (let i = 0; i < documents.length; i++) {
       if (isJobCancelled(jobId)) {
@@ -339,26 +356,64 @@ async function processExcelJob(
         // 3.1) Descargar ZIP del trackId.
         const zipBuffer = await downloadZipFile(doc.id, cookies);
 
-        // 3.2) Extraer primer PDF disponible del ZIP.
-        const { pdfBuffer, pdfFilename } = await extractPdfFromZip(zipBuffer);
+        // 3.2) Extraer XML y PDF del ZIP.
+        const { xmlBuffer, xmlFilename, pdfBuffer, pdfFilename } = await extractFilesFromZip(zipBuffer);
 
-        if (!pdfBuffer) {
-          throw new Error("No se encontró PDF en el ZIP");
+        if (!xmlBuffer) {
+          throw new Error("No se encontro XML en el ZIP");
         }
 
-        // 3.3) Extraer datos estructurados del PDF.
-        const invoiceData = await extractInvoiceData(pdfBuffer, {
+        // 3.3) Extraer datos estructurados del XML (mas rapido y preciso que PDF).
+        const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
           id: doc.id,
-          nit: doc.nit,
           docnum: doc.docnum,
         });
 
-        // 3.4) Subir PDF a Drive de forma opcional.
+        // 3.4) Subir archivos a Drive con estructura de carpetas.
         let driveUrl: string | undefined;
-        if (hasDrive && driveConfig) {
+        let wasSkipped = false;
+
+        const hasValidData = invoiceData.issueDate && invoiceData.issueDate !== "N/A" &&
+                             invoiceData.receiverNit && invoiceData.receiverNit !== "N/A";
+
+        if (hasDrive && driveConfig && hasValidData) {
           try {
-            const filename = `${doc.nit} - ${doc.docnum}.pdf`;
-            driveUrl = await uploadPdfToDrive(pdfBuffer, filename, driveConfig, onTokenRefresh);
+            // Verificar si ya existe en Drive antes de subir
+            const existing = await checkInvoiceExistsInDrive(
+              driveConfig,
+              userId,
+              invoiceData.issueDate!,
+              doc.docnum,
+              invoiceData.issuerNit || doc.nit,
+              invoiceData.receiverNit!,
+              onTokenRefresh
+            );
+
+            if (existing.exists) {
+              // Ya existe, usar URLs existentes
+              driveUrl = existing.pdfUrl || existing.folderUrl;
+              wasSkipped = true;
+              skippedCount++;
+              console.log(`[Excel] Factura ${doc.docnum} ya existe en Drive, omitiendo`);
+            } else {
+              // Subir archivos nuevos
+              const uploadResult = await uploadInvoiceFilesToDrive(
+                pdfBuffer,
+                xmlBuffer,
+                doc.docnum,
+                invoiceData.issuerNit || doc.nit,
+                invoiceData.receiverNit!,
+                invoiceData.issueDate!,
+                driveConfig,
+                userId,
+                onTokenRefresh
+              );
+
+              driveUrl = uploadResult.pdfUrl || uploadResult.folderUrl;
+              if (uploadResult.wasSkipped) {
+                skippedCount++;
+              }
+            }
           } catch (driveErr) {
             console.error(`[Excel] Error subiendo a Drive: ${doc.docnum}`, driveErr);
             driveUrl = "ERROR: No se pudo subir a Drive";
@@ -366,23 +421,26 @@ async function processExcelJob(
         }
 
         invoices.push({
-          entityType: invoiceData.entityType || "N/A",
+          issuerNit: invoiceData.issuerNit || "N/A",
+          issuerName: invoiceData.issuerName || "N/A",
+          receiverNit: invoiceData.receiverNit || "N/A",
+          receiverName: invoiceData.receiverName || "N/A",
           issueDate: invoiceData.issueDate || "N/A",
-          entityName: invoiceData.entityName || "N/A",
           subtotal: invoiceData.subtotal || 0,
           iva: invoiceData.iva || 0,
+          total: invoiceData.total || 0,
           concepts: invoiceData.concepts || "N/A",
+          lineItems: invoiceData.lineItems || [],
           documentType: invoiceData.documentType || "Factura Electrónica",
           cufe: invoiceData.cufe || "N/A",
           trackId: doc.id,
-          nit: doc.nit,
           docNumber: doc.docnum,
           driveUrl,
-          zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
+          zipFilename: `${invoiceData.issuerNit || doc.nit} - ${doc.docnum}.zip`,
         });
 
         successCount++;
-        console.log(`[Excel] Procesado ${i + 1}/${totalDocs}: ${doc.docnum}`);
+        console.log(`[Excel] Procesado ${i + 1}/${totalDocs}: ${doc.docnum}${wasSkipped ? " (existente)" : ""}`);
 
       } catch (err) {
         errorCount++;
@@ -390,16 +448,19 @@ async function processExcelJob(
 
         // Mantiene trazabilidad del documento fallido dentro del Excel.
         invoices.push({
-          entityType: "N/A",
+          issuerNit: doc.nit,
+          issuerName: "N/A",
+          receiverNit: "N/A",
+          receiverName: "N/A",
           issueDate: "N/A",
-          entityName: doc.docnum || "Desconocido",
           subtotal: 0,
           iva: 0,
+          total: 0,
           concepts: `ERROR: ${(err as Error).message}`,
+          lineItems: [],
           documentType: "N/A",
           cufe: "N/A",
           trackId: doc.id,
-          nit: doc.nit,
           docNumber: doc.docnum,
           zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
           error: (err as Error).message,
@@ -426,13 +487,15 @@ async function processExcelJob(
     job.completedAt = Date.now();
     job.invoicesProcessed = successCount;
     job.invoicesFailed = errorCount;
+    job.invoicesSkipped = skippedCount;
 
-    const summary = errorCount > 0
-      ? `Completado (${successCount} ok, ${errorCount} errores)`
-      : "Completado";
+    let summary = `Completado (${successCount} procesadas`;
+    if (skippedCount > 0) summary += `, ${skippedCount} existentes`;
+    if (errorCount > 0) summary += `, ${errorCount} errores`;
+    summary += ")";
 
     setProgress(jobId, { step: summary, current: totalDocs, total: totalDocs });
-    console.log(`[Excel] Job ${jobId} completado: ${successCount} facturas, ${errorCount} errores`);
+    console.log(`[Excel] Job ${jobId} completado: ${successCount} facturas, ${skippedCount} existentes, ${errorCount} errores`);
 
   } catch (err) {
     console.error(`[Excel] Error fatal en job ${jobId}:`, err);
@@ -491,20 +554,42 @@ async function downloadZipFile(
   throw lastError || new Error("Descarga fallida");
 }
 
-async function extractPdfFromZip(
-  zipBuffer: Buffer
-): Promise<{ pdfBuffer: Buffer | null; pdfFilename: string }> {
+interface ExtractedFiles {
+  xmlBuffer: Buffer | null;
+  xmlFilename: string;
+  pdfBuffer: Buffer | null;
+  pdfFilename: string;
+}
+
+async function extractFilesFromZip(zipBuffer: Buffer): Promise<ExtractedFiles> {
   const zip = await JSZip.loadAsync(zipBuffer);
 
-  // El ZIP DIAN suele incluir un unico PDF util para el parser.
+  let xmlBuffer: Buffer | null = null;
+  let xmlFilename = "";
+  let pdfBuffer: Buffer | null = null;
+  let pdfFilename = "";
+
+  // Extraer XML y PDF del ZIP
   for (const [filename, file] of Object.entries(zip.files)) {
-    if (!file.dir && filename.toLowerCase().endsWith(".pdf")) {
-      const buffer = await file.async("nodebuffer");
-      return { pdfBuffer: buffer, pdfFilename: filename };
+    if (file.dir) continue;
+
+    const lowerName = filename.toLowerCase();
+
+    if (lowerName.endsWith(".xml") && !xmlBuffer) {
+      xmlBuffer = await file.async("nodebuffer");
+      xmlFilename = filename;
     }
+
+    if (lowerName.endsWith(".pdf") && !pdfBuffer) {
+      pdfBuffer = await file.async("nodebuffer");
+      pdfFilename = filename;
+    }
+
+    // Si ya tenemos ambos, salir
+    if (xmlBuffer && pdfBuffer) break;
   }
 
-  return { pdfBuffer: null, pdfFilename: "" };
+  return { xmlBuffer, xmlFilename, pdfBuffer, pdfFilename };
 }
 
 export default router;

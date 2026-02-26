@@ -1,13 +1,20 @@
 import { google, type drive_v3 } from "googleapis";
 import { Readable } from "stream";
 import { encryptToken, decryptToken } from "../utils/encryption.js";
+import { updateUserDriveFolder } from "./database.js";
 import type { GoogleDriveConfig } from "../types/dianExcel.js";
 
 const SCOPES = [
   "https://www.googleapis.com/auth/drive.file",
   "https://www.googleapis.com/auth/userinfo.email",
 ];
-const FOLDER_NAME = "ContaGO Facturas";
+const ROOT_FOLDER_NAME = "Facturas DIAN - Herramienta ContaGO";
+
+// Meses en español
+const MONTHS_ES = [
+  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+];
 
 // Crear cliente OAuth2
 export function createOAuth2Client() {
@@ -113,14 +120,20 @@ async function checkFolderExists(
   }
 }
 
-// Buscar carpeta por nombre
+// Buscar carpeta por nombre en un parent específico
 async function findFolderByName(
   drive: drive_v3.Drive,
-  folderName: string
+  folderName: string,
+  parentId?: string
 ): Promise<string | null> {
   try {
+    let query = `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+    if (parentId) {
+      query += ` and '${parentId}' in parents`;
+    }
+
     const response = await drive.files.list({
-      q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+      q: query,
       fields: "files(id, name)",
       spaces: "drive",
     });
@@ -135,9 +148,33 @@ async function findFolderByName(
   }
 }
 
-// Obtener o crear carpeta ContaGO Facturas
-export async function getOrCreateFolder(
+// Crear carpeta
+async function createFolder(
+  drive: drive_v3.Drive,
+  folderName: string,
+  parentId?: string
+): Promise<string> {
+  const folderMetadata: drive_v3.Schema$File = {
+    name: folderName,
+    mimeType: "application/vnd.google-apps.folder",
+  };
+
+  if (parentId) {
+    folderMetadata.parents = [parentId];
+  }
+
+  const response = await drive.files.create({
+    requestBody: folderMetadata,
+    fields: "id",
+  });
+
+  return response.data.id!;
+}
+
+// Obtener o crear carpeta raíz "Facturas DIAN - Herramienta ContaGO"
+export async function getOrCreateRootFolder(
   driveConfig: GoogleDriveConfig,
+  userId: string,
   onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
 ): Promise<string> {
   const drive = await getDriveClient(driveConfig, onTokenRefresh);
@@ -151,26 +188,297 @@ export async function getOrCreateFolder(
   }
 
   // Buscar carpeta existente por nombre
-  const existingFolderId = await findFolderByName(drive, FOLDER_NAME);
+  const existingFolderId = await findFolderByName(drive, ROOT_FOLDER_NAME);
   if (existingFolderId) {
+    // Guardar el ID en la BD para futuras consultas
+    await updateUserDriveFolder(userId, existingFolderId, ROOT_FOLDER_NAME);
     return existingFolderId;
   }
 
   // Crear nueva carpeta
-  const folderMetadata = {
-    name: FOLDER_NAME,
-    mimeType: "application/vnd.google-apps.folder",
-  };
-
-  const response = await drive.files.create({
-    requestBody: folderMetadata,
-    fields: "id",
-  });
-
-  return response.data.id!;
+  const newFolderId = await createFolder(drive, ROOT_FOLDER_NAME);
+  
+  // Guardar el ID en la BD
+  await updateUserDriveFolder(userId, newFolderId, ROOT_FOLDER_NAME);
+  
+  return newFolderId;
 }
 
-// Subir archivo PDF a Drive
+// Alias para compatibilidad con código existente
+export async function getOrCreateFolder(
+  driveConfig: GoogleDriveConfig,
+  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
+): Promise<string> {
+  const drive = await getDriveClient(driveConfig, onTokenRefresh);
+
+  if (driveConfig.folder_id) {
+    const exists = await checkFolderExists(drive, driveConfig.folder_id);
+    if (exists) {
+      return driveConfig.folder_id;
+    }
+  }
+
+  const existingFolderId = await findFolderByName(drive, ROOT_FOLDER_NAME);
+  if (existingFolderId) {
+    return existingFolderId;
+  }
+
+  return await createFolder(drive, ROOT_FOLDER_NAME);
+}
+
+// Obtener o crear estructura de carpetas: Raíz/NIT Receptor/Año/Mes/NumFactura - NIT Emisor
+async function getOrCreateInvoiceFolder(
+  drive: drive_v3.Drive,
+  rootFolderId: string,
+  receiverNit: string,
+  year: string,
+  month: string,
+  invoiceFolderName: string
+): Promise<string> {
+  // NIT Receptor (solo NIT, sin razón social para evitar duplicados)
+  let receiverFolderId = await findFolderByName(drive, receiverNit, rootFolderId);
+  if (!receiverFolderId) {
+    receiverFolderId = await createFolder(drive, receiverNit, rootFolderId);
+  }
+
+  // Año
+  let yearFolderId = await findFolderByName(drive, year, receiverFolderId);
+  if (!yearFolderId) {
+    yearFolderId = await createFolder(drive, year, receiverFolderId);
+  }
+
+  // Mes
+  let monthFolderId = await findFolderByName(drive, month, yearFolderId);
+  if (!monthFolderId) {
+    monthFolderId = await createFolder(drive, month, yearFolderId);
+  }
+
+  // Carpeta de factura (NumFactura - NIT Emisor)
+  let invoiceFolderId = await findFolderByName(drive, invoiceFolderName, monthFolderId);
+  if (!invoiceFolderId) {
+    invoiceFolderId = await createFolder(drive, invoiceFolderName, monthFolderId);
+  }
+
+  return invoiceFolderId;
+}
+
+// Buscar archivo por nombre en una carpeta específica
+async function findFileInFolder(
+  drive: drive_v3.Drive,
+  fileName: string,
+  folderId: string
+): Promise<{ id: string; webViewLink: string } | null> {
+  try {
+    const response = await drive.files.list({
+      q: `name='${fileName}' and '${folderId}' in parents and trashed=false`,
+      fields: "files(id, webViewLink)",
+      spaces: "drive",
+    });
+
+    const files = response.data.files;
+    if (files && files.length > 0) {
+      return {
+        id: files[0].id!,
+        webViewLink: files[0].webViewLink || `https://drive.google.com/file/d/${files[0].id}/view`,
+      };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Verificar si una factura ya existe en Drive (estructura NIT Receptor/Año/Mes/NumFactura - NIT Emisor)
+export interface ExistingInvoiceFiles {
+  pdfUrl?: string;
+  xmlUrl?: string;
+  folderUrl?: string;
+  exists: boolean;
+}
+
+export async function checkInvoiceExistsInDrive(
+  driveConfig: GoogleDriveConfig,
+  userId: string,
+  issueDate: string, // Formato DD/MM/YYYY o YYYY-MM-DD
+  docNumber: string,
+  issuerNit: string,
+  receiverNit: string,
+  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
+): Promise<ExistingInvoiceFiles> {
+  try {
+    const drive = await getDriveClient(driveConfig, onTokenRefresh);
+    const rootFolderId = await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
+
+    // Parsear fecha
+    const { year, monthName } = parseInvoiceDate(issueDate);
+    const invoiceFolderName = `${docNumber} - ${issuerNit}`;
+
+    // Verificar si existe la carpeta del receptor (solo NIT)
+    const receiverFolderId = await findFolderByName(drive, receiverNit, rootFolderId);
+    if (!receiverFolderId) {
+      return { exists: false };
+    }
+
+    // Verificar si existe la carpeta del año
+    const yearFolderId = await findFolderByName(drive, year, receiverFolderId);
+    if (!yearFolderId) {
+      return { exists: false };
+    }
+
+    const monthFolderId = await findFolderByName(drive, monthName, yearFolderId);
+    if (!monthFolderId) {
+      return { exists: false };
+    }
+
+    const invoiceFolderId = await findFolderByName(drive, invoiceFolderName, monthFolderId);
+    if (!invoiceFolderId) {
+      return { exists: false };
+    }
+
+    // Buscar archivos PDF y XML en la carpeta
+    const pdfFile = await findFileInFolder(drive, `${docNumber}.pdf`, invoiceFolderId);
+    const xmlFile = await findFileInFolder(drive, `${docNumber}.xml`, invoiceFolderId);
+
+    // Si al menos uno existe, la factura ya está
+    if (pdfFile || xmlFile) {
+      return {
+        exists: true,
+        pdfUrl: pdfFile?.webViewLink,
+        xmlUrl: xmlFile?.webViewLink,
+        folderUrl: `https://drive.google.com/drive/folders/${invoiceFolderId}`,
+      };
+    }
+
+    return { exists: false };
+  } catch (err) {
+    console.error("[GoogleDrive] Error verificando existencia:", err);
+    return { exists: false };
+  }
+}
+
+// Parsear fecha de factura a año y mes
+function parseInvoiceDate(dateStr: string): { year: string; month: number; monthName: string } {
+  let year: string;
+  let month: number;
+
+  if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
+    // Formato ISO: YYYY-MM-DD
+    const parts = dateStr.split("-");
+    year = parts[0];
+    month = parseInt(parts[1], 10);
+  } else if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(dateStr)) {
+    // Formato DD/MM/YYYY
+    const parts = dateStr.split("/");
+    year = parts[2];
+    month = parseInt(parts[1], 10);
+  } else {
+    // Fallback: usar fecha actual
+    const now = new Date();
+    year = String(now.getFullYear());
+    month = now.getMonth() + 1;
+  }
+
+  const monthName = MONTHS_ES[month - 1] || "Enero";
+
+  return { year, month, monthName };
+}
+
+// Resultado de subida de archivos
+export interface UploadResult {
+  pdfUrl?: string;
+  xmlUrl?: string;
+  folderUrl: string;
+  wasSkipped: boolean;
+}
+
+// Subir PDF y XML a Drive con estructura de carpetas
+export async function uploadInvoiceFilesToDrive(
+  pdfBuffer: Buffer | null,
+  xmlBuffer: Buffer | null,
+  docNumber: string,
+  issuerNit: string,
+  receiverNit: string,
+  issueDate: string, // Formato DD/MM/YYYY o YYYY-MM-DD
+  driveConfig: GoogleDriveConfig,
+  userId: string,
+  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
+): Promise<UploadResult> {
+  const drive = await getDriveClient(driveConfig, onTokenRefresh);
+  const rootFolderId = await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
+
+  // Parsear fecha para estructura de carpetas
+  const { year, monthName } = parseInvoiceDate(issueDate);
+  const invoiceFolderName = `${docNumber} - ${issuerNit}`;
+
+  // Obtener o crear estructura de carpetas
+  const invoiceFolderId = await getOrCreateInvoiceFolder(
+    drive,
+    rootFolderId,
+    receiverNit,
+    year,
+    monthName,
+    invoiceFolderName
+  );
+
+  const folderUrl = `https://drive.google.com/drive/folders/${invoiceFolderId}`;
+  let pdfUrl: string | undefined;
+  let xmlUrl: string | undefined;
+  let wasSkipped = false;
+
+  // Subir PDF si existe
+  if (pdfBuffer) {
+    const pdfFilename = `${docNumber}.pdf`;
+    const existingPdf = await findFileInFolder(drive, pdfFilename, invoiceFolderId);
+
+    if (existingPdf) {
+      pdfUrl = existingPdf.webViewLink;
+      wasSkipped = true;
+    } else {
+      const stream = Readable.from(pdfBuffer);
+      const response = await drive.files.create({
+        requestBody: {
+          name: pdfFilename,
+          parents: [invoiceFolderId],
+        },
+        media: {
+          mimeType: "application/pdf",
+          body: stream,
+        },
+        fields: "id, webViewLink",
+      });
+      pdfUrl = response.data.webViewLink || `https://drive.google.com/file/d/${response.data.id}/view`;
+    }
+  }
+
+  // Subir XML si existe
+  if (xmlBuffer) {
+    const xmlFilename = `${docNumber}.xml`;
+    const existingXml = await findFileInFolder(drive, xmlFilename, invoiceFolderId);
+
+    if (existingXml) {
+      xmlUrl = existingXml.webViewLink;
+      wasSkipped = true;
+    } else {
+      const stream = Readable.from(xmlBuffer);
+      const response = await drive.files.create({
+        requestBody: {
+          name: xmlFilename,
+          parents: [invoiceFolderId],
+        },
+        media: {
+          mimeType: "application/xml",
+          body: stream,
+        },
+        fields: "id, webViewLink",
+      });
+      xmlUrl = response.data.webViewLink || `https://drive.google.com/file/d/${response.data.id}/view`;
+    }
+  }
+
+  return { pdfUrl, xmlUrl, folderUrl, wasSkipped };
+}
+
+// Función de compatibilidad (deprecated, usar uploadInvoiceFilesToDrive)
 export async function uploadPdfToDrive(
   pdfBuffer: Buffer,
   filename: string,
@@ -210,9 +518,6 @@ export async function uploadPdfToDrive(
   });
 
   const fileId = response.data.id!;
-
-  // Dar permiso de lectura al usuario propietario (ya tiene acceso, pero aseguramos)
-  // El archivo ya es privado por defecto en Drive
 
   return response.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view`;
 }

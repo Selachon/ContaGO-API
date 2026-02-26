@@ -20,11 +20,13 @@ export async function generateExcelFile(
   // Definir columnas
   const columns: Partial<ExcelJS.Column>[] = [
     { header: "ID", key: "id", width: 6 },
-    { header: "EMPRESA/PN", key: "entityType", width: 12 },
+    { header: "Número Factura", key: "docNumber", width: 20 },
+    { header: "NIT Emisor", key: "issuerNit", width: 14 },
+    { header: "Razón Social Emisor", key: "issuerName", width: 40 },
     { header: "Fecha de emisión", key: "issueDate", width: 16 },
-    { header: "Nombres Completos o Razón social", key: "entityName", width: 45 },
     { header: "Valor antes", key: "subtotal", width: 15 },
     { header: "Valor IVA (si aplica)", key: "iva", width: 18 },
+    { header: "Valor total", key: "total", width: 15 },
     { header: "Concepto", key: "concepts", width: 55 },
   ];
 
@@ -54,11 +56,13 @@ export async function generateExcelFile(
   invoices.forEach((invoice, index) => {
     const rowData: Record<string, unknown> = {
       id: index + 1,
-      entityType: invoice.entityType,
+      docNumber: invoice.docNumber,
+      issuerNit: invoice.issuerNit,
+      issuerName: invoice.issuerName,
       issueDate: invoice.issueDate,
-      entityName: invoice.entityName,
       subtotal: invoice.subtotal,
       iva: invoice.iva,
+      total: invoice.total,
       concepts: invoice.concepts,
       documentType: invoice.documentType,
       cufe: invoice.cufe,
@@ -76,6 +80,9 @@ export async function generateExcelFile(
 
     const ivaCell = row.getCell("iva");
     ivaCell.numFmt = '"$"#,##0.00';
+
+    const totalCell = row.getCell("total");
+    totalCell.numFmt = '"$"#,##0.00';
 
     // Hipervínculo en columna Drive
     if (includeDriveColumn && invoice.driveUrl && !invoice.driveUrl.includes("ERROR")) {
@@ -103,12 +110,11 @@ export async function generateExcelFile(
   });
 
   // Formato condicional para CUFEs duplicados (excluyendo "N/A")
-  const cufeColLetter = includeDriveColumn ? "J" : "I";
+  // Columna CUFE: con Drive es L, sin Drive es K
+  const cufeColLetter = includeDriveColumn ? "L" : "K";
   const lastRow = worksheet.rowCount;
 
   if (lastRow > 1) {
-    // ExcelJS no soporta duplicateValues directamente, usamos fórmula COUNTIF
-    // La fórmula excluye "N/A" de la detección de duplicados
     worksheet.addConditionalFormatting({
       ref: `${cufeColLetter}2:${cufeColLetter}${lastRow}`,
       rules: [
@@ -142,6 +148,93 @@ export async function generateExcelFile(
   for (let row = 1; row <= lastRow; row++) {
     for (let col = 1; col <= columns.length; col++) {
       const cell = worksheet.getCell(row, col);
+      cell.border = {
+        top: { style: "thin", color: { argb: "FFD0D0D0" } },
+        left: { style: "thin", color: { argb: "FFD0D0D0" } },
+        bottom: { style: "thin", color: { argb: "FFD0D0D0" } },
+        right: { style: "thin", color: { argb: "FFD0D0D0" } },
+      };
+    }
+  }
+
+  // Hoja 2: Detallado por concepto/línea
+  const detailedSheet = workbook.addWorksheet("Detallado", {
+    views: [{ state: "frozen", ySplit: 1 }],
+  });
+
+  detailedSheet.columns = [
+    { header: "Item", key: "lineNumber", width: 8 },
+    { header: "Número Factura", key: "docNumber", width: 20 },
+    { header: "Descripción", key: "description", width: 55 },
+    { header: "Cantidad", key: "quantity", width: 12 },
+    { header: "Precio unitario", key: "unitPrice", width: 16 },
+    { header: "Descuento detalle", key: "discount", width: 18 },
+    { header: "Recargo detalle", key: "surcharge", width: 16 },
+    { header: "IVA", key: "ivaAmount", width: 14 },
+    { header: "%", key: "ivaPercent", width: 10 },
+    { header: "INC", key: "incAmount", width: 14 },
+    { header: "%", key: "incPercent", width: 10 },
+    { header: "Precio unitario de venta", key: "totalUnitPrice", width: 24 },
+  ];
+
+  const detailedHeaderRow = detailedSheet.getRow(1);
+  detailedHeaderRow.font = { bold: true, size: 11, color: { argb: "FF000000" } };
+  detailedHeaderRow.fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: { argb: "FFD9D9D9" },
+  };
+  detailedHeaderRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+  detailedHeaderRow.height = 25;
+
+  invoices.forEach((invoice, invoiceIndex) => {
+    const mainSheetRow = invoiceIndex + 2;
+
+    (invoice.lineItems || []).forEach((lineItem) => {
+      const row = detailedSheet.addRow({
+        lineNumber: lineItem.lineNumber,
+        docNumber: invoice.docNumber,
+        description: lineItem.description,
+        quantity: lineItem.quantity,
+        unitPrice: lineItem.unitPrice,
+        discount: lineItem.discount,
+        surcharge: lineItem.surcharge,
+        ivaAmount: lineItem.ivaAmount,
+        ivaPercent: lineItem.ivaPercent,
+        incAmount: lineItem.incAmount,
+        incPercent: lineItem.incPercent,
+        totalUnitPrice: lineItem.totalUnitPrice,
+      });
+
+      const docNumberCell = row.getCell("docNumber");
+      docNumberCell.value = {
+        text: invoice.docNumber,
+        hyperlink: `#'Facturas DIAN'!B${mainSheetRow}`,
+      };
+      docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
+
+      row.getCell("unitPrice").numFmt = '"$"#,##0.00';
+      row.getCell("discount").numFmt = '"$"#,##0.00';
+      row.getCell("surcharge").numFmt = '"$"#,##0.00';
+      row.getCell("ivaAmount").numFmt = '"$"#,##0.00';
+      row.getCell("incAmount").numFmt = '"$"#,##0.00';
+      row.getCell("totalUnitPrice").numFmt = '"$"#,##0.00';
+      row.getCell("ivaPercent").numFmt = '0.00';
+      row.getCell("incPercent").numFmt = '0.00';
+
+      row.alignment = { vertical: "middle", wrapText: true };
+    });
+  });
+
+  const detailedLastRow = detailedSheet.rowCount;
+  detailedSheet.autoFilter = {
+    from: { row: 1, column: 1 },
+    to: { row: detailedLastRow, column: detailedSheet.columnCount },
+  };
+
+  for (let row = 1; row <= detailedLastRow; row++) {
+    for (let col = 1; col <= detailedSheet.columnCount; col++) {
+      const cell = detailedSheet.getCell(row, col);
       cell.border = {
         top: { style: "thin", color: { argb: "FFD0D0D0" } },
         left: { style: "thin", color: { argb: "FFD0D0D0" } },
