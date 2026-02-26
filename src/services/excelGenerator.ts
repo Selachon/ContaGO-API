@@ -26,6 +26,7 @@ export async function generateExcelFile(
     { header: "Fecha de emisión", key: "issueDate", width: 16 },
     { header: "Valor antes", key: "subtotal", width: 15 },
     { header: "Valor IVA (si aplica)", key: "iva", width: 18 },
+    { header: "Valor total", key: "total", width: 15 },
     { header: "Concepto", key: "concepts", width: 55 },
   ];
 
@@ -61,6 +62,7 @@ export async function generateExcelFile(
       issueDate: invoice.issueDate,
       subtotal: invoice.subtotal,
       iva: invoice.iva,
+      total: invoice.total,
       concepts: invoice.concepts,
       documentType: invoice.documentType,
       cufe: invoice.cufe,
@@ -78,6 +80,9 @@ export async function generateExcelFile(
 
     const ivaCell = row.getCell("iva");
     ivaCell.numFmt = '"$"#,##0.00';
+
+    const totalCell = row.getCell("total");
+    totalCell.numFmt = '"$"#,##0.00';
 
     // Hipervínculo en columna Drive
     if (includeDriveColumn && invoice.driveUrl && !invoice.driveUrl.includes("ERROR")) {
@@ -105,8 +110,8 @@ export async function generateExcelFile(
   });
 
   // Formato condicional para CUFEs duplicados (excluyendo "N/A")
-  // Columna CUFE: con Drive es K, sin Drive es J
-  const cufeColLetter = includeDriveColumn ? "K" : "J";
+  // Columna CUFE: con Drive es L, sin Drive es K
+  const cufeColLetter = includeDriveColumn ? "L" : "K";
   const lastRow = worksheet.rowCount;
 
   if (lastRow > 1) {

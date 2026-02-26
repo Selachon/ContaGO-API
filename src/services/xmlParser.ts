@@ -46,7 +46,7 @@ export async function extractInvoiceDataFromXml(
 
     // Extraer otros datos
     const issueDate = extractIssueDate(invoice);
-    const { subtotal, iva } = extractTotals(invoice);
+    const { subtotal, iva, total } = extractTotals(invoice);
     const concepts = extractConcepts(invoice);
     const lineItems = extractLineItems(invoice);
     const cufe = extractCUFE(invoice);
@@ -59,6 +59,7 @@ export async function extractInvoiceDataFromXml(
       issueDate,
       subtotal,
       iva,
+      total,
       concepts,
       lineItems,
       documentType: isNotaCredito ? "Nota Crédito" : "Factura Electrónica",
@@ -76,6 +77,7 @@ export async function extractInvoiceDataFromXml(
       issueDate: "N/A",
       subtotal: 0,
       iva: 0,
+      total: 0,
       concepts: "ERROR: No se pudo leer el XML",
       lineItems: [],
       documentType: "N/A",
@@ -189,9 +191,10 @@ function extractIssueDate(invoice: any): string {
 /**
  * Extrae subtotal e IVA de los totales monetarios
  */
-function extractTotals(invoice: any): { subtotal: number; iva: number } {
+function extractTotals(invoice: any): { subtotal: number; iva: number; total: number } {
   let subtotal = 0;
   let iva = 0;
+  let total = 0;
 
   try {
     // LegalMonetaryTotal > LineExtensionAmount (subtotal antes de impuestos)
@@ -199,6 +202,7 @@ function extractTotals(invoice: any): { subtotal: number; iva: number } {
     if (legalMonetaryTotal) {
       const lineExtension = legalMonetaryTotal.LineExtensionAmount;
       subtotal = parseAmount(lineExtension);
+      total = parseAmount(legalMonetaryTotal.PayableAmount);
     }
 
     // TaxTotal > TaxAmount (IVA)
@@ -232,7 +236,7 @@ function extractTotals(invoice: any): { subtotal: number; iva: number } {
     console.error("Error extrayendo totales:", err);
   }
 
-  return { subtotal, iva };
+  return { subtotal, iva, total };
 }
 
 /**

@@ -20,6 +20,7 @@ export interface InvoiceData {
   issueDate: string;
   subtotal: number;
   iva: number;
+  total: number;
   concepts: string;
   documentType: "Factura Electrónica" | "Nota Crédito" | "N/A";
   cufe: string;
