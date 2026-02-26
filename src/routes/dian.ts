@@ -14,6 +14,18 @@ import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserNits } from "../services/database.js";
 import type { DownloadRequest, ProgressData } from "../types/dian.js";
 
+// Magic bytes para validar que un archivo es realmente un PDF
+const PDF_MAGIC_BYTES = Buffer.from([0x25, 0x50, 0x44, 0x46]); // %PDF
+
+/**
+ * Valida que un buffer contenga un PDF real verificando los magic bytes.
+ * Algunos archivos de DIAN tienen extensión .pdf pero son XMLs o HTMLs de error.
+ */
+function isValidPdfBuffer(buffer: Buffer): boolean {
+  if (!buffer || buffer.length < 4) return false;
+  return buffer.subarray(0, 4).equals(PDF_MAGIC_BYTES);
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
 // Limite alto configurable para soportar lotes grandes.
@@ -517,18 +529,25 @@ async function processDownloadJob(
 
           for (const pdfName of pdfEntries) {
             const pdfBuffer = await zip.files[pdfName].async("nodebuffer");
-            allPdfBuffers.push({ name: `${zipFiles[z]}/${pdfName}`, buffer: pdfBuffer });
+            
+            // Validar que el archivo sea realmente un PDF (algunos tienen extensión .pdf pero son XMLs/HTMLs)
+            if (isValidPdfBuffer(pdfBuffer)) {
+              allPdfBuffers.push({ name: `${zipFiles[z]}/${pdfName}`, buffer: pdfBuffer });
+            } else {
+              console.warn(`[${jobId}] Archivo ${zipFiles[z]}/${pdfName} no es un PDF válido (magic bytes incorrectos), omitiendo`);
+            }
           }
         }
 
         if (allPdfBuffers.length > 0 && !isJobCancelled(jobId)) {
           setProgress(jobId, {
-            step: `Combinando ${allPdfBuffers.length} PDFs en uno solo...`,
+            step: `Combinando ${allPdfBuffers.length} PDFs válidos en uno solo...`,
             current: 0,
             total: allPdfBuffers.length,
           });
 
           const mergedPdf = await PDFDocument.create();
+          let skippedCount = 0;
 
           for (let p = 0; p < allPdfBuffers.length; p++) {
             // Checkpoint cada 10 PDFs para balancear costo y capacidad de cancelacion.
@@ -553,8 +572,14 @@ async function processDownloadJob(
                 mergedPdf.addPage(page);
               }
             } catch (pdfErr) {
-              console.error(`No se pudo agregar PDF: ${allPdfBuffers[p].name}`, pdfErr);
+              skippedCount++;
+              // Log menos verboso para no saturar los logs en producción
+              console.warn(`[${jobId}] PDF inválido omitido: ${allPdfBuffers[p].name}`);
             }
+          }
+          
+          if (skippedCount > 0) {
+            console.log(`[${jobId}] Se omitieron ${skippedCount} PDFs inválidos durante la consolidación`);
           }
 
           const consolidatedName = `Consolidado ${startLabel} - ${endLabel}.pdf`;
