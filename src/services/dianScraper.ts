@@ -457,12 +457,12 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
       
       if (!trackId) continue;
       
-      // Columnas de la tabla DIAN:
-      // 0: checkbox, 1: ?, 2: Tipo, 3: ?, 4: Número, 5: ?, 6: NIT
-      // El tipo de documento suele estar en la columna 2 o 3
+      // Columnas de la tabla DIAN (verificado):
+      // 0: checkbox, 1: Recepción, 2: Fecha, 3: Prefijo, 4: Nº documento,
+      // 5: Tipo, 6: NIT Emisor, 7: Emisor, 8: NIT Receptor, 9: Receptor, etc.
       const tds = row.querySelectorAll("td");
-      const docType = tds[2]?.textContent?.trim() || tds[3]?.textContent?.trim() || "";
       const docnum = tds[4]?.textContent?.trim() || "";
+      const docType = tds[5]?.textContent?.trim() || "";
       const nit = tds[6]?.textContent?.trim() || "";
 
       results.push({ id: trackId, docnum, nit, docType });
