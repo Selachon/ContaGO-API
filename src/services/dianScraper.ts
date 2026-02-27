@@ -126,10 +126,16 @@ export async function extractDocumentIds(
 
     while (true) {
       pageIndex++;
+      
+      // Mensaje descriptivo que muestra cantidad encontrada
+      const progressMsg = allDocuments.length > 0
+        ? `Extrayendo documentos... ${allDocuments.length} encontrados`
+        : `Extrayendo documentos (página ${pageIndex})...`;
+      
       updateProgress({
-        step: `Extrayendo lista (página ${pageIndex})...`,
+        step: progressMsg,
         current: allDocuments.length,
-        total: expectedTotal || Math.max(allDocuments.length + 5, 10),
+        total: expectedTotal || Math.max(allDocuments.length + 50, 100),
       });
 
       await delay(500);
@@ -151,7 +157,10 @@ export async function extractDocumentIds(
       const newDocs = await extractDocsFromPage(page, seenIds);
       allDocuments.push(...newDocs);
 
+      // Actualizar progreso inmediatamente después de extraer
+      const updatedMsg = `Extrayendo documentos... ${allDocuments.length} encontrados`;
       updateProgress({
+        step: updatedMsg,
         current: allDocuments.length,
         total: expectedTotal || allDocuments.length,
       });

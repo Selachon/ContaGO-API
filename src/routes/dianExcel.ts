@@ -22,10 +22,10 @@ import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
-const MAX_DOCUMENTS = Number(process.env.DIAN_MAX_DOCUMENTS || 500);
+const BATCH_SIZE = 500; // Procesar en tandas para evitar timeouts
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
-const JOB_TTL_MS = 60 * 60 * 1000; // 1 hora
+const JOB_TTL_MS = 2 * 60 * 60 * 1000; // 2 horas para jobs grandes
 
 // Crea carpeta de trabajo al iniciar el proceso.
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -302,15 +302,15 @@ async function processExcelJob(
       return;
     }
 
-    if (documents.length > MAX_DOCUMENTS) {
-      job.status = "error";
-      job.error = `Demasiados documentos (${documents.length}). Maximo: ${MAX_DOCUMENTS}`;
-      setProgress(jobId, { step: "Error", detalle: job.error });
-      return;
-    }
-
     const totalDocs = documents.length;
-    setProgress(jobId, { step: "Descargando y procesando facturas...", current: 0, total: totalDocs });
+    const totalBatches = Math.ceil(totalDocs / BATCH_SIZE);
+    console.log(`[Excel] Job ${jobId}: ${totalDocs} documentos en ${totalBatches} tandas de ${BATCH_SIZE}`);
+    
+    setProgress(jobId, { 
+      step: `${totalDocs} documentos encontrados. Iniciando descarga...`, 
+      current: 0, 
+      total: totalDocs 
+    });
 
     fs.mkdirSync(tempDir, { recursive: true });
 
@@ -333,11 +333,13 @@ async function processExcelJob(
       }
     }
 
-    // 3) Procesar cada documento de forma independiente.
+    // 3) Procesar cada documento de forma independiente, en tandas.
     const invoices: InvoiceData[] = [];
     let successCount = 0;
     let errorCount = 0;
     let skippedCount = 0;
+    let consecutiveErrors = 0;
+    const MAX_CONSECUTIVE_ERRORS = 10; // Si hay 10 errores seguidos, pausar y reintentar
 
     for (let i = 0; i < documents.length; i++) {
       if (isJobCancelled(jobId)) {
@@ -346,11 +348,25 @@ async function processExcelJob(
       }
 
       const doc = documents[i];
+      const currentBatch = Math.floor(i / BATCH_SIZE) + 1;
+      const posInBatch = (i % BATCH_SIZE) + 1;
+      
+      // Mensaje de progreso más descriptivo
+      const progressMsg = totalBatches > 1
+        ? `Procesando ${i + 1}/${totalDocs} (tanda ${currentBatch}/${totalBatches})`
+        : `Procesando factura ${i + 1} de ${totalDocs}`;
+      
       setProgress(jobId, {
-        step: `Procesando factura ${i + 1} de ${totalDocs}`,
+        step: progressMsg,
         current: i + 1,
         total: totalDocs,
       });
+      
+      // Pausa entre tandas para evitar sobrecargar
+      if (i > 0 && i % BATCH_SIZE === 0) {
+        console.log(`[Excel] Completada tanda ${currentBatch - 1}/${totalBatches}, pausando 2s...`);
+        await new Promise(r => setTimeout(r, 2000));
+      }
 
       try {
         // 3.1) Descargar ZIP del trackId.
@@ -440,11 +456,18 @@ async function processExcelJob(
         });
 
         successCount++;
-        console.log(`[Excel] Procesado ${i + 1}/${totalDocs}: ${doc.docnum}${wasSkipped ? " (existente)" : ""}`);
+        consecutiveErrors = 0; // Reset en éxito
+        
+        // Log cada 50 documentos para no saturar
+        if ((i + 1) % 50 === 0 || i === totalDocs - 1) {
+          console.log(`[Excel] Progreso ${i + 1}/${totalDocs}: ${successCount} ok, ${errorCount} errores, ${skippedCount} existentes`);
+        }
 
       } catch (err) {
         errorCount++;
-        console.error(`[Excel] Error procesando ${doc.docnum}:`, err);
+        consecutiveErrors++;
+        const errMsg = (err as Error).message;
+        console.error(`[Excel] Error procesando ${doc.docnum}:`, errMsg.substring(0, 100));
 
         // Mantiene trazabilidad del documento fallido dentro del Excel.
         invoices.push({
@@ -456,15 +479,27 @@ async function processExcelJob(
           subtotal: 0,
           iva: 0,
           total: 0,
-          concepts: `ERROR: ${(err as Error).message}`,
+          concepts: `ERROR: ${errMsg}`,
           lineItems: [],
           documentType: "N/A",
           cufe: "N/A",
           trackId: doc.id,
           docNumber: doc.docnum,
           zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
-          error: (err as Error).message,
+          error: errMsg,
         });
+        
+        // Si hay muchos errores consecutivos, pausar para recuperarse
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          console.warn(`[Excel] ${MAX_CONSECUTIVE_ERRORS} errores consecutivos, pausando 10s para recuperar...`);
+          setProgress(jobId, {
+            step: `Pausando por errores de conexión... reintentando en 10s`,
+            current: i + 1,
+            total: totalDocs,
+          });
+          await new Promise(r => setTimeout(r, 10000));
+          consecutiveErrors = 0; // Reset después de pausa
+        }
       }
     }
 
