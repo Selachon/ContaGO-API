@@ -60,10 +60,22 @@ export async function extractDocumentIds(
     await navigateWithRetry(page, tokenUrl, 3);
     await delay(1000);
 
+    // Verificar si el token expiró (redirige a página de login)
+    const currentUrl = page.url();
+    if (isLoginPage(currentUrl)) {
+      throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
+
     // 2) Navegar al listado de documentos recibidos (con reintentos).
     updateProgress({ step: "Navegando a documentos recibidos..." });
     await navigateWithRetry(page, "https://catalogo-vpfe.dian.gov.co/Document/Received", 3);
     await delay(600);
+
+    // Verificar nuevamente si redirigió a login (sesión inválida)
+    const urlAfterNav = page.url();
+    if (isLoginPage(urlAfterNav)) {
+      throw new Error("TOKEN_EXPIRED: La sesión ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
 
     updateProgress({ step: "Extrayendo lista (iniciando)...", current: 0, total: 0 });
 
@@ -114,10 +126,16 @@ export async function extractDocumentIds(
 
     while (true) {
       pageIndex++;
+      
+      // Mensaje descriptivo que muestra cantidad encontrada
+      const progressMsg = allDocuments.length > 0
+        ? `Extrayendo documentos... ${allDocuments.length} encontrados`
+        : `Extrayendo documentos (página ${pageIndex})...`;
+      
       updateProgress({
-        step: `Extrayendo lista (página ${pageIndex})...`,
+        step: progressMsg,
         current: allDocuments.length,
-        total: expectedTotal || Math.max(allDocuments.length + 5, 10),
+        total: expectedTotal || Math.max(allDocuments.length + 50, 100),
       });
 
       await delay(500);
@@ -139,7 +157,10 @@ export async function extractDocumentIds(
       const newDocs = await extractDocsFromPage(page, seenIds);
       allDocuments.push(...newDocs);
 
+      // Actualizar progreso inmediatamente después de extraer
+      const updatedMsg = `Extrayendo documentos... ${allDocuments.length} encontrados`;
       updateProgress({
+        step: updatedMsg,
         current: allDocuments.length,
         total: expectedTotal || allDocuments.length,
       });
@@ -372,7 +393,14 @@ async function setPageLength(page: Page, length: number): Promise<void> {
       }, length);
     }
   } catch (err) {
-    console.error("Error cambiando a 100 registros:", err);
+    // Errores de contexto destruido son comunes cuando la página recarga
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes("context") || errMsg.includes("Context") || errMsg.includes("detached")) {
+      console.log("Contexto cambiado durante setPageLength, esperando estabilización...");
+      await delay(2000);
+    } else {
+      console.warn("Error cambiando longitud de página:", errMsg.substring(0, 100));
+    }
   }
 }
 
@@ -610,23 +638,45 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
+ * Verifica si la URL actual es la página de login de DIAN.
+ * Esto indica que el token expiró o la sesión es inválida.
+ */
+function isLoginPage(url: string): boolean {
+  const loginIndicators = [
+    "/Account/Login",
+    "/User/Login", 
+    "/auth/login",
+    "login.microsoftonline.com",
+    "login.live.com",
+  ];
+  
+  const lowerUrl = url.toLowerCase();
+  return loginIndicators.some(indicator => lowerUrl.includes(indicator.toLowerCase()));
+}
+
+/**
  * Navega a una URL con reintentos y diferentes estrategias de espera.
- * Primero intenta con domcontentloaded (más rápido), luego con load si falla.
+ * Estrategia progresiva: domcontentloaded → load → networkidle2
  */
 async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3): Promise<void> {
   let lastError: Error | null = null;
   
+  // Estrategias de espera progresivas (de más rápido a más robusto)
+  const strategies: Array<{ waitUntil: "domcontentloaded" | "load" | "networkidle2"; timeout: number }> = [
+    { waitUntil: "domcontentloaded", timeout: 60000 },
+    { waitUntil: "load", timeout: 90000 },
+    { waitUntil: "networkidle2", timeout: 120000 },
+  ];
+  
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const strategy = strategies[Math.min(attempt - 1, strategies.length - 1)];
+    
     try {
-      console.log(`Navegación intento ${attempt}/${maxRetries}: ${url.substring(0, 60)}...`);
-      
-      // Primer intento: domcontentloaded es más rápido y suficiente para SPAs
-      const waitUntil = attempt === 1 ? "domcontentloaded" : "load";
-      const timeout = attempt === 1 ? 90000 : 120000;
+      console.log(`Navegación intento ${attempt}/${maxRetries} (${strategy.waitUntil}, ${strategy.timeout/1000}s): ${url.substring(0, 60)}...`);
       
       await page.goto(url, { 
-        waitUntil: waitUntil as "domcontentloaded" | "load",
-        timeout 
+        waitUntil: strategy.waitUntil,
+        timeout: strategy.timeout,
       });
       
       // Espera adicional para que scripts asíncronos carguen
@@ -637,21 +687,43 @@ async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3
       
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      console.log(`Navegación falló intento ${attempt}: ${lastError.message}`);
+      const isTimeout = lastError.message.includes("timeout") || lastError.message.includes("Timeout");
+      const isContextDestroyed = lastError.message.includes("context") || lastError.message.includes("Context");
       
-      // Si el error es de timeout, esperar antes de reintentar
-      if (lastError.message.includes("timeout") || lastError.message.includes("Timeout")) {
-        console.log(`Timeout detectado, esperando antes de reintentar...`);
-        await delay(3000);
+      console.log(`Navegación falló intento ${attempt}: ${lastError.message.substring(0, 100)}`);
+      
+      // Si es error de contexto destruido, la página puede haber cargado parcialmente
+      if (isContextDestroyed) {
+        console.log("Contexto destruido - verificando si la página cargó...");
+        await delay(2000);
+        
+        // Intentar verificar si estamos en una página válida
+        try {
+          const currentUrl = page.url();
+          if (currentUrl && !currentUrl.includes("about:blank")) {
+            console.log(`Página cargada parcialmente: ${currentUrl.substring(0, 60)}`);
+            return; // Considerar como éxito parcial
+          }
+        } catch {
+          // Ignorar errores de verificación
+        }
       }
       
-      // Si no es el último intento, continuar
-      if (attempt < maxRetries) {
+      // Si es timeout, esperar más antes de reintentar
+      if (isTimeout) {
+        console.log(`Timeout detectado, esperando ${3 + attempt}s antes de reintentar...`);
+        await delay(3000 + attempt * 1000);
+      } else {
         await delay(2000);
       }
     }
   }
   
-  // Si todos los intentos fallaron, lanzar el último error
+  // Si todos los intentos fallaron, lanzar error descriptivo
+  const errorMsg = lastError?.message || "Error desconocido";
+  if (errorMsg.includes("timeout") || errorMsg.includes("Timeout")) {
+    throw new Error(`NAVIGATION_TIMEOUT: No se pudo conectar con DIAN después de ${maxRetries} intentos. El servidor puede estar lento o no disponible. Por favor, intenta de nuevo en unos minutos.`);
+  }
+  
   throw lastError || new Error(`Navegación falló después de ${maxRetries} intentos`);
 }
