@@ -40,6 +40,10 @@ export async function extractDocumentIds(
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--no-first-run",
       ],
       executablePath: executablePath || undefined,
     });
@@ -47,19 +51,18 @@ export async function extractDocumentIds(
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Timeout alto para ambientes con latencia variable.
-    page.setDefaultTimeout(60000);
+    // Timeout alto para ambientes con latencia variable (2 minutos).
+    page.setDefaultTimeout(120000);
+    page.setDefaultNavigationTimeout(120000);
 
-    // 1) Acceso inicial con token_url.
+    // 1) Acceso inicial con token_url (con reintentos).
     updateProgress({ step: "Accediendo con token..." });
-    await page.goto(tokenUrl, { waitUntil: "networkidle2" });
+    await navigateWithRetry(page, tokenUrl, 3);
     await delay(1000);
 
-    // 2) Navegar al listado de documentos recibidos.
+    // 2) Navegar al listado de documentos recibidos (con reintentos).
     updateProgress({ step: "Navegando a documentos recibidos..." });
-    await page.goto("https://catalogo-vpfe.dian.gov.co/Document/Received", {
-      waitUntil: "networkidle2",
-    });
+    await navigateWithRetry(page, "https://catalogo-vpfe.dian.gov.co/Document/Received", 3);
     await delay(600);
 
     updateProgress({ step: "Extrayendo lista (iniciando)...", current: 0, total: 0 });
@@ -373,11 +376,25 @@ async function setPageLength(page: Page, length: number): Promise<void> {
   }
 }
 
+// Tipos de documento que deben ser ignorados (no son facturas reales)
+const IGNORED_DOC_TYPES = [
+  "application response",
+  "applicationresponse",
+  "app response",
+  "respuesta de aplicación",
+  "respuesta aplicación",
+];
+
+function shouldIgnoreDocType(docType: string): boolean {
+  const normalized = docType.toLowerCase().trim();
+  return IGNORED_DOC_TYPES.some(ignored => normalized.includes(ignored));
+}
+
 async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<DocumentInfo[]> {
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate(() => {
-    const results: Array<{ id: string; docnum: string; nit: string }> = [];
+    const results: Array<{ id: string; docnum: string; nit: string; docType: string }> = [];
     
     // Excluye la fila placeholder de DataTables.
     const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
@@ -440,22 +457,42 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
       
       if (!trackId) continue;
       
-      // Columnas esperadas de numero de documento y NIT.
+      // Columnas de la tabla DIAN (verificado):
+      // 0: checkbox, 1: Recepción, 2: Fecha, 3: Prefijo, 4: Nº documento,
+      // 5: Tipo, 6: NIT Emisor, 7: Emisor, 8: NIT Receptor, 9: Receptor, etc.
       const tds = row.querySelectorAll("td");
       const docnum = tds[4]?.textContent?.trim() || "";
+      const docType = tds[5]?.textContent?.trim() || "";
       const nit = tds[6]?.textContent?.trim() || "";
 
-      results.push({ id: trackId, docnum, nit });
+      results.push({ id: trackId, docnum, nit, docType });
     }
 
     return results;
   });
 
+  let skippedCount = 0;
+  
   for (const item of items) {
     if (!seenIds.has(item.id)) {
+      // Filtrar Application Response y otros tipos no relevantes
+      if (shouldIgnoreDocType(item.docType)) {
+        skippedCount++;
+        continue;
+      }
+      
       seenIds.add(item.id);
-      docs.push(item);
+      docs.push({
+        id: item.id,
+        docnum: item.docnum,
+        nit: item.nit,
+        docType: item.docType,
+      });
     }
+  }
+  
+  if (skippedCount > 0) {
+    console.log(`  -> Omitidos ${skippedCount} documentos tipo "Application Response"`);
   }
 
   return docs;
@@ -570,4 +607,51 @@ async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<voi
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Navega a una URL con reintentos y diferentes estrategias de espera.
+ * Primero intenta con domcontentloaded (más rápido), luego con load si falla.
+ */
+async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3): Promise<void> {
+  let lastError: Error | null = null;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Navegación intento ${attempt}/${maxRetries}: ${url.substring(0, 60)}...`);
+      
+      // Primer intento: domcontentloaded es más rápido y suficiente para SPAs
+      const waitUntil = attempt === 1 ? "domcontentloaded" : "load";
+      const timeout = attempt === 1 ? 90000 : 120000;
+      
+      await page.goto(url, { 
+        waitUntil: waitUntil as "domcontentloaded" | "load",
+        timeout 
+      });
+      
+      // Espera adicional para que scripts asíncronos carguen
+      await delay(1500);
+      
+      console.log(`Navegación exitosa en intento ${attempt}`);
+      return;
+      
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.log(`Navegación falló intento ${attempt}: ${lastError.message}`);
+      
+      // Si el error es de timeout, esperar antes de reintentar
+      if (lastError.message.includes("timeout") || lastError.message.includes("Timeout")) {
+        console.log(`Timeout detectado, esperando antes de reintentar...`);
+        await delay(3000);
+      }
+      
+      // Si no es el último intento, continuar
+      if (attempt < maxRetries) {
+        await delay(2000);
+      }
+    }
+  }
+  
+  // Si todos los intentos fallaron, lanzar el último error
+  throw lastError || new Error(`Navegación falló después de ${maxRetries} intentos`);
 }
