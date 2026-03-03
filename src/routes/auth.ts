@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import {
   createUser,
+  getUserById,
   getUserByEmail,
   getUserNits,
   getUserPurchases,
@@ -302,11 +303,16 @@ router.get("/me", async (req: Request, res: Response) => {
 
   try {
     const payload = jwt.verify(token, getJwtSecret()) as JWTPayload;
-    const user = await getUserByEmail(payload.email);
+    const user = await getUserById(payload.userId);
 
     if (!user) {
       res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
       return res.status(401).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    if (user.status === "suspended") {
+      res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+      return res.status(403).json({ ok: false, message: "Tu cuenta ha sido suspendida. Contacta al administrador." });
     }
 
     const [purchasedTools, nits] = await Promise.all([
