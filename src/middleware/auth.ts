@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction, type CookieOptions } from "express";
 import jwt from "jsonwebtoken";
 import type { JWTPayload } from "../types/auth.js";
-import { getUserById } from "../services/database.js";
+import { getUserByIdStrict } from "../services/database.js";
 
 export const AUTH_COOKIE_NAME = "contago_auth";
 
@@ -70,12 +70,19 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     return;
   }
 
+  let payload: JWTPayload;
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
+    payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
+  } catch {
+    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+    res.status(401).json({ ok: false, message: "Token inválido o expirado" });
+    return;
+  }
 
+  try {
     // Revalidar usuario real en DB para evitar claims obsoletos en JWT
     // (ej. suspensión o revocación de rol admin durante una sesión activa).
-    const currentUser = await getUserById(payload.userId);
+    const currentUser = await getUserByIdStrict(payload.userId);
     if (!currentUser) {
       res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
       res.status(401).json({ ok: false, message: "Usuario no encontrado" });
@@ -96,7 +103,6 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     };
     next();
   } catch {
-    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
-    res.status(401).json({ ok: false, message: "Token inválido o expirado" });
+    res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });
   }
 }

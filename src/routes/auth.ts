@@ -2,7 +2,7 @@ import { Router, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import {
   createUser,
-  getUserById,
+  getUserByIdStrict,
   getUserByEmail,
   getUserNits,
   getUserPurchases,
@@ -301,9 +301,16 @@ router.get("/me", async (req: Request, res: Response) => {
     return res.status(401).json({ ok: false, message: "Token no proporcionado" });
   }
 
+  let payload: JWTPayload;
   try {
-    const payload = jwt.verify(token, getJwtSecret()) as JWTPayload;
-    const user = await getUserById(payload.userId);
+    payload = jwt.verify(token, getJwtSecret()) as JWTPayload;
+  } catch {
+    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+    return res.status(401).json({ ok: false, message: "Token inválido" });
+  }
+
+  try {
+    const user = await getUserByIdStrict(payload.userId);
 
     if (!user) {
       res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
@@ -332,8 +339,7 @@ router.get("/me", async (req: Request, res: Response) => {
       },
     });
   } catch {
-    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
-    return res.status(401).json({ ok: false, message: "Token inválido" });
+    return res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });
   }
 });
 

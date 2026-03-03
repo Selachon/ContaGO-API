@@ -104,6 +104,16 @@ export async function getUserById(id: string): Promise<User | null> {
   }
 }
 
+// Version estricta: distingue "no encontrado" de errores de infraestructura.
+export async function getUserByIdStrict(id: string): Promise<User | null> {
+  if (!ObjectId.isValid(id)) {
+    return null;
+  }
+  const oid = new ObjectId(id);
+  const record = await usersCollection().findOne({ _id: oid });
+  return mapUser(record);
+}
+
 export async function getUserByEmail(email: string): Promise<User | null> {
   const record = await usersCollection().findOne({ email: email.toLowerCase().trim() });
   return mapUser(record);
