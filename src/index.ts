@@ -9,6 +9,7 @@ import authRoutes from "./routes/auth.js";
 import dianRoutes from "./routes/dian.js";
 import dianExcelRoutes from "./routes/dianExcel.js";
 import googleAuthRoutes from "./routes/googleAuth.js";
+import adminRoutes from "./routes/admin.js";
 import { connectMongo, seedAdminUser } from "./services/database.js";
 
 // ============================================
@@ -53,6 +54,7 @@ app.use(express.json({ limit: "1mb" }));
 // ============================================
 app.use("/auth", authRoutes);
 app.use("/auth/google", googleAuthRoutes);
+app.use("/admin", adminRoutes);
 app.use("/dian", dianRoutes);
 app.use("/dian-excel", dianExcelRoutes);
 

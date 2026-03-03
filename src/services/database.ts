@@ -11,6 +11,7 @@ interface UserRecord {
   is_admin: boolean;
   purchasedTools: string[];
   nits: string[];
+  status?: "active" | "suspended";
   created_at: string;
   legacyId?: number;
   google_drive?: GoogleDriveConfig;
@@ -55,6 +56,7 @@ function mapUser(record: UserRecord | null): User | null {
     password_hash: record.password_hash,
     is_admin: record.is_admin,
     nits: record.nits || [],
+    status: record.status || "active",
     created_at: record.created_at,
   };
 }

@@ -5,6 +5,7 @@ export interface User {
   password_hash: string;
   is_admin: boolean;
   nits: string[];
+  status?: "active" | "suspended";
   created_at: string;
 }
 

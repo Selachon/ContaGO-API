@@ -7,6 +7,7 @@ import {
   getUserPurchases,
   verifyPassword,
 } from "../services/database.js";
+import { logAdminAction } from "../services/adminService.js";
 import {
   AUTH_COOKIE_NAME,
   getAuthCookieClearOptions,
@@ -58,6 +59,12 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
   if (!valid) {
     const response: AuthResponse = { ok: false, message: "Credenciales incorrectas" };
     return res.status(401).json(response);
+  }
+
+  // Bloquear login si usuario esta suspendido
+  if (user.status === "suspended") {
+    const response: AuthResponse = { ok: false, message: "Tu cuenta ha sido suspendida. Contacta al administrador." };
+    return res.status(403).json(response);
   }
 
   const payload: JWTPayload = {
@@ -249,6 +256,20 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
     const response: AuthResponse = { ok: false, message: "Error al crear usuario" };
     return res.status(500).json(response);
   }
+
+  // Registrar auditoria de creacion
+  await logAdminAction({
+    actorId: req.user!.userId,
+    action: "create_user",
+    targetUserId: user.id,
+    after: {
+      email: user.email,
+      name: user.name,
+      isAdmin: !!isAdmin,
+      purchasedTools: cleanTools,
+      nits: cleanNits,
+    },
+  });
 
   const response: AuthResponse = {
     ok: true,
