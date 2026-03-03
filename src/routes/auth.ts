@@ -214,7 +214,7 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
   const normalizedNits = Array.isArray(nits)
     ? nits
     : typeof nits === "string"
-      ? [nits]
+      ? nits.split(",")
       : [];
 
   const cleanNits = Array.from(new Set(
@@ -223,6 +223,11 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
       .map((nit) => nit.trim())
       .filter(Boolean)
   ));
+
+  if (cleanNits.length === 0) {
+    const response: AuthResponse = { ok: false, message: "Debes proporcionar al menos un NIT" };
+    return res.status(400).json(response);
+  }
 
   const normalizedTools = Array.isArray(purchasedTools)
     ? purchasedTools
