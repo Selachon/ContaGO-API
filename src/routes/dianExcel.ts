@@ -16,6 +16,7 @@ import {
 } from "../services/googleDrive.js";
 import { encryptToken } from "../utils/encryption.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserNits, getUserGoogleDrive, updateUserDriveTokens } from "../services/database.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig } from "../types/dianExcel.js";
@@ -33,6 +34,7 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 }
 
 const router = Router();
+const DIAN_EXCEL_TOOL_ID = "dian-excel-exporter";
 
 // Estado en memoria de jobs de exportacion.
 const jobTracker = new Map<string, ExcelJobData>();
@@ -53,6 +55,9 @@ function setProgress(jobId: string, data: Partial<ExcelJobData["progress"]>): vo
 router.use((req, res, next) => {
   requireAuth(req, res, next);
 });
+
+// Exige compra de herramienta (o admin) para usar exportador Excel.
+router.use(requireToolAccess(DIAN_EXCEL_TOOL_ID));
 
 // Limpieza periodica de jobs expirados y artefactos locales.
 setInterval(() => {
