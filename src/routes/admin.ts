@@ -7,6 +7,7 @@ import {
   suspendUser,
   reactivateUser,
   logAdminAction,
+  getAuditLogs,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
 
@@ -233,6 +234,34 @@ router.post("/users/:id/reactivate", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[Admin] Error reactivando usuario:", err);
     res.status(500).json({ ok: false, message: "Error interno al reactivar usuario" });
+  }
+});
+
+// ============================================
+// GET /admin/audit - Logs de auditoria
+// ============================================
+router.get("/audit", async (req: Request, res: Response) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page as string) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string) || 20));
+    const targetUserId = req.query.userId as string | undefined;
+    const action = req.query.action as string | undefined;
+
+    const result = await getAuditLogs({ page, limit, targetUserId, action });
+
+    res.json({
+      ok: true,
+      logs: result.logs,
+      pagination: {
+        page,
+        limit,
+        total: result.total,
+        totalPages: Math.ceil(result.total / limit),
+      },
+    });
+  } catch (err) {
+    console.error("[Admin] Error obteniendo logs de auditoria:", err);
+    res.status(500).json({ ok: false, message: "Error interno al obtener logs" });
   }
 });
 
