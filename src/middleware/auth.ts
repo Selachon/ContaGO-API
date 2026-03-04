@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction, type CookieOptions } from "express";
 import jwt from "jsonwebtoken";
 import type { JWTPayload } from "../types/auth.js";
+import { getUserByIdStrict } from "../services/database.js";
 
 export const AUTH_COOKIE_NAME = "contago_auth";
 
@@ -55,7 +56,7 @@ declare global {
  * Middleware que exige un JWT válido en el header Authorization.
  * Si es válido, adjunta `req.user` con el payload decodificado.
  */
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
+export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const JWT_SECRET = process.env.JWT_SECRET;
 
   if (!JWT_SECRET) {
@@ -69,12 +70,39 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
     return;
   }
 
+  let payload: JWTPayload;
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
-    req.user = payload;
-    next();
+    payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
   } catch {
     res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
     res.status(401).json({ ok: false, message: "Token inválido o expirado" });
+    return;
+  }
+
+  try {
+    // Revalidar usuario real en DB para evitar claims obsoletos en JWT
+    // (ej. suspensión o revocación de rol admin durante una sesión activa).
+    const currentUser = await getUserByIdStrict(payload.userId);
+    if (!currentUser) {
+      res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+      res.status(401).json({ ok: false, message: "Usuario no encontrado" });
+      return;
+    }
+
+    if (currentUser.status === "suspended") {
+      res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+      res.status(403).json({ ok: false, message: "Tu cuenta ha sido suspendida. Contacta al administrador." });
+      return;
+    }
+
+    // No confiar en isAdmin del token; usar el estado actual en DB.
+    req.user = {
+      userId: currentUser.id,
+      email: currentUser.email,
+      isAdmin: !!currentUser.is_admin,
+    };
+    next();
+  } catch {
+    res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });
   }
 }

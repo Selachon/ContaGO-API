@@ -10,6 +10,7 @@ import { extractDocumentIds, progressTracker } from "../services/dianScraper.js"
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserNits } from "../services/database.js";
 import type { DownloadRequest, ProgressData } from "../types/dian.js";
@@ -42,6 +43,7 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 }
 
 const router = Router();
+const DIAN_DOWNLOADER_TOOL_ID = "dian-downloader";
 
 // Estado en memoria de jobs asincronos de descarga.
 interface JobData {
@@ -72,6 +74,9 @@ router.use((req, res, next) => {
   }
   requireAuth(req, res, next);
 });
+
+// Exige compra de herramienta (o admin) para usar descarga masiva.
+router.use(requireToolAccess(DIAN_DOWNLOADER_TOOL_ID));
 
 // Limpieza periodica de progreso y jobs vencidos por TTL.
 const PROGRESS_TTL_MS = 15 * 60 * 1000;
