@@ -292,7 +292,7 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
 // Crea un job asincrono y devuelve jobId de inmediato.
 router.post("/download-documents", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as DownloadRequest;
-  const { token_url, start_date, end_date, session_uid, consolidate_pdf } = body;
+  const { token_url, start_date, end_date, session_uid, consolidate_pdf, include_pdf_folder } = body;
 
   // Se valida formato para evitar errores en filtros de DIAN.
   if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
@@ -362,7 +362,7 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   });
 
   // No usar await para no retener la conexion HTTP.
-  processDownloadJob(jobId, token_url, start_date, end_date, consolidate_pdf).catch((err) => {
+  processDownloadJob(jobId, token_url, start_date, end_date, consolidate_pdf, include_pdf_folder).catch((err) => {
     console.error(`Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
@@ -379,7 +379,8 @@ async function processDownloadJob(
   token_url: string,
   start_date: string | undefined,
   end_date: string | undefined,
-  consolidate_pdf: boolean | undefined
+  consolidate_pdf: boolean | undefined,
+  include_pdf_folder: boolean | undefined
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
@@ -431,8 +432,10 @@ async function processDownloadJob(
     // Carpeta temporal por job para aislar artefactos.
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // Descarga individual por documento, con tolerancia a errores parciales.
-    const baseUrl = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
+    // URLs base para diferentes tipos de documentos DIAN
+    const baseUrlNormal = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
+    const baseUrlEquivalente = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId=";
+    
     const usedNames = new Set<string>();
     let successCount = 0;
     let errorCount = 0;
@@ -466,7 +469,23 @@ async function processDownloadJob(
           total: totalDocs,
         });
 
-        await downloadFile(baseUrl + docId, destPath, cookies);
+        // Construir URL según tipo de documento
+        let downloadUrl: string;
+        const isEquivalente = doc.documentTypeId === "20" || 
+                              doc.docType?.toLowerCase().includes("equivalente") ||
+                              doc.docType?.toLowerCase().includes("pos");
+        
+        if (isEquivalente && doc.fechaValidacion && doc.fechaGeneracion) {
+          // Documentos equivalentes POS requieren endpoint especial con fechas
+          downloadUrl = `${baseUrlEquivalente}${docId}&documentTypeId=${doc.documentTypeId || "20"}&FechaValidacionDIAN=${doc.fechaValidacion}&FechaGeneracionDIAN=${doc.fechaGeneracion}`;
+          console.log(`[${jobId}] Descargando doc ${i + 1}/${totalDocs} (equivalente): id=${docId.slice(0, 16)}..., tipo=${doc.docType}`);
+        } else {
+          // Facturas electrónicas normales
+          downloadUrl = `${baseUrlNormal}${docId}`;
+          console.log(`[${jobId}] Descargando doc ${i + 1}/${totalDocs}: id=${docId.slice(0, 16)}..., tipo=${doc.docType}`);
+        }
+        
+        await downloadFile(downloadUrl, destPath, cookies);
         successCount++;
         console.log(`[${jobId}] Descargado ${i + 1}/${totalDocs}: ${filename}`);
       } catch (err) {
@@ -598,6 +617,65 @@ async function processDownloadJob(
       } catch (consolidateErr) {
         console.error(`[${jobId}] Error durante la consolidación:`, consolidateErr);
         // La consolidacion es opcional; fallar aqui no invalida el ZIP final.
+      }
+    }
+
+    // Carpeta opcional con PDFs individuales nombrados como NIT - NumFactura.pdf
+    if (include_pdf_folder && !isJobCancelled(jobId)) {
+      try {
+        setProgress(jobId, {
+          step: "Creando carpeta de PDFs individuales...",
+          current: 0,
+          total: 1,
+        });
+
+        const pdfFolderPath = path.join(tempDir, "PDFs");
+        fs.mkdirSync(pdfFolderPath, { recursive: true });
+
+        const zipFiles = fs.readdirSync(tempDir).filter((f) => f.endsWith(".zip"));
+        let extractedCount = 0;
+
+        for (let z = 0; z < zipFiles.length; z++) {
+          if (isJobCancelled(jobId)) {
+            console.log(`[${jobId}] Job cancelado durante extracción de PDFs individuales`);
+            try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+            return;
+          }
+
+          setProgress(jobId, {
+            step: `Extrayendo PDF ${z + 1} de ${zipFiles.length} a carpeta PDFs...`,
+            current: z + 1,
+            total: zipFiles.length,
+          });
+
+          const zipFileName = zipFiles[z];
+          const zipFilePath = path.join(tempDir, zipFileName);
+          const zipData = fs.readFileSync(zipFilePath);
+          const zip = await JSZip.loadAsync(zipData);
+
+          const pdfEntries = Object.keys(zip.files).filter(
+            (name) => name.toLowerCase().endsWith(".pdf") && !zip.files[name].dir
+          );
+
+          for (const pdfName of pdfEntries) {
+            const pdfBuffer = await zip.files[pdfName].async("nodebuffer");
+
+            if (isValidPdfBuffer(pdfBuffer)) {
+              // Usar el nombre del ZIP (NIT - NumFactura.zip) como base para el PDF
+              const baseName = zipFileName.replace(/\.zip$/i, "");
+              const pdfFileName = `${baseName}.pdf`;
+              const pdfDestPath = path.join(pdfFolderPath, pdfFileName);
+
+              fs.writeFileSync(pdfDestPath, pdfBuffer);
+              extractedCount++;
+            }
+          }
+        }
+
+        console.log(`[${jobId}] Carpeta PDFs creada con ${extractedCount} archivos`);
+      } catch (pdfFolderErr) {
+        console.error(`[${jobId}] Error creando carpeta PDFs:`, pdfFolderErr);
+        // La carpeta PDFs es opcional; fallar aqui no invalida el ZIP final.
       }
     }
 

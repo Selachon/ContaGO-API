@@ -422,13 +422,24 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate(() => {
-    const results: Array<{ id: string; docnum: string; nit: string; docType: string }> = [];
+    const results: Array<{
+      id: string;
+      docnum: string;
+      nit: string;
+      docType: string;
+      documentTypeId?: string;
+      fechaValidacion?: string;
+      fechaGeneracion?: string;
+    }> = [];
     
     // Excluye la fila placeholder de DataTables.
     const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
     
     for (const row of rows) {
       let trackId: string | null = null;
+      let documentTypeId: string | undefined;
+      let fechaValidacion: string | undefined;
+      let fechaGeneracion: string | undefined;
       
       // Metodo 1: botones/enlaces de descarga en la fila.
       const downloadElements = row.querySelectorAll(
@@ -443,6 +454,14 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
                   el.getAttribute("data-trackid") || 
                   el.getAttribute("data-id") ||
                   el.getAttribute("data-track-id");
+        
+        // Extraer atributos adicionales para documentos equivalentes POS
+        if (el.classList.contains("download-equivalente-document")) {
+          documentTypeId = el.getAttribute("documentypeid") || el.getAttribute("documenttypeid") || undefined;
+          // emissiondate es la fecha de validación, generationdate es la fecha de generación
+          fechaValidacion = el.getAttribute("emissiondate") || undefined;
+          fechaGeneracion = el.getAttribute("generationdate") || undefined;
+        }
         
         if (!trackId) {
           const href = el.getAttribute("href") || "";
@@ -493,7 +512,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
       const docType = tds[5]?.textContent?.trim() || "";
       const nit = tds[6]?.textContent?.trim() || "";
 
-      results.push({ id: trackId, docnum, nit, docType });
+      results.push({ id: trackId, docnum, nit, docType, documentTypeId, fechaValidacion, fechaGeneracion });
     }
 
     return results;
@@ -515,6 +534,9 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
         docnum: item.docnum,
         nit: item.nit,
         docType: item.docType,
+        documentTypeId: item.documentTypeId,
+        fechaValidacion: item.fechaValidacion,
+        fechaGeneracion: item.fechaGeneracion,
       });
     }
   }
