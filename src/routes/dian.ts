@@ -466,6 +466,7 @@ async function processDownloadJob(
           total: totalDocs,
         });
 
+        console.log(`[${jobId}] Descargando doc ${i + 1}/${totalDocs}: id=${docId} (${docId.length} chars), tipo=${doc.docType}`);
         await downloadFile(baseUrl + docId, destPath, cookies);
         successCount++;
         console.log(`[${jobId}] Descargado ${i + 1}/${totalDocs}: ${filename}`);
