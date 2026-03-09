@@ -18,6 +18,7 @@ export interface InvoiceData {
 
   // Datos de la factura
   issueDate: string;
+  paymentMethod: string;
   subtotal: number;
   iva: number;
   total: number;
