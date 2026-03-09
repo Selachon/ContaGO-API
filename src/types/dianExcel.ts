@@ -27,7 +27,7 @@ export interface InvoiceData {
   iva: number;
   total: number;
   concepts: string;
-  documentType: "Factura Electrónica" | "Nota Crédito" | "N/A";
+  documentType: string; // Tipo de documento de DIAN (ej: "Factura electrónica", "Nota Crédito", "Documento soporte")
   cufe: string;
   driveUrl?: string;
 

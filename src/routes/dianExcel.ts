@@ -394,6 +394,7 @@ async function processExcelJob(
         const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
           id: doc.id,
           docnum: doc.docnum,
+          docType: doc.docType, // Tipo de documento de la tabla DIAN
         });
 
         // 3.4) Subir archivos a Drive con estructura de carpetas.

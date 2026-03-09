@@ -170,7 +170,7 @@ export async function extractDocumentIds(
       }
 
       // Extrae ids desde selectores alternos por variaciones de DIAN.
-      const newDocs = await extractDocsFromPage(page, seenIds);
+      const newDocs = await extractDocsFromPage(page, seenIds, isSent);
       allDocuments.push(...newDocs);
 
       // Actualizar progreso inmediatamente después de extraer
@@ -420,7 +420,7 @@ async function setPageLength(page: Page, length: number): Promise<void> {
   }
 }
 
-// Tipos de documento que deben ser ignorados (no son facturas reales)
+// Tipos de documento que deben ser ignorados siempre (no son facturas reales)
 const IGNORED_DOC_TYPES = [
   "application response",
   "applicationresponse",
@@ -429,12 +429,29 @@ const IGNORED_DOC_TYPES = [
   "respuesta aplicación",
 ];
 
-function shouldIgnoreDocType(docType: string): boolean {
+// Tipos de documento adicionales que deben ser ignorados solo para documentos emitidos
+const IGNORED_DOC_TYPES_SENT_ONLY = [
+  "nomina individual",
+  "nómina individual",
+];
+
+function shouldIgnoreDocType(docType: string, isSentDocuments: boolean = false): boolean {
   const normalized = docType.toLowerCase().trim();
-  return IGNORED_DOC_TYPES.some(ignored => normalized.includes(ignored));
+  
+  // Siempre ignorar estos tipos
+  if (IGNORED_DOC_TYPES.some(ignored => normalized.includes(ignored))) {
+    return true;
+  }
+  
+  // Para documentos emitidos, también ignorar nóminas
+  if (isSentDocuments && IGNORED_DOC_TYPES_SENT_ONLY.some(ignored => normalized.includes(ignored))) {
+    return true;
+  }
+  
+  return false;
 }
 
-async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<DocumentInfo[]> {
+async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocuments: boolean = false): Promise<DocumentInfo[]> {
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate(() => {
@@ -539,7 +556,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
   for (const item of items) {
     if (!seenIds.has(item.id)) {
       // Filtrar Application Response y otros tipos no relevantes
-      if (shouldIgnoreDocType(item.docType)) {
+      if (shouldIgnoreDocType(item.docType, isSentDocuments)) {
         skippedCount++;
         continue;
       }

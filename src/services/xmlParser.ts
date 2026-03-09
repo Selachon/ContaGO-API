@@ -4,6 +4,7 @@ import type { InvoiceData, InvoiceLineItem } from "../types/dianExcel.js";
 interface DocInfo {
   id: string;
   docnum: string;
+  docType?: string; // Tipo de documento de la tabla DIAN (ej: "Documento soporte", "Factura electrónica")
 }
 
 /**
@@ -33,6 +34,11 @@ export async function extractInvoiceDataFromXml(
     }
 
     const isNotaCredito = !!parsed.CreditNote;
+    
+    // Determinar el tipo de documento:
+    // 1. Si viene de la tabla DIAN (docType), usarlo directamente
+    // 2. Si no, deducirlo del XML (Nota Crédito vs Factura Electrónica)
+    const documentType = docInfo.docType || (isNotaCredito ? "Nota Crédito" : "Factura Electrónica");
 
     // Extraer datos del emisor (AccountingSupplierParty)
     const supplierParty = invoice.AccountingSupplierParty?.Party;
@@ -63,7 +69,7 @@ export async function extractInvoiceDataFromXml(
       total,
       concepts,
       lineItems,
-      documentType: isNotaCredito ? "Nota Crédito" : "Factura Electrónica",
+      documentType,
       cufe,
       paymentMethod,
       trackId: docInfo.id,
