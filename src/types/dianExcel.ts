@@ -1,10 +1,14 @@
 // Types para la herramienta Exportador DIAN a Excel
 
+import type { DocumentDirection } from "./dian.js";
+
 export interface ExcelGenerateRequest {
   token_url: string;
   start_date?: string;
   end_date?: string;
   session_uid?: string;
+  /** Tipo de documentos: "received" (recibidos) o "sent" (emitidos). Default: "received" */
+  document_direction?: DocumentDirection;
 }
 
 export interface InvoiceData {
