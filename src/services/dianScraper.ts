@@ -1,6 +1,6 @@
 import puppeteer, { Browser, Page, Cookie } from "puppeteer";
 import fs from "fs";
-import type { DocumentInfo, ProgressData } from "../types/dian.js";
+import type { DocumentInfo, ProgressData, DocumentDirection } from "../types/dian.js";
 
 // Estado de progreso compartido entre scraper y rutas de consulta.
 export const progressTracker: Map<string, ProgressData> = new Map();
@@ -10,6 +10,15 @@ interface ExtractionResult {
   cookies: Record<string, string>;
 }
 
+interface ExtractOptions {
+  tokenUrl: string;
+  startDate?: string;
+  endDate?: string;
+  progressUid?: string;
+  /** Tipo de documentos: "received" (recibidos) o "sent" (emitidos). Default: "received" */
+  documentDirection?: DocumentDirection;
+}
+
 /**
  * Extrae ids de documentos DIAN y cookies de sesion para descargas posteriores.
  */
@@ -17,8 +26,12 @@ export async function extractDocumentIds(
   tokenUrl: string,
   startDate: string | undefined,
   endDate: string | undefined,
-  progressUid?: string
+  progressUid?: string,
+  documentDirection: DocumentDirection = "received"
 ): Promise<ExtractionResult> {
+  const direction = documentDirection || "received";
+  const isSent = direction === "sent";
+  const directionLabel = isSent ? "emitidos" : "recibidos";
   const updateProgress = (data: Partial<ProgressData>) => {
     if (progressUid) {
       const current = progressTracker.get(progressUid) || { step: "", current: 0, total: 0 };
@@ -66,9 +79,12 @@ export async function extractDocumentIds(
       throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
     }
 
-    // 2) Navegar al listado de documentos recibidos (con reintentos).
-    updateProgress({ step: "Navegando a documentos recibidos..." });
-    await navigateWithRetry(page, "https://catalogo-vpfe.dian.gov.co/Document/Received", 3);
+    // 2) Navegar al listado de documentos (con reintentos).
+    const documentUrl = isSent 
+      ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+      : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+    updateProgress({ step: `Navegando a documentos ${directionLabel}...` });
+    await navigateWithRetry(page, documentUrl, 3);
     await delay(600);
 
     // Verificar nuevamente si redirigió a login (sesión inválida)

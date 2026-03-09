@@ -80,7 +80,10 @@ setInterval(() => {
 // Crea un job asincrono de extraccion y generacion de Excel.
 router.post("/generate", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as ExcelGenerateRequest;
-  const { token_url, start_date, end_date, session_uid } = body;
+  const { token_url, start_date, end_date, session_uid, document_direction } = body;
+  
+  // Validar document_direction si se proporciona
+  const direction = document_direction === "sent" ? "sent" : "received";
 
   // Se valida formato para filtros consistentes en DIAN.
   if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
@@ -142,7 +145,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   });
 
   // No usar await para no retener la conexion HTTP.
-  processExcelJob(jobId, token_url, start_date, end_date, userId).catch((err) => {
+  processExcelJob(jobId, token_url, start_date, end_date, userId, direction).catch((err) => {
     console.error(`[Excel] Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
@@ -278,12 +281,15 @@ async function processExcelJob(
   tokenUrl: string,
   startDate: string | undefined,
   endDate: string | undefined,
-  userId: string
+  userId: string,
+  documentDirection: "received" | "sent" = "received"
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
 
   job.status = "processing";
+  const isSentDocs = documentDirection === "sent";
+  const directionLabel = isSentDocs ? "emitidos" : "recibidos";
 
   const tempDir = path.join(DOWNLOADS_DIR, `excel-${jobId}`);
   const excelPath = path.join(DOWNLOADS_DIR, `${jobId}.xlsx`);
@@ -295,8 +301,8 @@ async function processExcelJob(
     if (isJobCancelled(jobId)) return;
 
     // 1) Extraer ids y cookies de sesion desde DIAN.
-    setProgress(jobId, { step: "Extrayendo lista de documentos...", current: 0, total: 1 });
-    const { documents, cookies } = await extractDocumentIds(tokenUrl, startDate, endDate, jobId);
+    setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
+    const { documents, cookies } = await extractDocumentIds(tokenUrl, startDate, endDate, jobId, documentDirection);
 
     if (isJobCancelled(jobId)) return;
 
@@ -518,14 +524,15 @@ async function processExcelJob(
     // 4) Generar archivo final.
     setProgress(jobId, { step: "Generando archivo Excel...", current: totalDocs, total: totalDocs });
 
-    await generateExcelFile(invoices, excelPath, hasDrive);
+    await generateExcelFile(invoices, excelPath, hasDrive, isSentDocs);
 
     // Limpia artefactos temporales una vez generado el Excel.
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
 
     // 5) Publicar estado final para polling/descarga.
     job.status = "completed";
-    job.excelName = generateExcelFilename(startDate, endDate);
+    const filePrefix = isSentDocs ? "Facturas Emitidas DIAN" : "Facturas DIAN";
+    job.excelName = generateExcelFilename(startDate, endDate, filePrefix);
     job.completedAt = Date.now();
     job.invoicesProcessed = successCount;
     job.invoicesFailed = errorCount;

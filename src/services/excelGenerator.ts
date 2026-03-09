@@ -3,11 +3,16 @@ import type { InvoiceData } from "../types/dianExcel.js";
 
 /**
  * Genera archivo Excel con los datos de las facturas
+ * @param invoices - Lista de facturas a exportar
+ * @param outputPath - Ruta donde guardar el archivo
+ * @param includeDriveColumn - Si incluir columna de enlace a Drive
+ * @param isSentDocuments - Si son documentos emitidos (muestra receptor en lugar de emisor)
  */
 export async function generateExcelFile(
   invoices: InvoiceData[],
   outputPath: string,
-  includeDriveColumn: boolean
+  includeDriveColumn: boolean,
+  isSentDocuments: boolean = false
 ): Promise<void> {
   const workbook = new ExcelJS.Workbook();
   
@@ -22,7 +27,10 @@ export async function generateExcelFile(
     fullCalcOnLoad: true,
   };
 
-  const worksheet = workbook.addWorksheet("Facturas DIAN", {
+  // Nombre de la hoja según el tipo de documentos
+  const sheetName = isSentDocuments ? "Facturas Emitidas" : "Facturas DIAN";
+  
+  const worksheet = workbook.addWorksheet(sheetName, {
     views: [{ state: "frozen", ySplit: 1, xSplit: 0 }], // Congelar primera fila
     properties: {
       defaultColWidth: 12,
@@ -31,12 +39,14 @@ export async function generateExcelFile(
     },
   });
 
-  // Definir columnas
+  // Definir columnas - Para emitidos mostramos el receptor, para recibidos el emisor
+  const partyLabel = isSentDocuments ? "Receptor" : "Emisor";
+  
   const columns: Partial<ExcelJS.Column>[] = [
     { header: "ID", key: "id", width: 6 },
     { header: "Número Factura", key: "docNumber", width: 20 },
-    { header: "NIT Emisor", key: "issuerNit", width: 14 },
-    { header: "Razón Social Emisor", key: "issuerName", width: 40 },
+    { header: `NIT ${partyLabel}`, key: "partyNit", width: 14 },
+    { header: `Razón Social ${partyLabel}`, key: "partyName", width: 40 },
     { header: "Fecha de emisión", key: "issueDate", width: 16 },
     { header: "Forma de pago", key: "paymentMethod", width: 18 },
     { header: "Valor antes", key: "subtotal", width: 15 },
@@ -69,11 +79,15 @@ export async function generateExcelFile(
 
   // Agregar filas de datos
   invoices.forEach((invoice, index) => {
+    // Para emitidos, mostramos datos del receptor; para recibidos, del emisor
+    const partyNit = isSentDocuments ? invoice.receiverNit : invoice.issuerNit;
+    const partyName = isSentDocuments ? invoice.receiverName : invoice.issuerName;
+    
     const rowData: Record<string, unknown> = {
       id: index + 1,
       docNumber: invoice.docNumber,
-      issuerNit: invoice.issuerNit,
-      issuerName: invoice.issuerName,
+      partyNit,
+      partyName,
       issueDate: invoice.issueDate,
       paymentMethod: invoice.paymentMethod || "N/A",
       subtotal: invoice.subtotal,
@@ -233,7 +247,7 @@ export async function generateExcelFile(
       const docNumberCell = row.getCell("docNumber");
       docNumberCell.value = {
         text: invoice.docNumber,
-        hyperlink: `#'Facturas DIAN'!B${mainSheetRow}`,
+        hyperlink: `#'${sheetName}'!B${mainSheetRow}`,
       };
       docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
 
@@ -281,8 +295,11 @@ export async function generateExcelFile(
 
 /**
  * Genera nombre de archivo Excel basado en rango de fechas
+ * @param startDate - Fecha inicio (YYYY-MM-DD)
+ * @param endDate - Fecha fin (YYYY-MM-DD)
+ * @param prefix - Prefijo del nombre de archivo (default: "Facturas DIAN")
  */
-export function generateExcelFilename(startDate?: string, endDate?: string): string {
+export function generateExcelFilename(startDate?: string, endDate?: string, prefix: string = "Facturas DIAN"): string {
   const formatDate = (date: string): string => {
     const [year, month, day] = date.split("-");
     const months = [
@@ -295,5 +312,5 @@ export function generateExcelFilename(startDate?: string, endDate?: string): str
   const start = startDate ? formatDate(startDate) : "Inicio";
   const end = endDate ? formatDate(endDate) : "Fin";
 
-  return `Facturas DIAN ${start} - ${end}.xlsx`;
+  return `${prefix} ${start} - ${end}.xlsx`;
 }

@@ -292,7 +292,10 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
 // Crea un job asincrono y devuelve jobId de inmediato.
 router.post("/download-documents", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as DownloadRequest;
-  const { token_url, start_date, end_date, session_uid, consolidate_pdf, include_pdf_folder } = body;
+  const { token_url, start_date, end_date, session_uid, consolidate_pdf, include_pdf_folder, document_direction } = body;
+  
+  // Validar document_direction si se proporciona
+  const direction = document_direction === "sent" ? "sent" : "received";
 
   // Se valida formato para evitar errores en filtros de DIAN.
   if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
@@ -362,7 +365,7 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   });
 
   // No usar await para no retener la conexion HTTP.
-  processDownloadJob(jobId, token_url, start_date, end_date, consolidate_pdf, include_pdf_folder).catch((err) => {
+  processDownloadJob(jobId, token_url, start_date, end_date, consolidate_pdf, include_pdf_folder, direction).catch((err) => {
     console.error(`Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
@@ -380,12 +383,15 @@ async function processDownloadJob(
   start_date: string | undefined,
   end_date: string | undefined,
   consolidate_pdf: boolean | undefined,
-  include_pdf_folder: boolean | undefined
+  include_pdf_folder: boolean | undefined,
+  documentDirection: "received" | "sent" = "received"
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
 
   job.status = "processing";
+  const isSentDocs = documentDirection === "sent";
+  const directionLabel = isSentDocs ? "emitidos" : "recibidos";
   
   const sessionDir = uuidv4();
   const tempDir = path.join(DOWNLOADS_DIR, sessionDir);
@@ -403,8 +409,8 @@ async function processDownloadJob(
     }
 
     // Paso 1: obtener ids y cookies de sesion DIAN.
-    setProgress(jobId, { step: "Extrayendo lista de documentos...", current: 0, total: 1 });
-    const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, jobId);
+    setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
+    const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, jobId, documentDirection);
 
     // Checkpoint tras la operacion mas costosa del scraper.
     if (isJobCancelled(jobId)) {
@@ -514,7 +520,8 @@ async function processDownloadJob(
     // Nombre de salida legible para el usuario.
     const startLabel = formatSpanishLabel(start_date) || "Desde";
     const endLabel = formatSpanishLabel(end_date) || "Hasta";
-    const zipName = `${startLabel} - ${endLabel}.zip`;
+    const typePrefix = isSentDocs ? "Emitidos" : "Recibidos";
+    const zipName = `${typePrefix} ${startLabel} - ${endLabel}.zip`;
 
     // Consolidacion opcional: agrega un PDF combinado sin eliminar los ZIP individuales.
     if (consolidate_pdf && !isJobCancelled(jobId)) {

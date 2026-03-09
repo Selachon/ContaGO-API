@@ -1,3 +1,5 @@
+export type DocumentDirection = "received" | "sent";
+
 export interface DownloadRequest {
   token_url: string;
   start_date?: string;
@@ -5,6 +7,8 @@ export interface DownloadRequest {
   session_uid?: string;
   consolidate_pdf?: boolean;
   include_pdf_folder?: boolean;
+  /** Tipo de documentos: "received" (recibidos) o "sent" (emitidos). Default: "received" */
+  document_direction?: DocumentDirection;
 }
 
 export interface DocumentInfo {
