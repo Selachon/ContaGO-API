@@ -10,11 +10,25 @@ export async function generateExcelFile(
   includeDriveColumn: boolean
 ): Promise<void> {
   const workbook = new ExcelJS.Workbook();
+  
+  // Propiedades del workbook para mejor compatibilidad con Excel y Sheets
   workbook.creator = "ContaGO";
   workbook.created = new Date();
+  workbook.modified = new Date();
+  workbook.lastPrinted = new Date();
+  
+  // Establecer propiedades de cálculo para compatibilidad
+  workbook.calcProperties = {
+    fullCalcOnLoad: true,
+  };
 
   const worksheet = workbook.addWorksheet("Facturas DIAN", {
-    views: [{ state: "frozen", ySplit: 1 }], // Congelar primera fila
+    views: [{ state: "frozen", ySplit: 1, xSplit: 0 }], // Congelar primera fila
+    properties: {
+      defaultColWidth: 12,
+      defaultRowHeight: 15,
+      tabColor: { argb: "FF4472C4" },
+    },
   });
 
   // Definir columnas
@@ -24,6 +38,7 @@ export async function generateExcelFile(
     { header: "NIT Emisor", key: "issuerNit", width: 14 },
     { header: "Razón Social Emisor", key: "issuerName", width: 40 },
     { header: "Fecha de emisión", key: "issueDate", width: 16 },
+    { header: "Forma de pago", key: "paymentMethod", width: 18 },
     { header: "Valor antes", key: "subtotal", width: 15 },
     { header: "Valor IVA (si aplica)", key: "iva", width: 18 },
     { header: "Valor total", key: "total", width: 15 },
@@ -60,6 +75,7 @@ export async function generateExcelFile(
       issuerNit: invoice.issuerNit,
       issuerName: invoice.issuerName,
       issueDate: invoice.issueDate,
+      paymentMethod: invoice.paymentMethod || "N/A",
       subtotal: invoice.subtotal,
       iva: invoice.iva,
       total: invoice.total,
@@ -74,15 +90,18 @@ export async function generateExcelFile(
 
     const row = worksheet.addRow(rowData);
 
-    // Formato de celdas numéricas
+    // Formato de celdas numéricas - usar formato estándar compatible con Excel y Sheets
     const subtotalCell = row.getCell("subtotal");
-    subtotalCell.numFmt = '"$"#,##0.00';
+    subtotalCell.numFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+    subtotalCell.value = typeof invoice.subtotal === "number" ? invoice.subtotal : 0;
 
     const ivaCell = row.getCell("iva");
-    ivaCell.numFmt = '"$"#,##0.00';
+    ivaCell.numFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+    ivaCell.value = typeof invoice.iva === "number" ? invoice.iva : 0;
 
     const totalCell = row.getCell("total");
-    totalCell.numFmt = '"$"#,##0.00';
+    totalCell.numFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+    totalCell.value = typeof invoice.total === "number" ? invoice.total : 0;
 
     // Hipervínculo en columna Drive
     if (includeDriveColumn && invoice.driveUrl && !invoice.driveUrl.includes("ERROR")) {
@@ -110,8 +129,8 @@ export async function generateExcelFile(
   });
 
   // Formato condicional para CUFEs duplicados (excluyendo "N/A")
-  // Columna CUFE: con Drive es L, sin Drive es K
-  const cufeColLetter = includeDriveColumn ? "L" : "K";
+  // Columna CUFE: con Drive es M, sin Drive es L (se agregó columna Forma de pago)
+  const cufeColLetter = includeDriveColumn ? "M" : "L";
   const lastRow = worksheet.rowCount;
 
   if (lastRow > 1) {
@@ -159,7 +178,12 @@ export async function generateExcelFile(
 
   // Hoja 2: Detallado por concepto/línea
   const detailedSheet = workbook.addWorksheet("Detallado", {
-    views: [{ state: "frozen", ySplit: 1 }],
+    views: [{ state: "frozen", ySplit: 1, xSplit: 0 }],
+    properties: {
+      defaultColWidth: 12,
+      defaultRowHeight: 15,
+      tabColor: { argb: "FF70AD47" },
+    },
   });
 
   detailedSheet.columns = [
@@ -213,14 +237,18 @@ export async function generateExcelFile(
       };
       docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
 
-      row.getCell("unitPrice").numFmt = '"$"#,##0.00';
-      row.getCell("discount").numFmt = '"$"#,##0.00';
-      row.getCell("surcharge").numFmt = '"$"#,##0.00';
-      row.getCell("ivaAmount").numFmt = '"$"#,##0.00';
-      row.getCell("incAmount").numFmt = '"$"#,##0.00';
-      row.getCell("totalUnitPrice").numFmt = '"$"#,##0.00';
-      row.getCell("ivaPercent").numFmt = '0.00';
-      row.getCell("incPercent").numFmt = '0.00';
+      // Formato numérico compatible con Excel y Sheets
+      const currencyFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+      const percentFmt = '0.00"%"';
+      
+      row.getCell("unitPrice").numFmt = currencyFmt;
+      row.getCell("discount").numFmt = currencyFmt;
+      row.getCell("surcharge").numFmt = currencyFmt;
+      row.getCell("ivaAmount").numFmt = currencyFmt;
+      row.getCell("incAmount").numFmt = currencyFmt;
+      row.getCell("totalUnitPrice").numFmt = currencyFmt;
+      row.getCell("ivaPercent").numFmt = percentFmt;
+      row.getCell("incPercent").numFmt = percentFmt;
 
       row.alignment = { vertical: "middle", wrapText: true };
     });
@@ -244,8 +272,11 @@ export async function generateExcelFile(
     }
   }
 
-  // Guardar archivo
-  await workbook.xlsx.writeFile(outputPath);
+  // Guardar archivo con opciones para mejor compatibilidad
+  await workbook.xlsx.writeFile(outputPath, {
+    useStyles: true,
+    useSharedStrings: true,
+  });
 }
 
 /**
