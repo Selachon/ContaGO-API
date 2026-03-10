@@ -1,6 +1,6 @@
 import puppeteer, { Browser, Page, Cookie } from "puppeteer";
 import fs from "fs";
-import type { DocumentInfo, ProgressData } from "../types/dian.js";
+import type { DocumentInfo, ProgressData, DocumentDirection } from "../types/dian.js";
 
 // Estado de progreso compartido entre scraper y rutas de consulta.
 export const progressTracker: Map<string, ProgressData> = new Map();
@@ -10,6 +10,15 @@ interface ExtractionResult {
   cookies: Record<string, string>;
 }
 
+interface ExtractOptions {
+  tokenUrl: string;
+  startDate?: string;
+  endDate?: string;
+  progressUid?: string;
+  /** Tipo de documentos: "received" (recibidos) o "sent" (emitidos). Default: "received" */
+  documentDirection?: DocumentDirection;
+}
+
 /**
  * Extrae ids de documentos DIAN y cookies de sesion para descargas posteriores.
  */
@@ -17,8 +26,12 @@ export async function extractDocumentIds(
   tokenUrl: string,
   startDate: string | undefined,
   endDate: string | undefined,
-  progressUid?: string
+  progressUid?: string,
+  documentDirection: DocumentDirection = "received"
 ): Promise<ExtractionResult> {
+  const direction = documentDirection || "received";
+  const isSent = direction === "sent";
+  const directionLabel = isSent ? "emitidos" : "recibidos";
   const updateProgress = (data: Partial<ProgressData>) => {
     if (progressUid) {
       const current = progressTracker.get(progressUid) || { step: "", current: 0, total: 0 };
@@ -40,6 +53,10 @@ export async function extractDocumentIds(
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--no-first-run",
       ],
       executablePath: executablePath || undefined,
     });
@@ -47,20 +64,34 @@ export async function extractDocumentIds(
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Timeout alto para ambientes con latencia variable.
-    page.setDefaultTimeout(60000);
+    // Timeout alto para ambientes con latencia variable (2 minutos).
+    page.setDefaultTimeout(120000);
+    page.setDefaultNavigationTimeout(120000);
 
-    // 1) Acceso inicial con token_url.
+    // 1) Acceso inicial con token_url (con reintentos).
     updateProgress({ step: "Accediendo con token..." });
-    await page.goto(tokenUrl, { waitUntil: "networkidle2" });
+    await navigateWithRetry(page, tokenUrl, 3);
     await delay(1000);
 
-    // 2) Navegar al listado de documentos recibidos.
-    updateProgress({ step: "Navegando a documentos recibidos..." });
-    await page.goto("https://catalogo-vpfe.dian.gov.co/Document/Received", {
-      waitUntil: "networkidle2",
-    });
+    // Verificar si el token expiró (redirige a página de login)
+    const currentUrl = page.url();
+    if (isLoginPage(currentUrl)) {
+      throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
+
+    // 2) Navegar al listado de documentos (con reintentos).
+    const documentUrl = isSent 
+      ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+      : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+    updateProgress({ step: `Navegando a documentos ${directionLabel}...` });
+    await navigateWithRetry(page, documentUrl, 3);
     await delay(600);
+
+    // Verificar nuevamente si redirigió a login (sesión inválida)
+    const urlAfterNav = page.url();
+    if (isLoginPage(urlAfterNav)) {
+      throw new Error("TOKEN_EXPIRED: La sesión ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
 
     updateProgress({ step: "Extrayendo lista (iniciando)...", current: 0, total: 0 });
 
@@ -111,10 +142,16 @@ export async function extractDocumentIds(
 
     while (true) {
       pageIndex++;
+      
+      // Mensaje descriptivo que muestra cantidad encontrada
+      const progressMsg = allDocuments.length > 0
+        ? `Extrayendo documentos... ${allDocuments.length} encontrados`
+        : `Extrayendo documentos (página ${pageIndex})...`;
+      
       updateProgress({
-        step: `Extrayendo lista (página ${pageIndex})...`,
+        step: progressMsg,
         current: allDocuments.length,
-        total: expectedTotal || Math.max(allDocuments.length + 5, 10),
+        total: expectedTotal || Math.max(allDocuments.length + 50, 100),
       });
 
       await delay(500);
@@ -133,10 +170,13 @@ export async function extractDocumentIds(
       }
 
       // Extrae ids desde selectores alternos por variaciones de DIAN.
-      const newDocs = await extractDocsFromPage(page, seenIds);
+      const newDocs = await extractDocsFromPage(page, seenIds, isSent);
       allDocuments.push(...newDocs);
 
+      // Actualizar progreso inmediatamente después de extraer
+      const updatedMsg = `Extrayendo documentos... ${allDocuments.length} encontrados`;
       updateProgress({
+        step: updatedMsg,
         current: allDocuments.length,
         total: expectedTotal || allDocuments.length,
       });
@@ -369,21 +409,70 @@ async function setPageLength(page: Page, length: number): Promise<void> {
       }, length);
     }
   } catch (err) {
-    console.error("Error cambiando a 100 registros:", err);
+    // Errores de contexto destruido son comunes cuando la página recarga
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes("context") || errMsg.includes("Context") || errMsg.includes("detached")) {
+      console.log("Contexto cambiado durante setPageLength, esperando estabilización...");
+      await delay(2000);
+    } else {
+      console.warn("Error cambiando longitud de página:", errMsg.substring(0, 100));
+    }
   }
 }
 
-async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<DocumentInfo[]> {
+// Tipos de documento que deben ser ignorados siempre (no son facturas reales)
+const IGNORED_DOC_TYPES = [
+  "application response",
+  "applicationresponse",
+  "app response",
+  "respuesta de aplicación",
+  "respuesta aplicación",
+];
+
+// Tipos de documento adicionales que deben ser ignorados solo para documentos emitidos
+const IGNORED_DOC_TYPES_SENT_ONLY = [
+  "nomina individual",
+  "nómina individual",
+];
+
+function shouldIgnoreDocType(docType: string, isSentDocuments: boolean = false): boolean {
+  const normalized = docType.toLowerCase().trim();
+  
+  // Siempre ignorar estos tipos
+  if (IGNORED_DOC_TYPES.some(ignored => normalized.includes(ignored))) {
+    return true;
+  }
+  
+  // Para documentos emitidos, también ignorar nóminas
+  if (isSentDocuments && IGNORED_DOC_TYPES_SENT_ONLY.some(ignored => normalized.includes(ignored))) {
+    return true;
+  }
+  
+  return false;
+}
+
+async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocuments: boolean = false): Promise<DocumentInfo[]> {
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate(() => {
-    const results: Array<{ id: string; docnum: string; nit: string }> = [];
+    const results: Array<{
+      id: string;
+      docnum: string;
+      nit: string;
+      docType: string;
+      documentTypeId?: string;
+      fechaValidacion?: string;
+      fechaGeneracion?: string;
+    }> = [];
     
     // Excluye la fila placeholder de DataTables.
     const rows = document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)");
     
     for (const row of rows) {
       let trackId: string | null = null;
+      let documentTypeId: string | undefined;
+      let fechaValidacion: string | undefined;
+      let fechaGeneracion: string | undefined;
       
       // Metodo 1: botones/enlaces de descarga en la fila.
       const downloadElements = row.querySelectorAll(
@@ -398,6 +487,14 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
                   el.getAttribute("data-trackid") || 
                   el.getAttribute("data-id") ||
                   el.getAttribute("data-track-id");
+        
+        // Extraer atributos adicionales para documentos equivalentes POS
+        if (el.classList.contains("download-equivalente-document")) {
+          documentTypeId = el.getAttribute("documentypeid") || el.getAttribute("documenttypeid") || undefined;
+          // emissiondate es la fecha de validación, generationdate es la fecha de generación
+          fechaValidacion = el.getAttribute("emissiondate") || undefined;
+          fechaGeneracion = el.getAttribute("generationdate") || undefined;
+        }
         
         if (!trackId) {
           const href = el.getAttribute("href") || "";
@@ -440,22 +537,45 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>): Promise<Do
       
       if (!trackId) continue;
       
-      // Columnas esperadas de numero de documento y NIT.
+      // Columnas de la tabla DIAN (verificado):
+      // 0: checkbox, 1: Recepción, 2: Fecha, 3: Prefijo, 4: Nº documento,
+      // 5: Tipo, 6: NIT Emisor, 7: Emisor, 8: NIT Receptor, 9: Receptor, etc.
       const tds = row.querySelectorAll("td");
       const docnum = tds[4]?.textContent?.trim() || "";
+      const docType = tds[5]?.textContent?.trim() || "";
       const nit = tds[6]?.textContent?.trim() || "";
 
-      results.push({ id: trackId, docnum, nit });
+      results.push({ id: trackId, docnum, nit, docType, documentTypeId, fechaValidacion, fechaGeneracion });
     }
 
     return results;
   });
 
+  let skippedCount = 0;
+  
   for (const item of items) {
     if (!seenIds.has(item.id)) {
+      // Filtrar Application Response y otros tipos no relevantes
+      if (shouldIgnoreDocType(item.docType, isSentDocuments)) {
+        skippedCount++;
+        continue;
+      }
+      
       seenIds.add(item.id);
-      docs.push(item);
+      docs.push({
+        id: item.id,
+        docnum: item.docnum,
+        nit: item.nit,
+        docType: item.docType,
+        documentTypeId: item.documentTypeId,
+        fechaValidacion: item.fechaValidacion,
+        fechaGeneracion: item.fechaGeneracion,
+      });
     }
+  }
+  
+  if (skippedCount > 0) {
+    console.log(`  -> Omitidos ${skippedCount} documentos tipo "Application Response"`);
   }
 
   return docs;
@@ -570,4 +690,95 @@ async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<voi
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Verifica si la URL actual es la página de login de DIAN.
+ * Esto indica que el token expiró o la sesión es inválida.
+ */
+function isLoginPage(url: string): boolean {
+  const loginIndicators = [
+    "/Account/Login",
+    "/User/Login", 
+    "/auth/login",
+    "login.microsoftonline.com",
+    "login.live.com",
+  ];
+  
+  const lowerUrl = url.toLowerCase();
+  return loginIndicators.some(indicator => lowerUrl.includes(indicator.toLowerCase()));
+}
+
+/**
+ * Navega a una URL con reintentos y diferentes estrategias de espera.
+ * Estrategia progresiva: domcontentloaded → load → networkidle2
+ */
+async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3): Promise<void> {
+  let lastError: Error | null = null;
+  
+  // Estrategias de espera progresivas (de más rápido a más robusto)
+  const strategies: Array<{ waitUntil: "domcontentloaded" | "load" | "networkidle2"; timeout: number }> = [
+    { waitUntil: "domcontentloaded", timeout: 60000 },
+    { waitUntil: "load", timeout: 90000 },
+    { waitUntil: "networkidle2", timeout: 120000 },
+  ];
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const strategy = strategies[Math.min(attempt - 1, strategies.length - 1)];
+    
+    try {
+      console.log(`Navegación intento ${attempt}/${maxRetries} (${strategy.waitUntil}, ${strategy.timeout/1000}s): ${url.substring(0, 60)}...`);
+      
+      await page.goto(url, { 
+        waitUntil: strategy.waitUntil,
+        timeout: strategy.timeout,
+      });
+      
+      // Espera adicional para que scripts asíncronos carguen
+      await delay(1500);
+      
+      console.log(`Navegación exitosa en intento ${attempt}`);
+      return;
+      
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      const isTimeout = lastError.message.includes("timeout") || lastError.message.includes("Timeout");
+      const isContextDestroyed = lastError.message.includes("context") || lastError.message.includes("Context");
+      
+      console.log(`Navegación falló intento ${attempt}: ${lastError.message.substring(0, 100)}`);
+      
+      // Si es error de contexto destruido, la página puede haber cargado parcialmente
+      if (isContextDestroyed) {
+        console.log("Contexto destruido - verificando si la página cargó...");
+        await delay(2000);
+        
+        // Intentar verificar si estamos en una página válida
+        try {
+          const currentUrl = page.url();
+          if (currentUrl && !currentUrl.includes("about:blank")) {
+            console.log(`Página cargada parcialmente: ${currentUrl.substring(0, 60)}`);
+            return; // Considerar como éxito parcial
+          }
+        } catch {
+          // Ignorar errores de verificación
+        }
+      }
+      
+      // Si es timeout, esperar más antes de reintentar
+      if (isTimeout) {
+        console.log(`Timeout detectado, esperando ${3 + attempt}s antes de reintentar...`);
+        await delay(3000 + attempt * 1000);
+      } else {
+        await delay(2000);
+      }
+    }
+  }
+  
+  // Si todos los intentos fallaron, lanzar error descriptivo
+  const errorMsg = lastError?.message || "Error desconocido";
+  if (errorMsg.includes("timeout") || errorMsg.includes("Timeout")) {
+    throw new Error(`NAVIGATION_TIMEOUT: No se pudo conectar con DIAN después de ${maxRetries} intentos. El servidor puede estar lento o no disponible. Por favor, intenta de nuevo en unos minutos.`);
+  }
+  
+  throw lastError || new Error(`Navegación falló después de ${maxRetries} intentos`);
 }

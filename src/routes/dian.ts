@@ -10,9 +10,22 @@ import { extractDocumentIds, progressTracker } from "../services/dianScraper.js"
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
 import { requireAuth } from "../middleware/auth.js";
+import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserNits } from "../services/database.js";
 import type { DownloadRequest, ProgressData } from "../types/dian.js";
+
+// Magic bytes para validar que un archivo es realmente un PDF
+const PDF_MAGIC_BYTES = Buffer.from([0x25, 0x50, 0x44, 0x46]); // %PDF
+
+/**
+ * Valida que un buffer contenga un PDF real verificando los magic bytes.
+ * Algunos archivos de DIAN tienen extensión .pdf pero son XMLs o HTMLs de error.
+ */
+function isValidPdfBuffer(buffer: Buffer): boolean {
+  if (!buffer || buffer.length < 4) return false;
+  return buffer.subarray(0, 4).equals(PDF_MAGIC_BYTES);
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
@@ -30,6 +43,7 @@ if (!fs.existsSync(DOWNLOADS_DIR)) {
 }
 
 const router = Router();
+const DIAN_DOWNLOADER_TOOL_ID = "dian-downloader";
 
 // Estado en memoria de jobs asincronos de descarga.
 interface JobData {
@@ -60,6 +74,9 @@ router.use((req, res, next) => {
   }
   requireAuth(req, res, next);
 });
+
+// Exige compra de herramienta (o admin) para usar descarga masiva.
+router.use(requireToolAccess(DIAN_DOWNLOADER_TOOL_ID));
 
 // Limpieza periodica de progreso y jobs vencidos por TTL.
 const PROGRESS_TTL_MS = 15 * 60 * 1000;
@@ -275,7 +292,10 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
 // Crea un job asincrono y devuelve jobId de inmediato.
 router.post("/download-documents", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as DownloadRequest;
-  const { token_url, start_date, end_date, session_uid, consolidate_pdf } = body;
+  const { token_url, start_date, end_date, session_uid, consolidate_pdf, include_pdf_folder, document_direction } = body;
+  
+  // Validar document_direction si se proporciona
+  const direction = document_direction === "sent" ? "sent" : "received";
 
   // Se valida formato para evitar errores en filtros de DIAN.
   if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
@@ -345,7 +365,7 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   });
 
   // No usar await para no retener la conexion HTTP.
-  processDownloadJob(jobId, token_url, start_date, end_date, consolidate_pdf).catch((err) => {
+  processDownloadJob(jobId, token_url, start_date, end_date, consolidate_pdf, include_pdf_folder, direction).catch((err) => {
     console.error(`Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
@@ -362,12 +382,16 @@ async function processDownloadJob(
   token_url: string,
   start_date: string | undefined,
   end_date: string | undefined,
-  consolidate_pdf: boolean | undefined
+  consolidate_pdf: boolean | undefined,
+  include_pdf_folder: boolean | undefined,
+  documentDirection: "received" | "sent" = "received"
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
 
   job.status = "processing";
+  const isSentDocs = documentDirection === "sent";
+  const directionLabel = isSentDocs ? "emitidos" : "recibidos";
   
   const sessionDir = uuidv4();
   const tempDir = path.join(DOWNLOADS_DIR, sessionDir);
@@ -385,8 +409,8 @@ async function processDownloadJob(
     }
 
     // Paso 1: obtener ids y cookies de sesion DIAN.
-    setProgress(jobId, { step: "Extrayendo lista de documentos...", current: 0, total: 1 });
-    const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, jobId);
+    setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
+    const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, jobId, documentDirection);
 
     // Checkpoint tras la operacion mas costosa del scraper.
     if (isJobCancelled(jobId)) {
@@ -414,8 +438,10 @@ async function processDownloadJob(
     // Carpeta temporal por job para aislar artefactos.
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // Descarga individual por documento, con tolerancia a errores parciales.
-    const baseUrl = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
+    // URLs base para diferentes tipos de documentos DIAN
+    const baseUrlNormal = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
+    const baseUrlEquivalente = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId=";
+    
     const usedNames = new Set<string>();
     let successCount = 0;
     let errorCount = 0;
@@ -449,7 +475,23 @@ async function processDownloadJob(
           total: totalDocs,
         });
 
-        await downloadFile(baseUrl + docId, destPath, cookies);
+        // Construir URL según tipo de documento
+        let downloadUrl: string;
+        const isEquivalente = doc.documentTypeId === "20" || 
+                              doc.docType?.toLowerCase().includes("equivalente") ||
+                              doc.docType?.toLowerCase().includes("pos");
+        
+        if (isEquivalente && doc.fechaValidacion && doc.fechaGeneracion) {
+          // Documentos equivalentes POS requieren endpoint especial con fechas
+          downloadUrl = `${baseUrlEquivalente}${docId}&documentTypeId=${doc.documentTypeId || "20"}&FechaValidacionDIAN=${doc.fechaValidacion}&FechaGeneracionDIAN=${doc.fechaGeneracion}`;
+          console.log(`[${jobId}] Descargando doc ${i + 1}/${totalDocs} (equivalente): id=${docId.slice(0, 16)}..., tipo=${doc.docType}`);
+        } else {
+          // Facturas electrónicas normales
+          downloadUrl = `${baseUrlNormal}${docId}`;
+          console.log(`[${jobId}] Descargando doc ${i + 1}/${totalDocs}: id=${docId.slice(0, 16)}..., tipo=${doc.docType}`);
+        }
+        
+        await downloadFile(downloadUrl, destPath, cookies);
         successCount++;
         console.log(`[${jobId}] Descargado ${i + 1}/${totalDocs}: ${filename}`);
       } catch (err) {
@@ -478,7 +520,8 @@ async function processDownloadJob(
     // Nombre de salida legible para el usuario.
     const startLabel = formatSpanishLabel(start_date) || "Desde";
     const endLabel = formatSpanishLabel(end_date) || "Hasta";
-    const zipName = `${startLabel} - ${endLabel}.zip`;
+    const typePrefix = isSentDocs ? "Emitidos" : "Recibidos";
+    const zipName = `${typePrefix} ${startLabel} - ${endLabel}.zip`;
 
     // Consolidacion opcional: agrega un PDF combinado sin eliminar los ZIP individuales.
     if (consolidate_pdf && !isJobCancelled(jobId)) {
@@ -517,18 +560,25 @@ async function processDownloadJob(
 
           for (const pdfName of pdfEntries) {
             const pdfBuffer = await zip.files[pdfName].async("nodebuffer");
-            allPdfBuffers.push({ name: `${zipFiles[z]}/${pdfName}`, buffer: pdfBuffer });
+            
+            // Validar que el archivo sea realmente un PDF (algunos tienen extensión .pdf pero son XMLs/HTMLs)
+            if (isValidPdfBuffer(pdfBuffer)) {
+              allPdfBuffers.push({ name: `${zipFiles[z]}/${pdfName}`, buffer: pdfBuffer });
+            } else {
+              console.warn(`[${jobId}] Archivo ${zipFiles[z]}/${pdfName} no es un PDF válido (magic bytes incorrectos), omitiendo`);
+            }
           }
         }
 
         if (allPdfBuffers.length > 0 && !isJobCancelled(jobId)) {
           setProgress(jobId, {
-            step: `Combinando ${allPdfBuffers.length} PDFs en uno solo...`,
+            step: `Combinando ${allPdfBuffers.length} PDFs válidos en uno solo...`,
             current: 0,
             total: allPdfBuffers.length,
           });
 
           const mergedPdf = await PDFDocument.create();
+          let skippedCount = 0;
 
           for (let p = 0; p < allPdfBuffers.length; p++) {
             // Checkpoint cada 10 PDFs para balancear costo y capacidad de cancelacion.
@@ -553,8 +603,14 @@ async function processDownloadJob(
                 mergedPdf.addPage(page);
               }
             } catch (pdfErr) {
-              console.error(`No se pudo agregar PDF: ${allPdfBuffers[p].name}`, pdfErr);
+              skippedCount++;
+              // Log menos verboso para no saturar los logs en producción
+              console.warn(`[${jobId}] PDF inválido omitido: ${allPdfBuffers[p].name}`);
             }
+          }
+          
+          if (skippedCount > 0) {
+            console.log(`[${jobId}] Se omitieron ${skippedCount} PDFs inválidos durante la consolidación`);
           }
 
           const consolidatedName = `Consolidado ${startLabel} - ${endLabel}.pdf`;
@@ -568,6 +624,65 @@ async function processDownloadJob(
       } catch (consolidateErr) {
         console.error(`[${jobId}] Error durante la consolidación:`, consolidateErr);
         // La consolidacion es opcional; fallar aqui no invalida el ZIP final.
+      }
+    }
+
+    // Carpeta opcional con PDFs individuales nombrados como NIT - NumFactura.pdf
+    if (include_pdf_folder && !isJobCancelled(jobId)) {
+      try {
+        setProgress(jobId, {
+          step: "Creando carpeta de PDFs individuales...",
+          current: 0,
+          total: 1,
+        });
+
+        const pdfFolderPath = path.join(tempDir, "PDFs");
+        fs.mkdirSync(pdfFolderPath, { recursive: true });
+
+        const zipFiles = fs.readdirSync(tempDir).filter((f) => f.endsWith(".zip"));
+        let extractedCount = 0;
+
+        for (let z = 0; z < zipFiles.length; z++) {
+          if (isJobCancelled(jobId)) {
+            console.log(`[${jobId}] Job cancelado durante extracción de PDFs individuales`);
+            try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+            return;
+          }
+
+          setProgress(jobId, {
+            step: `Extrayendo PDF ${z + 1} de ${zipFiles.length} a carpeta PDFs...`,
+            current: z + 1,
+            total: zipFiles.length,
+          });
+
+          const zipFileName = zipFiles[z];
+          const zipFilePath = path.join(tempDir, zipFileName);
+          const zipData = fs.readFileSync(zipFilePath);
+          const zip = await JSZip.loadAsync(zipData);
+
+          const pdfEntries = Object.keys(zip.files).filter(
+            (name) => name.toLowerCase().endsWith(".pdf") && !zip.files[name].dir
+          );
+
+          for (const pdfName of pdfEntries) {
+            const pdfBuffer = await zip.files[pdfName].async("nodebuffer");
+
+            if (isValidPdfBuffer(pdfBuffer)) {
+              // Usar el nombre del ZIP (NIT - NumFactura.zip) como base para el PDF
+              const baseName = zipFileName.replace(/\.zip$/i, "");
+              const pdfFileName = `${baseName}.pdf`;
+              const pdfDestPath = path.join(pdfFolderPath, pdfFileName);
+
+              fs.writeFileSync(pdfDestPath, pdfBuffer);
+              extractedCount++;
+            }
+          }
+        }
+
+        console.log(`[${jobId}] Carpeta PDFs creada con ${extractedCount} archivos`);
+      } catch (pdfFolderErr) {
+        console.error(`[${jobId}] Error creando carpeta PDFs:`, pdfFolderErr);
+        // La carpeta PDFs es opcional; fallar aqui no invalida el ZIP final.
       }
     }
 

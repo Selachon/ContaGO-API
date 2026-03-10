@@ -2,7 +2,7 @@ import ExcelJS from "exceljs";
 import type { InvoiceData } from "../types/dianExcel.js";
 
 /**
- * Convierte un número de columna (1-indexed) a letra de Excel
+ * Convierte un numero de columna (1-indexed) a letra de Excel
  * Ej: 1 -> A, 26 -> Z, 27 -> AA
  */
 function getExcelColumnLetter(colNum: number): string {
@@ -17,7 +17,7 @@ function getExcelColumnLetter(colNum: number): string {
 }
 
 /**
- * Recolecta todos los tipos de impuestos únicos de todas las facturas
+ * Recolecta todos los tipos de impuestos unicos de todas las facturas
  * IVA siempre se incluye aunque ninguna factura lo tenga
  */
 function collectAllTaxTypes(invoices: InvoiceData[]): string[] {
@@ -34,7 +34,7 @@ function collectAllTaxTypes(invoices: InvoiceData[]): string[] {
       }
     }
 
-    // Impuestos a nivel de línea
+    // Impuestos a nivel de linea
     for (const line of invoice.lineItems || []) {
       for (const tax of line.taxes || []) {
         if (tax.taxName && tax.taxName !== "IVA") {
@@ -44,7 +44,7 @@ function collectAllTaxTypes(invoices: InvoiceData[]): string[] {
     }
   }
 
-  // Ordenar: IVA primero, luego INC, luego Bolsas, luego el resto alfabéticamente
+  // Ordenar: IVA primero, luego INC, luego Bolsas, luego el resto alfabeticamente
   const priority = ["IVA", "INC", "Bolsas", "ICUI", "IC"];
   const sortedTaxTypes = Array.from(taxTypesSet).sort((a, b) => {
     const aIdx = priority.indexOf(a);
@@ -59,7 +59,7 @@ function collectAllTaxTypes(invoices: InvoiceData[]): string[] {
 }
 
 /**
- * Ordena las facturas por fecha de emisión en orden ascendente
+ * Ordena las facturas por fecha de emision en orden ascendente
  */
 function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
   return [...invoices].sort((a, b) => {
@@ -71,41 +71,66 @@ function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
 
 /**
  * Genera archivo Excel con los datos de las facturas
+ * @param invoices - Lista de facturas a exportar
+ * @param outputPath - Ruta donde guardar el archivo
+ * @param includeDriveColumn - Si incluir columna de enlace a Drive
+ * @param isSentDocuments - Si son documentos emitidos (muestra receptor en lugar de emisor)
  */
 export async function generateExcelFile(
   invoices: InvoiceData[],
   outputPath: string,
-  includeDriveColumn: boolean
+  includeDriveColumn: boolean,
+  isSentDocuments: boolean = false
 ): Promise<void> {
   const workbook = new ExcelJS.Workbook();
+  
+  // Propiedades del workbook para mejor compatibilidad con Excel y Sheets
   workbook.creator = "ContaGO";
   workbook.created = new Date();
+  workbook.modified = new Date();
+  workbook.lastPrinted = new Date();
+  
+  // Establecer propiedades de calculo para compatibilidad
+  workbook.calcProperties = {
+    fullCalcOnLoad: true,
+  };
 
-  // Ordenar facturas por fecha de emisión ascendente
+  // Ordenar facturas por fecha de emision ascendente
   const sortedInvoices = sortInvoicesByDate(invoices);
 
   // Recolectar todos los tipos de impuestos
   const allTaxTypes = collectAllTaxTypes(sortedInvoices);
 
-  const worksheet = workbook.addWorksheet("Facturas DIAN", {
-    views: [{ state: "frozen", ySplit: 1 }], // Congelar primera fila
+  // Nombre de la hoja segun el tipo de documentos
+  const sheetName = isSentDocuments ? "Facturas Emitidas" : "Facturas DIAN";
+  
+  const worksheet = workbook.addWorksheet(sheetName, {
+    views: [{ state: "frozen", ySplit: 1, xSplit: 0 }], // Congelar primera fila
+    properties: {
+      defaultColWidth: 12,
+      defaultRowHeight: 15,
+      tabColor: { argb: "FF4472C4" },
+    },
   });
 
-  // Definir columnas base según la nueva plantilla
+  // Definir columnas - Para emitidos mostramos el receptor, para recibidos el emisor
+  const partyLabel = isSentDocuments ? "Receptor" : "Emisor";
+  
   const columns: Partial<ExcelJS.Column>[] = [
     { header: "ID", key: "id", width: 6 },
     { header: "Tipo de documento", key: "documentType", width: 18 },
-    { header: "Número Factura", key: "docNumber", width: 20 },
-    { header: "NIT Emisor", key: "issuerNit", width: 14 },
-    { header: "Razón Social Emisor", key: "issuerName", width: 40 },
-    { header: "Fecha de emisión", key: "issueDate", width: 16 },
+    { header: "Numero Factura", key: "docNumber", width: 20 },
+    { header: `NIT ${partyLabel}`, key: "partyNit", width: 14 },
+    { header: `Razon Social ${partyLabel}`, key: "partyName", width: 40 },
+    { header: "Fecha de emision", key: "issueDate", width: 16 },
     { header: "Concepto", key: "concepts", width: 55 },
+    { header: "Forma de pago", key: "paymentMethod", width: 18 },
     { header: "Subtotal antes de impuestos", key: "subtotal", width: 22 },
     { header: "Descuento detalle", key: "discount", width: 16 },
     { header: "Recargo detalle", key: "surcharge", width: 16 },
   ];
 
-  // Agregar columnas dinámicas de impuestos (Valor X)
+  // Agregar columnas dinamicas de impuestos (Valor X)
   for (const taxType of allTaxTypes) {
     columns.push({
       header: `Valor ${taxType}`,
@@ -140,26 +165,34 @@ export async function generateExcelFile(
   headerRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   headerRow.height = 25;
 
+  // Formato numerico compatible con Excel y Sheets
+  const currencyFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+
   // Agregar filas de datos (ya ordenadas por fecha)
   sortedInvoices.forEach((invoice, index) => {
+    // Para emitidos, mostramos datos del receptor; para recibidos, del emisor
+    const partyNit = isSentDocuments ? invoice.receiverNit : invoice.issuerNit;
+    const partyName = isSentDocuments ? invoice.receiverName : invoice.issuerName;
+    
     const rowData: Record<string, unknown> = {
       id: index + 1, // ID basado en orden por fecha
       documentType: invoice.documentType,
       docNumber: invoice.docNumber,
-      issuerNit: invoice.issuerNit,
-      issuerName: invoice.issuerName,
+      partyNit,
+      partyName,
       issueDate: invoice.issueDate,
       concepts: invoice.concepts,
+      paymentMethod: invoice.paymentMethod || "N/A",
       subtotal: invoice.subtotal,
       discount: invoice.discount || 0,
       surcharge: invoice.surcharge || 0,
-      globalDiscount: 0, // Por ahora 0, se puede expandir si se necesita
+      globalDiscount: 0,
       globalSurcharge: 0,
       total: invoice.total,
       cufe: invoice.cufe,
     };
 
-    // Agregar valores de impuestos dinámicos
+    // Agregar valores de impuestos dinamicos
     for (const taxType of allTaxTypes) {
       const tax = (invoice.taxes || []).find(t => t.taxName === taxType);
       rowData[`tax_${taxType}`] = tax ? tax.amount : 0;
@@ -171,26 +204,28 @@ export async function generateExcelFile(
 
     const row = worksheet.addRow(rowData);
 
-    // Formato de celdas numéricas
+    // Formato de celdas numericas
     const subtotalCell = row.getCell("subtotal");
-    subtotalCell.numFmt = '"$"#,##0.00';
+    subtotalCell.numFmt = currencyFmt;
+    subtotalCell.value = typeof invoice.subtotal === "number" ? invoice.subtotal : 0;
 
-    row.getCell("discount").numFmt = '"$"#,##0.00';
-    row.getCell("surcharge").numFmt = '"$"#,##0.00';
+    row.getCell("discount").numFmt = currencyFmt;
+    row.getCell("surcharge").numFmt = currencyFmt;
 
-    // Formato para columnas de impuestos dinámicos
+    // Formato para columnas de impuestos dinamicos
     for (const taxType of allTaxTypes) {
       const taxCell = row.getCell(`tax_${taxType}`);
-      taxCell.numFmt = '"$"#,##0.00';
+      taxCell.numFmt = currencyFmt;
     }
 
-    row.getCell("globalDiscount").numFmt = '"$"#,##0.00';
-    row.getCell("globalSurcharge").numFmt = '"$"#,##0.00';
+    row.getCell("globalDiscount").numFmt = currencyFmt;
+    row.getCell("globalSurcharge").numFmt = currencyFmt;
 
     const totalCell = row.getCell("total");
-    totalCell.numFmt = '"$"#,##0.00';
+    totalCell.numFmt = currencyFmt;
+    totalCell.value = typeof invoice.total === "number" ? invoice.total : 0;
 
-    // Hipervínculo en columna Drive
+    // Hipervinculo en columna Drive
     if (includeDriveColumn && invoice.driveUrl && !invoice.driveUrl.includes("ERROR")) {
       const driveCell = row.getCell("driveUrl");
       driveCell.value = {
@@ -216,7 +251,6 @@ export async function generateExcelFile(
   });
 
   // Formato condicional para CUFEs duplicados (excluyendo "N/A")
-  // Columna CUFE es la última columna
   const lastRow = worksheet.rowCount;
   const cufeColIndex = columns.length;
   const cufeColLetter = getExcelColumnLetter(cufeColIndex);
@@ -245,7 +279,7 @@ export async function generateExcelFile(
     });
   }
 
-  // Agregar filtros automáticos
+  // Agregar filtros automaticos
   worksheet.autoFilter = {
     from: { row: 1, column: 1 },
     to: { row: lastRow, column: columns.length },
@@ -264,15 +298,20 @@ export async function generateExcelFile(
     }
   }
 
-  // Hoja 2: Detallado por concepto/línea
+  // Hoja 2: Detallado por concepto/linea
   const detailedSheet = workbook.addWorksheet("Detallado", {
-    views: [{ state: "frozen", ySplit: 1 }],
+    views: [{ state: "frozen", ySplit: 1, xSplit: 0 }],
+    properties: {
+      defaultColWidth: 12,
+      defaultRowHeight: 15,
+      tabColor: { argb: "FF70AD47" },
+    },
   });
 
   // Columnas base para la hoja detallada
   const detailedColumns: Partial<ExcelJS.Column>[] = [
     { header: "Item", key: "lineNumber", width: 8 },
-    { header: "Número Factura", key: "docNumber", width: 20 },
+    { header: "Numero Factura", key: "docNumber", width: 20 },
     { header: "Concepto", key: "description", width: 55 },
     { header: "Cantidad", key: "quantity", width: 12 },
     { header: "Base del impuesto", key: "totalUnitPrice", width: 18 },
@@ -280,7 +319,7 @@ export async function generateExcelFile(
     { header: "Recargo detalle", key: "surcharge", width: 16 },
   ];
 
-  // Agregar columnas dinámicas de impuestos (Valor y %)
+  // Agregar columnas dinamicas de impuestos (Valor y %)
   for (const taxType of allTaxTypes) {
     detailedColumns.push(
       { header: taxType, key: `tax_${taxType}_amount`, width: 14 },
@@ -303,11 +342,13 @@ export async function generateExcelFile(
   detailedHeaderRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   detailedHeaderRow.height = 25;
 
-  // Crear un mapa de docNumber a su fila en la hoja principal (después de ordenar)
+  // Crear un mapa de docNumber a su fila en la hoja principal (despues de ordenar)
   const docNumberToRow = new Map<string, number>();
   sortedInvoices.forEach((invoice, index) => {
     docNumberToRow.set(invoice.docNumber, index + 2);
   });
+
+  const percentFmt = '0.00"%"';
 
   sortedInvoices.forEach((invoice) => {
     const mainSheetRow = docNumberToRow.get(invoice.docNumber) || 2;
@@ -323,7 +364,7 @@ export async function generateExcelFile(
         surcharge: lineItem.surcharge,
       };
 
-      // Agregar valores de impuestos dinámicos por línea
+      // Agregar valores de impuestos dinamicos por linea
       for (const taxType of allTaxTypes) {
         const tax = (lineItem.taxes || []).find(t => t.taxName === taxType);
         rowData[`tax_${taxType}_amount`] = tax ? tax.amount : 0;
@@ -336,26 +377,26 @@ export async function generateExcelFile(
 
       const row = detailedSheet.addRow(rowData);
 
-      // Hipervínculo al número de factura
+      // Hipervinculo al numero de factura
       const docNumberCell = row.getCell("docNumber");
       docNumberCell.value = {
         text: invoice.docNumber,
-        hyperlink: `#'Facturas DIAN'!C${mainSheetRow}`,
+        hyperlink: `#'${sheetName}'!C${mainSheetRow}`,
       };
       docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
 
-      // Formato de celdas numéricas
-      row.getCell("totalUnitPrice").numFmt = '"$"#,##0.00';
-      row.getCell("discount").numFmt = '"$"#,##0.00';
-      row.getCell("surcharge").numFmt = '"$"#,##0.00';
-      row.getCell("unitPriceWithTax").numFmt = '"$"#,##0.00';
+      // Formato de celdas numericas
+      row.getCell("totalUnitPrice").numFmt = currencyFmt;
+      row.getCell("discount").numFmt = currencyFmt;
+      row.getCell("surcharge").numFmt = currencyFmt;
+      row.getCell("unitPriceWithTax").numFmt = currencyFmt;
 
-      // Formato para columnas de impuestos dinámicos
+      // Formato para columnas de impuestos dinamicos
       for (const taxType of allTaxTypes) {
         const amountCell = row.getCell(`tax_${taxType}_amount`);
-        amountCell.numFmt = '"$"#,##0.00';
+        amountCell.numFmt = currencyFmt;
         const percentCell = row.getCell(`tax_${taxType}_percent`);
-        percentCell.numFmt = '0.00';
+        percentCell.numFmt = percentFmt;
       }
 
       row.alignment = { vertical: "middle", wrapText: true };
@@ -380,14 +421,20 @@ export async function generateExcelFile(
     }
   }
 
-  // Guardar archivo
-  await workbook.xlsx.writeFile(outputPath);
+  // Guardar archivo con opciones para mejor compatibilidad
+  await workbook.xlsx.writeFile(outputPath, {
+    useStyles: true,
+    useSharedStrings: true,
+  });
 }
 
 /**
  * Genera nombre de archivo Excel basado en rango de fechas
+ * @param startDate - Fecha inicio (YYYY-MM-DD)
+ * @param endDate - Fecha fin (YYYY-MM-DD)
+ * @param prefix - Prefijo del nombre de archivo (default: "Facturas DIAN")
  */
-export function generateExcelFilename(startDate?: string, endDate?: string): string {
+export function generateExcelFilename(startDate?: string, endDate?: string, prefix: string = "Facturas DIAN"): string {
   const formatDate = (date: string): string => {
     const [year, month, day] = date.split("-");
     const months = [
@@ -400,5 +447,5 @@ export function generateExcelFilename(startDate?: string, endDate?: string): str
   const start = startDate ? formatDate(startDate) : "Inicio";
   const end = endDate ? formatDate(endDate) : "Fin";
 
-  return `Facturas DIAN ${start} - ${end}.xlsx`;
+  return `${prefix} ${start} - ${end}.xlsx`;
 }

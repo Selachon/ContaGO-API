@@ -4,6 +4,7 @@ import type { InvoiceData, InvoiceLineItem, TaxDetail } from "../types/dianExcel
 interface DocInfo {
   id: string;
   docnum: string;
+  docType?: string; // Tipo de documento de la tabla DIAN (ej: "Documento soporte", "Factura electrónica")
 }
 
 /**
@@ -33,6 +34,11 @@ export async function extractInvoiceDataFromXml(
     }
 
     const isNotaCredito = !!parsed.CreditNote;
+    
+    // Determinar el tipo de documento:
+    // 1. Si viene de la tabla DIAN (docType), usarlo directamente
+    // 2. Si no, deducirlo del XML (Nota Crédito vs Factura Electrónica)
+    const documentType = docInfo.docType || (isNotaCredito ? "Nota Crédito" : "Factura Electrónica");
 
     // Extraer datos del emisor (AccountingSupplierParty)
     const supplierParty = invoice.AccountingSupplierParty?.Party;
@@ -50,6 +56,7 @@ export async function extractInvoiceDataFromXml(
     const lineItems = extractLineItems(invoice);
     const concepts = extractConcepts(lineItems);
     const cufe = extractCUFE(invoice);
+    const paymentMethod = extractPaymentMethod(invoice);
 
     return {
       issuerNit,
@@ -66,8 +73,9 @@ export async function extractInvoiceDataFromXml(
       surcharge,
       concepts,
       lineItems,
-      documentType: isNotaCredito ? "Nota Crédito" : "Factura Electrónica",
+      documentType,
       cufe,
+      paymentMethod,
       trackId: docInfo.id,
       docNumber: docInfo.docnum,
     };
@@ -90,6 +98,7 @@ export async function extractInvoiceDataFromXml(
       lineItems: [],
       documentType: "N/A",
       cufe: "N/A",
+      paymentMethod: "N/A",
       trackId: docInfo.id,
       docNumber: docInfo.docnum,
       error: (err as Error).message,
@@ -133,22 +142,14 @@ function extractPartyNit(party: any): string {
 }
 
 /**
- * Extrae razón social de un Party (PartyName > Name)
+ * Extrae razón social de un Party (PartyLegalEntity > RegistrationName)
+ * Nota: PartyName > Name contiene el nombre comercial, NO la razón social
  */
 function extractPartyName(party: any): string {
   if (!party) return "N/A";
 
   try {
-    // Ruta principal: PartyName > Name
-    const partyName = party.PartyName;
-    if (partyName) {
-      const name = Array.isArray(partyName) ? partyName[0]?.Name : partyName.Name;
-      if (name) {
-        return cleanText(getText(name));
-      }
-    }
-
-    // Fallback: PartyLegalEntity > RegistrationName
+    // Ruta principal: PartyLegalEntity > RegistrationName (Razón Social)
     const legalEntity = party.PartyLegalEntity;
     if (legalEntity) {
       const entity = Array.isArray(legalEntity) ? legalEntity[0] : legalEntity;
@@ -167,6 +168,15 @@ function extractPartyName(party: any): string {
       const regName = taxScheme?.RegistrationName;
       if (regName) {
         return cleanText(getText(regName));
+      }
+    }
+
+    // Último fallback: PartyName > Name (nombre comercial, solo si no hay razón social)
+    const partyName = party.PartyName;
+    if (partyName) {
+      const name = Array.isArray(partyName) ? partyName[0]?.Name : partyName.Name;
+      if (name) {
+        return cleanText(getText(name));
       }
     }
 
@@ -469,6 +479,57 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
     });
   } catch {
     return [];
+  }
+}
+
+/**
+ * Extrae forma de pago del documento (PaymentMeans > PaymentMeansCode)
+ * Códigos DIAN/UN-EDIFACT
+ */
+function extractPaymentMethod(invoice: any): string {
+  try {
+    const paymentMeans = invoice.PaymentMeans;
+    if (!paymentMeans) return "N/A";
+
+    const paymentArr = Array.isArray(paymentMeans) ? paymentMeans : [paymentMeans];
+    const firstPayment = paymentArr[0];
+
+    if (!firstPayment) return "N/A";
+
+    const paymentCode = getText(firstPayment.PaymentMeansCode);
+    
+    // Mapeo de códigos DIAN/UN-EDIFACT a descripciones
+    const paymentCodeMap: Record<string, string> = {
+      "1": "Contado",
+      "2": "Crédito",
+      "3": "Débito",
+      "10": "Efectivo",
+      "20": "Cheque",
+      "30": "Transferencia crédito",
+      "31": "Transferencia débito",
+      "32": "Transferencia bancaria",
+      "42": "Pago a cuenta bancaria",
+      "47": "Transferencia entre cuentas",
+      "48": "Tarjeta crédito",
+      "49": "Cargo automático",
+      "50": "Giro postal",
+      "60": "Pagaré",
+      "70": "Retiro de caja",
+      "ZZZ": "Otro",
+      "41": "Transferencia electrónica",
+    };
+
+    if (paymentCode && paymentCodeMap[paymentCode]) {
+      return paymentCodeMap[paymentCode];
+    }
+
+    if (paymentCode) {
+      return `Código ${paymentCode}`;
+    }
+
+    return "N/A";
+  } catch {
+    return "N/A";
   }
 }
 

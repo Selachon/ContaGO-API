@@ -2,11 +2,13 @@ import { Router, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import {
   createUser,
+  getUserByIdStrict,
   getUserByEmail,
   getUserNits,
   getUserPurchases,
   verifyPassword,
 } from "../services/database.js";
+import { logAdminAction } from "../services/adminService.js";
 import {
   AUTH_COOKIE_NAME,
   getAuthCookieClearOptions,
@@ -58,6 +60,12 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
   if (!valid) {
     const response: AuthResponse = { ok: false, message: "Credenciales incorrectas" };
     return res.status(401).json(response);
+  }
+
+  // Bloquear login si usuario esta suspendido
+  if (user.status === "suspended") {
+    const response: AuthResponse = { ok: false, message: "Tu cuenta ha sido suspendida. Contacta al administrador." };
+    return res.status(403).json(response);
   }
 
   const payload: JWTPayload = {
@@ -207,7 +215,7 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
   const normalizedNits = Array.isArray(nits)
     ? nits
     : typeof nits === "string"
-      ? [nits]
+      ? nits.split(",")
       : [];
 
   const cleanNits = Array.from(new Set(
@@ -216,6 +224,11 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
       .map((nit) => nit.trim())
       .filter(Boolean)
   ));
+
+  if (cleanNits.length === 0) {
+    const response: AuthResponse = { ok: false, message: "Debes proporcionar al menos un NIT" };
+    return res.status(400).json(response);
+  }
 
   const normalizedTools = Array.isArray(purchasedTools)
     ? purchasedTools
@@ -250,6 +263,20 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
     return res.status(500).json(response);
   }
 
+  // Registrar auditoria de creacion
+  await logAdminAction({
+    actorId: req.user!.userId,
+    action: "create_user",
+    targetUserId: user.id,
+    after: {
+      email: user.email,
+      name: user.name,
+      isAdmin: !!isAdmin,
+      purchasedTools: cleanTools,
+      nits: cleanNits,
+    },
+  });
+
   const response: AuthResponse = {
     ok: true,
     user: {
@@ -274,13 +301,25 @@ router.get("/me", async (req: Request, res: Response) => {
     return res.status(401).json({ ok: false, message: "Token no proporcionado" });
   }
 
+  let payload: JWTPayload;
   try {
-    const payload = jwt.verify(token, getJwtSecret()) as JWTPayload;
-    const user = await getUserByEmail(payload.email);
+    payload = jwt.verify(token, getJwtSecret()) as JWTPayload;
+  } catch {
+    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+    return res.status(401).json({ ok: false, message: "Token inválido" });
+  }
+
+  try {
+    const user = await getUserByIdStrict(payload.userId);
 
     if (!user) {
       res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
       return res.status(401).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    if (user.status === "suspended") {
+      res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
+      return res.status(403).json({ ok: false, message: "Tu cuenta ha sido suspendida. Contacta al administrador." });
     }
 
     const [purchasedTools, nits] = await Promise.all([
@@ -300,8 +339,7 @@ router.get("/me", async (req: Request, res: Response) => {
       },
     });
   } catch {
-    res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
-    return res.status(401).json({ ok: false, message: "Token inválido" });
+    return res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });
   }
 });
 

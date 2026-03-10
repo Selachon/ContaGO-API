@@ -1,10 +1,14 @@
 // Types para la herramienta Exportador DIAN a Excel
 
+import type { DocumentDirection } from "./dian.js";
+
 export interface ExcelGenerateRequest {
   token_url: string;
   start_date?: string;
   end_date?: string;
   session_uid?: string;
+  /** Tipo de documentos: "received" (recibidos) o "sent" (emitidos). Default: "received" */
+  document_direction?: DocumentDirection;
 }
 
 /**
@@ -35,11 +39,12 @@ export interface InvoiceData {
   // Datos de la factura
   issueDate: string;
   issueDateISO: string;  // Fecha en formato ISO para ordenamiento (YYYY-MM-DD)
+  paymentMethod: string;
   subtotal: number;
   iva: number;
   total: number;
   concepts: string;
-  documentType: "Factura Electrónica" | "Nota Crédito" | "N/A";
+  documentType: string; // Tipo de documento de DIAN (ej: "Factura electrónica", "Nota Crédito", "Documento soporte")
   cufe: string;
   driveUrl?: string;
 
