@@ -1,5 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
-import type { InvoiceData, InvoiceLineItem } from "../types/dianExcel.js";
+import type { InvoiceData, InvoiceLineItem, TaxDetail } from "../types/dianExcel.js";
 
 interface DocInfo {
   id: string;
@@ -45,10 +45,10 @@ export async function extractInvoiceDataFromXml(
     const receiverName = extractPartyName(customerParty);
 
     // Extraer otros datos
-    const issueDate = extractIssueDate(invoice);
-    const { subtotal, iva, total } = extractTotals(invoice);
-    const concepts = extractConcepts(invoice);
+    const { issueDate, issueDateISO } = extractIssueDate(invoice);
+    const { subtotal, iva, total, taxes, discount, surcharge } = extractTotals(invoice);
     const lineItems = extractLineItems(invoice);
+    const concepts = extractConcepts(lineItems);
     const cufe = extractCUFE(invoice);
 
     return {
@@ -57,9 +57,13 @@ export async function extractInvoiceDataFromXml(
       receiverNit,
       receiverName,
       issueDate,
+      issueDateISO,
       subtotal,
       iva,
       total,
+      taxes,
+      discount,
+      surcharge,
       concepts,
       lineItems,
       documentType: isNotaCredito ? "Nota Crédito" : "Factura Electrónica",
@@ -75,9 +79,13 @@ export async function extractInvoiceDataFromXml(
       receiverNit: "N/A",
       receiverName: "N/A",
       issueDate: "N/A",
+      issueDateISO: "9999-12-31",
       subtotal: 0,
       iva: 0,
       total: 0,
+      taxes: [],
+      discount: 0,
+      surcharge: 0,
       concepts: "ERROR: No se pudo leer el XML",
       lineItems: [],
       documentType: "N/A",
@@ -169,32 +177,45 @@ function extractPartyName(party: any): string {
 }
 
 /**
- * Extrae fecha de emisión en formato DD/MM/YYYY
+ * Extrae fecha de emisión en formato DD/MM/YYYY y también en formato ISO para ordenamiento
  */
-function extractIssueDate(invoice: any): string {
+function extractIssueDate(invoice: any): { issueDate: string; issueDateISO: string } {
   try {
     const issueDate = invoice.IssueDate;
-    if (!issueDate) return "N/A";
+    if (!issueDate) return { issueDate: "N/A", issueDateISO: "9999-12-31" };
 
     // Formato ISO: YYYY-MM-DD
     if (typeof issueDate === "string" && /^\d{4}-\d{2}-\d{2}/.test(issueDate)) {
       const [year, month, day] = issueDate.split("-");
-      return `${day}/${month}/${year}`;
+      return {
+        issueDate: `${day}/${month}/${year}`,
+        issueDateISO: `${year}-${month}-${day}`
+      };
     }
 
-    return String(issueDate);
+    return { issueDate: String(issueDate), issueDateISO: "9999-12-31" };
   } catch {
-    return "N/A";
+    return { issueDate: "N/A", issueDateISO: "9999-12-31" };
   }
 }
 
 /**
- * Extrae subtotal e IVA de los totales monetarios
+ * Extrae subtotal, IVA, total y todos los impuestos dinámicamente
  */
-function extractTotals(invoice: any): { subtotal: number; iva: number; total: number } {
+function extractTotals(invoice: any): {
+  subtotal: number;
+  iva: number;
+  total: number;
+  taxes: TaxDetail[];
+  discount: number;
+  surcharge: number;
+} {
   let subtotal = 0;
   let iva = 0;
   let total = 0;
+  let discount = 0;
+  let surcharge = 0;
+  const taxesMap = new Map<string, TaxDetail>();
 
   try {
     // LegalMonetaryTotal > LineExtensionAmount (subtotal antes de impuestos)
@@ -203,9 +224,15 @@ function extractTotals(invoice: any): { subtotal: number; iva: number; total: nu
       const lineExtension = legalMonetaryTotal.LineExtensionAmount;
       subtotal = parseAmount(lineExtension);
       total = parseAmount(legalMonetaryTotal.PayableAmount);
+
+      // Extraer descuentos y recargos globales
+      const allowanceTotal = parseAmount(legalMonetaryTotal.AllowanceTotalAmount);
+      const chargeTotal = parseAmount(legalMonetaryTotal.ChargeTotalAmount);
+      discount = allowanceTotal;
+      surcharge = chargeTotal;
     }
 
-    // TaxTotal > TaxAmount (IVA)
+    // TaxTotal > Extraer TODOS los impuestos dinámicamente
     const taxTotal = invoice.TaxTotal;
     if (taxTotal) {
       const taxTotalArr = Array.isArray(taxTotal) ? taxTotal : [taxTotal];
@@ -216,19 +243,51 @@ function extractTotals(invoice: any): { subtotal: number; iva: number; total: nu
           const subtotals = Array.isArray(taxSubtotal) ? taxSubtotal : [taxSubtotal];
 
           for (const sub of subtotals) {
-            const taxSchemeId = sub.TaxCategory?.TaxScheme?.ID;
-            const taxId = String(getText(taxSchemeId));
+            const taxSchemeId = String(getText(sub.TaxCategory?.TaxScheme?.ID));
+            const taxSchemeName = String(getText(sub.TaxCategory?.TaxScheme?.Name)).toUpperCase();
+            const taxAmount = parseAmount(sub.TaxAmount);
+            const taxPercent = parseAmount(sub.TaxCategory?.Percent);
+
+            // Normalizar el ID del impuesto (quitar ceros a la izquierda para comparación)
+            const normalizedId = taxSchemeId.replace(/^0+/, "") || "0";
+            const taxName = normalizeTaxName(taxSchemeName, normalizedId);
 
             // "01" o "1" = IVA en nomenclatura DIAN
-            if (taxId === "01" || taxId === "1" || /IVA/i.test(taxId)) {
-              iva += parseAmount(sub.TaxAmount);
+            if (normalizedId === "1") {
+              iva += taxAmount;
+            }
+
+            // Agregar al mapa de impuestos (acumular si ya existe)
+            if (taxesMap.has(taxName)) {
+              const existing = taxesMap.get(taxName)!;
+              existing.amount += taxAmount;
+              // Mantener el porcentaje más alto si hay múltiples
+              if (taxPercent > existing.percent) {
+                existing.percent = taxPercent;
+              }
+            } else {
+              taxesMap.set(taxName, {
+                taxId: taxSchemeId,
+                taxName,
+                amount: taxAmount,
+                percent: taxPercent,
+              });
             }
           }
         }
 
-        // Si no hay TaxSubtotal, usar TaxAmount directo
+        // Si no hay TaxSubtotal, usar TaxAmount directo (asumir IVA)
         if (!taxSubtotal && tax.TaxAmount) {
-          iva += parseAmount(tax.TaxAmount);
+          const taxAmount = parseAmount(tax.TaxAmount);
+          iva += taxAmount;
+          if (!taxesMap.has("IVA")) {
+            taxesMap.set("IVA", {
+              taxId: "01",
+              taxName: "IVA",
+              amount: taxAmount,
+              percent: 0,
+            });
+          }
         }
       }
     }
@@ -236,15 +295,53 @@ function extractTotals(invoice: any): { subtotal: number; iva: number; total: nu
     console.error("Error extrayendo totales:", err);
   }
 
-  return { subtotal, iva, total };
+  // Convertir el mapa a array ordenado por ID de impuesto
+  const taxes = Array.from(taxesMap.values()).sort((a, b) => {
+    // IVA siempre primero
+    if (a.taxName === "IVA") return -1;
+    if (b.taxName === "IVA") return 1;
+    return a.taxId.localeCompare(b.taxId);
+  });
+
+  return { subtotal, iva, total, taxes, discount, surcharge };
 }
 
 /**
- * Extrae descripciones de los 2 primeros items (InvoiceLine con ID 1 y 2)
+ * Normaliza el nombre del impuesto según su ID DIAN
  */
-function extractConcepts(invoice: any): string {
+function normalizeTaxName(rawName: string, normalizedId: string): string {
+  // Mapeo de IDs DIAN a nombres estándar
+  const taxNameMap: Record<string, string> = {
+    "1": "IVA",        // Impuesto al Valor Agregado
+    "4": "INC",        // Impuesto Nacional al Consumo
+    "22": "Bolsas",    // Impuesto al consumo de bolsas plásticas
+    "35": "ICUI",      // Impuesto a bebidas ultraprocesadas azucaradas
+    "3": "IC",         // Impuesto al Consumo (departamental)
+    "5": "ReteIVA",    // Retención de IVA
+    "6": "ReteRenta",  // Retención en la fuente
+    "7": "ReteICA",    // Retención de ICA
+  };
+
+  // Usar el nombre del mapa si existe, sino usar el nombre del XML limpio
+  if (taxNameMap[normalizedId]) {
+    return taxNameMap[normalizedId];
+  }
+
+  // Limpiar el nombre del XML
+  const cleanName = rawName.trim().toUpperCase();
+  if (cleanName && cleanName !== "N/A" && cleanName !== "UNDEFINED") {
+    return cleanName;
+  }
+
+  // Fallback: usar el ID como nombre
+  return `TAX_${normalizedId}`;
+}
+
+/**
+ * Extrae descripciones de los 2 primeros items (ya extraídos)
+ */
+function extractConcepts(lineItems: InvoiceLineItem[]): string {
   try {
-    const lineItems = extractLineItems(invoice);
     const descriptions = lineItems
       .slice(0, 2)
       .map((item) => item.description)
@@ -259,6 +356,7 @@ function extractConcepts(invoice: any): string {
 
 /**
  * Extrae líneas detalladas de la factura para la hoja "Detallado"
+ * Ahora incluye todos los impuestos dinámicamente
  */
 function extractLineItems(invoice: any): InvoiceLineItem[] {
   try {
@@ -269,7 +367,7 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
 
     return linesArr.map((line: any, index: number) => {
       const lineNumber = parseAmount(line.ID) || index + 1;
-      const quantity = parseAmount(line.InvoicedQuantity);
+      const quantity = parseAmount(line.InvoicedQuantity) || parseAmount(line.CreditedQuantity);
       const unitPrice = parseAmount(line.Price?.PriceAmount);
       const lineExtensionAmount = parseAmount(line.LineExtensionAmount);
 
@@ -295,10 +393,14 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
         }
       }
 
+      // Variables legacy para IVA e INC (compatibilidad)
       let ivaAmount = 0;
       let ivaPercent = 0;
       let incAmount = 0;
       let incPercent = 0;
+
+      // Mapa para acumular todos los impuestos dinámicamente
+      const taxesMap = new Map<string, TaxDetail>();
 
       const taxTotals = line.TaxTotal ? (Array.isArray(line.TaxTotal) ? line.TaxTotal : [line.TaxTotal]) : [];
       for (const taxTotal of taxTotals) {
@@ -307,20 +409,48 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
           : [];
 
         for (const subtotal of subtotals) {
-          const taxId = String(getText(subtotal.TaxCategory?.TaxScheme?.ID));
-          const taxName = String(getText(subtotal.TaxCategory?.TaxScheme?.Name)).toUpperCase();
+          const taxSchemeId = String(getText(subtotal.TaxCategory?.TaxScheme?.ID));
+          const taxSchemeName = String(getText(subtotal.TaxCategory?.TaxScheme?.Name)).toUpperCase();
           const taxAmount = parseAmount(subtotal.TaxAmount);
           const taxPercent = parseAmount(subtotal.TaxCategory?.Percent);
 
-          if (taxId === "01" || taxId === "1" || taxName.includes("IVA")) {
+          // Normalizar el ID del impuesto
+          const normalizedId = taxSchemeId.replace(/^0+/, "") || "0";
+          const taxName = normalizeTaxName(taxSchemeName, normalizedId);
+
+          // Mantener compatibilidad con IVA e INC
+          if (normalizedId === "1") {
             ivaAmount += taxAmount;
             ivaPercent = taxPercent || ivaPercent;
-          } else if (taxId === "04" || taxId === "4" || taxName.includes("INC")) {
+          } else if (normalizedId === "4") {
             incAmount += taxAmount;
             incPercent = taxPercent || incPercent;
           }
+
+          // Agregar al mapa de impuestos dinámicos
+          if (taxesMap.has(taxName)) {
+            const existing = taxesMap.get(taxName)!;
+            existing.amount += taxAmount;
+            if (taxPercent > existing.percent) {
+              existing.percent = taxPercent;
+            }
+          } else {
+            taxesMap.set(taxName, {
+              taxId: taxSchemeId,
+              taxName,
+              amount: taxAmount,
+              percent: taxPercent,
+            });
+          }
         }
       }
+
+      // Convertir el mapa a array ordenado
+      const taxes = Array.from(taxesMap.values()).sort((a, b) => {
+        if (a.taxName === "IVA") return -1;
+        if (b.taxName === "IVA") return 1;
+        return a.taxId.localeCompare(b.taxId);
+      });
 
       return {
         lineNumber,
@@ -329,6 +459,7 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
         unitPrice,
         discount,
         surcharge,
+        taxes,
         ivaAmount,
         ivaPercent,
         incAmount,

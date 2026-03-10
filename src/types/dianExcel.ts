@@ -7,6 +7,22 @@ export interface ExcelGenerateRequest {
   session_uid?: string;
 }
 
+/**
+ * Representa un impuesto específico con su ID DIAN, nombre, valor y porcentaje
+ * Ejemplos de IDs DIAN:
+ * - 01: IVA
+ * - 04: INC (Impuesto Nacional al Consumo)
+ * - 22: Bolsas
+ * - 35: ICUI (Impuesto a bebidas ultraprocesadas azucaradas)
+ * - Otros impuestos según resolución DIAN
+ */
+export interface TaxDetail {
+  taxId: string;      // ID del impuesto según DIAN (ej: "01", "04", "35")
+  taxName: string;    // Nombre del impuesto (ej: "IVA", "INC", "ICUI")
+  amount: number;     // Valor del impuesto
+  percent: number;    // Porcentaje aplicado
+}
+
 export interface InvoiceData {
   // Datos del emisor (quien emite la factura)
   issuerNit: string;
@@ -18,6 +34,7 @@ export interface InvoiceData {
 
   // Datos de la factura
   issueDate: string;
+  issueDateISO: string;  // Fecha en formato ISO para ordenamiento (YYYY-MM-DD)
   subtotal: number;
   iva: number;
   total: number;
@@ -25,6 +42,13 @@ export interface InvoiceData {
   documentType: "Factura Electrónica" | "Nota Crédito" | "N/A";
   cufe: string;
   driveUrl?: string;
+
+  // Impuestos dinámicos (IVA, INC, Bolsas, ICUI, etc.)
+  taxes: TaxDetail[];
+
+  // Valores específicos para compatibilidad (se mantienen para IVA)
+  discount: number;       // Descuento detalle total
+  surcharge: number;      // Recargo detalle total
 
   // Líneas de detalle de productos/servicios
   lineItems: InvoiceLineItem[];
@@ -43,10 +67,16 @@ export interface InvoiceLineItem {
   unitPrice: number;            // Precio unitario
   discount: number;             // Descuento detalle
   surcharge: number;            // Recargo detalle
+
+  // Impuestos dinámicos por línea
+  taxes: TaxDetail[];
+
+  // Campos legacy para IVA e INC (se mantienen para compatibilidad)
   ivaAmount: number;            // IVA (valor)
   ivaPercent: number;           // % IVA
   incAmount: number;            // INC (valor)
   incPercent: number;           // % INC
+
   totalUnitPrice: number;       // Precio unitario de venta
 }
 
