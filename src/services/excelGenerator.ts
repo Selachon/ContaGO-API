@@ -2,6 +2,74 @@ import ExcelJS from "exceljs";
 import type { InvoiceData } from "../types/dianExcel.js";
 
 /**
+ * Convierte un numero de columna (1-indexed) a letra de Excel
+ * Ej: 1 -> A, 26 -> Z, 27 -> AA
+ */
+function getExcelColumnLetter(colNum: number): string {
+  let result = "";
+  let num = colNum;
+  while (num > 0) {
+    const remainder = (num - 1) % 26;
+    result = String.fromCharCode(65 + remainder) + result;
+    num = Math.floor((num - 1) / 26);
+  }
+  return result;
+}
+
+/**
+ * Recolecta todos los tipos de impuestos unicos de todas las facturas
+ * IVA siempre se incluye aunque ninguna factura lo tenga
+ */
+function collectAllTaxTypes(invoices: InvoiceData[]): string[] {
+  const taxTypesSet = new Set<string>();
+
+  // IVA siempre presente
+  taxTypesSet.add("IVA");
+
+  for (const invoice of invoices) {
+    // Impuestos a nivel de factura
+    for (const tax of invoice.taxes || []) {
+      if (tax.taxName && tax.taxName !== "IVA") {
+        taxTypesSet.add(tax.taxName);
+      }
+    }
+
+    // Impuestos a nivel de linea
+    for (const line of invoice.lineItems || []) {
+      for (const tax of line.taxes || []) {
+        if (tax.taxName && tax.taxName !== "IVA") {
+          taxTypesSet.add(tax.taxName);
+        }
+      }
+    }
+  }
+
+  // Ordenar: IVA primero, luego INC, luego Bolsas, luego el resto alfabeticamente
+  const priority = ["IVA", "INC", "Bolsas", "ICUI", "IC"];
+  const sortedTaxTypes = Array.from(taxTypesSet).sort((a, b) => {
+    const aIdx = priority.indexOf(a);
+    const bIdx = priority.indexOf(b);
+    if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+    if (aIdx !== -1) return -1;
+    if (bIdx !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  return sortedTaxTypes;
+}
+
+/**
+ * Ordena las facturas por fecha de emision en orden ascendente
+ */
+function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
+  return [...invoices].sort((a, b) => {
+    const dateA = a.issueDateISO || "9999-12-31";
+    const dateB = b.issueDateISO || "9999-12-31";
+    return dateA.localeCompare(dateB);
+  });
+}
+
+/**
  * Genera archivo Excel con los datos de las facturas
  * @param invoices - Lista de facturas a exportar
  * @param outputPath - Ruta donde guardar el archivo
@@ -22,12 +90,18 @@ export async function generateExcelFile(
   workbook.modified = new Date();
   workbook.lastPrinted = new Date();
   
-  // Establecer propiedades de cálculo para compatibilidad
+  // Establecer propiedades de calculo para compatibilidad
   workbook.calcProperties = {
     fullCalcOnLoad: true,
   };
 
-  // Nombre de la hoja según el tipo de documentos
+  // Ordenar facturas por fecha de emision ascendente
+  const sortedInvoices = sortInvoicesByDate(invoices);
+
+  // Recolectar todos los tipos de impuestos
+  const allTaxTypes = collectAllTaxTypes(sortedInvoices);
+
+  // Nombre de la hoja segun el tipo de documentos
   const sheetName = isSentDocuments ? "Facturas Emitidas" : "Facturas DIAN";
   
   const worksheet = workbook.addWorksheet(sheetName, {
@@ -44,25 +118,39 @@ export async function generateExcelFile(
   
   const columns: Partial<ExcelJS.Column>[] = [
     { header: "ID", key: "id", width: 6 },
-    { header: "Número Factura", key: "docNumber", width: 20 },
+    { header: "Tipo de documento", key: "documentType", width: 18 },
+    { header: "Numero Factura", key: "docNumber", width: 20 },
     { header: `NIT ${partyLabel}`, key: "partyNit", width: 14 },
-    { header: `Razón Social ${partyLabel}`, key: "partyName", width: 40 },
-    { header: "Fecha de emisión", key: "issueDate", width: 16 },
-    { header: "Forma de pago", key: "paymentMethod", width: 18 },
-    { header: "Valor antes", key: "subtotal", width: 15 },
-    { header: "Valor IVA (si aplica)", key: "iva", width: 18 },
-    { header: "Valor total", key: "total", width: 15 },
+    { header: `Razon Social ${partyLabel}`, key: "partyName", width: 40 },
+    { header: "Fecha de emision", key: "issueDate", width: 16 },
     { header: "Concepto", key: "concepts", width: 55 },
+    { header: "Forma de pago", key: "paymentMethod", width: 18 },
+    { header: "Subtotal antes de impuestos", key: "subtotal", width: 22 },
+    { header: "Descuento detalle", key: "discount", width: 16 },
+    { header: "Recargo detalle", key: "surcharge", width: 16 },
   ];
 
-  if (includeDriveColumn) {
-    columns.push({ header: "Adjunte factura", key: "driveUrl", width: 45 });
+  // Agregar columnas dinamicas de impuestos (Valor X)
+  for (const taxType of allTaxTypes) {
+    columns.push({
+      header: `Valor ${taxType}`,
+      key: `tax_${taxType}`,
+      width: 14,
+    });
   }
 
+  // Columnas finales
   columns.push(
-    { header: "Tipo de documento", key: "documentType", width: 20 },
-    { header: "CUFE", key: "cufe", width: 100 }
+    { header: "Descuento Global (-)", key: "globalDiscount", width: 18 },
+    { header: "Recargo Global (+)", key: "globalSurcharge", width: 16 },
+    { header: "Valor total", key: "total", width: 15 }
   );
+
+  if (includeDriveColumn) {
+    columns.push({ header: "Enlace factura", key: "driveUrl", width: 45 });
+  }
+
+  columns.push({ header: "CUFE", key: "cufe", width: 100 });
 
   worksheet.columns = columns;
 
@@ -77,26 +165,38 @@ export async function generateExcelFile(
   headerRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   headerRow.height = 25;
 
-  // Agregar filas de datos
-  invoices.forEach((invoice, index) => {
+  // Formato numerico compatible con Excel y Sheets
+  const currencyFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+
+  // Agregar filas de datos (ya ordenadas por fecha)
+  sortedInvoices.forEach((invoice, index) => {
     // Para emitidos, mostramos datos del receptor; para recibidos, del emisor
     const partyNit = isSentDocuments ? invoice.receiverNit : invoice.issuerNit;
     const partyName = isSentDocuments ? invoice.receiverName : invoice.issuerName;
     
     const rowData: Record<string, unknown> = {
-      id: index + 1,
+      id: index + 1, // ID basado en orden por fecha
+      documentType: invoice.documentType,
       docNumber: invoice.docNumber,
       partyNit,
       partyName,
       issueDate: invoice.issueDate,
+      concepts: invoice.concepts,
       paymentMethod: invoice.paymentMethod || "N/A",
       subtotal: invoice.subtotal,
-      iva: invoice.iva,
+      discount: invoice.discount || 0,
+      surcharge: invoice.surcharge || 0,
+      globalDiscount: 0,
+      globalSurcharge: 0,
       total: invoice.total,
-      concepts: invoice.concepts,
-      documentType: invoice.documentType,
       cufe: invoice.cufe,
     };
+
+    // Agregar valores de impuestos dinamicos
+    for (const taxType of allTaxTypes) {
+      const tax = (invoice.taxes || []).find(t => t.taxName === taxType);
+      rowData[`tax_${taxType}`] = tax ? tax.amount : 0;
+    }
 
     if (includeDriveColumn) {
       rowData.driveUrl = invoice.driveUrl || "";
@@ -104,20 +204,28 @@ export async function generateExcelFile(
 
     const row = worksheet.addRow(rowData);
 
-    // Formato de celdas numéricas - usar formato estándar compatible con Excel y Sheets
+    // Formato de celdas numericas
     const subtotalCell = row.getCell("subtotal");
-    subtotalCell.numFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+    subtotalCell.numFmt = currencyFmt;
     subtotalCell.value = typeof invoice.subtotal === "number" ? invoice.subtotal : 0;
 
-    const ivaCell = row.getCell("iva");
-    ivaCell.numFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
-    ivaCell.value = typeof invoice.iva === "number" ? invoice.iva : 0;
+    row.getCell("discount").numFmt = currencyFmt;
+    row.getCell("surcharge").numFmt = currencyFmt;
+
+    // Formato para columnas de impuestos dinamicos
+    for (const taxType of allTaxTypes) {
+      const taxCell = row.getCell(`tax_${taxType}`);
+      taxCell.numFmt = currencyFmt;
+    }
+
+    row.getCell("globalDiscount").numFmt = currencyFmt;
+    row.getCell("globalSurcharge").numFmt = currencyFmt;
 
     const totalCell = row.getCell("total");
-    totalCell.numFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
+    totalCell.numFmt = currencyFmt;
     totalCell.value = typeof invoice.total === "number" ? invoice.total : 0;
 
-    // Hipervínculo en columna Drive
+    // Hipervinculo en columna Drive
     if (includeDriveColumn && invoice.driveUrl && !invoice.driveUrl.includes("ERROR")) {
       const driveCell = row.getCell("driveUrl");
       driveCell.value = {
@@ -143,9 +251,9 @@ export async function generateExcelFile(
   });
 
   // Formato condicional para CUFEs duplicados (excluyendo "N/A")
-  // Columna CUFE: con Drive es M, sin Drive es L (se agregó columna Forma de pago)
-  const cufeColLetter = includeDriveColumn ? "M" : "L";
   const lastRow = worksheet.rowCount;
+  const cufeColIndex = columns.length;
+  const cufeColLetter = getExcelColumnLetter(cufeColIndex);
 
   if (lastRow > 1) {
     worksheet.addConditionalFormatting({
@@ -171,7 +279,7 @@ export async function generateExcelFile(
     });
   }
 
-  // Agregar filtros automáticos
+  // Agregar filtros automaticos
   worksheet.autoFilter = {
     from: { row: 1, column: 1 },
     to: { row: lastRow, column: columns.length },
@@ -190,7 +298,7 @@ export async function generateExcelFile(
     }
   }
 
-  // Hoja 2: Detallado por concepto/línea
+  // Hoja 2: Detallado por concepto/linea
   const detailedSheet = workbook.addWorksheet("Detallado", {
     views: [{ state: "frozen", ySplit: 1, xSplit: 0 }],
     properties: {
@@ -200,20 +308,29 @@ export async function generateExcelFile(
     },
   });
 
-  detailedSheet.columns = [
+  // Columnas base para la hoja detallada
+  const detailedColumns: Partial<ExcelJS.Column>[] = [
     { header: "Item", key: "lineNumber", width: 8 },
-    { header: "Número Factura", key: "docNumber", width: 20 },
-    { header: "Descripción", key: "description", width: 55 },
+    { header: "Numero Factura", key: "docNumber", width: 20 },
+    { header: "Concepto", key: "description", width: 55 },
     { header: "Cantidad", key: "quantity", width: 12 },
-    { header: "Precio unitario", key: "unitPrice", width: 16 },
-    { header: "Descuento detalle", key: "discount", width: 18 },
+    { header: "Base del impuesto", key: "totalUnitPrice", width: 18 },
+    { header: "Descuento detalle", key: "discount", width: 16 },
     { header: "Recargo detalle", key: "surcharge", width: 16 },
-    { header: "IVA", key: "ivaAmount", width: 14 },
-    { header: "%", key: "ivaPercent", width: 10 },
-    { header: "INC", key: "incAmount", width: 14 },
-    { header: "%", key: "incPercent", width: 10 },
-    { header: "Precio unitario de venta", key: "totalUnitPrice", width: 24 },
   ];
+
+  // Agregar columnas dinamicas de impuestos (Valor y %)
+  for (const taxType of allTaxTypes) {
+    detailedColumns.push(
+      { header: taxType, key: `tax_${taxType}_amount`, width: 14 },
+      { header: `% ${taxType}`, key: `tax_${taxType}_percent`, width: 10 }
+    );
+  }
+
+  // Columna final
+  detailedColumns.push({ header: "Precio unitario (incluye impuestos)", key: "unitPriceWithTax", width: 28 });
+
+  detailedSheet.columns = detailedColumns;
 
   const detailedHeaderRow = detailedSheet.getRow(1);
   detailedHeaderRow.font = { bold: true, size: 11, color: { argb: "FF000000" } };
@@ -225,44 +342,62 @@ export async function generateExcelFile(
   detailedHeaderRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
   detailedHeaderRow.height = 25;
 
-  invoices.forEach((invoice, invoiceIndex) => {
-    const mainSheetRow = invoiceIndex + 2;
+  // Crear un mapa de docNumber a su fila en la hoja principal (despues de ordenar)
+  const docNumberToRow = new Map<string, number>();
+  sortedInvoices.forEach((invoice, index) => {
+    docNumberToRow.set(invoice.docNumber, index + 2);
+  });
+
+  const percentFmt = '0.00"%"';
+
+  sortedInvoices.forEach((invoice) => {
+    const mainSheetRow = docNumberToRow.get(invoice.docNumber) || 2;
 
     (invoice.lineItems || []).forEach((lineItem) => {
-      const row = detailedSheet.addRow({
+      const rowData: Record<string, unknown> = {
         lineNumber: lineItem.lineNumber,
         docNumber: invoice.docNumber,
         description: lineItem.description,
         quantity: lineItem.quantity,
-        unitPrice: lineItem.unitPrice,
+        totalUnitPrice: lineItem.totalUnitPrice,
         discount: lineItem.discount,
         surcharge: lineItem.surcharge,
-        ivaAmount: lineItem.ivaAmount,
-        ivaPercent: lineItem.ivaPercent,
-        incAmount: lineItem.incAmount,
-        incPercent: lineItem.incPercent,
-        totalUnitPrice: lineItem.totalUnitPrice,
-      });
+      };
 
+      // Agregar valores de impuestos dinamicos por linea
+      for (const taxType of allTaxTypes) {
+        const tax = (lineItem.taxes || []).find(t => t.taxName === taxType);
+        rowData[`tax_${taxType}_amount`] = tax ? tax.amount : 0;
+        rowData[`tax_${taxType}_percent`] = tax ? tax.percent : 0;
+      }
+
+      // Calcular precio unitario con impuestos
+      const totalTaxAmount = (lineItem.taxes || []).reduce((sum, t) => sum + t.amount, 0);
+      rowData.unitPriceWithTax = lineItem.totalUnitPrice + totalTaxAmount;
+
+      const row = detailedSheet.addRow(rowData);
+
+      // Hipervinculo al numero de factura
       const docNumberCell = row.getCell("docNumber");
       docNumberCell.value = {
         text: invoice.docNumber,
-        hyperlink: `#'${sheetName}'!B${mainSheetRow}`,
+        hyperlink: `#'${sheetName}'!C${mainSheetRow}`,
       };
       docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
 
-      // Formato numérico compatible con Excel y Sheets
-      const currencyFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
-      const percentFmt = '0.00"%"';
-      
-      row.getCell("unitPrice").numFmt = currencyFmt;
+      // Formato de celdas numericas
+      row.getCell("totalUnitPrice").numFmt = currencyFmt;
       row.getCell("discount").numFmt = currencyFmt;
       row.getCell("surcharge").numFmt = currencyFmt;
-      row.getCell("ivaAmount").numFmt = currencyFmt;
-      row.getCell("incAmount").numFmt = currencyFmt;
-      row.getCell("totalUnitPrice").numFmt = currencyFmt;
-      row.getCell("ivaPercent").numFmt = percentFmt;
-      row.getCell("incPercent").numFmt = percentFmt;
+      row.getCell("unitPriceWithTax").numFmt = currencyFmt;
+
+      // Formato para columnas de impuestos dinamicos
+      for (const taxType of allTaxTypes) {
+        const amountCell = row.getCell(`tax_${taxType}_amount`);
+        amountCell.numFmt = currencyFmt;
+        const percentCell = row.getCell(`tax_${taxType}_percent`);
+        percentCell.numFmt = percentFmt;
+      }
 
       row.alignment = { vertical: "middle", wrapText: true };
     });
