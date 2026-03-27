@@ -22,8 +22,6 @@ export function createOAuth2Client() {
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
   const redirectUri = `${process.env.API_URL || "http://localhost:8000"}/auth/google/callback`;
 
-  console.log("[GoogleDrive] Creating OAuth2 client with redirectUri:", redirectUri);
-
   if (!clientId || !clientSecret) {
     throw new Error("GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET son requeridos");
   }
