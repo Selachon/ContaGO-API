@@ -297,6 +297,50 @@ describe("Siigo integration routes", () => {
     assert.equal(response.body.data.results[0].id, "pr-1");
   });
 
+  it("GET /purchase-document-types calls Siigo with type=FC", async () => {
+    const fetchCalls: string[] = [];
+    global.fetch = async (url) => {
+      fetchCalls.push(String(url));
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+      return jsonResponse(200, { results: [{ id: 1, code: "FC", name: "Factura compra" }] });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get("/integrations/siigo/purchase-document-types");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.ok(fetchCalls[1].includes("/v1/document-types"));
+    assert.ok(fetchCalls[1].includes("type=FC"));
+  });
+
+  it("GET /purchase-document-types/search filters case-insensitive and marks possible DS matches", async () => {
+    global.fetch = async (url) => {
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+
+      return jsonResponse(200, {
+        results: [
+          { id: 11, code: "DS", name: "Documento Soporte", description: "Doc soporte proveedores" },
+          { id: 12, code: "FC", name: "Factura Compra", description: "Factura tradicional" },
+        ],
+      });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get("/integrations/siigo/purchase-document-types/search?query=soporte");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.data.total_results, 1);
+    assert.equal(response.body.data.results[0].code, "DS");
+    assert.equal(response.body.data.results[0].possible_match, true);
+    assert.equal(response.body.data.applied_filters.query, "soporte");
+  });
+
   it("retries once after 401 and then succeeds", async () => {
     let call = 0;
     global.fetch = async (url) => {

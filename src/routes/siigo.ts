@@ -14,6 +14,7 @@ import {
   listDocumentTypes,
   listInvoices,
   listPaymentReceipts,
+  listPurchaseDocumentTypes,
   listPurchases,
   SiigoError,
 } from "../services/siigoService.js";
@@ -186,6 +187,23 @@ function buildFilteredPayload(
 
 function normalizeText(value: unknown): string {
   return String(value ?? "").trim().toLowerCase();
+}
+
+function containsText(value: unknown, search: string): boolean {
+  const candidate = normalizeText(value);
+  return Boolean(search && candidate.includes(search));
+}
+
+function isPossibleSupportDocument(record: Record<string, unknown>): boolean {
+  const code = normalizeText(record.code);
+  const name = normalizeText(record.name);
+  const description = normalizeText(record.description);
+
+  const supportKeywords = ["documento soporte", "soporte", "doc soporte"];
+  if (code === "ds" || code.startsWith("ds")) return true;
+  if (supportKeywords.some((keyword) => name.includes(keyword) || description.includes(keyword))) return true;
+  if (name.includes("ds") || description.includes("ds")) return true;
+  return false;
 }
 
 function getNestedValue(record: Record<string, unknown>, path: string): unknown {
@@ -551,6 +569,62 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   } catch (error) {
     return handleSiigoError(res, error);
   }
+  });
+
+  router.get("/purchase-document-types", async (_req: Request, res: Response) => {
+    try {
+      const data = await listPurchaseDocumentTypes();
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/purchase-document-types/search", async (req: Request, res: Response) => {
+    try {
+      const filters = getAllowedQuery(req, ["query", "code", "name", "description"]);
+      const query = normalizeText(filters.query);
+      const code = normalizeText(filters.code);
+      const name = normalizeText(filters.name);
+      const description = normalizeText(filters.description);
+
+      const raw = await listPurchaseDocumentTypes();
+      const rows = pickResults(raw);
+
+      const filtered = rows
+        .filter((row) => {
+          if (query) {
+            const anyMatch = [row.code, row.name, row.description].some((value) => containsText(value, query));
+            if (!anyMatch) return false;
+          }
+
+          if (code && !containsText(row.code, code)) return false;
+          if (name && !containsText(row.name, name)) return false;
+          if (description && !containsText(row.description, description)) return false;
+          return true;
+        })
+        .map((row) => ({
+          ...row,
+          ...(isPossibleSupportDocument(row) ? { possible_match: true } : {}),
+        }));
+
+      return res.json({
+        ok: true,
+        source: "siigo",
+        data: {
+          results: filtered,
+          total_results: filtered.length,
+          applied_filters: {
+            query: filters.query ?? null,
+            code: filters.code ?? null,
+            name: filters.name ?? null,
+            description: filters.description ?? null,
+          },
+        },
+      });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
   });
 
   return router;

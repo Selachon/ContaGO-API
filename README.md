@@ -69,6 +69,8 @@ Todos requieren autenticacion de ContaGO (JWT) o API key interna GPT.
 - `GET /integrations/siigo/payment-receipts`
 - `GET /integrations/siigo/payment-receipts/:id`
 - `GET /integrations/siigo/payment-receipts/search`
+- `GET /integrations/siigo/purchase-document-types`
+- `GET /integrations/siigo/purchase-document-types/search`
 - `GET /integrations/siigo/customers`
 - `GET /integrations/siigo/customers/:id`
 - `GET /integrations/siigo/products/:id`
@@ -105,6 +107,13 @@ Todos requieren autenticacion de ContaGO (JWT) o API key interna GPT.
 ### Document types
 
 - `type`
+
+### Purchase document types search
+
+- `query`
+- `code`
+- `name`
+- `description`
 
 ### Purchases search
 
@@ -146,6 +155,8 @@ El blueprint lista explicitamente los filtros de fecha e identificacion, y muest
 - `GET /integrations/siigo/payment-receipts`: usa filtros nativos enviados a Siigo (`created_start`, `created_end`, `updated_start`, `updated_end`, `page`, `page_size`).
 - `GET /integrations/siigo/purchases/search`: usa nativos `page`, `page_size`; aplica localmente `id`, `number`, `name`, `supplier_identification`, `provider_invoice_prefix`, `provider_invoice_number`, `date_start`, `date_end`.
 - `GET /integrations/siigo/payment-receipts/search`: usa nativos `created_start`, `created_end`, `updated_start`, `updated_end`, `page`, `page_size`; aplica localmente `id`, `number`, `name`, `document_id`, `date_start`, `date_end`, `third_party_identification`.
+- `GET /integrations/siigo/purchase-document-types`: consulta Siigo con filtro nativo fijo `type=FC`.
+- `GET /integrations/siigo/purchase-document-types/search`: consulta Siigo con `type=FC` y aplica filtros locales case-insensitive (`query`, `code`, `name`, `description`).
 
 ## Ejemplos de respuesta por endpoint
 
@@ -360,6 +371,51 @@ Mismo comportamiento que PDF (binario/base64/url).
 }
 ```
 
+### 12) `GET /integrations/siigo/purchase-document-types`
+
+```json
+{
+  "ok": true,
+  "source": "siigo",
+  "data": {
+    "results": [
+      {
+        "id": 11,
+        "code": "DS",
+        "name": "Documento Soporte"
+      }
+    ]
+  }
+}
+```
+
+### 13) `GET /integrations/siigo/purchase-document-types/search`
+
+```json
+{
+  "ok": true,
+  "source": "siigo",
+  "data": {
+    "results": [
+      {
+        "id": 11,
+        "code": "DS",
+        "name": "Documento Soporte",
+        "description": "Doc soporte proveedores",
+        "possible_match": true
+      }
+    ],
+    "total_results": 1,
+    "applied_filters": {
+      "query": "soporte",
+      "code": null,
+      "name": null,
+      "description": null
+    }
+  }
+}
+```
+
 ## Formato de errores
 
 Error estandar:
@@ -490,6 +546,18 @@ curl "http://localhost:8000/integrations/siigo/payment-receipts/search?document_
   -H "Authorization: Bearer <JWT_CONTAGO>"
 ```
 
+```bash
+# Tipos de comprobante de compras (type=FC en Siigo)
+curl "http://localhost:8000/integrations/siigo/purchase-document-types" \
+  -H "Authorization: Bearer <JWT_CONTAGO>"
+```
+
+```bash
+# Buscar posible Documento Soporte (DS)
+curl "http://localhost:8000/integrations/siigo/purchase-document-types/search?query=soporte" \
+  -H "Authorization: Bearer <JWT_CONTAGO>"
+```
+
 ## Pruebas automaticas minimas
 
 Se agregaron pruebas para:
@@ -500,6 +568,8 @@ Se agregaron pruebas para:
 - `purchases list`
 - `purchases search`
 - `payment-receipts search`
+- `purchase-document-types`
+- `purchase-document-types search`
 - `retry tras 401`
 - `error por configuracion faltante`
 

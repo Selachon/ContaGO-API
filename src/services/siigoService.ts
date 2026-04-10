@@ -400,3 +400,12 @@ export async function getProductById(id: string): Promise<unknown> {
 export async function listDocumentTypes(query: Record<string, unknown>): Promise<unknown> {
   return request("/v1/document-types", { query });
 }
+
+export async function listPurchaseDocumentTypes(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/document-types", {
+    query: {
+      type: "FC",
+      ...query,
+    },
+  });
+}
