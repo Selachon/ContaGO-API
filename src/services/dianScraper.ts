@@ -118,14 +118,18 @@ export async function extractDocumentIds(
 
     // Total reportado por DataTables para estimar progreso.
     const expectedTotal = await page.evaluate(() => {
-      const info = document.querySelector("#tableDocuments_info, .dataTables_info");
+      const info = document.querySelector("#tableDocuments_info, .dataTables_info, .dt-info");
       const text = info?.textContent || "";
-      // Soporta texto en espanol o ingles.
-      const match = text.match(/de\s+([\d,.]+)\s+registros|of\s+([\d,.]+)\s+entries/i);
-      if (match) {
-        const num = (match[1] || match[2]).replace(/[,.]/g, "");
-        return parseInt(num, 10) || 0;
+
+      // Extrae todos los numeros del texto (ej: "Mostrando registros del 1 al 50 de 8000").
+      const nums = Array.from(text.matchAll(/\d[\d.,]*/g)).map((m) =>
+        parseInt((m[0] || "").replace(/[.,]/g, ""), 10)
+      ).filter((n) => Number.isFinite(n));
+
+      if (nums.length >= 3) {
+        return nums[nums.length - 1] || 0;
       }
+
       return 0;
     });
     console.log(`Total esperado según paginación: ${expectedTotal}`);
@@ -364,10 +368,10 @@ async function applyDateFilter(page: Page, startDate: string, endDate: string): 
 
 async function waitForTableLoad(page: Page): Promise<void> {
   try {
-    // DataTables usa este overlay durante recargas.
+    // DataTables usa este overlay durante recargas (v1: #..._processing, v2: .dt-processing).
     try {
-      await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 5000 });
-      await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 20000 });
+      await page.waitForSelector("#tableDocuments_processing, .dt-processing", { visible: true, timeout: 5000 });
+      await page.waitForSelector("#tableDocuments_processing, .dt-processing", { hidden: true, timeout: 20000 });
     } catch {
       // Fallback cuando el overlay no se renderiza.
       await page.waitForSelector("table#tableDocuments tbody tr", { timeout: 6000 }).catch(() => {});
@@ -387,11 +391,11 @@ async function waitForFullTableLoad(page: Page, pageLength: number): Promise<voi
   
   while (Date.now() - startTime < maxWait) {
     const { expectedRows, actualRows } = await page.evaluate(() => {
-      const info = document.querySelector("#tableDocuments_info, .dataTables_info");
+      const info = document.querySelector("#tableDocuments_info, .dataTables_info, .dt-info");
       const text = info?.textContent || "";
       
       // Ejemplo esperado: "Mostrando del 1 al 50 de 172 registros".
-      const match = text.match(/del\s+(\d+)\s+al\s+(\d+)\s+de\s+([\d,.]+)/i);
+      const match = text.match(/del\s+(\d+)\s+al\s+(\d+)/i);
       
       let expected = 0;
       if (match) {
@@ -428,7 +432,8 @@ async function setPageLength(page: Page, length: number): Promise<void> {
     const selectHandle = await page.$(
       "select[name='tableDocuments_length'], " +
       "#tableDocuments_length select, " +
-      "select[name*='length']"
+      "select[name*='length'], " +
+      ".dt-length select"
     );
 
     if (selectHandle) {
@@ -627,20 +632,26 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
 async function goToNextPage(page: Page): Promise<boolean> {
   try {
     const nextBtn = await page.$(
-      "#tableDocuments_next, .paginate_button.next, a.next"
+      "#tableDocuments_next, .paginate_button.next, a.next, .dt-paging-button.next"
     );
 
     if (!nextBtn) return false;
 
     const isDisabled = await page.evaluate((el) => {
-      return el?.classList.contains("disabled") || false;
+      const selfDisabled = el?.classList.contains("disabled") ||
+        el?.getAttribute("aria-disabled") === "true" ||
+        (el as HTMLButtonElement | null)?.disabled === true;
+      const parentDisabled = el?.parentElement?.classList.contains("disabled") || false;
+      return Boolean(selfDisabled || parentDisabled);
     }, nextBtn);
 
     if (isDisabled) return false;
 
     // Permite confirmar que realmente avanzo de pagina.
     const currentPageNum = await page.evaluate(() => {
-      const active = document.querySelector("#tableDocuments_paginate .paginate_button.current, .paginate_button.active");
+      const active = document.querySelector(
+        "#tableDocuments_paginate .paginate_button.current, .paginate_button.active, .dt-paging-button.current"
+      );
       return active?.textContent?.trim() || "0";
     });
 
@@ -650,7 +661,9 @@ async function goToNextPage(page: Page): Promise<boolean> {
     const startTime = Date.now();
     while (Date.now() - startTime < 10000) {
       const newPageNum = await page.evaluate(() => {
-        const active = document.querySelector("#tableDocuments_paginate .paginate_button.current, .paginate_button.active");
+        const active = document.querySelector(
+          "#tableDocuments_paginate .paginate_button.current, .paginate_button.active, .dt-paging-button.current"
+        );
         return active?.textContent?.trim() || "0";
       });
       
@@ -662,7 +675,7 @@ async function goToNextPage(page: Page): Promise<boolean> {
     
     // Espera fin de recarga si el indicador aparece.
     try {
-      await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
+      await page.waitForSelector("#tableDocuments_processing, .dt-processing", { hidden: true, timeout: 15000 });
     } catch {
       // Si no aparece, seguir con espera de estabilizacion.
     }
@@ -679,7 +692,7 @@ async function goToNextPage(page: Page): Promise<boolean> {
 async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<void> {
   // Espera fin de recarga cuando DataTables lo reporta.
   try {
-    await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 15000 });
+    await page.waitForSelector("#tableDocuments_processing, .dt-processing", { hidden: true, timeout: 15000 });
   } catch {
     // Si no hay indicador, continuar con verificacion por ids.
   }
