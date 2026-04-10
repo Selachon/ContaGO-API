@@ -13,6 +13,25 @@ Todos los endpoints expuestos por ContaGO estan bajo:
 
 - `/integrations/siigo/*`
 
+## Autenticacion para /integrations/siigo/*
+
+Las rutas de Siigo aceptan dos mecanismos de autenticacion:
+
+1. JWT normal de ContaGO (`Bearer <JWT_CONTAGO>`)
+2. API key interna fija para GPT (`Bearer <GPT_INTERNAL_API_KEY>`)
+
+Variable nueva:
+
+```env
+GPT_INTERNAL_API_KEY=your-fixed-internal-api-key
+```
+
+Comportamiento:
+
+- Si el bearer coincide exactamente con `GPT_INTERNAL_API_KEY`, se autoriza como acceso interno.
+- Si no coincide, se intenta validar como JWT con el middleware actual.
+- Si no valida por ninguno de los dos caminos, responde `401` con formato consistente.
+
 ## Variables de entorno
 
 ```env
@@ -103,9 +122,12 @@ El blueprint lista explicitamente los filtros de fecha e identificacion, y muest
   "missing": [],
   "tokenCached": false,
   "baseUrl": "https://api.siigo.com",
-  "partnerId": "SentiidoAI"
+  "partnerId": "SentiidoAI",
+  "authMode": "jwt"
 }
 ```
+
+`authMode` aparece cuando la solicitud llega autenticada (por ejemplo `jwt` o `internal_api_key`).
 
 ### 2) `POST /integrations/siigo/auth`
 
@@ -261,6 +283,7 @@ Codigos comunes:
 
 - `POST /auth` nunca devuelve el `access_token` de Siigo.
 - `GET /health` nunca devuelve credenciales ni token.
+- `GET /health` puede incluir `authMode` (`jwt` o `internal_api_key`) sin exponer secretos.
 - Se envia `Partner-Id` en autenticacion y en todas las llamadas hacia Siigo.
 - Ante `401` de Siigo, hay un solo reintento con reautenticacion.
 - En `pdf/xml`, la API soporta respuestas de Siigo en binario o JSON (`base64` o URL).
@@ -286,6 +309,12 @@ curl -X POST http://localhost:8000/auth/login \
 # Health Siigo
 curl http://localhost:8000/integrations/siigo/health \
   -H "Authorization: Bearer <JWT_CONTAGO>"
+```
+
+```bash
+# Health Siigo con API key interna (GPT)
+curl http://localhost:8000/integrations/siigo/health \
+  -H "Authorization: Bearer <GPT_INTERNAL_API_KEY>"
 ```
 
 ```bash
@@ -353,17 +382,32 @@ npm run test:siigo
 ### Local
 
 1. Completar variables `SIIGO_*` en `.env`.
-2. Ejecutar `npm run dev`.
-3. Obtener JWT en `/auth/login`.
-4. Probar endpoints `/integrations/siigo/*`.
+2. (Opcional GPT) Configurar `GPT_INTERNAL_API_KEY`.
+3. Ejecutar `npm run dev`.
+4. Obtener JWT en `/auth/login` o usar API key interna.
+5. Probar endpoints `/integrations/siigo/*`.
 
 ### Render
 
 1. Definir `SIIGO_*` en el dashboard de Render.
-2. Desplegar.
-3. Probar:
+2. Definir `GPT_INTERNAL_API_KEY` en Render para consumo GPT.
+3. Desplegar.
+4. Probar:
 
 ```bash
 curl https://contago-api.onrender.com/integrations/siigo/health \
   -H "Authorization: Bearer <JWT_CONTAGO>"
 ```
+
+```bash
+curl https://contago-api.onrender.com/integrations/siigo/health \
+  -H "Authorization: Bearer <GPT_INTERNAL_API_KEY>"
+```
+
+## Configuracion sugerida para GPT Action
+
+1. En tu GPT Action, define `Server URL` hacia tu API (por ejemplo `https://contago-api.onrender.com`).
+2. En autenticacion, usa `API Key` con header `Authorization`.
+3. Valor del secreto: `Bearer <GPT_INTERNAL_API_KEY>`.
+4. Limita el scope de acciones solo a endpoints necesarios en `/integrations/siigo/*`.
+5. Rota periodicamente `GPT_INTERNAL_API_KEY` desde variables de entorno de Render.

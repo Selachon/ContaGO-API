@@ -4,12 +4,14 @@ import express, { type RequestHandler } from "express";
 import request from "supertest";
 import { createSiigoRouter } from "./siigo.js";
 import { resetSiigoTokenCache } from "../services/siigoService.js";
+import { createRequireIntegrationAuth } from "../middleware/requireIntegrationAuth.js";
 
 interface EnvSnapshot {
   SIIGO_API_BASE_URL?: string;
   SIIGO_PARTNER_ID?: string;
   SIIGO_USERNAME?: string;
   SIIGO_ACCESS_KEY?: string;
+  GPT_INTERNAL_API_KEY?: string;
 }
 
 const authStub: RequestHandler = (req, _res, next) => {
@@ -28,11 +30,19 @@ function buildApp() {
   return app;
 }
 
+function buildAppWithIntegrationAuth(jwtAuth: RequestHandler) {
+  const app = express();
+  app.use(express.json());
+  app.use("/integrations/siigo", createSiigoRouter(createRequireIntegrationAuth(jwtAuth)));
+  return app;
+}
+
 function setSiigoEnv(overrides: Partial<EnvSnapshot> = {}): void {
   process.env.SIIGO_API_BASE_URL = overrides.SIIGO_API_BASE_URL ?? "https://api.siigo.com";
   process.env.SIIGO_PARTNER_ID = overrides.SIIGO_PARTNER_ID ?? "SentiidoAI";
   process.env.SIIGO_USERNAME = overrides.SIIGO_USERNAME ?? "sandbox@siigoapi.com";
   process.env.SIIGO_ACCESS_KEY = overrides.SIIGO_ACCESS_KEY ?? "fake-access-key";
+  process.env.GPT_INTERNAL_API_KEY = overrides.GPT_INTERNAL_API_KEY ?? "gpt-internal-key";
 }
 
 function jsonResponse(status: number, payload: unknown, headers: Record<string, string> = {}): Response {
@@ -50,6 +60,7 @@ const envSnapshot: EnvSnapshot = {
   SIIGO_PARTNER_ID: process.env.SIIGO_PARTNER_ID,
   SIIGO_USERNAME: process.env.SIIGO_USERNAME,
   SIIGO_ACCESS_KEY: process.env.SIIGO_ACCESS_KEY,
+  GPT_INTERNAL_API_KEY: process.env.GPT_INTERNAL_API_KEY,
 };
 
 describe("Siigo integration routes", () => {
@@ -64,7 +75,57 @@ describe("Siigo integration routes", () => {
     process.env.SIIGO_PARTNER_ID = envSnapshot.SIIGO_PARTNER_ID;
     process.env.SIIGO_USERNAME = envSnapshot.SIIGO_USERNAME;
     process.env.SIIGO_ACCESS_KEY = envSnapshot.SIIGO_ACCESS_KEY;
+    process.env.GPT_INTERNAL_API_KEY = envSnapshot.GPT_INTERNAL_API_KEY;
     global.fetch = originalFetch;
+  });
+
+  it("allows access with JWT via integration auth middleware", async () => {
+    const jwtPassStub: RequestHandler = (req, _res, next) => {
+      req.user = {
+        userId: "jwt-user",
+        email: "jwt@example.com",
+        isAdmin: false,
+      };
+      next();
+    };
+
+    const app = buildAppWithIntegrationAuth(jwtPassStub);
+    const response = await request(app)
+      .get("/integrations/siigo/health")
+      .set("Authorization", "Bearer jwt-valid-token");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.authMode, "jwt");
+  });
+
+  it("allows access with GPT_INTERNAL_API_KEY", async () => {
+    const jwtFailStub: RequestHandler = (_req, res) => {
+      res.status(401).json({ ok: false, message: "Token inválido o expirado" });
+    };
+
+    const app = buildAppWithIntegrationAuth(jwtFailStub);
+    const response = await request(app)
+      .get("/integrations/siigo/health")
+      .set("Authorization", "Bearer gpt-internal-key");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.authMode, "internal_api_key");
+  });
+
+  it("rejects invalid bearer token when not JWT or internal key", async () => {
+    const jwtFailStub: RequestHandler = (_req, res) => {
+      res.status(401).json({ ok: false, message: "Token inválido o expirado" });
+    };
+
+    const app = buildAppWithIntegrationAuth(jwtFailStub);
+    const response = await request(app)
+      .get("/integrations/siigo/health")
+      .set("Authorization", "Bearer invalid-token");
+
+    assert.equal(response.status, 401);
+    assert.equal(response.body.ok, false);
   });
 
   it("GET /health reports missing configuration without exposing secrets", async () => {

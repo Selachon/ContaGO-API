@@ -1,5 +1,5 @@
 import { Router, Request, Response, type NextFunction, type RequestHandler } from "express";
-import { requireAuth } from "../middleware/auth.js";
+import { requireIntegrationAuth } from "../middleware/requireIntegrationAuth.js";
 import {
   authenticateWithSiigo,
   getCustomerById,
@@ -127,15 +127,16 @@ function validateId(id: string): string | null {
   return clean;
 }
 
-export function createSiigoRouter(authMiddleware: RequestHandler = requireAuth): Router {
+export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegrationAuth): Router {
   const router = Router();
 
   router.use((req: Request, res: Response, next: NextFunction) => authMiddleware(req, res, next));
 
   router.get("/health", (_req: Request, res: Response) => {
     const health = getSiigoIntegrationHealth();
+    const authMode = _req.integrationAuthMode;
     const status = health.ok ? 200 : 500;
-    return res.status(status).json(health);
+    return res.status(status).json(authMode ? { ...health, authMode } : health);
   });
 
   router.post("/auth", async (_req: Request, res: Response) => {
