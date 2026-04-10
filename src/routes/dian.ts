@@ -30,7 +30,7 @@ function isValidPdfBuffer(buffer: Buffer): boolean {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
 // Limite alto configurable para soportar lotes grandes.
-const MAX_DOCUMENTS_PER_REQUEST = Number(process.env.DIAN_MAX_DOCUMENTS || 2000);
+const MAX_DOCUMENTS_PER_REQUEST = Number(process.env.DIAN_MAX_DOCUMENTS || 10000);
 // Reintentos para descargas puntuales con fallas transitorias.
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
