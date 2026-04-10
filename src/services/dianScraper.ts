@@ -19,6 +19,9 @@ interface ExtractOptions {
   documentDirection?: DocumentDirection;
 }
 
+const BROWSER_LAUNCH_TIMEOUT_MS = Number(process.env.PUPPETEER_LAUNCH_TIMEOUT_MS || 120000);
+const BROWSER_LAUNCH_RETRIES = Number(process.env.PUPPETEER_LAUNCH_RETRIES || 3);
+
 /**
  * Extrae ids de documentos DIAN y cookies de sesion para descargas posteriores.
  */
@@ -46,20 +49,7 @@ export async function extractDocumentIds(
   try {
     const executablePath = resolveExecutablePath();
 
-    browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-sync",
-        "--no-first-run",
-      ],
-      executablePath: executablePath || undefined,
-    });
+    browser = await launchBrowserWithRetry(executablePath, updateProgress);
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
@@ -222,6 +212,54 @@ export async function extractDocumentIds(
       await browser.close();
     }
   }
+}
+
+async function launchBrowserWithRetry(
+  executablePath: string | null,
+  updateProgress: (data: Partial<ProgressData>) => void
+): Promise<Browser> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= BROWSER_LAUNCH_RETRIES; attempt++) {
+    try {
+      return await puppeteer.launch({
+        headless: true,
+        timeout: BROWSER_LAUNCH_TIMEOUT_MS,
+        protocolTimeout: BROWSER_LAUNCH_TIMEOUT_MS,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-extensions",
+          "--disable-background-networking",
+          "--disable-sync",
+          "--no-first-run",
+        ],
+        executablePath: executablePath || undefined,
+      });
+    } catch (err) {
+      lastError = err as Error;
+      const isLastAttempt = attempt >= BROWSER_LAUNCH_RETRIES;
+      const message = lastError.message || String(lastError);
+
+      console.warn(`Fallo iniciando navegador (intento ${attempt}/${BROWSER_LAUNCH_RETRIES}): ${message}`);
+
+      if (isLastAttempt) {
+        break;
+      }
+
+      updateProgress({
+        step: `Reintentando inicio de navegador (${attempt}/${BROWSER_LAUNCH_RETRIES})...`,
+      });
+
+      await delay(1500 * attempt);
+    }
+  }
+
+  throw new Error(
+    `No fue posible iniciar Chromium tras ${BROWSER_LAUNCH_RETRIES} intentos. Último error: ${lastError?.message || "desconocido"}`
+  );
 }
 
 function resolveExecutablePath(): string | null {
