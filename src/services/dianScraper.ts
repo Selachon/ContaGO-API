@@ -454,7 +454,7 @@ function shouldIgnoreDocType(docType: string, isSentDocuments: boolean = false):
 async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocuments: boolean = false): Promise<DocumentInfo[]> {
   const docs: DocumentInfo[] = [];
 
-  const items = await page.evaluate(() => {
+  const items = await page.evaluate((isSentDocumentsInPage) => {
     const results: Array<{
       id: string;
       docnum: string;
@@ -543,13 +543,18 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
       const tds = row.querySelectorAll("td");
       const docnum = tds[4]?.textContent?.trim() || "";
       const docType = tds[5]?.textContent?.trim() || "";
-      const nit = tds[6]?.textContent?.trim() || "";
+      const preferredNitIndex = isSentDocumentsInPage ? 8 : 6;
+      const fallbackNitIndex = isSentDocumentsInPage ? 6 : 8;
+      const nit =
+        tds[preferredNitIndex]?.textContent?.trim() ||
+        tds[fallbackNitIndex]?.textContent?.trim() ||
+        "";
 
       results.push({ id: trackId, docnum, nit, docType, documentTypeId, fechaValidacion, fechaGeneracion });
     }
 
     return results;
-  });
+  }, isSentDocuments);
 
   let skippedCount = 0;
   
