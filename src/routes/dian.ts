@@ -34,8 +34,12 @@ const MAX_DOCUMENTS_PER_REQUEST = Number(process.env.DIAN_MAX_DOCUMENTS || 2000)
 // Reintentos para descargas puntuales con fallas transitorias.
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
+// Timeout por descarga individual (3x para lotes grandes).
+const DOWNLOAD_REQUEST_TIMEOUT_MS = Number(process.env.DIAN_DOWNLOAD_TIMEOUT_MS || 180_000);
 // TTL de jobs (incluye artefactos en disco) para evitar acumulacion.
-const JOB_TTL_MS = 60 * 60 * 1000;
+const JOB_TTL_MS = Number(process.env.DIAN_JOB_TTL_MS || 3 * 60 * 60 * 1000);
+// Tiempo maximo de stream SSE para descargas largas.
+const SSE_TIMEOUT_SECONDS = Number(process.env.DIAN_SSE_TIMEOUT_SECONDS || 10_800);
 
 // Crear carpeta de trabajo al iniciar el proceso.
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -135,7 +139,7 @@ router.get("/progress/:uid", (req: Request, res: Response) => {
   res.setHeader("Connection", "keep-alive");
   res.setHeader("X-Accel-Buffering", "no");
 
-  const timeoutSeconds = 3600; // 1 hora para descargas grandes
+  const timeoutSeconds = SSE_TIMEOUT_SECONDS;
   const startTime = Date.now();
 
   const interval = setInterval(() => {
@@ -732,7 +736,7 @@ async function downloadFile(
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     const controller = new AbortController();
     // Timeout alto para documentos pesados en enlaces inestables.
-    const timeout = setTimeout(() => controller.abort(), 60_000);
+    const timeout = setTimeout(() => controller.abort(), DOWNLOAD_REQUEST_TIMEOUT_MS);
 
     try {
       const response = await fetch(url, {
