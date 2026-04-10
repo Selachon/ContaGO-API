@@ -55,7 +55,7 @@ Notas:
 
 ## Endpoints expuestos
 
-Todos requieren JWT de ContaGO (`Authorization: Bearer <JWT_CONTAGO>`).
+Todos requieren autenticacion de ContaGO (JWT) o API key interna GPT.
 
 - `GET /integrations/siigo/health`
 - `POST /integrations/siigo/auth`
@@ -63,7 +63,12 @@ Todos requieren JWT de ContaGO (`Authorization: Bearer <JWT_CONTAGO>`).
 - `GET /integrations/siigo/invoices/:id`
 - `GET /integrations/siigo/invoices/:id/pdf`
 - `GET /integrations/siigo/invoices/:id/xml`
+- `GET /integrations/siigo/purchases`
 - `GET /integrations/siigo/purchases/:id`
+- `GET /integrations/siigo/purchases/search`
+- `GET /integrations/siigo/payment-receipts`
+- `GET /integrations/siigo/payment-receipts/:id`
+- `GET /integrations/siigo/payment-receipts/search`
 - `GET /integrations/siigo/customers`
 - `GET /integrations/siigo/customers/:id`
 - `GET /integrations/siigo/products/:id`
@@ -101,6 +106,31 @@ Todos requieren JWT de ContaGO (`Authorization: Bearer <JWT_CONTAGO>`).
 
 - `type`
 
+### Purchases search
+
+- `id`
+- `number`
+- `name`
+- `supplier_identification`
+- `provider_invoice_prefix`
+- `provider_invoice_number`
+- `date_start`
+- `date_end`
+- `page`
+- `page_size`
+
+### Payment receipts search
+
+- `id`
+- `number`
+- `name`
+- `document_id`
+- `date_start`
+- `date_end`
+- `third_party_identification`
+- `page`
+- `page_size`
+
 ### Fuente y supuestos de parametros
 
 Se validaron contra el blueprint oficial de Apiary (`/api-description-document`) para:
@@ -109,6 +139,13 @@ Se validaron contra el blueprint oficial de Apiary (`/api-description-document`)
 - `GET /v1/customers{?created_start}`
 
 El blueprint lista explicitamente los filtros de fecha e identificacion, y muestra paginacion en enlaces (`page`/`page_size`) aunque no siempre los enumera en la tabla de parametros. Por compatibilidad se admiten ambos.
+
+### Filtros nativos Siigo vs filtros locales ContaGO
+
+- `GET /integrations/siigo/purchases`: usa filtros nativos enviados a Siigo (`created_start`, `created_end`, `updated_start`, `updated_end`, `page`, `page_size`).
+- `GET /integrations/siigo/payment-receipts`: usa filtros nativos enviados a Siigo (`created_start`, `created_end`, `updated_start`, `updated_end`, `page`, `page_size`).
+- `GET /integrations/siigo/purchases/search`: usa nativos `page`, `page_size`; aplica localmente `id`, `number`, `name`, `supplier_identification`, `provider_invoice_prefix`, `provider_invoice_number`, `date_start`, `date_end`.
+- `GET /integrations/siigo/payment-receipts/search`: usa nativos `created_start`, `created_end`, `updated_start`, `updated_end`, `page`, `page_size`; aplica localmente `id`, `number`, `name`, `document_id`, `date_start`, `date_end`, `third_party_identification`.
 
 ## Ejemplos de respuesta por endpoint
 
@@ -203,6 +240,74 @@ Mismo comportamiento que PDF (binario/base64/url).
   "source": "siigo",
   "data": {
     "id": "purchase-id"
+  }
+}
+```
+
+### 7.1) `GET /integrations/siigo/purchases`
+
+```json
+{
+  "ok": true,
+  "source": "siigo",
+  "data": {
+    "results": []
+  }
+}
+```
+
+### 7.2) `GET /integrations/siigo/purchases/search`
+
+```json
+{
+  "ok": true,
+  "source": "siigo",
+  "data": {
+    "results": [],
+    "_filtering": {
+      "native": ["page", "page_size"],
+      "local": ["id", "number", "name", "supplier_identification", "provider_invoice_prefix", "provider_invoice_number", "date_start", "date_end"]
+    }
+  }
+}
+```
+
+### 7.3) `GET /integrations/siigo/payment-receipts`
+
+```json
+{
+  "ok": true,
+  "source": "siigo",
+  "data": {
+    "results": []
+  }
+}
+```
+
+### 7.4) `GET /integrations/siigo/payment-receipts/:id`
+
+```json
+{
+  "ok": true,
+  "source": "siigo",
+  "data": {
+    "id": "payment-receipt-id"
+  }
+}
+```
+
+### 7.5) `GET /integrations/siigo/payment-receipts/search`
+
+```json
+{
+  "ok": true,
+  "source": "siigo",
+  "data": {
+    "results": [],
+    "_filtering": {
+      "native": ["created_start", "created_end", "updated_start", "updated_end", "page", "page_size"],
+      "local": ["id", "number", "name", "document_id", "date_start", "date_end", "third_party_identification"]
+    }
   }
 }
 ```
@@ -361,6 +466,30 @@ curl "http://localhost:8000/integrations/siigo/document-types?type=FV" \
   -H "Authorization: Bearer <JWT_CONTAGO>"
 ```
 
+```bash
+# Listar facturas de compra
+curl "http://localhost:8000/integrations/siigo/purchases?page=1&page_size=25" \
+  -H "Authorization: Bearer <JWT_CONTAGO>"
+```
+
+```bash
+# Buscar facturas de compra (filtros locales + paginacion nativa)
+curl "http://localhost:8000/integrations/siigo/purchases/search?supplier_identification=900123456&provider_invoice_prefix=PF&provider_invoice_number=7788&page=1&page_size=25" \
+  -H "Authorization: Bearer <JWT_CONTAGO>"
+```
+
+```bash
+# Listar recibos de pago/egreso
+curl "http://localhost:8000/integrations/siigo/payment-receipts?created_start=2025-01-01&page=1&page_size=25" \
+  -H "Authorization: Bearer <JWT_CONTAGO>"
+```
+
+```bash
+# Buscar recibos de pago/egreso
+curl "http://localhost:8000/integrations/siigo/payment-receipts/search?document_id=321&third_party_identification=800123&page=1&page_size=25" \
+  -H "Authorization: Bearer <JWT_CONTAGO>"
+```
+
 ## Pruebas automaticas minimas
 
 Se agregaron pruebas para:
@@ -368,6 +497,9 @@ Se agregaron pruebas para:
 - `health`
 - `auth`
 - `invoices list`
+- `purchases list`
+- `purchases search`
+- `payment-receipts search`
 - `retry tras 401`
 - `error por configuracion faltante`
 

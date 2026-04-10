@@ -373,6 +373,18 @@ export async function getPurchaseById(id: string): Promise<unknown> {
   return request(`/v1/purchases/${encodeURIComponent(id)}`);
 }
 
+export async function listPurchases(query: Record<string, unknown>): Promise<unknown> {
+  return request("/v1/purchases", { query });
+}
+
+export async function listPaymentReceipts(query: Record<string, unknown>): Promise<unknown> {
+  return request("/v1/payment-receipts", { query });
+}
+
+export async function getPaymentReceiptById(id: string): Promise<unknown> {
+  return request(`/v1/payment-receipts/${encodeURIComponent(id)}`);
+}
+
 export async function listCustomers(query: Record<string, unknown>): Promise<unknown> {
   return request("/v1/customers", { query });
 }

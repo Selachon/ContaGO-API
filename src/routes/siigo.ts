@@ -6,12 +6,15 @@ import {
   getInvoiceById,
   getInvoicePdf,
   getInvoiceXml,
+  getPaymentReceiptById,
   getProductById,
   getPurchaseById,
   getSiigoIntegrationHealth,
   listCustomers,
   listDocumentTypes,
   listInvoices,
+  listPaymentReceipts,
+  listPurchases,
   SiigoError,
 } from "../services/siigoService.js";
 
@@ -127,6 +130,126 @@ function validateId(id: string): string | null {
   return clean;
 }
 
+function toRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function toArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is Record<string, unknown> => Boolean(toRecord(item)));
+}
+
+function pickResults(payload: unknown): Record<string, unknown>[] {
+  if (Array.isArray(payload)) return toArray(payload);
+  const record = toRecord(payload);
+  if (!record) return [];
+  return toArray(record.results);
+}
+
+function buildFilteredPayload(
+  payload: unknown,
+  filteredResults: Record<string, unknown>[],
+  nativeFilters: string[],
+  localFilters: string[]
+): Record<string, unknown> {
+  if (Array.isArray(payload)) {
+    return {
+      results: filteredResults,
+      _filtering: {
+        native: nativeFilters,
+        local: localFilters,
+      },
+    };
+  }
+
+  const record = toRecord(payload);
+  if (!record) {
+    return {
+      results: filteredResults,
+      _filtering: {
+        native: nativeFilters,
+        local: localFilters,
+      },
+    };
+  }
+
+  return {
+    ...record,
+    results: filteredResults,
+    _filtering: {
+      native: nativeFilters,
+      local: localFilters,
+    },
+  };
+}
+
+function normalizeText(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function getNestedValue(record: Record<string, unknown>, path: string): unknown {
+  const parts = path.split(".");
+  let current: unknown = record;
+
+  for (const part of parts) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) {
+      return undefined;
+    }
+    current = (current as Record<string, unknown>)[part];
+  }
+
+  return current;
+}
+
+function parseDateValue(value: unknown): number | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function applyDateRangeFilter(
+  rows: Record<string, unknown>[],
+  datePath: string,
+  startDate?: string,
+  endDate?: string
+): Record<string, unknown>[] {
+  if (!startDate && !endDate) return rows;
+  const start = parseDateValue(startDate);
+  const end = parseDateValue(endDate);
+
+  return rows.filter((row) => {
+    const raw = getNestedValue(row, datePath);
+    const dateMs = parseDateValue(raw);
+    if (dateMs === null) return false;
+    if (start !== null && dateMs < start) return false;
+    if (end !== null && dateMs > end) return false;
+    return true;
+  });
+}
+
+function applyTextFilter(
+  rows: Record<string, unknown>[],
+  value: string | undefined,
+  candidatePaths: string[],
+  mode: "contains" | "equals" = "contains"
+): Record<string, unknown>[] {
+  if (!value) return rows;
+  const search = normalizeText(value);
+  if (!search) return rows;
+
+  return rows.filter((row) => {
+    for (const path of candidatePaths) {
+      const candidate = normalizeText(getNestedValue(row, path));
+      if (!candidate) continue;
+      if (mode === "equals" ? candidate === search : candidate.includes(search)) {
+        return true;
+      }
+    }
+    return false;
+  });
+}
+
 export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegrationAuth): Router {
   const router = Router();
 
@@ -214,6 +337,74 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   }
   });
 
+  router.get("/purchases", async (req: Request, res: Response) => {
+    try {
+      const query = getAllowedQuery(req, ["created_start", "created_end", "updated_start", "updated_end", "page", "page_size"]);
+      const data = await listPurchases(query);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/purchases/search", async (req: Request, res: Response) => {
+    try {
+      const nativeQuery = getAllowedQuery(req, ["page", "page_size"]);
+      const searchQuery = getAllowedQuery(req, [
+        "id",
+        "number",
+        "name",
+        "supplier_identification",
+        "provider_invoice_prefix",
+        "provider_invoice_number",
+        "date_start",
+        "date_end",
+      ]);
+
+      const raw = await listPurchases(nativeQuery);
+      const rows = pickResults(raw);
+
+      let filtered = rows;
+      filtered = applyTextFilter(filtered, searchQuery.id as string | undefined, ["id"], "equals");
+      filtered = applyTextFilter(filtered, searchQuery.number as string | undefined, ["number", "name"], "contains");
+      filtered = applyTextFilter(filtered, searchQuery.name as string | undefined, ["name"], "contains");
+      filtered = applyTextFilter(filtered, searchQuery.supplier_identification as string | undefined, ["supplier.identification"], "contains");
+      filtered = applyTextFilter(
+        filtered,
+        searchQuery.provider_invoice_prefix as string | undefined,
+        ["provider_invoice_prefix", "provider_invoice.prefix"],
+        "contains"
+      );
+      filtered = applyTextFilter(
+        filtered,
+        searchQuery.provider_invoice_number as string | undefined,
+        ["provider_invoice_number", "provider_invoice.number"],
+        "contains"
+      );
+      filtered = applyDateRangeFilter(
+        filtered,
+        "date",
+        searchQuery.date_start as string | undefined,
+        searchQuery.date_end as string | undefined
+      );
+
+      const data = buildFilteredPayload(raw, filtered, ["page", "page_size"], [
+        "id",
+        "number",
+        "name",
+        "supplier_identification",
+        "provider_invoice_prefix",
+        "provider_invoice_number",
+        "date_start",
+        "date_end",
+      ]);
+
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
   router.get("/purchases/:id", async (req: Request, res: Response) => {
   try {
     const id = validateId(req.params.id);
@@ -226,6 +417,82 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   } catch (error) {
     return handleSiigoError(res, error);
   }
+  });
+
+  router.get("/payment-receipts", async (req: Request, res: Response) => {
+    try {
+      const query = getAllowedQuery(req, ["created_start", "created_end", "updated_start", "updated_end", "page", "page_size"]);
+      const data = await listPaymentReceipts(query);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/payment-receipts/search", async (req: Request, res: Response) => {
+    try {
+      const nativeQuery = getAllowedQuery(req, ["created_start", "created_end", "updated_start", "updated_end", "page", "page_size"]);
+      const searchQuery = getAllowedQuery(req, [
+        "id",
+        "number",
+        "name",
+        "document_id",
+        "date_start",
+        "date_end",
+        "third_party_identification",
+      ]);
+
+      const raw = await listPaymentReceipts(nativeQuery);
+      const rows = pickResults(raw);
+
+      let filtered = rows;
+      filtered = applyTextFilter(filtered, searchQuery.id as string | undefined, ["id"], "equals");
+      filtered = applyTextFilter(filtered, searchQuery.number as string | undefined, ["number", "name"], "contains");
+      filtered = applyTextFilter(filtered, searchQuery.name as string | undefined, ["name"], "contains");
+      filtered = applyTextFilter(filtered, searchQuery.document_id as string | undefined, ["document.id", "document_id"], "equals");
+      filtered = applyTextFilter(
+        filtered,
+        searchQuery.third_party_identification as string | undefined,
+        ["third_party.identification", "supplier.identification", "customer.identification"],
+        "contains"
+      );
+      filtered = applyDateRangeFilter(
+        filtered,
+        "date",
+        searchQuery.date_start as string | undefined,
+        searchQuery.date_end as string | undefined
+      );
+
+      const data = buildFilteredPayload(raw, filtered, ["created_start", "created_end", "updated_start", "updated_end", "page", "page_size"], [
+        "id",
+        "number",
+        "name",
+        "document_id",
+        "date_start",
+        "date_end",
+        "third_party_identification",
+      ]);
+
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/payment-receipts/:id", async (req: Request, res: Response) => {
+    try {
+      const id = validateId(req.params.id);
+      if (!id) {
+        return res
+          .status(400)
+          .json({ ok: false, source: "siigo", code: "invalid_id", message: "ID de recibo de pago inválido" });
+      }
+
+      const data = await getPaymentReceiptById(id);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
   });
 
   router.get("/customers", async (req: Request, res: Response) => {

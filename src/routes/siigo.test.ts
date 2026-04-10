@@ -183,6 +183,120 @@ describe("Siigo integration routes", () => {
     assert.equal(partnerHeader, "SentiidoAI");
   });
 
+  it("GET /purchases forwards native list query params", async () => {
+    const fetchCalls: Array<{ url: string; init?: RequestInit }> = [];
+    global.fetch = async (url, init) => {
+      fetchCalls.push({ url: String(url), init });
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+      return jsonResponse(200, { results: [], pagination: { page: 1 } });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get(
+      "/integrations/siigo/purchases?created_start=2025-01-01&updated_end=2025-01-31&page=1&page_size=25"
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.ok(fetchCalls[1].url.includes("/v1/purchases"));
+    assert.ok(fetchCalls[1].url.includes("created_start=2025-01-01"));
+    assert.ok(fetchCalls[1].url.includes("updated_end=2025-01-31"));
+    assert.ok(fetchCalls[1].url.includes("page_size=25"));
+  });
+
+  it("GET /purchases/search applies local filters for supplier and provider invoice fields", async () => {
+    global.fetch = async (url) => {
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+
+      return jsonResponse(200, {
+        results: [
+          {
+            id: "pur-1",
+            number: 10,
+            name: "FC-1-10",
+            date: "2025-01-15",
+            supplier: { identification: "900123" },
+            provider_invoice_prefix: "PF",
+            provider_invoice_number: "7788",
+          },
+          {
+            id: "pur-2",
+            number: 11,
+            name: "FC-1-11",
+            date: "2025-01-16",
+            supplier: { identification: "900999" },
+            provider_invoice_prefix: "OT",
+            provider_invoice_number: "9999",
+          },
+        ],
+      });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get(
+      "/integrations/siigo/purchases/search?supplier_identification=900123&provider_invoice_prefix=PF"
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.data.results.length, 1);
+    assert.equal(response.body.data.results[0].id, "pur-1");
+    assert.deepEqual(response.body.data._filtering.local, [
+      "id",
+      "number",
+      "name",
+      "supplier_identification",
+      "provider_invoice_prefix",
+      "provider_invoice_number",
+      "date_start",
+      "date_end",
+    ]);
+  });
+
+  it("GET /payment-receipts/search applies local filters and keeps consistent response", async () => {
+    global.fetch = async (url) => {
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+
+      return jsonResponse(200, {
+        results: [
+          {
+            id: "pr-1",
+            number: 100,
+            name: "RP-1-100",
+            date: "2025-02-01",
+            document: { id: 321 },
+            supplier: { identification: "800123" },
+          },
+          {
+            id: "pr-2",
+            number: 101,
+            name: "RP-1-101",
+            date: "2025-02-02",
+            document: { id: 999 },
+            supplier: { identification: "800999" },
+          },
+        ],
+      });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get(
+      "/integrations/siigo/payment-receipts/search?document_id=321&third_party_identification=800123"
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.source, "siigo");
+    assert.equal(response.body.data.results.length, 1);
+    assert.equal(response.body.data.results[0].id, "pr-1");
+  });
+
   it("retries once after 401 and then succeeds", async () => {
     let call = 0;
     global.fetch = async (url) => {
