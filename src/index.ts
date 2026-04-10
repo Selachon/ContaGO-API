@@ -10,6 +10,7 @@ import dianRoutes from "./routes/dian.js";
 import dianExcelRoutes from "./routes/dianExcel.js";
 import googleAuthRoutes from "./routes/googleAuth.js";
 import adminRoutes from "./routes/admin.js";
+import siigoRoutes from "./routes/siigo.js";
 import { connectMongo, seedAdminUser } from "./services/database.js";
 
 // ============================================
@@ -57,6 +58,7 @@ app.use("/auth/google", googleAuthRoutes);
 app.use("/admin", adminRoutes);
 app.use("/dian", dianRoutes);
 app.use("/dian-excel", dianExcelRoutes);
+app.use("/integrations/siigo", siigoRoutes);
 
 // Health check
 app.get("/", (_req, res) => {
