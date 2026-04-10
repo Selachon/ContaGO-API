@@ -191,6 +191,12 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
   }
 
+  // Sincroniza progreso en vivo del scraper (progressTracker) con el estado del job.
+  const liveProgress = progressTracker.get(jobId);
+  if (liveProgress) {
+    setProgress(jobId, liveProgress);
+  }
+
   res.json({
     status: job.status,
     progress: job.progress,
