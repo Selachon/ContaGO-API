@@ -37,8 +37,12 @@ function getTokenFromCookies(req: Request): string | null {
 
 export function getRequestToken(req: Request): string | null {
   const authHeader = req.headers.authorization;
-  if (authHeader?.startsWith("Bearer ")) {
-    return authHeader.slice(7);
+  if (typeof authHeader === "string") {
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (match?.[1]) {
+      const token = match[1].trim();
+      if (token) return token;
+    }
   }
   return getTokenFromCookies(req);
 }

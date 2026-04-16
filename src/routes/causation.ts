@@ -1,6 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
-import { requireAuth } from "../middleware/auth.js";
+import { requireIntegrationAuth } from "../middleware/requireIntegrationAuth.js";
 import {
   CausationError,
   ensurePdfExtension,
@@ -49,7 +49,15 @@ function isPdfBuffer(buffer: Buffer): boolean {
   return buffer.length >= 5 && buffer.subarray(0, 5).toString("utf8") === "%PDF-";
 }
 
-router.use((req, res, next) => requireAuth(req, res, next));
+router.use((req, res, next) => requireIntegrationAuth(req, res, next));
+
+router.get("/health", (_req: Request, res: Response) => {
+  return res.json({
+    ok: true,
+    source: "causation",
+    authMode: _req.integrationAuthMode || null,
+  });
+});
 
 router.post("/build", upload.single("document"), async (req: Request, res: Response) => {
   try {
