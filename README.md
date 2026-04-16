@@ -2,6 +2,51 @@
 
 Backend API de ContaGO (Express + TypeScript).
 
+## Causacion (PDF + Excel + Drive)
+
+Se implemento el endpoint `POST /documents/causation/build-and-upload` para:
+
+1. Recibir PDF inicial + Excel
+2. Buscar coincidencia exacta contra columna `X` usando nombre del PDF
+3. Tomar link de cuenta de cobro en columna `L`
+4. Combinar ambos PDFs (inicial primero, cuenta de cobro segundo)
+5. Subir PDF final a Drive en estructura `raiz/año/mes`
+
+Columnas usadas:
+
+- `B`: fecha documento (año/mes destino)
+- `L`: enlace de Drive de cuenta de cobro
+- `X`: referencia (clave de búsqueda y nombre final)
+
+Regla de comparación:
+
+- sin extensión `.pdf`
+- trim de espacios
+- case-insensitive
+
+## Causacion desde Google Sheet fijo
+
+Se implemento un flujo alterno (sin adjuntar Excel por request) con fuente fija en Google Sheets:
+
+- Endpoint: `POST /causation/build`
+- Fuente: Google Sheet `Registro de Cuentas de Cobro`
+  - `spreadsheetId`: `1SHCCqtbesErScljl7UqaSeQ2oKBzHRGzYttIU4H70ns`
+  - `gid`: `42421166`
+
+Cruce de columnas:
+
+- `B`: fecha documento -> carpeta año/mes destino en Drive
+- `L`: enlace de Drive de cuenta de cobro
+- `X`: referencia de factura -> clave de cruce con nombre del PDF inicial
+
+Comparación de referencia:
+
+- quitar `.pdf`
+- trim de espacios
+- case-insensitive
+
+El endpoint recibe solo `document` (PDF inicial) y opcional `debug`.
+
 ## Integracion Siigo (Fase 1)
 
 La integracion de Siigo esta implementada en:
@@ -39,12 +84,20 @@ SIIGO_API_BASE_URL=https://api.siigo.com
 SIIGO_PARTNER_ID=SentiidoAI
 SIIGO_USERNAME=...
 SIIGO_ACCESS_KEY=...
+GOOGLE_DRIVE_CAUSATION_ROOT_FOLDER_ID=...
+GOOGLE_SHEETS_CAUSATION_SPREADSHEET_ID=1SHCCqtbesErScljl7UqaSeQ2oKBzHRGzYttIU4H70ns
+GOOGLE_SHEETS_CAUSATION_GID=42421166
+GOOGLE_DRIVE_CLIENT_EMAIL=service-account@project-id.iam.gserviceaccount.com
+GOOGLE_DRIVE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+GOOGLE_DRIVE_SHARED_DRIVE_ID=...
+GOOGLE_DRIVE_USE_SHARED_DRIVE=false
 ```
 
 Notas:
 
 - `SIIGO_PARTNER_ID` tiene default `SentiidoAI`.
 - Nunca se expone `SIIGO_ACCESS_KEY` ni el token completo en respuestas.
+- Para `POST /causation/build`, debes compartir el Google Sheet "Registro de Cuentas de Cobro" con el `GOOGLE_DRIVE_CLIENT_EMAIL` de la service account.
 
 ## Estrategia de token y autenticacion
 
@@ -71,6 +124,8 @@ Todos requieren autenticacion de ContaGO (JWT) o API key interna GPT.
 - `GET /integrations/siigo/payment-receipts/search`
 - `GET /integrations/siigo/purchase-document-types`
 - `GET /integrations/siigo/purchase-document-types/search`
+- `POST /documents/causation/build-and-upload`
+- `POST /causation/build`
 - `GET /integrations/siigo/customers`
 - `GET /integrations/siigo/customers/:id`
 - `GET /integrations/siigo/products/:id`
@@ -416,6 +471,46 @@ Mismo comportamiento que PDF (binario/base64/url).
 }
 ```
 
+### 14) `POST /documents/causation/build-and-upload`
+
+```json
+{
+  "ok": true,
+  "data": {
+    "reference": "DS-2025-000123",
+    "matched_row": 17,
+    "drive_source_link": "https://drive.google.com/file/d/1Abc.../view",
+    "year_folder": "2025",
+    "month_folder": "01-Enero",
+    "uploaded_file_name": "DS-2025-000123.pdf",
+    "uploaded_file_id": "1Zxy...",
+    "uploaded_file_url": "https://drive.google.com/file/d/1Zxy.../view"
+  }
+}
+```
+
+### 15) `POST /causation/build`
+
+```json
+{
+  "ok": true,
+  "data": {
+    "reference": "DS-2025-000123",
+    "matched_row": 17,
+    "registro_source": {
+      "spreadsheetId": "1SHCCqtbesErScljl7UqaSeQ2oKBzHRGzYttIU4H70ns",
+      "gid": "42421166"
+    },
+    "drive_source_link": "https://drive.google.com/file/d/1Abc.../view",
+    "year_folder": "2025",
+    "month_folder": "01-Enero",
+    "uploaded_file_name": "DS-2025-000123.pdf",
+    "uploaded_file_id": "1Zxy...",
+    "uploaded_file_url": "https://drive.google.com/file/d/1Zxy.../view"
+  }
+}
+```
+
 ## Formato de errores
 
 Error estandar:
@@ -456,6 +551,10 @@ Codigos comunes:
 - No hay circuit breaker ni backoff automatico para `429`/`503` en esta fase.
 - Siigo puede cambiar estructuras de respuesta en `pdf/xml`; se maneja compatibilidad basica, pero pueden requerirse ajustes puntuales.
 - No se versiona aun el contrato de respuestas de ContaGO para este modulo (se recomienda en fase 2).
+- El flujo de causacion requiere Google Drive conectado para el usuario y acceso al archivo enlazado en columna L.
+- El flujo de causacion no usa OCR ni lectura de contenido PDF; solo cruza por nombre de archivo vs columna X.
+- El endpoint `POST /causation/build` depende de permisos de la service account sobre el Sheet y sobre los archivos/carpeta en Drive.
+- Si `GOOGLE_DRIVE_USE_SHARED_DRIVE=true`, se debe configurar `GOOGLE_DRIVE_SHARED_DRIVE_ID`.
 
 ## Ejemplos curl actualizados
 
@@ -558,6 +657,23 @@ curl "http://localhost:8000/integrations/siigo/purchase-document-types/search?qu
   -H "Authorization: Bearer <JWT_CONTAGO>"
 ```
 
+```bash
+# Construir y subir archivo de causacion
+curl -X POST "http://localhost:8000/documents/causation/build-and-upload" \
+  -H "Authorization: Bearer <JWT_CONTAGO>" \
+  -F "initial_pdf=@/ruta/DS-2025-000123.pdf" \
+  -F "excel=@/ruta/Cruce-Causacion.xlsx" \
+  -F "debug=true"
+```
+
+```bash
+# Construir causacion usando Google Sheet fijo (Registro de Cuentas de Cobro)
+curl -X POST "http://localhost:8000/causation/build" \
+  -H "Authorization: Bearer <JWT_CONTAGO>" \
+  -F "document=@/ruta/DS-2025-000123.pdf" \
+  -F "debug=true"
+```
+
 ## Pruebas automaticas minimas
 
 Se agregaron pruebas para:
@@ -570,6 +686,9 @@ Se agregaron pruebas para:
 - `payment-receipts search`
 - `purchase-document-types`
 - `purchase-document-types search`
+- `causation match/date/filename`
+- `causation rows matching` (exacta, sin coincidencia, múltiples, columna L vacía)
+- `causation date folders` (año/mes)
 - `retry tras 401`
 - `error por configuracion faltante`
 
@@ -577,6 +696,7 @@ Ejecutar:
 
 ```bash
 npm run test:siigo
+npm run test:causation
 ```
 
 ## Prueba local y Render
