@@ -45,7 +45,12 @@ Comparación de referencia:
 - trim de espacios
 - case-insensitive
 
-El endpoint recibe solo `document` (PDF inicial) y opcional `debug`.
+El endpoint `POST /causation/build` acepta:
+
+- `application/json` con `openaiFileIdRefs` (modo recomendado para ChatGPT Actions)
+- `multipart/form-data` con `document` (compatibilidad manual)
+
+En `openaiFileIdRefs`, toma el primer archivo del arreglo como PDF inicial.
 
 ## Integracion Siigo (Fase 1)
 
@@ -674,6 +679,24 @@ curl -X POST "http://localhost:8000/causation/build" \
   -F "debug=true"
 ```
 
+```bash
+# Construir causacion con ChatGPT Actions (openaiFileIdRefs)
+curl -X POST "http://localhost:8000/causation/build" \
+  -H "Authorization: Bearer <GPT_INTERNAL_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "openaiFileIdRefs": [
+      {
+        "name": "DS-1-1570.pdf",
+        "id": "file-abc123",
+        "mime_type": "application/pdf",
+        "download_link": "https://files.openai.com/v1/files/file-abc123/content"
+      }
+    ],
+    "debug": true
+  }'
+```
+
 ## Pruebas automaticas minimas
 
 Se agregaron pruebas para:
@@ -689,6 +712,7 @@ Se agregaron pruebas para:
 - `causation match/date/filename`
 - `causation rows matching` (exacta, sin coincidencia, múltiples, columna L vacía)
 - `causation date folders` (año/mes)
+- `causation openaiFileIdRefs` (válido, faltante, vacío, no PDF)
 - `retry tras 401`
 - `error por configuracion faltante`
 

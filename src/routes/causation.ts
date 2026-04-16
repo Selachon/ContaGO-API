@@ -1,4 +1,4 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type Request, type RequestHandler, type Response } from "express";
 import multer from "multer";
 import { requireIntegrationAuth } from "../middleware/requireIntegrationAuth.js";
 import {
@@ -8,6 +8,7 @@ import {
   mergePdfBuffers,
   parseExcelDateToFolders,
 } from "../services/causationService.js";
+import { resolveInitialDocumentInput } from "../services/causationInputService.js";
 import { readRegistroCuentasCobroRows } from "../services/googleSheetsService.js";
 import {
   createServiceAccountDriveClient,
@@ -17,8 +18,6 @@ import {
   uploadCausationFileToDrive,
 } from "../services/googleDriveCausationService.js";
 
-const router = Router();
-
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -26,6 +25,28 @@ const upload = multer({
     files: 1,
   },
 });
+
+interface CausationDeps {
+  resolveInput: typeof resolveInitialDocumentInput;
+  readRegistroRows: typeof readRegistroCuentasCobroRows;
+  createDriveClient: typeof createServiceAccountDriveClient;
+  getRootFolderId: typeof getCausationRootFolderId;
+  downloadDrivePdf: typeof downloadDrivePdfFromLink;
+  createFolderPath: typeof getOrCreateCausationFolderPath;
+  mergePdf: typeof mergePdfBuffers;
+  uploadFile: typeof uploadCausationFileToDrive;
+}
+
+const defaultDeps: CausationDeps = {
+  resolveInput: resolveInitialDocumentInput,
+  readRegistroRows: readRegistroCuentasCobroRows,
+  createDriveClient: createServiceAccountDriveClient,
+  getRootFolderId: getCausationRootFolderId,
+  downloadDrivePdf: downloadDrivePdfFromLink,
+  createFolderPath: getOrCreateCausationFolderPath,
+  mergePdf: mergePdfBuffers,
+  uploadFile: uploadCausationFileToDrive,
+};
 
 function handleError(res: Response, error: unknown): Response {
   if (error instanceof CausationError) {
@@ -45,74 +66,77 @@ function handleError(res: Response, error: unknown): Response {
   });
 }
 
-function isPdfBuffer(buffer: Buffer): boolean {
-  return buffer.length >= 5 && buffer.subarray(0, 5).toString("utf8") === "%PDF-";
-}
+export function createCausationRouter(
+  authMiddleware: RequestHandler = requireIntegrationAuth,
+  deps: Partial<CausationDeps> = {}
+): Router {
+  const router = Router();
+  const services: CausationDeps = {
+    ...defaultDeps,
+    ...deps,
+  };
 
-router.use((req, res, next) => requireIntegrationAuth(req, res, next));
+  router.use((req, res, next) => authMiddleware(req, res, next));
 
-router.get("/health", (_req: Request, res: Response) => {
-  return res.json({
-    ok: true,
-    source: "causation",
-    authMode: _req.integrationAuthMode || null,
-  });
-});
-
-router.post("/build", upload.single("document"), async (req: Request, res: Response) => {
-  try {
-    const documentFile = req.file;
-    const debug = String(req.body?.debug || "").toLowerCase() === "true";
-
-    if (!documentFile) {
-      throw new CausationError("Falta archivo document", 400, "missing_document");
-    }
-
-    if (!isPdfBuffer(documentFile.buffer)) {
-      throw new CausationError("El archivo document no es un PDF válido", 422, "document_not_pdf");
-    }
-
-    const source = await readRegistroCuentasCobroRows();
-    const match = findUniqueMatchFromRows(source.rows, documentFile.originalname);
-    const folders = parseExcelDateToFolders(match.dateCellRaw);
-    const finalFileName = ensurePdfExtension(match.reference);
-
-    const drive = await createServiceAccountDriveClient();
-    const rootFolderId = getCausationRootFolderId();
-    const sourcePdfBuffer = await downloadDrivePdfFromLink(drive, match.driveSourceLink);
-    const mergedPdf = await mergePdfBuffers(documentFile.buffer, sourcePdfBuffer);
-
-    const { monthFolderId } = await getOrCreateCausationFolderPath(drive, rootFolderId, folders.year, folders.monthName);
-    const uploaded = await uploadCausationFileToDrive(drive, monthFolderId, finalFileName, mergedPdf);
-
+  router.get("/health", (req: Request, res: Response) => {
     return res.json({
       ok: true,
-      data: {
-        reference: match.reference,
-        matched_row: match.matchedRow,
-        registro_source: {
-          spreadsheetId: source.spreadsheetId,
-          gid: source.gid,
-        },
-        drive_source_link: match.driveSourceLink,
-        year_folder: folders.year,
-        month_folder: folders.monthName,
-        uploaded_file_name: finalFileName,
-        uploaded_file_id: uploaded.id,
-        uploaded_file_url: uploaded.url,
-        ...(debug
-          ? {
-              debug: {
-                source_rows: source.rows.length,
-                document_file_name: documentFile.originalname,
-              },
-            }
-          : {}),
-      },
+      source: "causation",
+      authMode: req.integrationAuthMode || null,
     });
-  } catch (error) {
-    return handleError(res, error);
-  }
-});
+  });
 
+  router.post("/build", upload.single("document"), async (req: Request, res: Response) => {
+    try {
+      const debug = String(req.body?.debug || "").toLowerCase() === "true";
+
+      const input = await services.resolveInput(req);
+      const source = await services.readRegistroRows();
+      const match = findUniqueMatchFromRows(source.rows, input.fileName);
+      const folders = parseExcelDateToFolders(match.dateCellRaw);
+      const finalFileName = ensurePdfExtension(match.reference);
+
+      const drive = await services.createDriveClient();
+      const rootFolderId = services.getRootFolderId();
+      const sourcePdfBuffer = await services.downloadDrivePdf(drive, match.driveSourceLink);
+      const mergedPdf = await services.mergePdf(input.buffer, sourcePdfBuffer);
+
+      const { monthFolderId } = await services.createFolderPath(drive, rootFolderId, folders.year, folders.monthName);
+      const uploaded = await services.uploadFile(drive, monthFolderId, finalFileName, mergedPdf);
+
+      return res.json({
+        ok: true,
+        data: {
+          reference: match.reference,
+          matched_row: match.matchedRow,
+          registro_source: {
+            spreadsheetId: source.spreadsheetId,
+            gid: source.gid,
+          },
+          drive_source_link: match.driveSourceLink,
+          year_folder: folders.year,
+          month_folder: folders.monthName,
+          uploaded_file_name: finalFileName,
+          uploaded_file_id: uploaded.id,
+          uploaded_file_url: uploaded.url,
+          ...(debug
+            ? {
+                debug: {
+                  source_rows: source.rows.length,
+                  document_file_name: input.fileName,
+                  input_source: input.source,
+                },
+              }
+            : {}),
+        },
+      });
+    } catch (error) {
+      return handleError(res, error);
+    }
+  });
+
+  return router;
+}
+
+const router = createCausationRouter();
 export default router;
