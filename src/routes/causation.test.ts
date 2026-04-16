@@ -26,6 +26,24 @@ afterEach(() => {
 });
 
 describe("causation route with openaiFileIdRefs", () => {
+  it("test-openai-file accepts mime_type null when name ends with .pdf", async () => {
+    const app = buildApp({});
+    const response = await request(app).post("/causation/test-openai-file").send({
+      openaiFileIdRefs: [
+        {
+          name: "DS-1-1570.pdf",
+          id: "file-123",
+          mime_type: null,
+          download_link: "https://files.example.com/download/file-123",
+        },
+      ],
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.data.reached_controller, true);
+  });
+
   it("accepts openaiFileIdRefs valid request", async () => {
     global.fetch = async () =>
       new Response(Buffer.from("%PDF-1.4\nchatgpt-file"), {

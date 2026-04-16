@@ -8,7 +8,7 @@ import {
   mergePdfBuffers,
   parseExcelDateToFolders,
 } from "../services/causationService.js";
-import { resolveInitialDocumentInput } from "../services/causationInputService.js";
+import { inspectOpenAIFileIdRefs, resolveInitialDocumentInput, validateOpenAIFileRef } from "../services/causationInputService.js";
 import { readRegistroCuentasCobroRows } from "../services/googleSheetsService.js";
 import {
   createServiceAccountDriveClient,
@@ -86,23 +86,88 @@ export function createCausationRouter(
     });
   });
 
+  router.post("/test-openai-file", async (req: Request, res: Response) => {
+    try {
+      console.log(`[Causation] test-openai-file authMode=${req.integrationAuthMode || "unknown"}`);
+      const refsInfo = inspectOpenAIFileIdRefs((req.body as Record<string, unknown> | undefined)?.openaiFileIdRefs);
+      const first = refsInfo.first;
+      if (!first) {
+        throw new CausationError("openaiFileIdRefs está vacío", 400, "empty_openai_file_id_refs");
+      }
+
+      const validated = validateOpenAIFileRef(first, 0);
+
+      return res.json({
+        ok: true,
+        source: "causation",
+        data: {
+          auth_mode: req.integrationAuthMode || null,
+          refs_count: refsInfo.count,
+          first_file_name: validated.fileName,
+          first_file_mime: validated.mimeType || null,
+          reached_controller: true,
+        },
+      });
+    } catch (error) {
+      return handleError(res, error);
+    }
+  });
+
   router.post("/build", upload.single("document"), async (req: Request, res: Response) => {
     try {
       const debug = String(req.body?.debug || "").toLowerCase() === "true";
+      console.log(`[Causation] build authMode=${req.integrationAuthMode || "unknown"} entered_controller=true`);
 
-      const input = await services.resolveInput(req);
-      const source = await services.readRegistroRows();
+      let input;
+      try {
+        input = await services.resolveInput(req);
+      } catch (error) {
+        if (error instanceof CausationError && error.code === "openai_file_download_failed") {
+          console.error("[Causation] build failed_step=openai_download");
+        }
+        throw error;
+      }
+
+      let source;
+      try {
+        source = await services.readRegistroRows();
+      } catch (error) {
+        console.error("[Causation] build failed_step=read_sheets");
+        throw error;
+      }
+
       const match = findUniqueMatchFromRows(source.rows, input.fileName);
       const folders = parseExcelDateToFolders(match.dateCellRaw);
       const finalFileName = ensurePdfExtension(match.reference);
 
       const drive = await services.createDriveClient();
       const rootFolderId = services.getRootFolderId();
-      const sourcePdfBuffer = await services.downloadDrivePdf(drive, match.driveSourceLink);
-      const mergedPdf = await services.mergePdf(input.buffer, sourcePdfBuffer);
+
+      let sourcePdfBuffer;
+      try {
+        sourcePdfBuffer = await services.downloadDrivePdf(drive, match.driveSourceLink);
+      } catch (error) {
+        console.error("[Causation] build failed_step=download_drive_pdf");
+        throw error;
+      }
+
+      let mergedPdf;
+      try {
+        mergedPdf = await services.mergePdf(input.buffer, sourcePdfBuffer);
+      } catch (error) {
+        console.error("[Causation] build failed_step=merge_pdf");
+        throw error;
+      }
 
       const { monthFolderId } = await services.createFolderPath(drive, rootFolderId, folders.year, folders.monthName);
-      const uploaded = await services.uploadFile(drive, monthFolderId, finalFileName, mergedPdf);
+
+      let uploaded;
+      try {
+        uploaded = await services.uploadFile(drive, monthFolderId, finalFileName, mergedPdf);
+      } catch (error) {
+        console.error("[Causation] build failed_step=upload_drive_pdf");
+        throw error;
+      }
 
       return res.json({
         ok: true,

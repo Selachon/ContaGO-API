@@ -29,6 +29,7 @@ Regla de comparación:
 Se implemento un flujo alterno (sin adjuntar Excel por request) con fuente fija en Google Sheets:
 
 - Endpoint: `POST /causation/build`
+- Endpoint temporal de diagnóstico: `POST /causation/test-openai-file`
 - Fuente: Google Sheet `Registro de Cuentas de Cobro`
   - `spreadsheetId`: `1SHCCqtbesErScljl7UqaSeQ2oKBzHRGzYttIU4H70ns`
   - `gid`: `42421166`
@@ -51,6 +52,8 @@ El endpoint `POST /causation/build` acepta:
 - `multipart/form-data` con `document` (compatibilidad manual)
 
 En `openaiFileIdRefs`, toma el primer archivo del arreglo como PDF inicial.
+
+`POST /causation/test-openai-file` sirve para validar auth + payload de Actions sin ejecutar Drive/Sheets/merge.
 
 ## Integracion Siigo (Fase 1)
 
@@ -131,6 +134,7 @@ Todos requieren autenticacion de ContaGO (JWT) o API key interna GPT.
 - `GET /integrations/siigo/purchase-document-types/search`
 - `POST /documents/causation/build-and-upload`
 - `POST /causation/build`
+- `POST /causation/test-openai-file`
 - `GET /integrations/siigo/customers`
 - `GET /integrations/siigo/customers/:id`
 - `GET /integrations/siigo/products/:id`
@@ -697,6 +701,23 @@ curl -X POST "http://localhost:8000/causation/build" \
   }'
 ```
 
+```bash
+# Validar payload openaiFileIdRefs sin ejecutar flujo completo
+curl -X POST "http://localhost:8000/causation/test-openai-file" \
+  -H "Authorization: Bearer <GPT_INTERNAL_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "openaiFileIdRefs": [
+      {
+        "name": "DS-1-1570.pdf",
+        "id": "file-abc123",
+        "mime_type": null,
+        "download_link": "https://files.openai.com/v1/files/file-abc123/content"
+      }
+    ]
+  }'
+```
+
 ## Pruebas automaticas minimas
 
 Se agregaron pruebas para:
@@ -713,6 +734,7 @@ Se agregaron pruebas para:
 - `causation rows matching` (exacta, sin coincidencia, múltiples, columna L vacía)
 - `causation date folders` (año/mes)
 - `causation openaiFileIdRefs` (válido, faltante, vacío, no PDF)
+- `causation test-openai-file` (auth + payload mínimo)
 - `retry tras 401`
 - `error por configuracion faltante`
 

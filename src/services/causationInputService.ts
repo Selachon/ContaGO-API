@@ -21,6 +21,7 @@ export function isPdfBuffer(buffer: Buffer): boolean {
 function isCompatiblePdfMimeType(mimeType: string | undefined, fileName: string): boolean {
   const clean = (mimeType || "").trim().toLowerCase();
   if (clean === "application/pdf" || clean === "application/x-pdf") return true;
+  if (!clean && fileName.toLowerCase().endsWith(".pdf")) return true;
   if (clean === "application/octet-stream" && fileName.toLowerCase().endsWith(".pdf")) return true;
   return false;
 }
@@ -57,24 +58,54 @@ function parseOpenAIFileIdRefs(raw: unknown): OpenAIFileIdRef[] | null {
   return parsed as OpenAIFileIdRef[];
 }
 
-async function downloadOpenAIFile(ref: OpenAIFileIdRef): Promise<{ buffer: Buffer; fileName: string }> {
-  const fileName = String(ref.name || "").trim() || "document.pdf";
+export function validateOpenAIFileRef(ref: OpenAIFileIdRef, index = 0): { fileName: string; mimeType: string; hasDownloadLink: boolean } {
+  const fileName = String(ref.name || "").trim();
   const mimeType = String(ref.mime_type || "").trim().toLowerCase();
   const downloadLink = String(ref.download_link || "").trim();
 
-  if (!downloadLink) {
-    throw new CausationError("openaiFileIdRefs[0].download_link es requerido", 400, "missing_openai_download_link");
+  if (!fileName) {
+    throw new CausationError(`openaiFileIdRefs[${index}].name es requerido`, 400, "missing_openai_file_name");
   }
 
-  console.log(
-    `[CausationInput] source=openaiFileIdRefs name=${maskText(fileName)} mime=${mimeType || "[none]"} hasDownloadLink=true`
-  );
+  if (!downloadLink) {
+    throw new CausationError(`openaiFileIdRefs[${index}].download_link es requerido`, 400, "missing_openai_download_link");
+  }
 
   if (!isCompatiblePdfMimeType(mimeType, fileName)) {
     throw new CausationError("El archivo en openaiFileIdRefs no es PDF compatible", 422, "unsupported_openai_file_mime_type", {
       mime_type: mimeType || null,
+      file_name: fileName,
     });
   }
+
+  return {
+    fileName,
+    mimeType,
+    hasDownloadLink: true,
+  };
+}
+
+export function inspectOpenAIFileIdRefs(raw: unknown): { count: number; first?: OpenAIFileIdRef } {
+  const refs = parseOpenAIFileIdRefs(raw);
+  if (!refs) {
+    throw new CausationError(
+      "No se recibió archivo fuente. Envía openaiFileIdRefs (Actions) o document (multipart)",
+      400,
+      "missing_input_file"
+    );
+  }
+
+  return {
+    count: refs.length,
+    first: refs[0],
+  };
+}
+
+async function downloadOpenAIFile(ref: OpenAIFileIdRef): Promise<{ buffer: Buffer; fileName: string }> {
+  const { fileName, mimeType } = validateOpenAIFileRef(ref, 0);
+  const downloadLink = String(ref.download_link || "").trim();
+
+  console.log(`[CausationInput] source=openaiFileIdRefs name=${maskText(fileName)} mime=${mimeType || "[none]"} hasDownloadLink=true`);
 
   let response: Response;
   try {
