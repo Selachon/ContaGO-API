@@ -76,7 +76,17 @@ export function createCausationRouter(
     ...deps,
   };
 
+  router.use((req, _res, next) => {
+    console.log(`[Causation] middleware_entry path=${req.originalUrl || req.path}`);
+    next();
+  });
+
   router.use((req, res, next) => authMiddleware(req, res, next));
+
+  router.use((req, _res, next) => {
+    console.log(`[Causation] middleware_auth_passed authMode=${req.integrationAuthMode || "unknown"}`);
+    next();
+  });
 
   router.get("/health", (req: Request, res: Response) => {
     return res.json({
@@ -89,7 +99,9 @@ export function createCausationRouter(
   router.post("/test-openai-file", async (req: Request, res: Response) => {
     try {
       console.log(`[Causation] test-openai-file authMode=${req.integrationAuthMode || "unknown"}`);
-      const refsInfo = inspectOpenAIFileIdRefs((req.body as Record<string, unknown> | undefined)?.openaiFileIdRefs);
+      const body = (req.body as Record<string, unknown> | undefined) || {};
+      const bodyParams = (body.params as Record<string, unknown> | undefined) || {};
+      const refsInfo = inspectOpenAIFileIdRefs(body.openaiFileIdRefs ?? bodyParams.openaiFileIdRefs);
       const first = refsInfo.first;
       if (!first) {
         throw new CausationError("openaiFileIdRefs está vacío", 400, "empty_openai_file_id_refs");

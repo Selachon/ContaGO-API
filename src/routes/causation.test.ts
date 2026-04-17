@@ -124,7 +124,56 @@ describe("causation route with openaiFileIdRefs", () => {
     const response = await request(app).post("/causation/build").send({ openaiFileIdRefs: [] });
 
     assert.equal(response.status, 400);
-    assert.equal(response.body.code, "empty_openai_file_id_refs");
+    assert.equal(response.body.code, "missing_input_file");
+    assert.equal(response.body.message, "openaiFileIdRefs debe contener al menos un archivo");
+  });
+
+  it("accepts openaiFileIdRefs nested inside params", async () => {
+    global.fetch = async () =>
+      new Response(Buffer.from("%PDF-1.4\nchatgpt-file"), {
+        status: 200,
+        headers: { "content-type": "application/pdf" },
+      });
+
+    const deps = {
+      readRegistroRows: async () => ({
+        spreadsheetId: "sheet-id",
+        gid: "42421166",
+        rows: [
+          {
+            rowNumber: 7,
+            dateValue: "2025-01-20",
+            driveLink: "https://drive.google.com/file/d/1AbcDefGhIjKlMnOpQrStUvWxYz12345/view",
+            reference: "DS-1-1570",
+          },
+        ],
+      }),
+      createDriveClient: async () => ({}) as any,
+      getRootFolderId: () => "root-folder-id",
+      downloadDrivePdf: async () => Buffer.from("%PDF-1.4\nsource-drive"),
+      createFolderPath: async () => ({ yearFolderId: "year", monthFolderId: "month" }),
+      mergePdf: async () => Buffer.from("%PDF-1.4\nmerged"),
+      uploadFile: async () => ({ id: "uploaded-id", url: "https://drive.google.com/file/d/uploaded-id/view" }),
+    };
+
+    const app = buildApp(deps);
+    const response = await request(app).post("/causation/build").send({
+      params: {
+        openaiFileIdRefs: [
+          {
+            name: "DS-1-1570.pdf",
+            id: "file-123",
+            mime_type: null,
+            download_link: "https://files.example.com/download/file-123",
+          },
+        ],
+      },
+      debug: true,
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.data.reference, "DS-1-1570");
   });
 
   it("rejects request when first openai file is not PDF", async () => {

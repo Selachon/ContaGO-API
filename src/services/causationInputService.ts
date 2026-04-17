@@ -51,10 +51,6 @@ function parseOpenAIFileIdRefs(raw: unknown): OpenAIFileIdRef[] | null {
     throw new CausationError("openaiFileIdRefs debe ser un arreglo", 400, "invalid_openai_file_id_refs");
   }
 
-  if (parsed.length === 0) {
-    throw new CausationError("openaiFileIdRefs está vacío", 400, "empty_openai_file_id_refs");
-  }
-
   return parsed as OpenAIFileIdRef[];
 }
 
@@ -87,9 +83,9 @@ export function validateOpenAIFileRef(ref: OpenAIFileIdRef, index = 0): { fileNa
 
 export function inspectOpenAIFileIdRefs(raw: unknown): { count: number; first?: OpenAIFileIdRef } {
   const refs = parseOpenAIFileIdRefs(raw);
-  if (!refs) {
+  if (!refs || refs.length === 0) {
     throw new CausationError(
-      "No se recibió archivo fuente. Envía openaiFileIdRefs (Actions) o document (multipart)",
+      "openaiFileIdRefs debe contener al menos un archivo",
       400,
       "missing_input_file"
     );
@@ -131,7 +127,8 @@ async function downloadOpenAIFile(ref: OpenAIFileIdRef): Promise<{ buffer: Buffe
 
 export async function resolveInitialDocumentInput(req: Request): Promise<InitialDocumentInput> {
   const body = (req.body as Record<string, unknown> | undefined) || {};
-  const refs = parseOpenAIFileIdRefs(body.openaiFileIdRefs);
+  const bodyParams = (body.params as Record<string, unknown> | undefined) || {};
+  const refs = parseOpenAIFileIdRefs(body.openaiFileIdRefs ?? bodyParams.openaiFileIdRefs);
 
   console.log(
     `[CausationInput] contentType=${req.headers["content-type"] || "[none]"} hasOpenaiFileIdRefs=${Array.isArray(refs)} refsCount=${Array.isArray(refs) ? refs.length : 0} hasMultipartDocument=${Boolean(req.file)}`
@@ -145,6 +142,10 @@ export async function resolveInitialDocumentInput(req: Request): Promise<Initial
       fileName: downloaded.fileName,
       source: "openaiFileIdRefs",
     };
+  }
+
+  if (Array.isArray(refs) && refs.length === 0) {
+    throw new CausationError("openaiFileIdRefs debe contener al menos un archivo", 400, "missing_input_file");
   }
 
   if (req.file) {
@@ -162,7 +163,7 @@ export async function resolveInitialDocumentInput(req: Request): Promise<Initial
   }
 
   throw new CausationError(
-    "No se recibió archivo fuente. Envía openaiFileIdRefs (Actions) o document (multipart)",
+    "openaiFileIdRefs debe contener al menos un archivo",
     400,
     "missing_input_file"
   );

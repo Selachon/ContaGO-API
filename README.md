@@ -55,6 +55,16 @@ En `openaiFileIdRefs`, toma el primer archivo del arreglo como PDF inicial.
 
 `POST /causation/test-openai-file` sirve para validar auth + payload de Actions sin ejecutar Drive/Sheets/merge.
 
+Si `openaiFileIdRefs` falta o está vacío, `POST /causation/build` responde `400` con:
+
+```json
+{
+  "ok": false,
+  "code": "missing_input_file",
+  "message": "openaiFileIdRefs debe contener al menos un archivo"
+}
+```
+
 ## Integracion Siigo (Fase 1)
 
 La integracion de Siigo esta implementada en:
