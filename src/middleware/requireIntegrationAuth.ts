@@ -22,12 +22,35 @@ function maskToken(token: string | null): string {
   return `${token.slice(0, 4)}...${token.slice(-2)}`;
 }
 
+function getIntegrationToken(req: Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader === "string" && authHeader.trim()) {
+    const bearer = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (bearer?.[1]?.trim()) return bearer[1].trim();
+
+    // Compatibilidad con clientes que envían Authorization sin prefijo Bearer.
+    return authHeader.trim();
+  }
+
+  const xApiKey = req.headers["x-api-key"];
+  if (typeof xApiKey === "string" && xApiKey.trim()) {
+    return xApiKey.trim();
+  }
+
+  if (Array.isArray(xApiKey) && typeof xApiKey[0] === "string" && xApiKey[0].trim()) {
+    return xApiKey[0].trim();
+  }
+
+  return getRequestToken(req);
+}
+
 export function createRequireIntegrationAuth(jwtAuth: RequestHandler = requireAuth): RequestHandler {
   return (req: Request, res: Response, next: NextFunction) => {
-    const token = getRequestToken(req);
+    const token = getIntegrationToken(req);
     const hasAuthorizationHeader = typeof req.headers.authorization === "string";
+    const hasXApiKey = typeof req.headers["x-api-key"] === "string" || Array.isArray(req.headers["x-api-key"]);
     console.log(
-      `[IntegrationAuth] path=${req.originalUrl || req.path} hasAuthorization=${hasAuthorizationHeader} token=${maskToken(token)}`
+      `[IntegrationAuth] path=${req.originalUrl || req.path} hasAuthorization=${hasAuthorizationHeader} hasXApiKey=${hasXApiKey} token=${maskToken(token)}`
     );
 
     const internalApiKey = getInternalApiKey();
