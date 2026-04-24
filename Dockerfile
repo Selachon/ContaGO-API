@@ -65,8 +65,10 @@ RUN npm install --omit=dev
 # Copy build output
 COPY --from=builder /app/dist ./dist
 
-# Create downloads directory writable by node user
-RUN mkdir -p /app/downloads && chown node:node /app/downloads
+# Create directories writable by node user
+RUN mkdir -p /app/downloads /app/.cache/puppeteer \
+    && chown node:node /app/downloads \
+    && chown -R node:node /app/.cache
 
 # Expose port
 EXPOSE 8000
