@@ -4,6 +4,11 @@ import path from "node:path";
 
 const isRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_HOSTNAME);
 const isRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+const skipDownload = String(process.env.PUPPETEER_SKIP_DOWNLOAD || "").toLowerCase() === "true";
+
+if (skipDownload) {
+  process.exit(0);
+}
 
 if (!isRender && !isRailway) {
   process.exit(0);

@@ -4,8 +4,11 @@ FROM node:20-slim AS builder
 
 WORKDIR /app
 
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+
 # Copy package files
 COPY package*.json ./
+COPY scripts ./scripts
 
 # Install dependencies (incl. dev for build)
 RUN npm install
@@ -54,6 +57,7 @@ WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
+COPY scripts ./scripts
 
 # Install production dependencies
 RUN npm install --omit=dev

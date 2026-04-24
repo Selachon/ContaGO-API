@@ -19,9 +19,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserNits, getUserGoogleDrive, updateUserDriveTokens } from "../services/database.js";
-import { createDianDocumentsForNit } from "../dian/createDianDocuments.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig } from "../types/dianExcel.js";
-import type { DianEnvironment } from "../dian/types/DianResponse.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
@@ -29,22 +27,6 @@ const BATCH_SIZE = 500; // Procesar en tandas para evitar timeouts
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
 const JOB_TTL_MS = 2 * 60 * 60 * 1000; // 2 horas para jobs grandes
-
-function resolveDianEnvironment(): DianEnvironment {
-  const raw = (process.env.DIAN_ENVIRONMENT || "hab").toLowerCase().trim();
-  if (raw === "prod") return "prod";
-  return "hab";
-}
-
-function extractNitFromTokenUrl(tokenUrl: string): string {
-  try {
-    const parsed = new URL(tokenUrl);
-    const rawNit = parsed.searchParams.get("rk") || "";
-    return rawNit.replace(/[^\d]/g, "").trim();
-  } catch {
-    return "";
-  }
-}
 
 // Crea carpeta de trabajo al iniciar el proceso.
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -347,34 +329,6 @@ async function processExcelJob(
     const driveConfig = await getUserGoogleDrive(userId);
     const hasDrive = !!driveConfig;
 
-    const tokenNit = extractNitFromTokenUrl(tokenUrl);
-    const dianEnvironment = resolveDianEnvironment();
-    const shouldUseSoapForXml = Boolean(tokenNit) && !hasDrive;
-    let dianDocuments: Awaited<ReturnType<typeof createDianDocumentsForNit>> = null;
-
-    if (shouldUseSoapForXml && tokenNit) {
-      try {
-        dianDocuments = await createDianDocumentsForNit({
-          nit: tokenNit,
-          environment: dianEnvironment,
-          companyId: userId,
-        });
-
-        if (dianDocuments) {
-          console.log(
-            `[Excel] Job ${jobId}: usando SOAP para extracción XML (NIT ${tokenNit}, ${dianEnvironment})`
-          );
-        } else {
-          console.log(
-            `[Excel] Job ${jobId}: sin certificado SOAP para NIT ${tokenNit}, usando flujo legacy`
-          );
-        }
-      } catch (soapInitErr) {
-        console.warn(`[Excel] Job ${jobId}: no se pudo inicializar SOAP, se usa flujo legacy`, soapInitErr);
-        dianDocuments = null;
-      }
-    }
-
     // Persiste token refrescado para evitar vencimientos en jobs largos.
     const onTokenRefresh = async (newAccessToken: string, expiryDate: number) => {
       const encryptedToken = encryptToken(newAccessToken);
@@ -426,31 +380,11 @@ async function processExcelJob(
       }
 
       try {
-        // 3.1) Obtener XML del documento (SOAP preferido cuando no se requiere PDF para Drive).
-        let xmlBuffer: Buffer | null = null;
-        let pdfBuffer: Buffer | null = null;
+        // 3.1) Descargar ZIP del trackId.
+        const zipBuffer = await downloadZipFile(doc.id, cookies);
 
-        if (dianDocuments) {
-          try {
-            const soapZipBuffer = await dianDocuments.getStatusZipXmlArchiveBuffer(doc.id);
-            const extracted = await extractFilesFromZip(soapZipBuffer);
-            xmlBuffer = extracted.xmlBuffer;
-            pdfBuffer = extracted.pdfBuffer;
-          } catch (soapErr) {
-            console.warn(
-              `[Excel] Job ${jobId}: SOAP falló para ${doc.docnum}, reintentando por descarga legacy`,
-              soapErr
-            );
-          }
-        }
-
-        // Fallback completo al flujo legacy cuando SOAP no está disponible o no devolvió XML.
-        if (!xmlBuffer) {
-          const zipBuffer = await downloadZipFile(doc.id, cookies);
-          const extracted = await extractFilesFromZip(zipBuffer);
-          xmlBuffer = extracted.xmlBuffer;
-          pdfBuffer = extracted.pdfBuffer;
-        }
+        // 3.2) Extraer XML y PDF del ZIP.
+        const { xmlBuffer, xmlFilename, pdfBuffer, pdfFilename } = await extractFilesFromZip(zipBuffer);
 
         if (!xmlBuffer) {
           throw new Error("No se encontro XML en el ZIP");

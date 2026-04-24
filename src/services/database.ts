@@ -45,10 +45,6 @@ export async function connectMongo(): Promise<void> {
   const users = usersCollection();
   await users.createIndex({ email: 1 }, { unique: true });
   await users.createIndex({ legacyId: 1 });
-
-  const dianCertificates = db.collection("dian_certificates");
-  await dianCertificates.createIndex({ nit: 1, environment: 1 }, { unique: true });
-  await dianCertificates.createIndex({ enabled: 1 });
 }
 
 function mapUser(record: UserRecord | null): User | null {
