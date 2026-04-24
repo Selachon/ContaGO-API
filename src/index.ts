@@ -31,7 +31,7 @@ const PORT = process.env.PORT || 8000;
 // ============================================
 app.use(helmet());
 
-// Trust proxy (Render, nginx, etc.)
+// Trust proxy (Railway, nginx, etc.)
 app.set("trust proxy", 1);
 
 // ============================================
@@ -69,9 +69,12 @@ app.get("/", (_req, res) => {
 
 async function ensurePuppeteer(): Promise<void> {
   const isRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_HOSTNAME);
-  if (!isRender) return;
+  const isRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
+  if (!isRender && !isRailway) return;
 
-  const cacheDir = process.env.PUPPETEER_CACHE_DIR || "/opt/render/.cache/puppeteer";
+  const defaultCacheDir = isRender ? "/opt/render/.cache/puppeteer" : `${process.cwd()}/.cache/puppeteer`;
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR || defaultCacheDir;
+  fs.mkdirSync(cacheDir, { recursive: true });
   process.env.PUPPETEER_CACHE_DIR = cacheDir;
 
   const execPath = puppeteer.executablePath();

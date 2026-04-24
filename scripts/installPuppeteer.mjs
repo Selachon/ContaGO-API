@@ -3,13 +3,15 @@ import { existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 
 const isRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_HOSTNAME);
+const isRailway = Boolean(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_PROJECT_ID);
 
-if (!isRender) {
+if (!isRender && !isRailway) {
   process.exit(0);
 }
 
 const cacheDir =
-  process.env.PUPPETEER_CACHE_DIR || "/opt/render/.cache/puppeteer";
+  process.env.PUPPETEER_CACHE_DIR ||
+  (isRender ? "/opt/render/.cache/puppeteer" : path.join(process.cwd(), ".cache", "puppeteer"));
 
 if (!existsSync(cacheDir)) {
   mkdirSync(cacheDir, { recursive: true });

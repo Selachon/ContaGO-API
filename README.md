@@ -755,7 +755,7 @@ npm run test:siigo
 npm run test:causation
 ```
 
-## Prueba local y Render
+## Prueba local y Railway
 
 ### Local
 
@@ -765,27 +765,28 @@ npm run test:causation
 4. Obtener JWT en `/auth/login` o usar API key interna.
 5. Probar endpoints `/integrations/siigo/*`.
 
-### Render
+### Railway
 
-1. Definir `SIIGO_*` en el dashboard de Render.
-2. Definir `GPT_INTERNAL_API_KEY` en Render para consumo GPT.
-3. Desplegar.
-4. Probar:
+1. Crear servicio en Railway apuntando a este backend.
+2. Definir `SIIGO_*` en Variables del servicio.
+3. Definir `GPT_INTERNAL_API_KEY` en Railway para consumo GPT.
+4. Desplegar.
+5. Probar:
 
 ```bash
-curl https://contago-api.onrender.com/integrations/siigo/health \
+curl https://<tu-dominio-railway>/integrations/siigo/health \
   -H "Authorization: Bearer <JWT_CONTAGO>"
 ```
 
 ```bash
-curl https://contago-api.onrender.com/integrations/siigo/health \
+curl https://<tu-dominio-railway>/integrations/siigo/health \
   -H "Authorization: Bearer <GPT_INTERNAL_API_KEY>"
 ```
 
 ## Configuracion sugerida para GPT Action
 
-1. En tu GPT Action, define `Server URL` hacia tu API (por ejemplo `https://contago-api.onrender.com`).
+1. En tu GPT Action, define `Server URL` hacia tu API (por ejemplo `https://<tu-dominio-railway>`).
 2. En autenticacion, usa `API Key` con header `Authorization`.
 3. Valor del secreto: `Bearer <GPT_INTERNAL_API_KEY>`.
 4. Limita el scope de acciones solo a endpoints necesarios en `/integrations/siigo/*`.
-5. Rota periodicamente `GPT_INTERNAL_API_KEY` desde variables de entorno de Render.
+5. Rota periodicamente `GPT_INTERNAL_API_KEY` desde variables de entorno de Railway.
