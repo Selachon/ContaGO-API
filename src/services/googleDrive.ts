@@ -10,6 +10,17 @@ const SCOPES = [
 ];
 const ROOT_FOLDER_NAME = "Facturas DIAN - Herramienta ContaGO";
 
+function buildGoogleRedirectUri(): string {
+  const explicitRedirect = process.env.GOOGLE_REDIRECT_URI?.trim();
+  if (explicitRedirect) {
+    return explicitRedirect;
+  }
+
+  const apiUrl = (process.env.API_URL || "http://localhost:8000").trim();
+  const normalizedApiUrl = apiUrl.replace(/\/+$/, "");
+  return `${normalizedApiUrl}/auth/google/callback`;
+}
+
 // Meses en español
 const MONTHS_ES = [
   "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
@@ -20,7 +31,7 @@ const MONTHS_ES = [
 export function createOAuth2Client() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = `${process.env.API_URL || "http://localhost:8000"}/auth/google/callback`;
+  const redirectUri = buildGoogleRedirectUri();
 
   if (!clientId || !clientSecret) {
     throw new Error("GOOGLE_CLIENT_ID y GOOGLE_CLIENT_SECRET son requeridos");
