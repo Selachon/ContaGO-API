@@ -1,4 +1,6 @@
 import ExcelJS from "exceljs";
+import fs from "fs";
+import path from "path";
 import type { InvoiceData } from "../types/dianExcel.js";
 
 /**
@@ -69,6 +71,184 @@ function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
   });
 }
 
+function resolveTemplatePath(): string {
+  const configuredPath = process.env.DIAN_EXCEL_TEMPLATE_PATH?.trim() || "templates/dian-excel-template.xlsx";
+  return path.isAbsolute(configuredPath)
+    ? configuredPath
+    : path.join(process.cwd(), configuredPath);
+}
+
+function getTemplateHeaderRow(): number {
+  const raw = Number(process.env.DIAN_EXCEL_TEMPLATE_HEADER_ROW || "2");
+  if (!Number.isFinite(raw) || raw < 1) return 1;
+  return Math.floor(raw);
+}
+
+function normalizeHeader(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .trim();
+}
+
+function cellText(value: ExcelJS.CellValue | undefined | null): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number" || typeof value === "boolean") return String(value).trim();
+  if (typeof value === "object" && "text" in value && typeof value.text === "string") {
+    return value.text.trim();
+  }
+  if (typeof value === "object" && "richText" in value && Array.isArray(value.richText)) {
+    return value.richText.map((part: { text?: string }) => part.text || "").join("").trim();
+  }
+  return "";
+}
+
+function buildHeaderMap(worksheet: ExcelJS.Worksheet, headerRowIndex: number): Map<string, number> {
+  const map = new Map<string, number>();
+  const row = worksheet.getRow(headerRowIndex);
+  row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+    const text = cellText(cell.value);
+    if (text) map.set(normalizeHeader(text), colNumber);
+  });
+  return map;
+}
+
+function ensureHeaders(
+  worksheet: ExcelJS.Worksheet,
+  headerRowIndex: number,
+  headers: string[],
+  getWidth?: (header: string) => number
+): Map<string, number> {
+  const headerRow = worksheet.getRow(headerRowIndex);
+  const map = buildHeaderMap(worksheet, headerRowIndex);
+
+  for (const header of headers) {
+    const key = normalizeHeader(header);
+    if (map.has(key)) continue;
+    const colNumber = worksheet.columnCount + 1;
+    headerRow.getCell(colNumber).value = header;
+    if (getWidth) {
+      worksheet.getColumn(colNumber).width = getWidth(header);
+    }
+    map.set(key, colNumber);
+  }
+
+  return map;
+}
+
+function clearDataRows(worksheet: ExcelJS.Worksheet, headerRowIndex: number): void {
+  const rowsToDelete = Math.max(0, worksheet.rowCount - headerRowIndex);
+  if (rowsToDelete > 0) {
+    worksheet.spliceRows(headerRowIndex + 1, rowsToDelete);
+  }
+}
+
+function getCol(headerMap: Map<string, number>, header: string): number {
+  return headerMap.get(normalizeHeader(header)) || 1;
+}
+
+function findSheet(workbook: ExcelJS.Workbook, ...names: string[]): ExcelJS.Worksheet | undefined {
+  const wanted = names.map((name) => normalizeHeader(name));
+  return workbook.worksheets.find((sheet) => wanted.includes(normalizeHeader(sheet.name)));
+}
+
+function updateSheetTableRange(
+  worksheet: ExcelJS.Worksheet,
+  headerRowIndex: number,
+  dataRowCount: number,
+  requestedName?: string
+): void {
+  const tables = (worksheet.model as { tables?: Array<Record<string, any>> } | undefined)?.tables;
+  if (!tables || tables.length === 0) return;
+
+  const table = tables[0];
+  const ref = table.tableRef;
+  if (!ref) return;
+
+  const match = ref.match(/^([A-Z]+)(\d+):([A-Z]+)(\d+)$/i);
+  if (!match) return;
+
+  const startCol = match[1].toUpperCase();
+  const endCol = match[3].toUpperCase();
+  const endRow = Math.max(headerRowIndex + 1, headerRowIndex + Math.max(1, dataRowCount));
+  table.tableRef = `${startCol}${headerRowIndex}:${endCol}${endRow}`;
+
+  if (requestedName) {
+    const safeName = requestedName.replace(/[^A-Za-z0-9_]/g, "_");
+    table.name = safeName;
+    table.displayName = safeName;
+  }
+}
+
+function pickThirdPartyValue(
+  headerLabel: string,
+  index: number,
+  invoice: InvoiceData,
+  isSentDocuments: boolean
+): ExcelJS.CellValue {
+  const key = normalizeHeader(headerLabel);
+  const party = isSentDocuments
+    ? {
+        nit: invoice.receiverNit,
+        name: invoice.receiverName,
+        email: invoice.receiverEmail || "N/A",
+        phone: invoice.receiverPhone || "N/A",
+        address: invoice.receiverAddress || "N/A",
+        city: invoice.receiverCity || "N/A",
+        department: invoice.receiverDepartment || "N/A",
+        country: invoice.receiverCountry || "N/A",
+        commercialName: invoice.receiverCommercialName || "N/A",
+        taxpayerType: invoice.receiverTaxpayerType || "N/A",
+        fiscalRegime: invoice.receiverFiscalRegime || "N/A",
+        taxResponsibility: invoice.receiverTaxResponsibility || "N/A",
+        economicActivity: invoice.receiverEconomicActivity || "N/A",
+      }
+    : {
+        nit: invoice.issuerNit,
+        name: invoice.issuerName,
+        email: invoice.issuerEmail || "N/A",
+        phone: invoice.issuerPhone || "N/A",
+        address: invoice.issuerAddress || "N/A",
+        city: invoice.issuerCity || "N/A",
+        department: invoice.issuerDepartment || "N/A",
+        country: invoice.issuerCountry || "N/A",
+        commercialName: invoice.issuerCommercialName || "N/A",
+        taxpayerType: invoice.issuerTaxpayerType || "N/A",
+        fiscalRegime: invoice.issuerFiscalRegime || "N/A",
+        taxResponsibility: invoice.issuerTaxResponsibility || "N/A",
+        economicActivity: invoice.issuerEconomicActivity || "N/A",
+      };
+
+  if (["id", "item", "consecutivo", "indice"].some((token) => key === token || key.startsWith(token))) {
+    return index + 1;
+  }
+  if (key.includes("numerofactura") || key.includes("nrofactura") || key.includes("numfactura")) return invoice.docNumber;
+  if (key.includes("fechaemision") || key.includes("fechafactura")) return invoice.issueDate;
+  if (key.includes("tipodocumento") && key.includes("factura")) return invoice.documentType;
+  if (key.includes("cufe")) return invoice.cufe;
+  if (key.includes("nit")) return party.nit;
+  if (key.includes("razonsocial") || key.includes("nombretercero") || key.includes("nombreemisor") || key.includes("nombrevendedor") || key.includes("nombrereceptor")) return party.name;
+  if (key.includes("nombrecomercial")) return party.commercialName;
+  if (key.includes("tipodecontribuyente") || key.includes("tipocontribuyente")) return party.taxpayerType;
+  if (key.includes("regimenfiscal")) return party.fiscalRegime;
+  if (key.includes("responsabilidadtributaria")) return party.taxResponsibility;
+  if (key.includes("actividadeconomica")) return party.economicActivity;
+  if (key.includes("correo") || key.includes("email")) return party.email;
+  if (key.includes("telefono") || key.includes("celular") || key.includes("movil")) return party.phone;
+  if (key.includes("direccion")) return party.address;
+  if (key.includes("ciudad") || key.includes("municipio") || key.includes("municipo")) return party.city;
+  if (key.includes("departamento") || key.includes("provincia")) return party.department;
+  if (key.includes("pais")) return party.country;
+  if (key.includes("tipotercero") || key.includes("roltercero")) {
+    return isSentDocuments ? "Receptor / Comprador" : "Emisor / Vendedor";
+  }
+
+  return "";
+}
+
 /**
  * Genera archivo Excel con los datos de las facturas
  * @param invoices - Lista de facturas a exportar
@@ -82,322 +262,261 @@ export async function generateExcelFile(
   includeDriveColumn: boolean,
   isSentDocuments: boolean = false
 ): Promise<void> {
+  const templatePath = resolveTemplatePath();
+  if (!fs.existsSync(templatePath)) {
+    throw new Error(`No se encontró la plantilla Excel en: ${templatePath}`);
+  }
+
   const workbook = new ExcelJS.Workbook();
-  
-  // Propiedades del workbook para mejor compatibilidad con Excel y Sheets
+  await workbook.xlsx.readFile(templatePath);
+
   workbook.creator = "ContaGO";
-  workbook.created = new Date();
+  workbook.created = workbook.created || new Date();
   workbook.modified = new Date();
   workbook.lastPrinted = new Date();
-  
-  // Establecer propiedades de calculo para compatibilidad
-  workbook.calcProperties = {
-    fullCalcOnLoad: true,
-  };
+  workbook.calcProperties = { fullCalcOnLoad: true };
 
-  // Ordenar facturas por fecha de emision ascendente
   const sortedInvoices = sortInvoicesByDate(invoices);
-
-  // Recolectar todos los tipos de impuestos
   const allTaxTypes = collectAllTaxTypes(sortedInvoices);
+  const headerRowIndex = getTemplateHeaderRow();
 
-  // Nombre de la hoja segun el tipo de documentos
-  const sheetName = isSentDocuments ? "Facturas Emitidas" : "Facturas DIAN";
-  
-  const worksheet = workbook.addWorksheet(sheetName, {
-    views: [{ state: "frozen", ySplit: 1, xSplit: 0 }], // Congelar primera fila
-    properties: {
-      defaultColWidth: 12,
-      defaultRowHeight: 15,
-      tabColor: { argb: "FF4472C4" },
-    },
-  });
+  const requestedMainSheetName = isSentDocuments ? "Facturas Emitidas" : "Facturas DIAN";
+  const worksheet =
+    findSheet(workbook, requestedMainSheetName) ||
+    findSheet(workbook, "Facturas DIAN") ||
+    workbook.worksheets[0];
 
-  // Definir columnas - Para emitidos mostramos el receptor, para recibidos el emisor
+  if (!worksheet) {
+    throw new Error("La plantilla no contiene una hoja para el resumen de facturas.");
+  }
+
+  clearDataRows(worksheet, headerRowIndex);
+
   const partyLabel = isSentDocuments ? "Receptor" : "Emisor";
-  
-  const columns: Partial<ExcelJS.Column>[] = [
-    { header: "ID", key: "id", width: 6 },
-    { header: "Tipo de documento", key: "documentType", width: 18 },
-    { header: "Numero Factura", key: "docNumber", width: 20 },
-    { header: `NIT ${partyLabel}`, key: "partyNit", width: 14 },
-    { header: `Razon Social ${partyLabel}`, key: "partyName", width: 40 },
-    { header: "Fecha de emision", key: "issueDate", width: 16 },
-    { header: "Concepto", key: "concepts", width: 55 },
-    { header: "Forma de pago", key: "paymentMethod", width: 18 },
-    { header: "Subtotal antes de impuestos", key: "subtotal", width: 22 },
-    { header: "Descuento detalle", key: "discount", width: 16 },
-    { header: "Recargo detalle", key: "surcharge", width: 16 },
+  const mainHeaders = [
+    "ID",
+    "Tipo de documento",
+    "Numero Factura",
+    `NIT ${partyLabel}`,
+    `Razon Social ${partyLabel}`,
+    "Fecha de emision",
+    "Concepto",
+    "Forma de pago",
+    "Subtotal antes de impuestos",
+    "Descuento detalle",
+    "Recargo detalle",
+    ...allTaxTypes.map((taxType) => `Valor ${taxType}`),
+    "Descuento Global (-)",
+    "Recargo Global (+)",
+    "Valor total",
+    ...(includeDriveColumn ? ["Enlace factura"] : []),
+    "CUFE",
   ];
 
-  // Agregar columnas dinamicas de impuestos (Valor X)
-  for (const taxType of allTaxTypes) {
-    columns.push({
-      header: `Valor ${taxType}`,
-      key: `tax_${taxType}`,
-      width: 14,
-    });
-  }
+  const mainHeaderMap = ensureHeaders(worksheet, headerRowIndex, mainHeaders, (header) => {
+    if (header === "ID") return 6;
+    if (header === "Tipo de documento") return 18;
+    if (header === "Numero Factura") return 20;
+    if (header.startsWith("NIT ")) return 14;
+    if (header.startsWith("Razon Social ")) return 40;
+    if (header === "Fecha de emision") return 16;
+    if (header === "Concepto") return 55;
+    if (header === "Forma de pago") return 18;
+    if (header === "Subtotal antes de impuestos") return 22;
+    if (header.includes("Descuento")) return 18;
+    if (header.includes("Recargo")) return 16;
+    if (header.startsWith("Valor ")) return 14;
+    if (header === "Enlace factura") return 45;
+    if (header === "CUFE") return 100;
+    return 14;
+  });
 
-  // Columnas finales
-  columns.push(
-    { header: "Descuento Global (-)", key: "globalDiscount", width: 18 },
-    { header: "Recargo Global (+)", key: "globalSurcharge", width: 16 },
-    { header: "Valor total", key: "total", width: 15 }
-  );
-
-  if (includeDriveColumn) {
-    columns.push({ header: "Enlace factura", key: "driveUrl", width: 45 });
-  }
-
-  columns.push({ header: "CUFE", key: "cufe", width: 100 });
-
-  worksheet.columns = columns;
-
-  // Estilos del header
-  const headerRow = worksheet.getRow(1);
-  headerRow.font = { bold: true, size: 11, color: { argb: "FF000000" } };
-  headerRow.fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FFD9D9D9" },
-  };
-  headerRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-  headerRow.height = 25;
-
-  // Formato numerico compatible con Excel y Sheets
   const currencyFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
 
-  // Agregar filas de datos (ya ordenadas por fecha)
+  let mainRowNumber = headerRowIndex + 1;
   sortedInvoices.forEach((invoice, index) => {
-    // Para emitidos, mostramos datos del receptor; para recibidos, del emisor
     const partyNit = isSentDocuments ? invoice.receiverNit : invoice.issuerNit;
     const partyName = isSentDocuments ? invoice.receiverName : invoice.issuerName;
-    
-    const rowData: Record<string, unknown> = {
-      id: index + 1, // ID basado en orden por fecha
-      documentType: invoice.documentType,
-      docNumber: invoice.docNumber,
-      partyNit,
-      partyName,
-      issueDate: invoice.issueDate,
-      concepts: invoice.concepts,
-      paymentMethod: invoice.paymentMethod || "N/A",
-      subtotal: invoice.subtotal,
-      discount: invoice.discount || 0,
-      surcharge: invoice.surcharge || 0,
-      globalDiscount: 0,
-      globalSurcharge: 0,
-      total: invoice.total,
-      cufe: invoice.cufe,
-    };
 
-    // Agregar valores de impuestos dinamicos
-    for (const taxType of allTaxTypes) {
-      const tax = (invoice.taxes || []).find(t => t.taxName === taxType);
-      rowData[`tax_${taxType}`] = tax ? tax.amount : 0;
-    }
+    const row = worksheet.getRow(mainRowNumber++);
+    row.getCell(getCol(mainHeaderMap, "ID")).value = index + 1;
+    row.getCell(getCol(mainHeaderMap, "Tipo de documento")).value = invoice.documentType;
+    row.getCell(getCol(mainHeaderMap, "Numero Factura")).value = invoice.docNumber;
+    row.getCell(getCol(mainHeaderMap, `NIT ${partyLabel}`)).value = partyNit;
+    row.getCell(getCol(mainHeaderMap, `Razon Social ${partyLabel}`)).value = partyName;
+    row.getCell(getCol(mainHeaderMap, "Fecha de emision")).value = invoice.issueDate;
+    row.getCell(getCol(mainHeaderMap, "Concepto")).value = invoice.concepts;
+    row.getCell(getCol(mainHeaderMap, "Forma de pago")).value = invoice.paymentMethod || "N/A";
 
-    if (includeDriveColumn) {
-      rowData.driveUrl = invoice.driveUrl || "";
-    }
-
-    const row = worksheet.addRow(rowData);
-
-    // Formato de celdas numericas
-    const subtotalCell = row.getCell("subtotal");
-    subtotalCell.numFmt = currencyFmt;
+    const subtotalCell = row.getCell(getCol(mainHeaderMap, "Subtotal antes de impuestos"));
     subtotalCell.value = typeof invoice.subtotal === "number" ? invoice.subtotal : 0;
+    subtotalCell.numFmt = currencyFmt;
 
-    row.getCell("discount").numFmt = currencyFmt;
-    row.getCell("surcharge").numFmt = currencyFmt;
+    const discountCell = row.getCell(getCol(mainHeaderMap, "Descuento detalle"));
+    discountCell.value = invoice.discount || 0;
+    discountCell.numFmt = currencyFmt;
 
-    // Formato para columnas de impuestos dinamicos
+    const surchargeCell = row.getCell(getCol(mainHeaderMap, "Recargo detalle"));
+    surchargeCell.value = invoice.surcharge || 0;
+    surchargeCell.numFmt = currencyFmt;
+
     for (const taxType of allTaxTypes) {
-      const taxCell = row.getCell(`tax_${taxType}`);
+      const tax = (invoice.taxes || []).find((t) => t.taxName === taxType);
+      const taxCell = row.getCell(getCol(mainHeaderMap, `Valor ${taxType}`));
+      taxCell.value = tax ? tax.amount : 0;
       taxCell.numFmt = currencyFmt;
     }
 
-    row.getCell("globalDiscount").numFmt = currencyFmt;
-    row.getCell("globalSurcharge").numFmt = currencyFmt;
+    const globalDiscountCell = row.getCell(getCol(mainHeaderMap, "Descuento Global (-)"));
+    globalDiscountCell.value = 0;
+    globalDiscountCell.numFmt = currencyFmt;
 
-    const totalCell = row.getCell("total");
-    totalCell.numFmt = currencyFmt;
+    const globalSurchargeCell = row.getCell(getCol(mainHeaderMap, "Recargo Global (+)"));
+    globalSurchargeCell.value = 0;
+    globalSurchargeCell.numFmt = currencyFmt;
+
+    const totalCell = row.getCell(getCol(mainHeaderMap, "Valor total"));
     totalCell.value = typeof invoice.total === "number" ? invoice.total : 0;
+    totalCell.numFmt = currencyFmt;
 
-    // Hipervinculo en columna Drive
+    row.getCell(getCol(mainHeaderMap, "CUFE")).value = invoice.cufe;
+
     if (includeDriveColumn && invoice.driveUrl && !invoice.driveUrl.includes("ERROR")) {
-      const driveCell = row.getCell("driveUrl");
-      driveCell.value = {
-        text: "Ver factura",
-        hyperlink: invoice.driveUrl,
-      };
+      const driveCell = row.getCell(getCol(mainHeaderMap, "Enlace factura"));
+      driveCell.value = { text: "Ver factura", hyperlink: invoice.driveUrl };
       driveCell.font = { color: { argb: "FF0066CC" }, underline: true };
     }
 
-    // Marcar errores
     if (invoice.error || invoice.cufe === "N/A") {
       row.eachCell((cell) => {
         cell.fill = {
           type: "pattern",
           pattern: "solid",
-          fgColor: { argb: "FFFFF3CD" }, // Amarillo suave
+          fgColor: { argb: "FFFFF3CD" },
         };
       });
     }
 
-    // Alignment
     row.alignment = { vertical: "middle", wrapText: true };
   });
 
-  // Formato condicional para CUFEs duplicados (excluyendo "N/A")
   const lastRow = worksheet.rowCount;
-  const cufeColIndex = columns.length;
+  const cufeColIndex = getCol(mainHeaderMap, "CUFE");
   const cufeColLetter = getExcelColumnLetter(cufeColIndex);
+  const dataStartRow = headerRowIndex + 1;
 
-  if (lastRow > 1) {
+  if (lastRow >= dataStartRow) {
     worksheet.addConditionalFormatting({
-      ref: `${cufeColLetter}2:${cufeColLetter}${lastRow}`,
+      ref: `${cufeColLetter}${dataStartRow}:${cufeColLetter}${lastRow}`,
       rules: [
         {
           type: "expression",
-          formulae: [`AND(${cufeColLetter}2<>"N/A",COUNTIF($${cufeColLetter}$2:$${cufeColLetter}$${lastRow},${cufeColLetter}2)>1)`],
+          formulae: [`AND(${cufeColLetter}${dataStartRow}<>"N/A",COUNTIF($${cufeColLetter}$${dataStartRow}:$${cufeColLetter}$${lastRow},${cufeColLetter}${dataStartRow})>1)`],
           priority: 1,
           style: {
-            fill: {
-              type: "pattern",
-              pattern: "solid",
-              fgColor: { argb: "FFFF6B6B" }, // Rojo
-            },
-            font: {
-              color: { argb: "FFFFFFFF" }, // Blanco
-              bold: true,
-            },
+            fill: { type: "pattern", pattern: "solid", fgColor: { argb: "FFFF6B6B" } },
+            font: { color: { argb: "FFFFFFFF" }, bold: true },
           },
         },
       ],
     });
   }
 
-  // Agregar filtros automaticos
   worksheet.autoFilter = {
-    from: { row: 1, column: 1 },
-    to: { row: lastRow, column: columns.length },
+    from: { row: headerRowIndex, column: 1 },
+    to: { row: Math.max(headerRowIndex, lastRow), column: worksheet.columnCount },
   };
+  updateSheetTableRange(worksheet, headerRowIndex, sortedInvoices.length);
 
-  // Bordes para todas las celdas con datos
-  for (let row = 1; row <= lastRow; row++) {
-    for (let col = 1; col <= columns.length; col++) {
-      const cell = worksheet.getCell(row, col);
-      cell.border = {
-        top: { style: "thin", color: { argb: "FFD0D0D0" } },
-        left: { style: "thin", color: { argb: "FFD0D0D0" } },
-        bottom: { style: "thin", color: { argb: "FFD0D0D0" } },
-        right: { style: "thin", color: { argb: "FFD0D0D0" } },
-      };
-    }
+  const detailedSheet =
+    findSheet(workbook, "Detallado") ||
+    findSheet(workbook, "Detalle") ||
+    workbook.worksheets[1];
+
+  if (!detailedSheet) {
+    throw new Error("La plantilla no contiene una hoja para el detalle de conceptos.");
   }
 
-  // Hoja 2: Detallado por concepto/linea
-  const detailedSheet = workbook.addWorksheet("Detallado", {
-    views: [{ state: "frozen", ySplit: 1, xSplit: 0 }],
-    properties: {
-      defaultColWidth: 12,
-      defaultRowHeight: 15,
-      tabColor: { argb: "FF70AD47" },
-    },
-  });
+  clearDataRows(detailedSheet, headerRowIndex);
 
-  // Columnas base para la hoja detallada
-  const detailedColumns: Partial<ExcelJS.Column>[] = [
-    { header: "Item", key: "lineNumber", width: 8 },
-    { header: "Numero Factura", key: "docNumber", width: 20 },
-    { header: "Concepto", key: "description", width: 55 },
-    { header: "Cantidad", key: "quantity", width: 12 },
-    { header: "Base del impuesto", key: "totalUnitPrice", width: 18 },
-    { header: "Descuento detalle", key: "discount", width: 16 },
-    { header: "Recargo detalle", key: "surcharge", width: 16 },
+  const detailedHeaders = [
+    "Item",
+    "Numero Factura",
+    "Concepto",
+    "Cantidad",
+    "Base del impuesto",
+    "Descuento detalle",
+    "Recargo detalle",
+    ...allTaxTypes.flatMap((taxType) => [taxType, `% ${taxType}`]),
+    "Precio unitario (incluye impuestos)",
   ];
 
-  // Agregar columnas dinamicas de impuestos (Valor y %)
-  for (const taxType of allTaxTypes) {
-    detailedColumns.push(
-      { header: taxType, key: `tax_${taxType}_amount`, width: 14 },
-      { header: `% ${taxType}`, key: `tax_${taxType}_percent`, width: 10 }
-    );
-  }
+  const detailedHeaderMap = ensureHeaders(detailedSheet, headerRowIndex, detailedHeaders, (header) => {
+    if (header === "Item") return 8;
+    if (header === "Numero Factura") return 20;
+    if (header === "Concepto") return 55;
+    if (header === "Cantidad") return 12;
+    if (header === "Base del impuesto") return 18;
+    if (header.includes("Descuento")) return 16;
+    if (header.includes("Recargo")) return 16;
+    if (header.startsWith("% ")) return 10;
+    if (header === "Precio unitario (incluye impuestos)") return 28;
+    return 14;
+  });
 
-  // Columna final
-  detailedColumns.push({ header: "Precio unitario (incluye impuestos)", key: "unitPriceWithTax", width: 28 });
-
-  detailedSheet.columns = detailedColumns;
-
-  const detailedHeaderRow = detailedSheet.getRow(1);
-  detailedHeaderRow.font = { bold: true, size: 11, color: { argb: "FF000000" } };
-  detailedHeaderRow.fill = {
-    type: "pattern",
-    pattern: "solid",
-    fgColor: { argb: "FFD9D9D9" },
-  };
-  detailedHeaderRow.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-  detailedHeaderRow.height = 25;
-
-  // Crear un mapa de docNumber a su fila en la hoja principal (despues de ordenar)
   const docNumberToRow = new Map<string, number>();
   sortedInvoices.forEach((invoice, index) => {
-    docNumberToRow.set(invoice.docNumber, index + 2);
+    docNumberToRow.set(invoice.docNumber, index + dataStartRow);
   });
 
   const percentFmt = '0.00"%"';
 
+  let detailedRowsCount = 0;
   sortedInvoices.forEach((invoice) => {
-    const mainSheetRow = docNumberToRow.get(invoice.docNumber) || 2;
+    const mainSheetRow = docNumberToRow.get(invoice.docNumber) || dataStartRow;
 
     (invoice.lineItems || []).forEach((lineItem) => {
-      const rowData: Record<string, unknown> = {
-        lineNumber: lineItem.lineNumber,
-        docNumber: invoice.docNumber,
-        description: lineItem.description,
-        quantity: lineItem.quantity,
-        totalUnitPrice: lineItem.totalUnitPrice,
-        discount: lineItem.discount,
-        surcharge: lineItem.surcharge,
-      };
+      const row = detailedSheet.getRow(detailedSheet.rowCount + 1);
+      detailedRowsCount += 1;
 
-      // Agregar valores de impuestos dinamicos por linea
+      row.getCell(getCol(detailedHeaderMap, "Item")).value = lineItem.lineNumber;
+      row.getCell(getCol(detailedHeaderMap, "Concepto")).value = lineItem.description;
+      row.getCell(getCol(detailedHeaderMap, "Cantidad")).value = lineItem.quantity;
+
+      const baseCell = row.getCell(getCol(detailedHeaderMap, "Base del impuesto"));
+      baseCell.value = lineItem.totalUnitPrice;
+      baseCell.numFmt = currencyFmt;
+
+      const discountCell = row.getCell(getCol(detailedHeaderMap, "Descuento detalle"));
+      discountCell.value = lineItem.discount;
+      discountCell.numFmt = currencyFmt;
+
+      const surchargeCell = row.getCell(getCol(detailedHeaderMap, "Recargo detalle"));
+      surchargeCell.value = lineItem.surcharge;
+      surchargeCell.numFmt = currencyFmt;
+
       for (const taxType of allTaxTypes) {
-        const tax = (lineItem.taxes || []).find(t => t.taxName === taxType);
-        rowData[`tax_${taxType}_amount`] = tax ? tax.amount : 0;
-        rowData[`tax_${taxType}_percent`] = tax ? tax.percent : 0;
-      }
-
-      // Calcular precio unitario con impuestos
-      const totalTaxAmount = (lineItem.taxes || []).reduce((sum, t) => sum + t.amount, 0);
-      rowData.unitPriceWithTax = lineItem.totalUnitPrice + totalTaxAmount;
-
-      const row = detailedSheet.addRow(rowData);
-
-      // Hipervinculo al numero de factura
-      const docNumberCell = row.getCell("docNumber");
-      docNumberCell.value = {
-        text: invoice.docNumber,
-        hyperlink: `#'${sheetName}'!C${mainSheetRow}`,
-      };
-      docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
-
-      // Formato de celdas numericas
-      row.getCell("totalUnitPrice").numFmt = currencyFmt;
-      row.getCell("discount").numFmt = currencyFmt;
-      row.getCell("surcharge").numFmt = currencyFmt;
-      row.getCell("unitPriceWithTax").numFmt = currencyFmt;
-
-      // Formato para columnas de impuestos dinamicos
-      for (const taxType of allTaxTypes) {
-        const amountCell = row.getCell(`tax_${taxType}_amount`);
+        const tax = (lineItem.taxes || []).find((t) => t.taxName === taxType);
+        const amountCell = row.getCell(getCol(detailedHeaderMap, taxType));
+        amountCell.value = tax ? tax.amount : 0;
         amountCell.numFmt = currencyFmt;
-        const percentCell = row.getCell(`tax_${taxType}_percent`);
+
+        const percentCell = row.getCell(getCol(detailedHeaderMap, `% ${taxType}`));
+        percentCell.value = tax ? tax.percent : 0;
         percentCell.numFmt = percentFmt;
       }
+
+      const totalTaxAmount = (lineItem.taxes || []).reduce((sum, t) => sum + t.amount, 0);
+      const unitPriceCell = row.getCell(getCol(detailedHeaderMap, "Precio unitario (incluye impuestos)"));
+      unitPriceCell.value = lineItem.totalUnitPrice + totalTaxAmount;
+      unitPriceCell.numFmt = currencyFmt;
+
+      const docNumberCell = row.getCell(getCol(detailedHeaderMap, "Numero Factura"));
+      docNumberCell.value = {
+        text: invoice.docNumber,
+        hyperlink: `#'${worksheet.name}'!C${mainSheetRow}`,
+      };
+      docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
 
       row.alignment = { vertical: "middle", wrapText: true };
     });
@@ -405,23 +524,38 @@ export async function generateExcelFile(
 
   const detailedLastRow = detailedSheet.rowCount;
   detailedSheet.autoFilter = {
-    from: { row: 1, column: 1 },
-    to: { row: detailedLastRow, column: detailedSheet.columnCount },
+    from: { row: headerRowIndex, column: 1 },
+    to: { row: Math.max(headerRowIndex, detailedLastRow), column: detailedSheet.columnCount },
   };
+  updateSheetTableRange(detailedSheet, headerRowIndex, detailedRowsCount);
 
-  for (let row = 1; row <= detailedLastRow; row++) {
-    for (let col = 1; col <= detailedSheet.columnCount; col++) {
-      const cell = detailedSheet.getCell(row, col);
-      cell.border = {
-        top: { style: "thin", color: { argb: "FFD0D0D0" } },
-        left: { style: "thin", color: { argb: "FFD0D0D0" } },
-        bottom: { style: "thin", color: { argb: "FFD0D0D0" } },
-        right: { style: "thin", color: { argb: "FFD0D0D0" } },
-      };
-    }
+  const thirdSheet = findSheet(workbook, "Datos de terceros", "Datos terceros", "Terceros");
+  if (thirdSheet) {
+    clearDataRows(thirdSheet, headerRowIndex);
+    const headerRow = thirdSheet.getRow(headerRowIndex);
+    const headersByColumn = new Map<number, string>();
+
+    headerRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      const label = cellText(cell.value);
+      if (label) headersByColumn.set(colNumber, label);
+    });
+
+    sortedInvoices.forEach((invoice, index) => {
+      const row = thirdSheet.getRow(headerRowIndex + 1 + index);
+      for (const [col, label] of headersByColumn.entries()) {
+        row.getCell(col).value = pickThirdPartyValue(label, index, invoice, isSentDocuments);
+      }
+      row.alignment = { vertical: "middle", wrapText: true };
+    });
+
+    const thirdLastRow = thirdSheet.rowCount;
+    thirdSheet.autoFilter = {
+      from: { row: headerRowIndex, column: 1 },
+      to: { row: Math.max(headerRowIndex, thirdLastRow), column: thirdSheet.columnCount },
+    };
+    updateSheetTableRange(thirdSheet, headerRowIndex, sortedInvoices.length, "Datos de terceros");
   }
 
-  // Guardar archivo con opciones para mejor compatibilidad
   await workbook.xlsx.writeFile(outputPath, {
     useStyles: true,
     useSharedStrings: true,

@@ -31,10 +31,32 @@ export interface InvoiceData {
   // Datos del emisor (quien emite la factura)
   issuerNit: string;
   issuerName: string;
+  issuerEmail?: string;
+  issuerPhone?: string;
+  issuerAddress?: string;
+  issuerCity?: string;
+  issuerDepartment?: string;
+  issuerCountry?: string;
+  issuerCommercialName?: string;
+  issuerTaxpayerType?: string;
+  issuerFiscalRegime?: string;
+  issuerTaxResponsibility?: string;
+  issuerEconomicActivity?: string;
 
   // Datos del receptor (quien recibe la factura)
   receiverNit: string;
   receiverName: string;
+  receiverEmail?: string;
+  receiverPhone?: string;
+  receiverAddress?: string;
+  receiverCity?: string;
+  receiverDepartment?: string;
+  receiverCountry?: string;
+  receiverCommercialName?: string;
+  receiverTaxpayerType?: string;
+  receiverFiscalRegime?: string;
+  receiverTaxResponsibility?: string;
+  receiverEconomicActivity?: string;
 
   // Datos de la factura
   issueDate: string;

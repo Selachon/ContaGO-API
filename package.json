@@ -13,6 +13,7 @@
     "test:siigo": "tsx --test src/routes/siigo.test.ts",
     "test:dian": "tsx scripts/test-dian.ts",
     "migrate:sqlite-mongo": "tsx scripts/migrateSqliteToMongo.ts",
+    "template:dian-excel": "node scripts/generateDianExcelTemplate.mjs",
     "postinstall": "node scripts/installPuppeteer.mjs"
   },
   "keywords": [

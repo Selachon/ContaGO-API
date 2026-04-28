@@ -44,11 +44,13 @@ export async function extractInvoiceDataFromXml(
     const supplierParty = invoice.AccountingSupplierParty?.Party;
     const issuerNit = extractPartyNit(supplierParty);
     const issuerName = extractPartyName(supplierParty);
+    const issuerDetails = extractPartyDetails(supplierParty);
 
     // Extraer datos del receptor (AccountingCustomerParty)
     const customerParty = invoice.AccountingCustomerParty?.Party;
     const receiverNit = extractPartyNit(customerParty);
     const receiverName = extractPartyName(customerParty);
+    const receiverDetails = extractPartyDetails(customerParty);
 
     // Extraer otros datos
     const { issueDate, issueDateISO } = extractIssueDate(invoice);
@@ -61,8 +63,30 @@ export async function extractInvoiceDataFromXml(
     return {
       issuerNit,
       issuerName,
+      issuerEmail: issuerDetails.email,
+      issuerPhone: issuerDetails.phone,
+      issuerAddress: issuerDetails.address,
+      issuerCity: issuerDetails.city,
+      issuerDepartment: issuerDetails.department,
+      issuerCountry: issuerDetails.country,
+      issuerCommercialName: issuerDetails.commercialName,
+      issuerTaxpayerType: issuerDetails.taxpayerType,
+      issuerFiscalRegime: issuerDetails.fiscalRegime,
+      issuerTaxResponsibility: issuerDetails.taxResponsibility,
+      issuerEconomicActivity: issuerDetails.economicActivity,
       receiverNit,
       receiverName,
+      receiverEmail: receiverDetails.email,
+      receiverPhone: receiverDetails.phone,
+      receiverAddress: receiverDetails.address,
+      receiverCity: receiverDetails.city,
+      receiverDepartment: receiverDetails.department,
+      receiverCountry: receiverDetails.country,
+      receiverCommercialName: receiverDetails.commercialName,
+      receiverTaxpayerType: receiverDetails.taxpayerType,
+      receiverFiscalRegime: receiverDetails.fiscalRegime,
+      receiverTaxResponsibility: receiverDetails.taxResponsibility,
+      receiverEconomicActivity: receiverDetails.economicActivity,
       issueDate,
       issueDateISO,
       subtotal,
@@ -84,8 +108,30 @@ export async function extractInvoiceDataFromXml(
     return {
       issuerNit: "N/A",
       issuerName: "N/A",
+      issuerEmail: "N/A",
+      issuerPhone: "N/A",
+      issuerAddress: "N/A",
+      issuerCity: "N/A",
+      issuerDepartment: "N/A",
+      issuerCountry: "N/A",
+      issuerCommercialName: "N/A",
+      issuerTaxpayerType: "N/A",
+      issuerFiscalRegime: "N/A",
+      issuerTaxResponsibility: "N/A",
+      issuerEconomicActivity: "N/A",
       receiverNit: "N/A",
       receiverName: "N/A",
+      receiverEmail: "N/A",
+      receiverPhone: "N/A",
+      receiverAddress: "N/A",
+      receiverCity: "N/A",
+      receiverDepartment: "N/A",
+      receiverCountry: "N/A",
+      receiverCommercialName: "N/A",
+      receiverTaxpayerType: "N/A",
+      receiverFiscalRegime: "N/A",
+      receiverTaxResponsibility: "N/A",
+      receiverEconomicActivity: "N/A",
       issueDate: "N/A",
       issueDateISO: "9999-12-31",
       subtotal: 0,
@@ -183,6 +229,124 @@ function extractPartyName(party: any): string {
     return "N/A";
   } catch {
     return "N/A";
+  }
+}
+
+function pickAddressNode(party: any): any {
+  if (!party) return null;
+
+  const physical = party.PhysicalLocation?.Address;
+  if (physical) return Array.isArray(physical) ? physical[0] : physical;
+
+  const legal = party.PartyLegalEntity;
+  if (legal) {
+    const entity = Array.isArray(legal) ? legal[0] : legal;
+    const addr = entity?.RegistrationAddress;
+    if (addr) return Array.isArray(addr) ? addr[0] : addr;
+  }
+
+  const tax = party.PartyTaxScheme;
+  if (tax) {
+    const taxScheme = Array.isArray(tax) ? tax[0] : tax;
+    const addr = taxScheme?.RegistrationAddress;
+    if (addr) return Array.isArray(addr) ? addr[0] : addr;
+  }
+
+  return null;
+}
+
+function extractPartyDetails(party: any): {
+  email: string;
+  phone: string;
+  address: string;
+  city: string;
+  department: string;
+  country: string;
+  commercialName: string;
+  taxpayerType: string;
+  fiscalRegime: string;
+  taxResponsibility: string;
+  economicActivity: string;
+} {
+  if (!party) {
+    return {
+      email: "N/A",
+      phone: "N/A",
+      address: "N/A",
+      city: "N/A",
+      department: "N/A",
+      country: "N/A",
+      commercialName: "N/A",
+      taxpayerType: "N/A",
+      fiscalRegime: "N/A",
+      taxResponsibility: "N/A",
+      economicActivity: "N/A",
+    };
+  }
+
+  try {
+    const contact = party.Contact;
+    const contactNode = Array.isArray(contact) ? contact[0] : contact;
+
+    const emailRaw = contactNode?.ElectronicMail;
+    const phoneRaw = contactNode?.Telephone;
+
+    const addressNode = pickAddressNode(party);
+    const addressLineRaw = addressNode?.AddressLine;
+    const addressLineNode = Array.isArray(addressLineRaw) ? addressLineRaw[0] : addressLineRaw;
+
+    const address = cleanText(getText(addressLineNode?.Line || addressNode?.Line || "N/A"));
+    const city = cleanText(getText(addressNode?.CityName || "N/A"));
+    const department = cleanText(getText(addressNode?.CountrySubentity || "N/A"));
+    const countryNode = addressNode?.Country;
+    const country = cleanText(getText(countryNode?.Name || countryNode?.IdentificationCode || "N/A"));
+
+    const partyNameNode = party.PartyName;
+    const commercialNameRaw = Array.isArray(partyNameNode)
+      ? partyNameNode[0]?.Name
+      : partyNameNode?.Name;
+
+    const partyTaxScheme = party.PartyTaxScheme;
+    const taxNode = Array.isArray(partyTaxScheme) ? partyTaxScheme[0] : partyTaxScheme;
+    const taxResponsibilityRaw = taxNode?.TaxLevelCode;
+    const fiscalRegimeRaw = taxNode?.TaxScheme?.Name || taxNode?.TaxScheme?.ID;
+
+    const legalEntity = party.PartyLegalEntity;
+    const legalNode = Array.isArray(legalEntity) ? legalEntity[0] : legalEntity;
+    const economicActivityRaw =
+      legalNode?.CorporateRegistrationScheme?.Name ||
+      legalNode?.CorporateRegistrationScheme?.ID ||
+      legalNode?.CompanyID;
+
+    const taxpayerTypeRaw = party.AdditionalAccountID;
+
+    return {
+      email: cleanText(getText(emailRaw || "N/A")),
+      phone: cleanText(getText(phoneRaw || "N/A")),
+      address,
+      city,
+      department,
+      country,
+      commercialName: cleanText(getText(commercialNameRaw || "N/A")),
+      taxpayerType: cleanText(getText(taxpayerTypeRaw || "N/A")),
+      fiscalRegime: cleanText(getText(fiscalRegimeRaw || "N/A")),
+      taxResponsibility: cleanText(getText(taxResponsibilityRaw || "N/A")),
+      economicActivity: cleanText(getText(economicActivityRaw || "N/A")),
+    };
+  } catch {
+    return {
+      email: "N/A",
+      phone: "N/A",
+      address: "N/A",
+      city: "N/A",
+      department: "N/A",
+      country: "N/A",
+      commercialName: "N/A",
+      taxpayerType: "N/A",
+      fiscalRegime: "N/A",
+      taxResponsibility: "N/A",
+      economicActivity: "N/A",
+    };
   }
 }
 
