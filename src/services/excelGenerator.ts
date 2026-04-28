@@ -420,7 +420,7 @@ export async function generateExcelFile(
     row.alignment = { vertical: "middle", wrapText: true };
   });
 
-  const lastRow = worksheet.rowCount;
+  const lastRow = headerRowIndex + sortedInvoices.length;
   const cufeColIndex = getCol(mainHeaderMap, "CUFE");
   const cufeColLetter = getExcelColumnLetter(cufeColIndex);
   const dataStartRow = headerRowIndex + 1;
@@ -492,11 +492,12 @@ export async function generateExcelFile(
   const percentFmt = '0.00"%"';
 
   let detailedRowsCount = 0;
+  let detailedRowNumber = headerRowIndex + 1;
   sortedInvoices.forEach((invoice) => {
     const mainSheetRow = docNumberToRow.get(invoice.docNumber) || dataStartRow;
 
     (invoice.lineItems || []).forEach((lineItem) => {
-      const row = detailedSheet.getRow(detailedSheet.rowCount + 1);
+      const row = detailedSheet.getRow(detailedRowNumber++);
       detailedRowsCount += 1;
 
       row.getCell(getCol(detailedHeaderMap, "Item")).value = lineItem.lineNumber;
@@ -542,7 +543,7 @@ export async function generateExcelFile(
     });
   });
 
-  const detailedLastRow = detailedSheet.rowCount;
+  const detailedLastRow = headerRowIndex + detailedRowsCount;
   detailedSheet.autoFilter = {
     from: { row: headerRowIndex, column: 1 },
     to: { row: Math.max(headerRowIndex, detailedLastRow), column: detailedSheet.columnCount },
@@ -568,7 +569,7 @@ export async function generateExcelFile(
       row.alignment = { vertical: "middle", wrapText: true };
     });
 
-    const thirdLastRow = thirdSheet.rowCount;
+    const thirdLastRow = headerRowIndex + sortedInvoices.length;
     thirdSheet.autoFilter = {
       from: { row: headerRowIndex, column: 1 },
       to: { row: Math.max(headerRowIndex, thirdLastRow), column: thirdSheet.columnCount },
