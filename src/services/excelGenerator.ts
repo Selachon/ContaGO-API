@@ -160,9 +160,11 @@ function ensureHeaders(
 }
 
 function clearDataRows(worksheet: ExcelJS.Worksheet, headerRowIndex: number): void {
-  const rowsToDelete = Math.max(0, worksheet.rowCount - headerRowIndex);
-  if (rowsToDelete > 0) {
-    worksheet.spliceRows(headerRowIndex + 1, rowsToDelete);
+  for (let rowIndex = headerRowIndex + 1; rowIndex <= worksheet.rowCount; rowIndex++) {
+    const row = worksheet.getRow(rowIndex);
+    row.eachCell({ includeEmpty: true }, (cell) => {
+      cell.value = null;
+    });
   }
 }
 
@@ -195,6 +197,7 @@ function updateSheetTableRange(
   const endCol = match[3].toUpperCase();
   const endRow = Math.max(headerRowIndex + 1, headerRowIndex + Math.max(1, dataRowCount));
   table.tableRef = `${startCol}${headerRowIndex}:${endCol}${endRow}`;
+  table.headerRow = true;
 
   if (requestedName) {
     const safeName = requestedName.replace(/[^A-Za-z0-9_]/g, "_");
