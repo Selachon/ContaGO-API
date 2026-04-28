@@ -73,9 +73,29 @@ function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
 
 function resolveTemplatePath(): string {
   const configuredPath = process.env.DIAN_EXCEL_TEMPLATE_PATH?.trim() || "templates/dian-excel-template.xlsx";
-  return path.isAbsolute(configuredPath)
-    ? configuredPath
-    : path.join(process.cwd(), configuredPath);
+
+  const candidates = new Set<string>();
+
+  if (path.isAbsolute(configuredPath)) {
+    candidates.add(configuredPath);
+  } else {
+    candidates.add(path.join(process.cwd(), configuredPath));
+  }
+
+  candidates.add(path.join(process.cwd(), "templates", "dian-excel-template.xlsx"));
+  candidates.add(path.join(path.dirname(new URL(import.meta.url).pathname), "../../templates/dian-excel-template.xlsx"));
+  candidates.add("/app/templates/dian-excel-template.xlsx");
+
+  for (const candidate of candidates) {
+    const normalized = path.normalize(candidate);
+    if (fs.existsSync(normalized)) {
+      return normalized;
+    }
+  }
+
+  throw new Error(
+    `No se encontró la plantilla Excel. Revisa DIAN_EXCEL_TEMPLATE_PATH. cwd=${process.cwd()} configurado=${configuredPath}`
+  );
 }
 
 function getTemplateHeaderRow(): number {
@@ -263,9 +283,6 @@ export async function generateExcelFile(
   isSentDocuments: boolean = false
 ): Promise<void> {
   const templatePath = resolveTemplatePath();
-  if (!fs.existsSync(templatePath)) {
-    throw new Error(`No se encontró la plantilla Excel en: ${templatePath}`);
-  }
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(templatePath);

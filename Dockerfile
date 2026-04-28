@@ -16,6 +16,7 @@ RUN npm install
 # Copy source
 COPY tsconfig.json ./
 COPY src ./src
+COPY templates ./templates
 
 # Build TypeScript
 RUN npm run build
@@ -64,6 +65,7 @@ RUN npm install --omit=dev
 
 # Copy build output
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/templates ./templates
 
 # Create directories writable by node user
 RUN mkdir -p /app/downloads /app/.cache/puppeteer \
