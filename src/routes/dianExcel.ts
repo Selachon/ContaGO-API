@@ -303,6 +303,15 @@ async function processExcelJob(
     // 1) Extraer ids y cookies de sesion desde DIAN.
     setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
     const { documents, cookies } = await extractDocumentIds(tokenUrl, startDate, endDate, jobId, documentDirection);
+    console.log(
+      `[Excel] Job ${jobId}: extractDocumentIds devolvio ${documents.length} documentos (${directionLabel})`
+    );
+    if (documents.length > 0) {
+      const firstDoc = documents[0];
+      console.log(
+        `[Excel] Job ${jobId}: primer documento id=${firstDoc.id} docnum=${firstDoc.docnum} tipo=${firstDoc.docType}`
+      );
+    }
 
     if (isJobCancelled(jobId)) return;
 
@@ -576,6 +585,14 @@ async function processExcelJob(
 
     // 4) Generar archivo final.
     setProgress(jobId, { step: "Generando archivo Excel...", current: totalDocs, total: totalDocs });
+
+    console.log(
+      `[Excel] Job ${jobId}: procesados=${successCount} errores=${errorCount} omitidos=${skippedCount} filas_excel=${invoices.length}`
+    );
+
+    if (invoices.length === 0) {
+      throw new Error("No se generaron filas para el Excel. Revisa logs de extracción de documentos.");
+    }
 
     await generateExcelFile(invoices, excelPath, hasDrive, isSentDocs);
 
