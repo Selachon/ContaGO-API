@@ -85,9 +85,9 @@ function patchSheetXml(
   const sdEnd = out.indexOf("</sheetData>") + "</sheetData>".length;
   out = out.substring(0, sdStart) + newSheetData + out.substring(sdEnd);
 
-  // Insert <hyperlinks> before <tableParts>
+  // Insert <hyperlinks> before <pageMargins> (OOXML spec order: position 19, before margins at 21)
   if (hyperlinksXml) {
-    out = out.replace("<tableParts", hyperlinksXml + "<tableParts");
+    out = out.replace("<pageMargins", hyperlinksXml + "<pageMargins");
   }
 
   return out;
