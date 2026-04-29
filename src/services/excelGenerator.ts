@@ -169,7 +169,19 @@ function clearDataRows(worksheet: ExcelJS.Worksheet, headerRowIndex: number): vo
 }
 
 function getCol(headerMap: Map<string, number>, header: string): number {
-  return headerMap.get(normalizeHeader(header)) || 1;
+  return headerMap.get(normalizeHeader(header)) ?? 0;
+}
+
+function writeCell(
+  row: ExcelJS.Row,
+  col: number,
+  value: ExcelJS.CellValue,
+  numFmt?: string
+): void {
+  if (!col) return;
+  const cell = row.getCell(col);
+  cell.value = value;
+  if (numFmt) cell.numFmt = numFmt;
 }
 
 function findSheet(workbook: ExcelJS.Workbook, ...names: string[]): ExcelJS.Worksheet | undefined {
@@ -313,43 +325,18 @@ export async function generateExcelFile(
   clearDataRows(worksheet, headerRowIndex);
 
   const partyLabel = isSentDocuments ? "Receptor" : "Emisor";
-  const mainHeaders = [
-    "ID",
-    "Tipo de documento",
-    "Numero Factura",
-    `NIT ${partyLabel}`,
-    `Razon Social ${partyLabel}`,
-    "Fecha de emision",
-    "Concepto",
-    "Forma de pago",
-    "Subtotal antes de impuestos",
-    "Descuento detalle",
-    "Recargo detalle",
-    ...allTaxTypes.map((taxType) => `Valor ${taxType}`),
-    "Descuento Global (-)",
-    "Recargo Global (+)",
-    "Valor total",
-    ...(includeDriveColumn ? ["Enlace factura"] : []),
-    "CUFE",
-  ];
 
-  const mainHeaderMap = ensureHeaders(worksheet, headerRowIndex, mainHeaders, (header) => {
-    if (header === "ID") return 6;
-    if (header === "Tipo de documento") return 18;
-    if (header === "Numero Factura") return 20;
-    if (header.startsWith("NIT ")) return 14;
-    if (header.startsWith("Razon Social ")) return 40;
-    if (header === "Fecha de emision") return 16;
-    if (header === "Concepto") return 55;
-    if (header === "Forma de pago") return 18;
-    if (header === "Subtotal antes de impuestos") return 22;
-    if (header.includes("Descuento")) return 18;
-    if (header.includes("Recargo")) return 16;
-    if (header.startsWith("Valor ")) return 14;
-    if (header === "Enlace factura") return 45;
-    if (header === "CUFE") return 100;
-    return 14;
-  });
+  // Solo lee las columnas que ya existen en la plantilla, sin agregar nuevas
+  const mainHeaderMap = buildHeaderMap(worksheet, headerRowIndex);
+
+  // Para documentos emitidos la plantilla puede decir "Emisor" en vez de "Receptor";
+  // intenta primero el nombre dinámico y si no existe usa el fallback de la plantilla.
+  const nitColKey = getCol(mainHeaderMap, `NIT ${partyLabel}`)
+    ? `NIT ${partyLabel}`
+    : "NIT Emisor";
+  const nameColKey = getCol(mainHeaderMap, `Razon Social ${partyLabel}`)
+    ? `Razon Social ${partyLabel}`
+    : "Razon Social Emisor";
 
   const currencyFmt = '_("$"* #,##0.00_);_("$"* (#,##0.00);_("$"* "-"??_);_(@_)';
 
@@ -359,50 +346,31 @@ export async function generateExcelFile(
     const partyName = isSentDocuments ? invoice.receiverName : invoice.issuerName;
 
     const row = worksheet.getRow(mainRowNumber++);
-    row.getCell(getCol(mainHeaderMap, "ID")).value = index + 1;
-    row.getCell(getCol(mainHeaderMap, "Tipo de documento")).value = invoice.documentType;
-    row.getCell(getCol(mainHeaderMap, "Numero Factura")).value = invoice.docNumber;
-    row.getCell(getCol(mainHeaderMap, `NIT ${partyLabel}`)).value = partyNit;
-    row.getCell(getCol(mainHeaderMap, `Razon Social ${partyLabel}`)).value = partyName;
-    row.getCell(getCol(mainHeaderMap, "Fecha de emision")).value = invoice.issueDate;
-    row.getCell(getCol(mainHeaderMap, "Concepto")).value = invoice.concepts;
-    row.getCell(getCol(mainHeaderMap, "Forma de pago")).value = invoice.paymentMethod || "N/A";
-
-    const subtotalCell = row.getCell(getCol(mainHeaderMap, "Subtotal antes de impuestos"));
-    subtotalCell.value = typeof invoice.subtotal === "number" ? invoice.subtotal : 0;
-    subtotalCell.numFmt = currencyFmt;
-
-    const discountCell = row.getCell(getCol(mainHeaderMap, "Descuento detalle"));
-    discountCell.value = invoice.discount || 0;
-    discountCell.numFmt = currencyFmt;
-
-    const surchargeCell = row.getCell(getCol(mainHeaderMap, "Recargo detalle"));
-    surchargeCell.value = invoice.surcharge || 0;
-    surchargeCell.numFmt = currencyFmt;
+    writeCell(row, getCol(mainHeaderMap, "ID"), index + 1);
+    writeCell(row, getCol(mainHeaderMap, "Tipo de documento"), invoice.documentType);
+    writeCell(row, getCol(mainHeaderMap, "Numero Factura"), invoice.docNumber);
+    writeCell(row, getCol(mainHeaderMap, nitColKey), partyNit);
+    writeCell(row, getCol(mainHeaderMap, nameColKey), partyName);
+    writeCell(row, getCol(mainHeaderMap, "Fecha de emision"), invoice.issueDate);
+    writeCell(row, getCol(mainHeaderMap, "Concepto"), invoice.concepts);
+    writeCell(row, getCol(mainHeaderMap, "Forma de pago"), invoice.paymentMethod || "N/A");
+    writeCell(row, getCol(mainHeaderMap, "Subtotal antes de impuestos"), typeof invoice.subtotal === "number" ? invoice.subtotal : 0, currencyFmt);
+    writeCell(row, getCol(mainHeaderMap, "Descuento detalle"), invoice.discount || 0, currencyFmt);
+    writeCell(row, getCol(mainHeaderMap, "Recargo detalle"), invoice.surcharge || 0, currencyFmt);
 
     for (const taxType of allTaxTypes) {
       const tax = (invoice.taxes || []).find((t) => t.taxName === taxType);
-      const taxCell = row.getCell(getCol(mainHeaderMap, `Valor ${taxType}`));
-      taxCell.value = tax ? tax.amount : 0;
-      taxCell.numFmt = currencyFmt;
+      writeCell(row, getCol(mainHeaderMap, `Valor ${taxType}`), tax ? tax.amount : 0, currencyFmt);
     }
 
-    const globalDiscountCell = row.getCell(getCol(mainHeaderMap, "Descuento Global (-)"));
-    globalDiscountCell.value = 0;
-    globalDiscountCell.numFmt = currencyFmt;
+    writeCell(row, getCol(mainHeaderMap, "Descuento Global (-)"), 0, currencyFmt);
+    writeCell(row, getCol(mainHeaderMap, "Recargo Global (+)"), 0, currencyFmt);
+    writeCell(row, getCol(mainHeaderMap, "Valor total"), typeof invoice.total === "number" ? invoice.total : 0, currencyFmt);
+    writeCell(row, getCol(mainHeaderMap, "CUFE"), invoice.cufe);
 
-    const globalSurchargeCell = row.getCell(getCol(mainHeaderMap, "Recargo Global (+)"));
-    globalSurchargeCell.value = 0;
-    globalSurchargeCell.numFmt = currencyFmt;
-
-    const totalCell = row.getCell(getCol(mainHeaderMap, "Valor total"));
-    totalCell.value = typeof invoice.total === "number" ? invoice.total : 0;
-    totalCell.numFmt = currencyFmt;
-
-    row.getCell(getCol(mainHeaderMap, "CUFE")).value = invoice.cufe;
-
-    if (includeDriveColumn && invoice.driveUrl && !invoice.driveUrl.includes("ERROR")) {
-      const driveCell = row.getCell(getCol(mainHeaderMap, "Enlace factura"));
+    const driveCol = getCol(mainHeaderMap, "Enlace factura");
+    if (driveCol && invoice.driveUrl && !invoice.driveUrl.includes("ERROR")) {
+      const driveCell = row.getCell(driveCol);
       driveCell.value = { text: "Ver factura", hyperlink: invoice.driveUrl };
       driveCell.font = { color: { argb: "FF0066CC" }, underline: true };
     }
@@ -422,10 +390,10 @@ export async function generateExcelFile(
 
   const lastRow = headerRowIndex + sortedInvoices.length;
   const cufeColIndex = getCol(mainHeaderMap, "CUFE");
-  const cufeColLetter = getExcelColumnLetter(cufeColIndex);
   const dataStartRow = headerRowIndex + 1;
 
-  if (lastRow >= dataStartRow) {
+  if (cufeColIndex && lastRow >= dataStartRow) {
+    const cufeColLetter = getExcelColumnLetter(cufeColIndex);
     worksheet.addConditionalFormatting({
       ref: `${cufeColLetter}${dataStartRow}:${cufeColLetter}${lastRow}`,
       rules: [
@@ -459,35 +427,17 @@ export async function generateExcelFile(
 
   clearDataRows(detailedSheet, headerRowIndex);
 
-  const detailedHeaders = [
-    "Item",
-    "Numero Factura",
-    "Concepto",
-    "Cantidad",
-    "Base del impuesto",
-    "Descuento detalle",
-    "Recargo detalle",
-    ...allTaxTypes.flatMap((taxType) => [taxType, `% ${taxType}`]),
-    "Precio unitario (incluye impuestos)",
-  ];
-
-  const detailedHeaderMap = ensureHeaders(detailedSheet, headerRowIndex, detailedHeaders, (header) => {
-    if (header === "Item") return 8;
-    if (header === "Numero Factura") return 20;
-    if (header === "Concepto") return 55;
-    if (header === "Cantidad") return 12;
-    if (header === "Base del impuesto") return 18;
-    if (header.includes("Descuento")) return 16;
-    if (header.includes("Recargo")) return 16;
-    if (header.startsWith("% ")) return 10;
-    if (header === "Precio unitario (incluye impuestos)") return 28;
-    return 14;
-  });
+  // Solo lee las columnas que ya existen en la plantilla, sin agregar nuevas
+  const detailedHeaderMap = buildHeaderMap(detailedSheet, headerRowIndex);
 
   const docNumberToRow = new Map<string, number>();
   sortedInvoices.forEach((invoice, index) => {
     docNumberToRow.set(invoice.docNumber, index + dataStartRow);
   });
+
+  // Columna de "Numero Factura" en la hoja principal para el hipervínculo
+  const mainNumFacturaCol = getCol(mainHeaderMap, "Numero Factura");
+  const mainNumFacturaLetter = mainNumFacturaCol ? getExcelColumnLetter(mainNumFacturaCol) : "D";
 
   const percentFmt = '0.00"%"';
 
@@ -500,44 +450,31 @@ export async function generateExcelFile(
       const row = detailedSheet.getRow(detailedRowNumber++);
       detailedRowsCount += 1;
 
-      row.getCell(getCol(detailedHeaderMap, "Item")).value = lineItem.lineNumber;
-      row.getCell(getCol(detailedHeaderMap, "Concepto")).value = lineItem.description;
-      row.getCell(getCol(detailedHeaderMap, "Cantidad")).value = lineItem.quantity;
-
-      const baseCell = row.getCell(getCol(detailedHeaderMap, "Base del impuesto"));
-      baseCell.value = lineItem.totalUnitPrice;
-      baseCell.numFmt = currencyFmt;
-
-      const discountCell = row.getCell(getCol(detailedHeaderMap, "Descuento detalle"));
-      discountCell.value = lineItem.discount;
-      discountCell.numFmt = currencyFmt;
-
-      const surchargeCell = row.getCell(getCol(detailedHeaderMap, "Recargo detalle"));
-      surchargeCell.value = lineItem.surcharge;
-      surchargeCell.numFmt = currencyFmt;
+      writeCell(row, getCol(detailedHeaderMap, "Item"), lineItem.lineNumber);
+      writeCell(row, getCol(detailedHeaderMap, "Concepto"), lineItem.description);
+      writeCell(row, getCol(detailedHeaderMap, "Cantidad"), lineItem.quantity);
+      writeCell(row, getCol(detailedHeaderMap, "Base del impuesto"), lineItem.totalUnitPrice, currencyFmt);
+      writeCell(row, getCol(detailedHeaderMap, "Descuento detalle"), lineItem.discount, currencyFmt);
+      writeCell(row, getCol(detailedHeaderMap, "Recargo detalle"), lineItem.surcharge, currencyFmt);
 
       for (const taxType of allTaxTypes) {
         const tax = (lineItem.taxes || []).find((t) => t.taxName === taxType);
-        const amountCell = row.getCell(getCol(detailedHeaderMap, taxType));
-        amountCell.value = tax ? tax.amount : 0;
-        amountCell.numFmt = currencyFmt;
-
-        const percentCell = row.getCell(getCol(detailedHeaderMap, `% ${taxType}`));
-        percentCell.value = tax ? tax.percent : 0;
-        percentCell.numFmt = percentFmt;
+        writeCell(row, getCol(detailedHeaderMap, taxType), tax ? tax.amount : 0, currencyFmt);
+        writeCell(row, getCol(detailedHeaderMap, `% ${taxType}`), tax ? tax.percent : 0, percentFmt);
       }
 
       const totalTaxAmount = (lineItem.taxes || []).reduce((sum, t) => sum + t.amount, 0);
-      const unitPriceCell = row.getCell(getCol(detailedHeaderMap, "Precio unitario (incluye impuestos)"));
-      unitPriceCell.value = lineItem.totalUnitPrice + totalTaxAmount;
-      unitPriceCell.numFmt = currencyFmt;
+      writeCell(row, getCol(detailedHeaderMap, "Precio unitario (incluye impuestos)"), lineItem.totalUnitPrice + totalTaxAmount, currencyFmt);
 
-      const docNumberCell = row.getCell(getCol(detailedHeaderMap, "Numero Factura"));
-      docNumberCell.value = {
-        text: invoice.docNumber,
-        hyperlink: `#'${worksheet.name}'!C${mainSheetRow}`,
-      };
-      docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
+      const docNumberCol = getCol(detailedHeaderMap, "Numero Factura");
+      if (docNumberCol) {
+        const docNumberCell = row.getCell(docNumberCol);
+        docNumberCell.value = {
+          text: invoice.docNumber,
+          hyperlink: `#'${worksheet.name}'!${mainNumFacturaLetter}${mainSheetRow}`,
+        };
+        docNumberCell.font = { color: { argb: "FF0066CC" }, underline: true };
+      }
 
       row.alignment = { vertical: "middle", wrapText: true };
     });
