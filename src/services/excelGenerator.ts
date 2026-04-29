@@ -29,6 +29,12 @@ function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
   });
 }
 
+function normalizeNit(nit: string | null | undefined): string {
+  const raw = (nit || "").trim();
+  if (!raw) return "N/A";
+  return raw.replace(/[^0-9A-Za-z]/g, "").toUpperCase() || "N/A";
+}
+
 function resolveTemplatePath(): string {
   const configured = process.env.DIAN_EXCEL_TEMPLATE_PATH?.trim() || "templates/dian-excel-template.xlsx";
   const candidates: string[] = [];
@@ -284,9 +290,23 @@ export async function generateExcelFile(
 
   let sheet3Rows: string[] = [];
 
-  sorted.forEach((inv, idx) => {
-    const rowNum = 3 + idx;
-    const p = isSentDocuments
+  type ThirdPartyRow = {
+    nit: string;
+    name: string;
+    commercial: string;
+    taxResp: string;
+    country: string;
+    dept: string;
+    city: string;
+    addr: string;
+    phone: string;
+    email: string;
+  };
+
+  const thirdPartiesByNit = new Map<string, ThirdPartyRow>();
+
+  for (const inv of sorted) {
+    const p: ThirdPartyRow = isSentDocuments
       ? {
           nit: inv.receiverNit,
           name: inv.receiverName,
@@ -312,6 +332,16 @@ export async function generateExcelFile(
           email: inv.issuerEmail || "N/A",
         };
 
+    const nitKey = normalizeNit(p.nit);
+    if (!thirdPartiesByNit.has(nitKey)) {
+      thirdPartiesByNit.set(nitKey, p);
+    }
+  }
+
+  const uniqueThirdParties = Array.from(thirdPartiesByNit.values());
+
+  uniqueThirdParties.forEach((p, idx) => {
+    const rowNum = 3 + idx;
     let c = "";
     c += txtCell(`A${rowNum}`, p.nit);
     c += txtCell(`B${rowNum}`, p.name);
@@ -323,11 +353,10 @@ export async function generateExcelFile(
     c += txtCell(`H${rowNum}`, p.addr);
     c += txtCell(`I${rowNum}`, p.phone);
     c += txtCell(`J${rowNum}`, p.email);
-
     sheet3Rows.push(`<row r="${rowNum}">${c}</row>`);
   });
 
-  const sheet3LastRow = Math.max(3, 2 + sorted.length);
+  const sheet3LastRow = Math.max(3, 2 + uniqueThirdParties.length);
 
   let sheet3Xml = await zip.file("xl/worksheets/sheet3.xml")!.async("string");
   const s3TemplateRows = extractTemplateRows(sheet3Xml);
