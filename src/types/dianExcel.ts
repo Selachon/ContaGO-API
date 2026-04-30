@@ -7,6 +7,7 @@ export interface ExcelGenerateRequest {
   start_date?: string;
   end_date?: string;
   session_uid?: string;
+  drive_connection_id?: string;
   /** Tipo de documentos: "received" (recibidos) o "sent" (emitidos). Default: "received" */
   document_direction?: DocumentDirection;
 }
@@ -125,9 +126,14 @@ export interface ExcelJobData {
   invoicesFailed?: number;
   invoicesSkipped?: number;
   userId?: string;
+  startedAt?: number;
+  documentsFoundAt?: number;
+  downloadStartedAt?: number;
+  excelGenerationStartedAt?: number;
 }
 
 export interface GoogleDriveConfig {
+  connection_id: string;
   encrypted_access_token: string;
   encrypted_refresh_token: string;
   token_expiry: string;

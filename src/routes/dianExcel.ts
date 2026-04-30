@@ -18,7 +18,7 @@ import { encryptToken } from "../utils/encryption.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
-import { getUserNits, getUserGoogleDrive, updateUserDriveTokens } from "../services/database.js";
+import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig } from "../types/dianExcel.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -80,7 +80,7 @@ setInterval(() => {
 // Crea un job asincrono de extraccion y generacion de Excel.
 router.post("/generate", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as ExcelGenerateRequest;
-  const { token_url, start_date, end_date, session_uid, document_direction } = body;
+  const { token_url, start_date, end_date, session_uid, document_direction, drive_connection_id } = body;
   
   // Validar document_direction si se proporciona
   const direction = document_direction === "sent" ? "sent" : "received";
@@ -145,7 +145,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   });
 
   // No usar await para no retener la conexion HTTP.
-  processExcelJob(jobId, token_url, start_date, end_date, userId, direction).catch((err) => {
+  processExcelJob(jobId, token_url, start_date, end_date, userId, direction, drive_connection_id).catch((err) => {
     console.error(`[Excel] Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
@@ -182,6 +182,13 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     invoicesProcessed: job.invoicesProcessed,
     invoicesFailed: job.invoicesFailed,
     invoicesSkipped: job.invoicesSkipped,
+    timings: {
+      startedAt: job.startedAt || job.createdAt,
+      documentsFoundAt: job.documentsFoundAt || null,
+      downloadStartedAt: job.downloadStartedAt || null,
+      excelGenerationStartedAt: job.excelGenerationStartedAt || null,
+      completedAt: job.completedAt || null,
+    },
   });
 });
 
@@ -282,12 +289,14 @@ async function processExcelJob(
   startDate: string | undefined,
   endDate: string | undefined,
   userId: string,
-  documentDirection: "received" | "sent" = "received"
+  documentDirection: "received" | "sent" = "received",
+  driveConnectionId?: string
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
 
   job.status = "processing";
+  job.startedAt = Date.now();
   const isSentDocs = documentDirection === "sent";
   const directionLabel = isSentDocs ? "emitidos" : "recibidos";
 
@@ -323,6 +332,7 @@ async function processExcelJob(
     }
 
     const totalDocs = documents.length;
+    job.documentsFoundAt = Date.now();
     const totalBatches = Math.ceil(totalDocs / BATCH_SIZE);
     console.log(`[Excel] Job ${jobId}: ${totalDocs} documentos en ${totalBatches} tandas de ${BATCH_SIZE}`);
     
@@ -335,13 +345,13 @@ async function processExcelJob(
     fs.mkdirSync(tempDir, { recursive: true });
 
     // 2) Cargar config de Drive para subir archivos si el usuario lo habilito.
-    const driveConfig = await getUserGoogleDrive(userId);
+    const driveConfig = await getUserGoogleDriveById(userId, driveConnectionId);
     const hasDrive = !!driveConfig;
 
     // Persiste token refrescado para evitar vencimientos en jobs largos.
     const onTokenRefresh = async (newAccessToken: string, expiryDate: number) => {
       const encryptedToken = encryptToken(newAccessToken);
-      await updateUserDriveTokens(userId, encryptedToken, new Date(expiryDate).toISOString());
+      await updateUserDriveTokens(userId, encryptedToken, new Date(expiryDate).toISOString(), driveConnectionId);
     };
 
     // Pre-crear carpeta raiz de Drive si es necesario
@@ -354,6 +364,10 @@ async function processExcelJob(
     }
 
     // 3) Procesar cada documento de forma independiente, en tandas.
+    job.downloadStartedAt = Date.now();
+    console.log(`[Excel] Job ${jobId}: checkpoint descargas iniciadas`);
+    setProgress(jobId, { step: "Iniciando descargas...", current: 0, total: totalDocs });
+
     const invoices: InvoiceData[] = [];
     let successCount = 0;
     let errorCount = 0;
@@ -381,6 +395,9 @@ async function processExcelJob(
         current: i + 1,
         total: totalDocs,
       });
+      job.invoicesProcessed = successCount;
+      job.invoicesFailed = errorCount;
+      job.invoicesSkipped = skippedCount;
       
       // Pausa entre tandas para evitar sobrecargar
       if (i > 0 && i % BATCH_SIZE === 0) {
@@ -584,6 +601,7 @@ async function processExcelJob(
     }
 
     // 4) Generar archivo final.
+    job.excelGenerationStartedAt = Date.now();
     setProgress(jobId, { step: "Generando archivo Excel...", current: totalDocs, total: totalDocs });
 
     console.log(

@@ -15,6 +15,8 @@ interface UserRecord {
   created_at: string;
   legacyId?: number;
   google_drive?: GoogleDriveConfig;
+  google_drives?: GoogleDriveConfig[];
+  selected_google_drive_id?: string | null;
 }
 
 
@@ -183,13 +185,49 @@ export async function getUserNits(userId: string): Promise<string[]> {
 // ============================================
 
 export async function getUserGoogleDrive(userId: string): Promise<GoogleDriveConfig | null> {
+  return getUserGoogleDriveById(userId);
+}
+
+export async function getUserGoogleDrives(userId: string): Promise<GoogleDriveConfig[]> {
   try {
     const oid = new ObjectId(userId);
     const record = await usersCollection().findOne(
       { _id: oid },
-      { projection: { google_drive: 1 } }
+      { projection: { google_drive: 1, google_drives: 1 } }
     );
-    return record?.google_drive || null;
+    if (record?.google_drives && record.google_drives.length > 0) {
+      return record.google_drives;
+    }
+    return record?.google_drive ? [record.google_drive] : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function getUserGoogleDriveById(
+  userId: string,
+  connectionId?: string
+): Promise<GoogleDriveConfig | null> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne(
+      { _id: oid },
+      { projection: { google_drive: 1, google_drives: 1, selected_google_drive_id: 1 } }
+    );
+
+    const drives = (record?.google_drives && record.google_drives.length > 0)
+      ? record.google_drives
+      : (record?.google_drive ? [record.google_drive] : []);
+
+    if (drives.length === 0) return null;
+    if (connectionId) return drives.find((d) => d.connection_id === connectionId) || null;
+
+    const selectedId = record?.selected_google_drive_id;
+    if (selectedId) {
+      const selected = drives.find((d) => d.connection_id === selectedId);
+      if (selected) return selected;
+    }
+    return drives[0] || null;
   } catch {
     return null;
   }
@@ -201,11 +239,17 @@ export async function updateUserGoogleDrive(
 ): Promise<boolean> {
   try {
     const oid = new ObjectId(userId);
+    const existingDrives = await getUserGoogleDrives(userId);
+    const nextDrives = existingDrives.filter((d) => d.connection_id !== driveConfig.connection_id);
+    nextDrives.push(driveConfig);
+
     const result = await usersCollection().updateOne(
       { _id: oid },
       {
         $set: {
+          google_drives: nextDrives,
           google_drive: driveConfig,
+          selected_google_drive_id: driveConfig.connection_id,
         },
       }
     );
@@ -219,10 +263,34 @@ export async function updateUserGoogleDrive(
 export async function updateUserDriveTokens(
   userId: string,
   encryptedAccessToken: string,
-  tokenExpiry: string
+  tokenExpiry: string,
+  connectionId?: string
 ): Promise<boolean> {
   try {
     const oid = new ObjectId(userId);
+    if (connectionId) {
+      const drives = await getUserGoogleDrives(userId);
+      const idx = drives.findIndex((d) => d.connection_id === connectionId);
+      if (idx === -1) return false;
+      drives[idx] = {
+        ...drives[idx],
+        encrypted_access_token: encryptedAccessToken,
+        token_expiry: tokenExpiry,
+        last_used: new Date().toISOString(),
+      };
+      const selected = await getUserGoogleDriveById(userId);
+      const result = await usersCollection().updateOne(
+        { _id: oid },
+        {
+          $set: {
+            google_drives: drives,
+            ...(selected?.connection_id === connectionId ? { google_drive: drives[idx] } : {}),
+          },
+        }
+      );
+      return result.modifiedCount > 0 || result.matchedCount > 0;
+    }
+
     const result = await usersCollection().updateOne(
       { _id: oid },
       {
@@ -262,11 +330,55 @@ export async function updateUserDriveFolder(
 }
 
 export async function removeUserGoogleDrive(userId: string): Promise<boolean> {
+  return removeUserGoogleDriveById(userId);
+}
+
+export async function setSelectedUserGoogleDrive(userId: string, connectionId: string): Promise<boolean> {
   try {
     const oid = new ObjectId(userId);
+    const drives = await getUserGoogleDrives(userId);
+    const selected = drives.find((d) => d.connection_id === connectionId);
+    if (!selected) return false;
     const result = await usersCollection().updateOne(
       { _id: oid },
-      { $unset: { google_drive: "" } }
+      {
+        $set: {
+          selected_google_drive_id: connectionId,
+          google_drive: selected,
+        },
+      }
+    );
+    return result.modifiedCount > 0 || result.matchedCount > 0;
+  } catch {
+    return false;
+  }
+}
+
+export async function removeUserGoogleDriveById(userId: string, connectionId?: string): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    if (connectionId) {
+      const drives = await getUserGoogleDrives(userId);
+      const nextDrives = drives.filter((d) => d.connection_id !== connectionId);
+      const selectedId = nextDrives[0]?.connection_id || null;
+      const selectedDrive = nextDrives[0] || null;
+      const result = await usersCollection().updateOne(
+        { _id: oid },
+        {
+          $set: {
+            google_drives: nextDrives,
+            selected_google_drive_id: selectedId,
+            ...(selectedDrive ? { google_drive: selectedDrive } : {}),
+          },
+          ...(selectedDrive ? {} : { $unset: { google_drive: "" } }),
+        }
+      );
+      return result.modifiedCount > 0 || result.matchedCount > 0;
+    }
+
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      { $unset: { google_drive: "", google_drives: "", selected_google_drive_id: "" } }
     );
     return result.modifiedCount > 0;
   } catch {

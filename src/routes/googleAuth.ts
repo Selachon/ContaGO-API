@@ -1,4 +1,5 @@
 import { Router, Request, Response } from "express";
+import crypto from "crypto";
 import { requireAuth } from "../middleware/auth.js";
 import {
   getAuthUrl,
@@ -10,8 +11,12 @@ import {
 } from "../services/googleDrive.js";
 import {
   getUserGoogleDrive,
+  getUserGoogleDriveById,
+  getUserGoogleDrives,
   updateUserGoogleDrive,
   removeUserGoogleDrive,
+  removeUserGoogleDriveById,
+  setSelectedUserGoogleDrive,
 } from "../services/database.js";
 
 const router = Router();
@@ -32,12 +37,20 @@ function escapeHtml(value: string): string {
 router.get("/status", requireAuth, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.userId;
-    const driveConfig = await getUserGoogleDrive(userId);
+    const drives = await getUserGoogleDrives(userId);
+    const selected = await getUserGoogleDrive(userId);
 
     res.json({
-      connected: !!driveConfig,
-      folderName: driveConfig?.folder_name || null,
-      connectedAt: driveConfig?.connected_at || null,
+      connected: drives.length > 0,
+      folderName: selected?.folder_name || null,
+      connectedAt: selected?.connected_at || null,
+      selectedConnectionId: selected?.connection_id || null,
+      connections: drives.map((d) => ({
+        connectionId: d.connection_id,
+        email: d.user_email,
+        folderName: d.folder_name,
+        connectedAt: d.connected_at,
+      })),
     });
   } catch (err) {
     console.error("Error verificando estado de Google Drive:", err);
@@ -193,6 +206,7 @@ router.get("/callback", async (req: Request, res: Response) => {
 
     // Configuracion base de la integracion por usuario.
     const driveConfig = {
+      connection_id: crypto.randomUUID(),
       encrypted_access_token: encryptedTokens.encrypted_access_token,
       encrypted_refresh_token: encryptedTokens.encrypted_refresh_token,
       token_expiry: new Date(expiryDate).toISOString(),
@@ -228,7 +242,10 @@ router.get("/callback", async (req: Request, res: Response) => {
 router.post("/disconnect", requireAuth, async (req: Request, res: Response) => {
   try {
     const userId = req.user!.userId;
-    const driveConfig = await getUserGoogleDrive(userId);
+    const { connectionId } = req.body as { connectionId?: string };
+    const driveConfig = connectionId
+      ? await getUserGoogleDriveById(userId, connectionId)
+      : await getUserGoogleDrive(userId);
 
     if (!driveConfig) {
       return res.status(400).json({ status: "error", detalle: "Google Drive no está conectado" });
@@ -238,7 +255,11 @@ router.post("/disconnect", requireAuth, async (req: Request, res: Response) => {
     await revokeAccess(driveConfig);
 
     // Borrar configuracion local despues de revocar.
-    await removeUserGoogleDrive(userId);
+    if (connectionId) {
+      await removeUserGoogleDriveById(userId, connectionId);
+    } else {
+      await removeUserGoogleDrive(userId);
+    }
 
     console.log(`Google Drive desconectado para usuario ${userId}`);
     res.json({ status: "ok", message: "Google Drive desconectado exitosamente" });
@@ -246,6 +267,24 @@ router.post("/disconnect", requireAuth, async (req: Request, res: Response) => {
   } catch (err) {
     console.error("Error desconectando Google Drive:", err);
     res.status(500).json({ status: "error", detalle: "Error al desconectar" });
+  }
+});
+
+router.post("/select", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.userId;
+    const { connectionId } = req.body as { connectionId?: string };
+    if (!connectionId) {
+      return res.status(400).json({ status: "error", detalle: "connectionId es requerido" });
+    }
+    const ok = await setSelectedUserGoogleDrive(userId, connectionId);
+    if (!ok) {
+      return res.status(404).json({ status: "error", detalle: "Conexión no encontrada" });
+    }
+    return res.json({ status: "ok" });
+  } catch (err) {
+    console.error("Error seleccionando Google Drive:", err);
+    return res.status(500).json({ status: "error", detalle: "Error al seleccionar conexión" });
   }
 });
 
