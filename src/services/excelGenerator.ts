@@ -112,7 +112,7 @@ const STYLE_PERCENT = 8;  // numFmtId 165 → 0.00"%"
 export async function generateExcelFile(
   invoices: InvoiceData[],
   outputPath: string,
-  _includeDriveColumn: boolean,
+  includeDriveColumn: boolean,
   isSentDocuments: boolean = false
 ): Promise<void> {
   const templatePath = resolveTemplatePath();
@@ -190,14 +190,15 @@ export async function generateExcelFile(
     c += numCell(`R${rowNum}`, 0, STYLE_CURRENCY);
     c += numCell(`S${rowNum}`, typeof inv.total === "number" ? inv.total : 0, STYLE_CURRENCY);
 
-    if (inv.driveUrl && !inv.driveUrl.includes("ERROR")) {
+    if (includeDriveColumn && inv.driveUrl && !inv.driveUrl.includes("ERROR")) {
       const relId = `rId${rIdCounter++}`;
       sheet1DriveRels.push({ id: relId, url: inv.driveUrl });
       sheet1Hyperlinks.push(`<hyperlink ref="T${rowNum}" r:id="${relId}" display="Ver factura"/>`);
       c += txtCell(`T${rowNum}`, "Ver factura");
     }
 
-    c += txtCell(`U${rowNum}`, inv.cufe);
+    if (includeDriveColumn) c += txtCell(`U${rowNum}`, inv.cufe);
+    else c += txtCell(`T${rowNum}`, inv.cufe);
 
     sheet1Rows.push(`<row r="${rowNum}">${c}</row>`);
   });
@@ -211,7 +212,7 @@ export async function generateExcelFile(
     sheet1Hyperlinks.length > 0
       ? `<hyperlinks>${sheet1Hyperlinks.join("")}</hyperlinks>`
       : null;
-  sheet1Xml = patchSheetXml(sheet1Xml, s1SheetData, s1Hyperlinks, sheet1LastRow, "U");
+  sheet1Xml = patchSheetXml(sheet1Xml, s1SheetData, s1Hyperlinks, sheet1LastRow, includeDriveColumn ? "U" : "T");
   zip.file("xl/worksheets/sheet1.xml", sheet1Xml);
 
   if (sheet1DriveRels.length > 0) {
@@ -365,7 +366,7 @@ export async function generateExcelFile(
   zip.file("xl/worksheets/sheet3.xml", sheet3Xml);
 
   // ── 6. Patch table refs ──────────────────────────────────────────────────
-  zip.file("xl/tables/table1.xml", patchTableRef(await zip.file("xl/tables/table1.xml")!.async("string"), "U", sheet1LastRow));
+  zip.file("xl/tables/table1.xml", patchTableRef(await zip.file("xl/tables/table1.xml")!.async("string"), includeDriveColumn ? "U" : "T", sheet1LastRow));
   zip.file("xl/tables/table2.xml", patchTableRef(await zip.file("xl/tables/table2.xml")!.async("string"), "R", sheet2LastRow));
   zip.file("xl/tables/table3.xml", patchTableRef(await zip.file("xl/tables/table3.xml")!.async("string"), "J", sheet3LastRow));
 

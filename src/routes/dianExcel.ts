@@ -21,6 +21,15 @@ import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig } from "../types/dianExcel.js";
 
+interface DeferredDriveUploadItem {
+  pdfPath: string;
+  xmlPath: string;
+  docnum: string;
+  issuerNit: string;
+  receiverNit: string;
+  issueDate: string;
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
 const BATCH_SIZE = 500; // Procesar en tandas para evitar timeouts
@@ -124,7 +133,7 @@ setInterval(() => {
 // Crea un job asincrono de extraccion y generacion de Excel.
 router.post("/generate", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as ExcelGenerateRequest;
-  const { token_url, start_date, end_date, session_uid, document_direction, drive_connection_id } = body;
+  const { token_url, start_date, end_date, session_uid, document_direction, drive_connection_id, include_drive_links } = body;
   
   // Validar document_direction si se proporciona
   const direction = document_direction === "sent" ? "sent" : "received";
@@ -189,7 +198,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   });
 
   // No usar await para no retener la conexion HTTP.
-  processExcelJob(jobId, token_url, start_date, end_date, userId, direction, drive_connection_id).catch((err) => {
+  processExcelJob(jobId, token_url, start_date, end_date, userId, direction, drive_connection_id, include_drive_links === true).catch((err) => {
     console.error(`[Excel] Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
@@ -226,6 +235,11 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     invoicesProcessed: job.invoicesProcessed,
     invoicesFailed: job.invoicesFailed,
     invoicesSkipped: job.invoicesSkipped,
+    driveUploadStatus: job.driveUploadStatus,
+    driveUploadCurrent: job.driveUploadCurrent,
+    driveUploadTotal: job.driveUploadTotal,
+    driveUploadFolderUrl: job.driveUploadFolderUrl,
+    driveUploadError: job.driveUploadError,
     timings: {
       startedAt: job.startedAt || job.createdAt,
       documentsFoundAt: job.documentsFoundAt || null,
@@ -282,10 +296,14 @@ router.get("/download/:jobId", (req: Request, res: Response) => {
       if (job.excelPath && fs.existsSync(job.excelPath)) {
         try { fs.unlinkSync(job.excelPath); } catch {}
       }
-      if (job.tempDir && fs.existsSync(job.tempDir)) {
-        try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch {}
+      if (job.driveUploadStatus === "processing" || job.driveUploadStatus === "pending") {
+        job.excelPath = undefined;
+      } else {
+        if (job.tempDir && fs.existsSync(job.tempDir)) {
+          try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch {}
+        }
+        jobTracker.delete(jobId);
       }
-      jobTracker.delete(jobId);
     }, 10_000);
   });
 });
@@ -334,7 +352,8 @@ async function processExcelJob(
   endDate: string | undefined,
   userId: string,
   documentDirection: "received" | "sent" = "received",
-  driveConnectionId?: string
+  driveConnectionId?: string,
+  includeDriveLinks: boolean = false
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
@@ -401,6 +420,13 @@ async function processExcelJob(
     // 2) Cargar config de Drive para subir archivos si el usuario lo habilito.
     const driveConfig = await getUserGoogleDriveById(userId, driveConnectionId);
     const hasDrive = !!driveConfig;
+    const useInlineDriveLinks = includeDriveLinks && hasDrive;
+    const runDeferredDriveUpload = !includeDriveLinks && hasDrive;
+    const deferredUploads: DeferredDriveUploadItem[] = [];
+
+    job.driveUploadStatus = hasDrive ? (runDeferredDriveUpload ? "pending" : "disabled") : "disabled";
+    job.driveUploadCurrent = 0;
+    job.driveUploadTotal = 0;
 
     // Persiste token refrescado para evitar vencimientos en jobs largos.
     const onTokenRefresh = async (newAccessToken: string, expiryDate: number) => {
@@ -411,7 +437,8 @@ async function processExcelJob(
     // Pre-crear carpeta raiz de Drive si es necesario
     if (hasDrive && driveConfig) {
       try {
-        await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
+        const rootFolderId = await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
+        job.driveUploadFolderUrl = `https://drive.google.com/drive/folders/${rootFolderId}`;
       } catch (err) {
         console.warn("[Excel] No se pudo pre-crear carpeta Drive:", err);
       }
@@ -529,7 +556,7 @@ async function processExcelJob(
         const hasValidData = invoiceData.issueDate && invoiceData.issueDate !== "N/A" &&
                              receiver.nit && receiver.nit !== "N/A";
 
-        if (hasDrive && driveConfig && hasValidData) {
+        if (useInlineDriveLinks && driveConfig && hasValidData) {
           try {
             // Verificar si ya existe en Drive antes de subir
             const existing = await checkInvoiceExistsInDrive(
@@ -571,6 +598,26 @@ async function processExcelJob(
             console.error(`[Excel] Error subiendo a Drive: ${doc.docnum}`, driveErr);
             driveUrl = "ERROR: No se pudo subir a Drive";
           }
+        }
+
+        if (runDeferredDriveUpload && driveConfig && hasValidData && xmlBuffer) {
+          const pendingDir = path.join(tempDir, "drive-pending");
+          fs.mkdirSync(pendingDir, { recursive: true });
+          const safeDocNum = doc.docnum.replace(/[^a-zA-Z0-9._-]/g, "_");
+          const itemPrefix = `${String(i + 1).padStart(6, "0")}-${safeDocNum}`;
+          const xmlPath = path.join(pendingDir, `${itemPrefix}.xml`);
+          const pdfPath = path.join(pendingDir, `${itemPrefix}.pdf`);
+          fs.writeFileSync(xmlPath, xmlBuffer);
+          fs.writeFileSync(pdfPath, pdfBuffer || Buffer.alloc(0));
+          deferredUploads.push({
+            pdfPath,
+            xmlPath,
+            docnum: doc.docnum,
+            issuerNit: invoiceData.issuerNit || doc.nit,
+            receiverNit: receiver.nit,
+            issueDate: invoiceData.issueDate || "N/A",
+          });
+          job.driveUploadTotal = deferredUploads.length;
         }
 
         const invoiceRow: InvoiceData = {
@@ -723,10 +770,12 @@ async function processExcelJob(
       throw new Error("No se generaron filas para el Excel. Revisa logs de extracción de documentos.");
     }
 
-    await generateExcelFile(invoicesForExcel, excelPath, hasDrive, isSentDocs);
+    await generateExcelFile(invoicesForExcel, excelPath, useInlineDriveLinks, isSentDocs);
 
-    // Limpia artefactos temporales una vez generado el Excel.
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    // Si no hay carga diferida, limpiar temporales de inmediato.
+    if (!runDeferredDriveUpload) {
+      try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
 
     // 5) Publicar estado final para polling/descarga.
     job.status = "completed";
@@ -744,6 +793,10 @@ async function processExcelJob(
 
     setProgress(jobId, { step: summary, current: totalDocs, total: totalDocs });
     console.log(`[Excel] Job ${jobId} completado: ${successCount} facturas, ${skippedCount} existentes, ${errorCount} errores`);
+
+    if (runDeferredDriveUpload && driveConfig) {
+      void runDriveUploadInBackground(jobId, userId, driveConfig, deferredUploads, onTokenRefresh, tempDir);
+    }
 
   } catch (err) {
     console.error(`[Excel] Error fatal en job ${jobId}:`, err);
@@ -800,6 +853,54 @@ async function downloadZipFile(
   }
 
   throw lastError || new Error("Descarga fallida");
+}
+
+async function runDriveUploadInBackground(
+  jobId: string,
+  userId: string,
+  driveConfig: GoogleDriveConfig,
+  uploads: DeferredDriveUploadItem[],
+  onTokenRefresh: (newAccessToken: string, expiryDate: number) => Promise<void>,
+  tempDir: string
+): Promise<void> {
+  const job = jobTracker.get(jobId);
+  if (!job) return;
+
+  job.driveUploadStatus = "processing";
+  job.driveUploadCurrent = 0;
+  job.driveUploadTotal = uploads.length;
+
+  try {
+    for (let i = 0; i < uploads.length; i++) {
+      if (isJobCancelled(jobId)) return;
+      const item = uploads[i];
+      const pdfBuffer = fs.existsSync(item.pdfPath) ? fs.readFileSync(item.pdfPath) : null;
+      const xmlBuffer = fs.readFileSync(item.xmlPath);
+
+      await uploadInvoiceFilesToDrive(
+        pdfBuffer,
+        xmlBuffer,
+        item.docnum,
+        item.issuerNit,
+        item.receiverNit,
+        item.issueDate,
+        driveConfig,
+        userId,
+        onTokenRefresh
+      );
+
+      job.driveUploadCurrent = i + 1;
+    }
+
+    job.driveUploadStatus = "completed";
+    console.log(`[Excel] Job ${jobId}: carga diferida a Drive completada (${uploads.length})`);
+  } catch (err) {
+    job.driveUploadStatus = "error";
+    job.driveUploadError = (err as Error).message || "Error en carga diferida a Drive";
+    console.error(`[Excel] Job ${jobId}: error en carga diferida a Drive`, err);
+  } finally {
+    try { if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  }
 }
 
 interface ExtractedFiles {

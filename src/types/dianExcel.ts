@@ -8,6 +8,7 @@ export interface ExcelGenerateRequest {
   end_date?: string;
   session_uid?: string;
   drive_connection_id?: string;
+  include_drive_links?: boolean;
   /** Tipo de documentos: "received" (recibidos) o "sent" (emitidos). Default: "received" */
   document_direction?: DocumentDirection;
 }
@@ -130,6 +131,11 @@ export interface ExcelJobData {
   documentsFoundAt?: number;
   downloadStartedAt?: number;
   excelGenerationStartedAt?: number;
+  driveUploadStatus?: "pending" | "processing" | "completed" | "error" | "disabled";
+  driveUploadCurrent?: number;
+  driveUploadTotal?: number;
+  driveUploadFolderUrl?: string;
+  driveUploadError?: string;
 }
 
 export interface GoogleDriveConfig {
