@@ -51,6 +51,13 @@ function setProgress(jobId: string, data: Partial<ExcelJobData["progress"]>): vo
   }
 }
 
+function normalizeNitForMatch(nit: string | null | undefined): string {
+  return String(nit || "")
+    .replace(/[^0-9A-Za-z]/g, "")
+    .toUpperCase()
+    .trim();
+}
+
 // Todas las rutas requieren sesion autenticada.
 router.use((req, res, next) => {
   requireAuth(req, res, next);
@@ -423,12 +430,57 @@ async function processExcelJob(
           docType: doc.docType, // Tipo de documento de la tabla DIAN
         });
 
+        let issuer = {
+          nit: invoiceData.issuerNit || "N/A",
+          name: invoiceData.issuerName || "N/A",
+          email: invoiceData.issuerEmail || "N/A",
+          phone: invoiceData.issuerPhone || "N/A",
+          address: invoiceData.issuerAddress || "N/A",
+          city: invoiceData.issuerCity || "N/A",
+          department: invoiceData.issuerDepartment || "N/A",
+          country: invoiceData.issuerCountry || "N/A",
+          commercialName: invoiceData.issuerCommercialName || "N/A",
+          taxpayerType: invoiceData.issuerTaxpayerType || "N/A",
+          fiscalRegime: invoiceData.issuerFiscalRegime || "N/A",
+          taxResponsibility: invoiceData.issuerTaxResponsibility || "N/A",
+          economicActivity: invoiceData.issuerEconomicActivity || "N/A",
+        };
+
+        let receiver = {
+          nit: invoiceData.receiverNit || "N/A",
+          name: invoiceData.receiverName || "N/A",
+          email: invoiceData.receiverEmail || "N/A",
+          phone: invoiceData.receiverPhone || "N/A",
+          address: invoiceData.receiverAddress || "N/A",
+          city: invoiceData.receiverCity || "N/A",
+          department: invoiceData.receiverDepartment || "N/A",
+          country: invoiceData.receiverCountry || "N/A",
+          commercialName: invoiceData.receiverCommercialName || "N/A",
+          taxpayerType: invoiceData.receiverTaxpayerType || "N/A",
+          fiscalRegime: invoiceData.receiverFiscalRegime || "N/A",
+          taxResponsibility: invoiceData.receiverTaxResponsibility || "N/A",
+          economicActivity: invoiceData.receiverEconomicActivity || "N/A",
+        };
+
+        if (isSentDocs) {
+          const docNitNorm = normalizeNitForMatch(doc.nit);
+          const issuerNitNorm = normalizeNitForMatch(issuer.nit);
+          const receiverNitNorm = normalizeNitForMatch(receiver.nit);
+
+          if (docNitNorm && issuerNitNorm === docNitNorm && receiverNitNorm !== docNitNorm) {
+            const originalIssuer = issuer;
+            issuer = receiver;
+            receiver = originalIssuer;
+            console.log(`[Excel] Job ${jobId}: swap emisor/receptor aplicado para doc ${doc.docnum} (${doc.docType || "N/A"})`);
+          }
+        }
+
         // 3.4) Subir archivos a Drive con estructura de carpetas.
         let driveUrl: string | undefined;
         let wasSkipped = false;
 
         const hasValidData = invoiceData.issueDate && invoiceData.issueDate !== "N/A" &&
-                             invoiceData.receiverNit && invoiceData.receiverNit !== "N/A";
+                             receiver.nit && receiver.nit !== "N/A";
 
         if (hasDrive && driveConfig && hasValidData) {
           try {
@@ -439,7 +491,7 @@ async function processExcelJob(
               invoiceData.issueDate!,
               doc.docnum,
               invoiceData.issuerNit || doc.nit,
-              invoiceData.receiverNit!,
+              receiver.nit,
               onTokenRefresh
             );
 
@@ -456,7 +508,7 @@ async function processExcelJob(
                 xmlBuffer,
                 doc.docnum,
                 invoiceData.issuerNit || doc.nit,
-                invoiceData.receiverNit!,
+                receiver.nit,
                 invoiceData.issueDate!,
                 driveConfig,
                 userId,
@@ -475,32 +527,32 @@ async function processExcelJob(
         }
 
         invoices.push({
-          issuerNit: invoiceData.issuerNit || "N/A",
-          issuerName: invoiceData.issuerName || "N/A",
-          issuerEmail: invoiceData.issuerEmail || "N/A",
-          issuerPhone: invoiceData.issuerPhone || "N/A",
-          issuerAddress: invoiceData.issuerAddress || "N/A",
-          issuerCity: invoiceData.issuerCity || "N/A",
-          issuerDepartment: invoiceData.issuerDepartment || "N/A",
-          issuerCountry: invoiceData.issuerCountry || "N/A",
-          issuerCommercialName: invoiceData.issuerCommercialName || "N/A",
-          issuerTaxpayerType: invoiceData.issuerTaxpayerType || "N/A",
-          issuerFiscalRegime: invoiceData.issuerFiscalRegime || "N/A",
-          issuerTaxResponsibility: invoiceData.issuerTaxResponsibility || "N/A",
-          issuerEconomicActivity: invoiceData.issuerEconomicActivity || "N/A",
-          receiverNit: invoiceData.receiverNit || "N/A",
-          receiverName: invoiceData.receiverName || "N/A",
-          receiverEmail: invoiceData.receiverEmail || "N/A",
-          receiverPhone: invoiceData.receiverPhone || "N/A",
-          receiverAddress: invoiceData.receiverAddress || "N/A",
-          receiverCity: invoiceData.receiverCity || "N/A",
-          receiverDepartment: invoiceData.receiverDepartment || "N/A",
-          receiverCountry: invoiceData.receiverCountry || "N/A",
-          receiverCommercialName: invoiceData.receiverCommercialName || "N/A",
-          receiverTaxpayerType: invoiceData.receiverTaxpayerType || "N/A",
-          receiverFiscalRegime: invoiceData.receiverFiscalRegime || "N/A",
-          receiverTaxResponsibility: invoiceData.receiverTaxResponsibility || "N/A",
-          receiverEconomicActivity: invoiceData.receiverEconomicActivity || "N/A",
+          issuerNit: issuer.nit,
+          issuerName: issuer.name,
+          issuerEmail: issuer.email,
+          issuerPhone: issuer.phone,
+          issuerAddress: issuer.address,
+          issuerCity: issuer.city,
+          issuerDepartment: issuer.department,
+          issuerCountry: issuer.country,
+          issuerCommercialName: issuer.commercialName,
+          issuerTaxpayerType: issuer.taxpayerType,
+          issuerFiscalRegime: issuer.fiscalRegime,
+          issuerTaxResponsibility: issuer.taxResponsibility,
+          issuerEconomicActivity: issuer.economicActivity,
+          receiverNit: receiver.nit,
+          receiverName: receiver.name,
+          receiverEmail: receiver.email,
+          receiverPhone: receiver.phone,
+          receiverAddress: receiver.address,
+          receiverCity: receiver.city,
+          receiverDepartment: receiver.department,
+          receiverCountry: receiver.country,
+          receiverCommercialName: receiver.commercialName,
+          receiverTaxpayerType: receiver.taxpayerType,
+          receiverFiscalRegime: receiver.fiscalRegime,
+          receiverTaxResponsibility: receiver.taxResponsibility,
+          receiverEconomicActivity: receiver.economicActivity,
           issueDate: invoiceData.issueDate || "N/A",
           issueDateISO: invoiceData.issueDateISO || "9999-12-31",
           paymentMethod: invoiceData.paymentMethod || "N/A",
