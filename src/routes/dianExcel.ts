@@ -27,6 +27,7 @@ const BATCH_SIZE = 500; // Procesar en tandas para evitar timeouts
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
 const JOB_TTL_MS = 2 * 60 * 60 * 1000; // 2 horas para jobs grandes
+const USE_STAGING_PIPELINE = process.env.DIAN_EXCEL_USE_STAGING !== "0";
 
 // Crea carpeta de trabajo al iniciar el proceso.
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -56,6 +57,42 @@ function normalizeNitForMatch(nit: string | null | undefined): string {
     .replace(/[^0-9A-Za-z]/g, "")
     .toUpperCase()
     .trim();
+}
+
+async function appendInvoiceToStaging(
+  writer: fs.WriteStream,
+  invoice: InvoiceData
+): Promise<void> {
+  const line = `${JSON.stringify(invoice)}\n`;
+  if (!writer.write(line, "utf8")) {
+    await new Promise<void>((resolve) => writer.once("drain", resolve));
+  }
+}
+
+function loadInvoicesFromStaging(stagingFilePath: string): InvoiceData[] {
+  if (!fs.existsSync(stagingFilePath)) return [];
+  const raw = fs.readFileSync(stagingFilePath, "utf8");
+  if (!raw.trim()) return [];
+
+  const invoices: InvoiceData[] = [];
+  const lines = raw.split("\n");
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      invoices.push(JSON.parse(trimmed) as InvoiceData);
+    } catch (err) {
+      console.warn("[Excel] No se pudo parsear línea de staging:", (err as Error).message);
+    }
+  }
+  return invoices;
+}
+
+async function closeStagingWriter(writer: fs.WriteStream): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    writer.end(() => resolve());
+    writer.once("error", reject);
+  });
 }
 
 // Todas las rutas requieren sesion autenticada.
@@ -350,6 +387,16 @@ async function processExcelJob(
     });
 
     fs.mkdirSync(tempDir, { recursive: true });
+    const stagingFilePath = path.join(tempDir, "invoices-staging.jsonl");
+    let stagingWriter: fs.WriteStream | null = null;
+    if (USE_STAGING_PIPELINE) {
+      stagingWriter = fs.createWriteStream(stagingFilePath, {
+        flags: "w",
+        encoding: "utf8",
+        highWaterMark: 1024 * 1024,
+      });
+      console.log(`[Excel] Job ${jobId}: pipeline staging habilitado (JSONL)`);
+    }
 
     // 2) Cargar config de Drive para subir archivos si el usuario lo habilito.
     const driveConfig = await getUserGoogleDriveById(userId, driveConnectionId);
@@ -375,7 +422,7 @@ async function processExcelJob(
     console.log(`[Excel] Job ${jobId}: checkpoint descargas iniciadas`);
     setProgress(jobId, { step: "Iniciando descargas...", current: 0, total: totalDocs });
 
-    const invoices: InvoiceData[] = [];
+    const invoices: InvoiceData[] = USE_STAGING_PIPELINE ? [] : [];
     let successCount = 0;
     let errorCount = 0;
     let skippedCount = 0;
@@ -526,7 +573,7 @@ async function processExcelJob(
           }
         }
 
-        invoices.push({
+        const invoiceRow: InvoiceData = {
           issuerNit: issuer.nit,
           issuerName: issuer.name,
           issuerEmail: issuer.email,
@@ -570,7 +617,10 @@ async function processExcelJob(
           docNumber: doc.docnum,
           driveUrl,
           zipFilename: `${invoiceData.issuerNit || doc.nit} - ${doc.docnum}.zip`,
-        });
+        };
+
+        if (stagingWriter) await appendInvoiceToStaging(stagingWriter, invoiceRow);
+        else invoices.push(invoiceRow);
 
         successCount++;
         consecutiveErrors = 0; // Reset en éxito
@@ -587,7 +637,7 @@ async function processExcelJob(
         console.error(`[Excel] Error procesando ${doc.docnum}:`, errMsg.substring(0, 100));
 
         // Mantiene trazabilidad del documento fallido dentro del Excel.
-        invoices.push({
+        const errorInvoiceRow: InvoiceData = {
           issuerNit: doc.nit,
           issuerName: "N/A",
           issuerEmail: "N/A",
@@ -631,7 +681,10 @@ async function processExcelJob(
           docNumber: doc.docnum,
           zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
           error: errMsg,
-        });
+        };
+
+        if (stagingWriter) await appendInvoiceToStaging(stagingWriter, errorInvoiceRow);
+        else invoices.push(errorInvoiceRow);
         
         // Si hay muchos errores consecutivos, pausar para recuperarse
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
@@ -647,6 +700,10 @@ async function processExcelJob(
       }
     }
 
+    if (stagingWriter) {
+      await closeStagingWriter(stagingWriter);
+    }
+
     if (isJobCancelled(jobId)) {
       try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
       return;
@@ -656,15 +713,17 @@ async function processExcelJob(
     job.excelGenerationStartedAt = Date.now();
     setProgress(jobId, { step: "Generando archivo Excel...", current: totalDocs, total: totalDocs });
 
+    const invoicesForExcel = USE_STAGING_PIPELINE ? loadInvoicesFromStaging(stagingFilePath) : invoices;
+
     console.log(
-      `[Excel] Job ${jobId}: procesados=${successCount} errores=${errorCount} omitidos=${skippedCount} filas_excel=${invoices.length}`
+      `[Excel] Job ${jobId}: procesados=${successCount} errores=${errorCount} omitidos=${skippedCount} filas_excel=${invoicesForExcel.length}`
     );
 
-    if (invoices.length === 0) {
+    if (invoicesForExcel.length === 0) {
       throw new Error("No se generaron filas para el Excel. Revisa logs de extracción de documentos.");
     }
 
-    await generateExcelFile(invoices, excelPath, hasDrive, isSentDocs);
+    await generateExcelFile(invoicesForExcel, excelPath, hasDrive, isSentDocs);
 
     // Limpia artefactos temporales una vez generado el Excel.
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
