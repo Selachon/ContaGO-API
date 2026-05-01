@@ -47,7 +47,7 @@ export function getAuthUrl(state?: string): string {
   return oauth2Client.generateAuthUrl({
     access_type: "offline",
     scope: SCOPES,
-    prompt: "consent", // Forzar para obtener refresh_token
+    prompt: "select_account consent", // Forzar selector de cuenta + refresh_token
     state: state || "",
   });
 }
