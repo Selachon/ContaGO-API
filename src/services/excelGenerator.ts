@@ -105,6 +105,48 @@ function patchTableRef(tableXml: string, endCol: string, lastRow: number): strin
   return tableXml.replace(/ref="A2:[A-Z]+\d+"/g, `ref="${newRef}"`);
 }
 
+function patchSentHeaders(sharedStringsXml: string): string {
+  return sharedStringsXml
+    .replace(/<t>NIT Emisor<\/t>/g, "<t>NIT Receptor</t>")
+    .replace(/<t>Razon Social Emisor<\/t>/g, "<t>Razon Social Receptor</t>");
+}
+
+function patchTable1HeadersForSent(tableXml: string): string {
+  return tableXml
+    .replace(/name="NIT Emisor"/g, 'name="NIT Receptor"')
+    .replace(/name="Razon Social Emisor"/g, 'name="Razon Social Receptor"');
+}
+
+function removeDriveColumnFromTable1(tableXml: string): string {
+  return tableXml
+    .replace('ref="A2:U3"', 'ref="A2:T3"')
+    .replace('autoFilter ref="A2:U3"', 'autoFilter ref="A2:T3"')
+    .replace('tableColumns count="21"', 'tableColumns count="20"')
+    .replace(/<tableColumn[^>]*name="Enlace factura"\/>/g, "");
+}
+
+function patchTable2ForIcl(tableXml: string): string {
+  let out = tableXml
+    .replace('ref="A2:R3"', 'ref="A2:T3"')
+    .replace('autoFilter ref="A2:R3"', 'autoFilter ref="A2:T3"')
+    .replace('tableColumns count="18"', 'tableColumns count="20"')
+    .replace(/<tableColumn([^>]*)name="Precio unitario \(incluye impuestos\)"\/>/g, '<tableColumn$1name="ICL"/><tableColumn id="19" name="% ICL"/><tableColumn id="20" name="Precio unitario (incluye impuestos)"/>');
+  return out;
+}
+
+function patchSheet2HeaderWithIcl(sheetXml: string): string {
+  const row2Regex = /<row r="2"[^>]*>.*?<\/row>/;
+  return sheetXml
+    .replace('spans="1:18"', 'spans="1:20"')
+    .replace(
+      row2Regex,
+      (row2) =>
+        row2
+          .replace('spans="1:18"', 'spans="1:20"')
+          .replace('</row>', '<c r="S2" s="3" t="inlineStr"><is><t>ICL</t></is></c><c r="T2" s="3" t="inlineStr"><is><t>% ICL</t></is></c></row>')
+    );
+}
+
 // Style indices added to styles.xml (appended after the 7 existing xfs, indices 0-6)
 const STYLE_CURRENCY = 7; // numFmtId 164 → #,##0.00
 const STYLE_PERCENT = 8;  // numFmtId 165 → 0.00"%"
@@ -117,6 +159,14 @@ export async function generateExcelFile(
 ): Promise<void> {
   const templatePath = resolveTemplatePath();
   const zip = await JSZip.loadAsync(fs.readFileSync(templatePath));
+
+  if (isSentDocuments) {
+    const sharedStringsFile = zip.file("xl/sharedStrings.xml");
+    if (sharedStringsFile) {
+      const sharedStringsXml = await sharedStringsFile.async("string");
+      zip.file("xl/sharedStrings.xml", patchSentHeaders(sharedStringsXml));
+    }
+  }
 
   // ── 1. Patch styles.xml ──────────────────────────────────────────────────
   let stylesXml = await zip.file("xl/styles.xml")!.async("string");
@@ -230,7 +280,7 @@ export async function generateExcelFile(
   // ── 4. Sheet 2 — Detallado ───────────────────────────────────────────────
   // A=Item  B=Num Factura  C=Concepto  D=Cantidad  E=Base impuesto
   // F=Desc detalle  G=Recargo detalle  H=IVA  I=%IVA  J=INC  K=%INC
-  // L=Bolsas  M=%Bolsas  N=ICUI  O=%ICUI  P=IC  Q=%IC  R=Precio unitario
+  // L=Bolsas  M=%Bolsas  N=ICUI  O=%ICUI  P=IC  Q=%IC  R=ICL  S=%ICL  T=Precio unitario
 
   let sheet2Rows: string[] = [];
   let sheet2Hyperlinks: string[] = [];
@@ -267,7 +317,9 @@ export async function generateExcelFile(
       c += numCell(`O${rowNum}`, td["ICUI"]?.percent ?? 0, STYLE_PERCENT);
       c += numCell(`P${rowNum}`, td["IC"]?.amount ?? 0, STYLE_CURRENCY);
       c += numCell(`Q${rowNum}`, td["IC"]?.percent ?? 0, STYLE_PERCENT);
-      c += numCell(`R${rowNum}`, li.totalUnitPrice + totalTax, STYLE_CURRENCY);
+      c += numCell(`R${rowNum}`, td["ICL"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`S${rowNum}`, td["ICL"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`T${rowNum}`, li.totalUnitPrice + totalTax, STYLE_CURRENCY);
 
       sheet2Rows.push(`<row r="${rowNum}">${c}</row>`);
     }
@@ -282,7 +334,8 @@ export async function generateExcelFile(
     sheet2Hyperlinks.length > 0
       ? `<hyperlinks>${sheet2Hyperlinks.join("")}</hyperlinks>`
       : null;
-  sheet2Xml = patchSheetXml(sheet2Xml, s2SheetData, s2Hyperlinks, sheet2LastRow, "R");
+  sheet2Xml = patchSheetXml(sheet2Xml, s2SheetData, s2Hyperlinks, sheet2LastRow, "T");
+  sheet2Xml = patchSheet2HeaderWithIcl(sheet2Xml);
   zip.file("xl/worksheets/sheet2.xml", sheet2Xml);
 
   // ── 5. Sheet 3 — Datos de terceros ───────────────────────────────────────
@@ -366,8 +419,16 @@ export async function generateExcelFile(
   zip.file("xl/worksheets/sheet3.xml", sheet3Xml);
 
   // ── 6. Patch table refs ──────────────────────────────────────────────────
-  zip.file("xl/tables/table1.xml", patchTableRef(await zip.file("xl/tables/table1.xml")!.async("string"), includeDriveColumn ? "U" : "T", sheet1LastRow));
-  zip.file("xl/tables/table2.xml", patchTableRef(await zip.file("xl/tables/table2.xml")!.async("string"), "R", sheet2LastRow));
+  const table1Xml = await zip.file("xl/tables/table1.xml")!.async("string");
+  const table1RefPatched = patchTableRef(table1Xml, includeDriveColumn ? "U" : "T", sheet1LastRow);
+  let finalTable1 = isSentDocuments ? patchTable1HeadersForSent(table1RefPatched) : table1RefPatched;
+  if (!includeDriveColumn) {
+    finalTable1 = removeDriveColumnFromTable1(finalTable1);
+  }
+  zip.file("xl/tables/table1.xml", finalTable1);
+  const table2Xml = await zip.file("xl/tables/table2.xml")!.async("string");
+  const table2RefPatched = patchTableRef(table2Xml, "T", sheet2LastRow);
+  zip.file("xl/tables/table2.xml", patchTable2ForIcl(table2RefPatched));
   zip.file("xl/tables/table3.xml", patchTableRef(await zip.file("xl/tables/table3.xml")!.async("string"), "J", sheet3LastRow));
 
   // ── 7. Write output ──────────────────────────────────────────────────────

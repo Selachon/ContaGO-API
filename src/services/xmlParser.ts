@@ -503,6 +503,12 @@ function normalizeTaxName(rawName: string, normalizedId: string): string {
 
   // Limpiar el nombre del XML
   const cleanName = rawName.trim().toUpperCase();
+
+  // Algunas facturas reportan ICL como nombre del impuesto.
+  if (cleanName === "ICL" || cleanName.includes("IMPUESTO AL CARBONO")) {
+    return "ICL";
+  }
+
   if (cleanName && cleanName !== "N/A" && cleanName !== "UNDEFINED") {
     return cleanName;
   }
