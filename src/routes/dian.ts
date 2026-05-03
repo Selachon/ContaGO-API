@@ -302,7 +302,16 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
 // Crea un job asincrono y devuelve jobId de inmediato.
 router.post("/download-documents", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as DownloadRequest;
-  const { token_url, start_date, end_date, session_uid, consolidate_pdf, include_pdf_folder, document_direction } = body;
+  const {
+    token_url,
+    start_date,
+    end_date,
+    session_uid,
+    consolidate_pdf,
+    include_pdf_folder,
+    include_xml_folder,
+    document_direction,
+  } = body;
   
   // Validar document_direction si se proporciona
   const direction = document_direction === "sent" ? "sent" : "received";
@@ -375,7 +384,16 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   });
 
   // No usar await para no retener la conexion HTTP.
-  processDownloadJob(jobId, token_url, start_date, end_date, consolidate_pdf, include_pdf_folder, direction).catch((err) => {
+  processDownloadJob(
+    jobId,
+    token_url,
+    start_date,
+    end_date,
+    consolidate_pdf,
+    include_pdf_folder,
+    include_xml_folder,
+    direction
+  ).catch((err) => {
     console.error(`Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
@@ -394,6 +412,7 @@ async function processDownloadJob(
   end_date: string | undefined,
   consolidate_pdf: boolean | undefined,
   include_pdf_folder: boolean | undefined,
+  include_xml_folder: boolean | undefined,
   documentDirection: "received" | "sent" = "received"
 ): Promise<void> {
   const job = jobTracker.get(jobId);
@@ -693,6 +712,61 @@ async function processDownloadJob(
       } catch (pdfFolderErr) {
         console.error(`[${jobId}] Error creando carpeta PDFs:`, pdfFolderErr);
         // La carpeta PDFs es opcional; fallar aqui no invalida el ZIP final.
+      }
+    }
+
+    // Carpeta opcional con XMLs individuales nombrados como NIT - NumFactura.xml
+    if (include_xml_folder && !isJobCancelled(jobId)) {
+      try {
+        setProgress(jobId, {
+          step: "Creando carpeta de XMLs...",
+          current: 0,
+          total: 1,
+        });
+
+        const xmlFolderPath = path.join(tempDir, "XMLs");
+        fs.mkdirSync(xmlFolderPath, { recursive: true });
+
+        const zipFiles = fs.readdirSync(tempDir).filter((f) => f.endsWith(".zip"));
+        let extractedCount = 0;
+
+        for (let z = 0; z < zipFiles.length; z++) {
+          if (isJobCancelled(jobId)) {
+            console.log(`[${jobId}] Job cancelado durante extracción de XMLs`);
+            try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+            return;
+          }
+
+          setProgress(jobId, {
+            step: `Extrayendo XML ${z + 1} de ${zipFiles.length} a carpeta XMLs...`,
+            current: z + 1,
+            total: zipFiles.length,
+          });
+
+          const zipFileName = zipFiles[z];
+          const zipFilePath = path.join(tempDir, zipFileName);
+          const zipData = fs.readFileSync(zipFilePath);
+          const zip = await JSZip.loadAsync(zipData);
+
+          const xmlEntries = Object.keys(zip.files).filter(
+            (name) => name.toLowerCase().endsWith(".xml") && !zip.files[name].dir
+          );
+
+          for (const xmlName of xmlEntries) {
+            const xmlBuffer = await zip.files[xmlName].async("nodebuffer");
+            const baseName = zipFileName.replace(/\.zip$/i, "");
+            const xmlFileName = `${baseName}.xml`;
+            const xmlDestPath = path.join(xmlFolderPath, xmlFileName);
+
+            fs.writeFileSync(xmlDestPath, xmlBuffer);
+            extractedCount++;
+          }
+        }
+
+        console.log(`[${jobId}] Carpeta XMLs creada con ${extractedCount} archivos`);
+      } catch (xmlFolderErr) {
+        console.error(`[${jobId}] Error creando carpeta XMLs:`, xmlFolderErr);
+        // La carpeta XMLs es opcional; fallar aqui no invalida el ZIP final.
       }
     }
 

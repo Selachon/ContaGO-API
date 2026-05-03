@@ -7,6 +7,7 @@ export interface DownloadRequest {
   session_uid?: string;
   consolidate_pdf?: boolean;
   include_pdf_folder?: boolean;
+  include_xml_folder?: boolean;
   /** Tipo de documentos: "received" (recibidos) o "sent" (emitidos). Default: "received" */
   document_direction?: DocumentDirection;
 }
