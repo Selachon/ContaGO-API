@@ -450,3 +450,119 @@ export function generateExcelFilename(startDate?: string, endDate?: string, pref
   const end = endDate ? fmt(endDate) : "Fin";
   return `${prefix} ${start} - ${end}.xlsx`;
 }
+
+export async function generateThirdPartiesExcelFile(
+  invoices: Partial<InvoiceData>[],
+  outputPath: string,
+  isSentDocuments: boolean = false
+): Promise<void> {
+  const templatePath = resolveTemplatePath();
+  const zip = await JSZip.loadAsync(fs.readFileSync(templatePath));
+  const sorted = sortInvoicesByDate(invoices as InvoiceData[]);
+
+  // Eliminar hojas y tablas que no aplican para este archivo final.
+  zip.remove("xl/worksheets/sheet1.xml");
+  zip.remove("xl/worksheets/sheet2.xml");
+  zip.remove("xl/worksheets/_rels/sheet1.xml.rels");
+  zip.remove("xl/worksheets/_rels/sheet2.xml.rels");
+  zip.remove("xl/tables/table1.xml");
+  zip.remove("xl/tables/table2.xml");
+
+  let sheet3Rows: string[] = [];
+  type ThirdPartyRow = {
+    nit: string;
+    name: string;
+    commercial: string;
+    taxResp: string;
+    country: string;
+    dept: string;
+    city: string;
+    addr: string;
+    phone: string;
+    email: string;
+  };
+  const thirdPartiesByNit = new Map<string, ThirdPartyRow>();
+
+  for (const inv of sorted) {
+    const p: ThirdPartyRow = isSentDocuments
+      ? {
+          nit: inv.receiverNit,
+          name: inv.receiverName,
+          commercial: inv.receiverCommercialName || "N/A",
+          taxResp: inv.receiverTaxResponsibility || "N/A",
+          country: inv.receiverCountry || "N/A",
+          dept: inv.receiverDepartment || "N/A",
+          city: inv.receiverCity || "N/A",
+          addr: inv.receiverAddress || "N/A",
+          phone: inv.receiverPhone || "N/A",
+          email: inv.receiverEmail || "N/A",
+        }
+      : {
+          nit: inv.issuerNit,
+          name: inv.issuerName,
+          commercial: inv.issuerCommercialName || "N/A",
+          taxResp: inv.issuerTaxResponsibility || "N/A",
+          country: inv.issuerCountry || "N/A",
+          dept: inv.issuerDepartment || "N/A",
+          city: inv.issuerCity || "N/A",
+          addr: inv.issuerAddress || "N/A",
+          phone: inv.issuerPhone || "N/A",
+          email: inv.issuerEmail || "N/A",
+        };
+
+    const nitKey = normalizeNit(p.nit);
+    if (!thirdPartiesByNit.has(nitKey)) thirdPartiesByNit.set(nitKey, p);
+  }
+
+  const uniqueThirdParties = Array.from(thirdPartiesByNit.values());
+  uniqueThirdParties.forEach((p, idx) => {
+    const rowNum = 3 + idx;
+    let c = "";
+    c += txtCell(`A${rowNum}`, p.nit);
+    c += txtCell(`B${rowNum}`, p.name);
+    c += txtCell(`C${rowNum}`, p.commercial);
+    c += txtCell(`D${rowNum}`, p.taxResp);
+    c += txtCell(`E${rowNum}`, p.country);
+    c += txtCell(`F${rowNum}`, p.dept);
+    c += txtCell(`G${rowNum}`, p.city);
+    c += txtCell(`H${rowNum}`, p.addr);
+    c += txtCell(`I${rowNum}`, p.phone);
+    c += txtCell(`J${rowNum}`, p.email);
+    sheet3Rows.push(`<row r="${rowNum}">${c}</row>`);
+  });
+
+  const sheet3LastRow = Math.max(3, 2 + uniqueThirdParties.length);
+  let sheet3Xml = await zip.file("xl/worksheets/sheet3.xml")!.async("string");
+  const s3TemplateRows = extractTemplateRows(sheet3Xml);
+  const s3SheetData = `<sheetData>${s3TemplateRows}${sheet3Rows.join("")}</sheetData>`;
+  sheet3Xml = patchSheetXml(sheet3Xml, s3SheetData, null, sheet3LastRow, "J");
+  zip.file("xl/worksheets/sheet3.xml", sheet3Xml);
+  zip.file("xl/tables/table3.xml", patchTableRef(await zip.file("xl/tables/table3.xml")!.async("string"), "J", sheet3LastRow));
+
+  let workbookXml = await zip.file("xl/workbook.xml")!.async("string");
+  workbookXml = workbookXml
+    .replace(/<sheets>[\s\S]*<\/sheets>/, '<sheets><sheet name="Datos de terceros" sheetId="1" r:id="rId3"/></sheets>')
+    .replace(/activeTab="\d+"/g, 'activeTab="0"');
+  zip.file("xl/workbook.xml", workbookXml);
+
+  let workbookRelsXml = await zip.file("xl/_rels/workbook.xml.rels")!.async("string");
+  workbookRelsXml = workbookRelsXml
+    .replace(/<Relationship[^>]*Id="rId1"[^>]*\/>/g, "")
+    .replace(/<Relationship[^>]*Id="rId2"[^>]*\/>/g, "");
+  zip.file("xl/_rels/workbook.xml.rels", workbookRelsXml);
+
+  let contentTypesXml = await zip.file("[Content_Types].xml")!.async("string");
+  contentTypesXml = contentTypesXml
+    .replace(/<Override PartName="\/xl\/worksheets\/sheet1\.xml"[^>]*\/>/g, "")
+    .replace(/<Override PartName="\/xl\/worksheets\/sheet2\.xml"[^>]*\/>/g, "")
+    .replace(/<Override PartName="\/xl\/tables\/table1\.xml"[^>]*\/>/g, "")
+    .replace(/<Override PartName="\/xl\/tables\/table2\.xml"[^>]*\/>/g, "");
+  zip.file("[Content_Types].xml", contentTypesXml);
+
+  const buf = await zip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 6 },
+  });
+  fs.writeFileSync(outputPath, buf);
+}

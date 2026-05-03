@@ -8,6 +8,7 @@ import { execSync } from "child_process";
 import authRoutes from "./routes/auth.js";
 import dianRoutes from "./routes/dian.js";
 import dianExcelRoutes from "./routes/dianExcel.js";
+import dianThirdPartiesRoutes from "./routes/dianThirdParties.js";
 import googleAuthRoutes from "./routes/googleAuth.js";
 import adminRoutes from "./routes/admin.js";
 import siigoRoutes from "./routes/siigo.js";
@@ -59,6 +60,7 @@ app.use("/auth/google", googleAuthRoutes);
 app.use("/admin", adminRoutes);
 app.use("/dian", dianRoutes);
 app.use("/dian-excel", dianExcelRoutes);
+app.use("/dian-third-parties", dianThirdPartiesRoutes);
 app.use("/integrations/siigo", siigoRoutes);
 app.use("/causation", causationRoutes);
 
