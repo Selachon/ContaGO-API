@@ -143,7 +143,8 @@ function patchSheet2HeaderWithIcl(sheetXml: string): string {
       (row2) =>
         row2
           .replace('spans="1:18"', 'spans="1:20"')
-          .replace('</row>', '<c r="S2" s="3" t="inlineStr"><is><t>ICL</t></is></c><c r="T2" s="3" t="inlineStr"><is><t>% ICL</t></is></c></row>')
+          .replace(/<c r="R2"[^>]*>.*?<\/c>/, '<c r="R2" s="3" t="inlineStr"><is><t>ICL</t></is></c>')
+          .replace('</row>', '<c r="S2" s="3" t="inlineStr"><is><t>% ICL</t></is></c><c r="T2" s="3" t="inlineStr"><is><t>Precio unitario (incluye impuestos)</t></is></c></row>')
     );
 }
 
