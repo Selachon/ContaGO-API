@@ -111,10 +111,22 @@ function patchSentHeaders(sharedStringsXml: string): string {
     .replace(/<t>Razon Social Emisor<\/t>/g, "<t>Razon Social Receptor</t>");
 }
 
+function patchIclHeaders(sharedStringsXml: string): string {
+  return sharedStringsXml
+    .replace(/<t>Descuento Global \(-\)<\/t>/g, "<t>Valor ICL</t>")
+    .replace(/<t>% IC<\/t>/g, "<t>% ICL</t>");
+}
+
 function patchTable1HeadersForSent(tableXml: string): string {
   return tableXml
     .replace(/name="NIT Emisor"/g, 'name="NIT Receptor"')
     .replace(/name="Razon Social Emisor"/g, 'name="Razon Social Receptor"');
+}
+
+function patchTable1HeadersForIcl(tableXml: string): string {
+  return tableXml
+    .replace(/name="Descuento Global \(-\)"/g, 'name="Valor ICL"')
+    .replace(/name="% IC"/g, 'name="% ICL"');
 }
 
 function removeDriveColumnFromTable1(tableXml: string): string {
@@ -161,12 +173,12 @@ export async function generateExcelFile(
   const templatePath = resolveTemplatePath();
   const zip = await JSZip.loadAsync(fs.readFileSync(templatePath));
 
-  if (isSentDocuments) {
-    const sharedStringsFile = zip.file("xl/sharedStrings.xml");
-    if (sharedStringsFile) {
-      const sharedStringsXml = await sharedStringsFile.async("string");
-      zip.file("xl/sharedStrings.xml", patchSentHeaders(sharedStringsXml));
-    }
+  const sharedStringsFile = zip.file("xl/sharedStrings.xml");
+  if (sharedStringsFile) {
+    const sharedStringsXml = await sharedStringsFile.async("string");
+    let patchedSharedStrings = patchIclHeaders(sharedStringsXml);
+    if (isSentDocuments) patchedSharedStrings = patchSentHeaders(patchedSharedStrings);
+    zip.file("xl/sharedStrings.xml", patchedSharedStrings);
   }
 
   // ── 1. Patch styles.xml ──────────────────────────────────────────────────
@@ -237,7 +249,7 @@ export async function generateExcelFile(
     c += numCell(`N${rowNum}`, taxes["Bolsas"] ?? 0, STYLE_CURRENCY);
     c += numCell(`O${rowNum}`, taxes["ICUI"] ?? 0, STYLE_CURRENCY);
     c += numCell(`P${rowNum}`, taxes["IC"] ?? 0, STYLE_CURRENCY);
-    c += numCell(`Q${rowNum}`, 0, STYLE_CURRENCY);
+    c += numCell(`Q${rowNum}`, taxes["ICL"] ?? 0, STYLE_CURRENCY);
     c += numCell(`R${rowNum}`, 0, STYLE_CURRENCY);
     c += numCell(`S${rowNum}`, typeof inv.total === "number" ? inv.total : 0, STYLE_CURRENCY);
 
@@ -422,7 +434,8 @@ export async function generateExcelFile(
   // ── 6. Patch table refs ──────────────────────────────────────────────────
   const table1Xml = await zip.file("xl/tables/table1.xml")!.async("string");
   const table1RefPatched = patchTableRef(table1Xml, includeDriveColumn ? "U" : "T", sheet1LastRow);
-  let finalTable1 = isSentDocuments ? patchTable1HeadersForSent(table1RefPatched) : table1RefPatched;
+  let finalTable1 = patchTable1HeadersForIcl(table1RefPatched);
+  if (isSentDocuments) finalTable1 = patchTable1HeadersForSent(finalTable1);
   if (!includeDriveColumn) {
     finalTable1 = removeDriveColumnFromTable1(finalTable1);
   }
