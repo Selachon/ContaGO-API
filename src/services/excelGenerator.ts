@@ -137,6 +137,20 @@ function removeDriveColumnFromTable1(tableXml: string): string {
     .replace(/<tableColumn[^>]*name="Enlace factura"\/>/g, "");
 }
 
+function patchSheet1HeaderWithoutDrive(sheetXml: string): string {
+  const row2Regex = /<row r="2"[^>]*>.*?<\/row>/;
+  return sheetXml
+    .replace('spans="1:21"', 'spans="1:20"')
+    .replace(
+      row2Regex,
+      (row2) =>
+        row2
+          .replace('spans="1:21"', 'spans="1:20"')
+          .replace(/<c r="T2"[^>]*>.*?<\/c>/, '<c r="T2" s="3" t="inlineStr"><is><t>CUFE</t></is></c>')
+          .replace(/<c r="U2"[^>]*>.*?<\/c>/, "")
+    );
+}
+
 function patchTable2ForIcl(tableXml: string): string {
   let out = tableXml
     .replace('ref="A2:R3"', 'ref="A2:T3"')
@@ -276,6 +290,9 @@ export async function generateExcelFile(
       ? `<hyperlinks>${sheet1Hyperlinks.join("")}</hyperlinks>`
       : null;
   sheet1Xml = patchSheetXml(sheet1Xml, s1SheetData, s1Hyperlinks, sheet1LastRow, includeDriveColumn ? "U" : "T");
+  if (!includeDriveColumn) {
+    sheet1Xml = patchSheet1HeaderWithoutDrive(sheet1Xml);
+  }
   zip.file("xl/worksheets/sheet1.xml", sheet1Xml);
 
   if (sheet1DriveRels.length > 0) {

@@ -95,21 +95,9 @@ export async function extractDocumentIds(
     updateProgress({ step: "Cargando resultados..." });
     await waitForTableLoad(page);
 
-    // 5) Forzar 50 filas/pagina; 100 ha mostrado respuestas parciales en DIAN.
-    updateProgress({ step: "Optimizando vista (50 registros)..." });
-    await setPageLength(page, 50);
-    
-    // Espera la recarga de DataTables tras cambiar longitud.
-    try {
-      await page.waitForSelector("#tableDocuments_processing", { visible: true, timeout: 3000 });
-      await page.waitForSelector("#tableDocuments_processing", { hidden: true, timeout: 20000 });
-    } catch {
-      // Fallback cuando el indicador no aparece.
-      await delay(2000);
-    }
-    
-    // Confirmar que la pagina actual cargo completa.
-    await waitForFullTableLoad(page, 50);
+    // 5) Mantener longitud por defecto de DIAN para evitar omisiones en rangos largos.
+    updateProgress({ step: "Validando resultados..." });
+    await waitForFullTableLoad(page, 0);
 
     // 6) Extraer con paginacion deduplicando por trackId.
     const allDocuments: DocumentInfo[] = [];
@@ -192,7 +180,7 @@ export async function extractDocumentIds(
 
       // Espera cambio real de pagina antes de continuar.
       await waitForTableChange(page, seenIds);
-      await waitForFullTableLoad(page, 50);
+      await waitForFullTableLoad(page, 0);
     }
 
     // Reutiliza cookies del navegador para las descargas HTTP.
@@ -414,12 +402,12 @@ async function waitForFullTableLoad(page: Page, pageLength: number): Promise<voi
     }
     
     // Fallback: aceptar pagina llena aunque no haya texto parseable.
-    if (actualRows >= pageLength) {
+    if (pageLength > 0 && actualRows >= pageLength) {
       console.log(`Tabla cargada con ${actualRows} filas (máximo por página)`);
       return;
     }
     
-    console.log(`Esperando filas: ${actualRows}/${expectedRows || pageLength}`);
+    console.log(`Esperando filas: ${actualRows}/${expectedRows || (pageLength > 0 ? pageLength : "?")}`);
     await delay(500);
   }
   
