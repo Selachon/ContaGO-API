@@ -27,18 +27,23 @@ export async function extractInvoiceDataFromXml(
 
     const parsed = parser.parse(xmlString);
 
-    // El documento puede ser Invoice (factura) o CreditNote (nota crédito)
-    const invoice = parsed.Invoice || parsed.CreditNote;
+    // El documento puede ser Invoice (factura), CreditNote o DebitNote
+    const invoice = parsed.Invoice || parsed.CreditNote || parsed.DebitNote;
     if (!invoice) {
-      throw new Error("No se encontró Invoice o CreditNote en el XML");
+      throw new Error("No se encontró Invoice, CreditNote o DebitNote en el XML");
     }
 
     const isNotaCredito = !!parsed.CreditNote;
+    const isNotaDebito = !!parsed.DebitNote;
     
     // Determinar el tipo de documento:
     // 1. Si viene de la tabla DIAN (docType), usarlo directamente
     // 2. Si no, deducirlo del XML (Nota Crédito vs Factura Electrónica)
-    const documentType = docInfo.docType || (isNotaCredito ? "Nota Crédito" : "Factura Electrónica");
+    const documentType = docInfo.docType || (isNotaCredito
+      ? "Nota Crédito"
+      : isNotaDebito
+        ? "Nota Débito"
+        : "Factura Electrónica");
 
     // Extraer datos del emisor (AccountingSupplierParty)
     const supplierParty = invoice.AccountingSupplierParty?.Party;
@@ -420,7 +425,13 @@ function extractTotals(invoice: any): {
             const taxSchemeId = String(getText(sub.TaxCategory?.TaxScheme?.ID));
             const taxSchemeName = String(getText(sub.TaxCategory?.TaxScheme?.Name)).toUpperCase();
             const taxAmount = parseAmount(sub.TaxAmount);
-            const taxPercent = parseAmount(sub.TaxCategory?.Percent);
+            const taxPercentRaw = parseAmount(sub.TaxCategory?.Percent);
+            const taxableBase = parseAmount(sub.TaxableAmount);
+            const taxPercent = taxPercentRaw > 0
+              ? taxPercentRaw
+              : taxableBase > 0
+                ? (taxAmount / taxableBase) * 100
+                : 0;
 
             // Normalizar el ID del impuesto (quitar ceros a la izquierda para comparación)
             const normalizedId = taxSchemeId.replace(/^0+/, "") || "0";
@@ -494,6 +505,7 @@ function normalizeTaxName(rawName: string, normalizedId: string): string {
     "5": "ReteIVA",    // Retención de IVA
     "6": "ReteRenta",  // Retención en la fuente
     "7": "ReteICA",    // Retención de ICA
+    "8": "IC Porcentual", // Impuesto al consumo porcentual
   };
 
   // Usar el nombre del mapa si existe, sino usar el nombre del XML limpio
@@ -540,7 +552,7 @@ function extractConcepts(lineItems: InvoiceLineItem[]): string {
  */
 function extractLineItems(invoice: any): InvoiceLineItem[] {
   try {
-    const lines = invoice.InvoiceLine || invoice.CreditNoteLine;
+    const lines = invoice.InvoiceLine || invoice.CreditNoteLine || invoice.DebitNoteLine;
     if (!lines) return [];
 
     const linesArr = Array.isArray(lines) ? lines : [lines];
@@ -592,7 +604,13 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
           const taxSchemeId = String(getText(subtotal.TaxCategory?.TaxScheme?.ID));
           const taxSchemeName = String(getText(subtotal.TaxCategory?.TaxScheme?.Name)).toUpperCase();
           const taxAmount = parseAmount(subtotal.TaxAmount);
-          const taxPercent = parseAmount(subtotal.TaxCategory?.Percent);
+          const taxPercentRaw = parseAmount(subtotal.TaxCategory?.Percent);
+          const taxableBase = parseAmount(subtotal.TaxableAmount);
+          const taxPercent = taxPercentRaw > 0
+            ? taxPercentRaw
+            : taxableBase > 0
+              ? (taxAmount / taxableBase) * 100
+              : 0;
 
           // Normalizar el ID del impuesto
           const normalizedId = taxSchemeId.replace(/^0+/, "") || "0";

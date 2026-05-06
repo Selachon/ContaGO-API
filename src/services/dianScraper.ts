@@ -95,9 +95,10 @@ export async function extractDocumentIds(
     updateProgress({ step: "Cargando resultados..." });
     await waitForTableLoad(page);
 
-    // 5) Mantener longitud por defecto de DIAN para evitar omisiones en rangos largos.
-    updateProgress({ step: "Validando resultados..." });
-    await waitForFullTableLoad(page, 0);
+    // 5) Forzar mayor tamaño de página para reducir paginación y omisiones.
+    updateProgress({ step: "Ajustando paginación..." });
+    await setPageLength(page, 100);
+    await waitForFullTableLoad(page, 100);
 
     // 6) Extraer con paginacion deduplicando por trackId.
     const allDocuments: DocumentInfo[] = [];
@@ -144,11 +145,24 @@ export async function extractDocumentIds(
       });
       console.log(`Página ${pageIndex} - filas visibles: ${visibleRows}`);
 
-      // Corta cuando DataTables marca tabla vacia.
-      const isEmpty = await page.$("tr.dataTables_empty");
-      if (isEmpty) {
-        console.log(`Página ${pageIndex} - tabla vacía, terminando`);
-        break;
+      // Evita terminar prematuramente en estados intermedios de recarga.
+      if (visibleRows === 0) {
+        await waitForFullTableLoad(page, 100);
+        const rowsAfterWait = await page.evaluate(() => {
+          return document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)").length;
+        });
+
+        if (rowsAfterWait === 0) {
+          const hasNextWhenEmpty = await goToNextPage(page);
+          if (!hasNextWhenEmpty) {
+            console.log(`Página ${pageIndex} - tabla vacía sin más páginas, terminando`);
+            break;
+          }
+
+          await waitForTableChange(page, seenIds);
+          await waitForFullTableLoad(page, 100);
+          continue;
+        }
       }
 
       // Extrae ids desde selectores alternos por variaciones de DIAN.
@@ -180,7 +194,7 @@ export async function extractDocumentIds(
 
       // Espera cambio real de pagina antes de continuar.
       await waitForTableChange(page, seenIds);
-      await waitForFullTableLoad(page, 0);
+      await waitForFullTableLoad(page, 100);
     }
 
     // Reutiliza cookies del navegador para las descargas HTTP.
@@ -382,13 +396,13 @@ async function waitForFullTableLoad(page: Page, pageLength: number): Promise<voi
       const info = document.querySelector("#tableDocuments_info, .dataTables_info, .dt-info");
       const text = info?.textContent || "";
       
-      // Ejemplo esperado: "Mostrando del 1 al 50 de 172 registros".
-      const match = text.match(/del\s+(\d+)\s+al\s+(\d+)/i);
+      // Ejemplo esperado: "Mostrando del 1 al 50 de 1.172 registros".
+      const match = text.match(/del\s+([\d.,]+)\s+al\s+([\d.,]+)/i);
       
       let expected = 0;
       if (match) {
-        const from = parseInt(match[1], 10);
-        const to = parseInt(match[2], 10);
+        const from = parseInt(match[1].replace(/[.,]/g, ""), 10);
+        const to = parseInt(match[2].replace(/[.,]/g, ""), 10);
         expected = to - from + 1;
       }
       
