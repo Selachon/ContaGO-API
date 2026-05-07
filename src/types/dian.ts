@@ -16,6 +16,7 @@ export interface DocumentInfo {
   id: string;
   docnum: string;
   nit: string;
+  cufe?: string;
   docType?: string;
   /** Para documentos equivalentes POS (documentTypeId=20) se requiere endpoint especial */
   documentTypeId?: string;

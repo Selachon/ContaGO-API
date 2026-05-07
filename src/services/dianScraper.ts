@@ -1,5 +1,6 @@
 import puppeteer, { Browser, Page, Cookie } from "puppeteer";
 import fs from "fs";
+import JSZip from "jszip";
 import type { DocumentInfo, ProgressData, DocumentDirection } from "../types/dian.js";
 
 // Estado de progreso compartido entre scraper y rutas de consulta.
@@ -8,6 +9,11 @@ export const progressTracker: Map<string, ProgressData> = new Map();
 interface ExtractionResult {
   documents: DocumentInfo[];
   cookies: Record<string, string>;
+}
+
+interface ListingRecord {
+  cufe: string;
+  docnum: string;
 }
 
 interface ExtractOptions {
@@ -195,6 +201,59 @@ export async function extractDocumentIds(
       // Espera cambio real de pagina antes de continuar.
       await waitForTableChange(page, seenIds);
       await waitForFullTableLoad(page, 100);
+    }
+
+    // 7) Reconciliar con listado maestro por CUFE/numero de documento.
+    const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
+    if (listedRecords.length > 0) {
+      const byId = new Map(allDocuments.map((d) => [d.id, d]));
+      const byDocNum = new Map<string, DocumentInfo>();
+      for (const d of allDocuments) {
+        const key = (d.docnum || "").trim();
+        if (key && !byDocNum.has(key)) byDocNum.set(key, d);
+      }
+
+      const missing = listedRecords.filter((r) => {
+        const doc = byDocNum.get(r.docnum);
+        return !doc;
+      });
+
+      if (missing.length > 0) {
+        console.log(`Reconciliación DIAN: faltan ${missing.length} registros del listado maestro. Buscando por CUFE/docnum...`);
+        updateProgress({
+          step: `Reconciliando faltantes por CUFE (${missing.length})...`,
+          current: allDocuments.length,
+          total: Math.max(expectedTotal || allDocuments.length + missing.length, allDocuments.length + missing.length),
+        });
+
+        let rescued = 0;
+        for (const rec of missing) {
+          const found = await findDocumentByUniqueCodeOrDocnum(page, rec.cufe, rec.docnum, seenIds, isSent);
+          if (found) {
+            if (!byId.has(found.id)) {
+              byId.set(found.id, found);
+              allDocuments.push(found);
+              rescued++;
+            }
+            if (!byDocNum.has(found.docnum)) {
+              byDocNum.set(found.docnum, found);
+            }
+          }
+        }
+
+        console.log(`Reconciliación DIAN: recuperados ${rescued}/${missing.length} faltantes.`);
+
+        const unresolved = missing.filter((r) => !byDocNum.has(r.docnum));
+        if (unresolved.length > 0) {
+          const sample = unresolved.slice(0, 5).map((r) => r.docnum).join(", ");
+          const msg = `INCOMPLETE_EXTRACTION: Faltan ${unresolved.length} documentos del listado DIAN después de reconciliación por CUFE. Ejemplos: ${sample}`;
+          updateProgress({
+            step: "Error de reconciliación",
+            detalle: msg,
+          });
+          throw new Error(msg);
+        }
+      }
     }
 
     // Reutiliza cookies del navegador para las descargas HTTP.
@@ -504,6 +563,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
       id: string;
       docnum: string;
       nit: string;
+      cufe: string;
       docType: string;
       documentTypeId?: string;
       fechaValidacion?: string;
@@ -595,7 +655,9 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
         tds[fallbackNitIndex]?.textContent?.trim() ||
         "";
 
-      results.push({ id: trackId, docnum, nit, docType, documentTypeId, fechaValidacion, fechaGeneracion });
+      const cufe = (tds[13]?.textContent?.trim() || tds[12]?.textContent?.trim() || "").toLowerCase();
+
+      results.push({ id: trackId, docnum, nit, cufe, docType, documentTypeId, fechaValidacion, fechaGeneracion });
     }
 
     return results;
@@ -616,6 +678,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
         id: item.id,
         docnum: item.docnum,
         nit: item.nit,
+        cufe: item.cufe,
         docType: item.docType,
         documentTypeId: item.documentTypeId,
         fechaValidacion: item.fechaValidacion,
@@ -629,6 +692,228 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
   }
 
   return docs;
+}
+
+async function extractListingRecordsFromDownloadTab(
+  page: Page,
+  direction: DocumentDirection,
+  startDate?: string,
+  endDate?: string
+): Promise<ListingRecord[]> {
+  try {
+    const baseUrl = "https://catalogo-vpfe.dian.gov.co";
+    await navigateWithRetry(page, `${baseUrl}/Document/Export`, 2);
+    await delay(800);
+
+    const formData = await page.evaluate(() => {
+      const token = (document.querySelector("input[name='__RequestVerificationToken']") as HTMLInputElement | null)?.value || "";
+      const type = (document.querySelector("input[name='Type']") as HTMLInputElement | null)?.value || "0";
+      const amountAdmin = (document.querySelector("input[name='AmountAdmin']") as HTMLInputElement | null)?.value || "100000";
+      return { token, type, amountAdmin };
+    });
+
+    if (!formData.token) return [];
+
+    const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
+    const body = new URLSearchParams();
+    body.set("__RequestVerificationToken", formData.token);
+    body.set("Type", formData.type || "0");
+    body.set("AmountAdmin", formData.amountAdmin || "100000");
+    body.set("ReceiverCode", "");
+    body.set("GroupCode", direction === "sent" ? "1" : "2");
+    if (startDate) body.set("StartDate", toDianExportDate(startDate));
+    if (endDate) body.set("EndDate", toDianExportDate(endDate, true));
+
+    await fetch(`${baseUrl}/Document/Export`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: cookieHeader,
+        Referer: `${baseUrl}/Document/Export`,
+      },
+      body: body.toString(),
+    });
+
+    await delay(1500);
+    const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
+      method: "GET",
+      headers: {
+        Cookie: cookieHeader,
+        Referer: `${baseUrl}/Document/Export`,
+      },
+    }).then((r) => r.text());
+
+    const links = Array.from(exportHtml.matchAll(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/g))
+      .map((m) => m[1].replace(/&amp;/g, "&"));
+    if (links.length === 0) return [];
+
+    const latestLink = links[0];
+    const downloaded = await fetch(`${baseUrl}${latestLink}`, {
+      method: "GET",
+      headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
+    }).then((r) => r.arrayBuffer());
+    const zipBuffer = Buffer.from(new Uint8Array(downloaded));
+
+    return await parseListingRecordsFromExportZip(zipBuffer, direction);
+  } catch {
+    return [];
+  }
+}
+
+function toDianExportDate(dateISO: string, endOfDay: boolean = false): string {
+  const [year, month, day] = dateISO.split("-");
+  if (!year || !month || !day) return dateISO;
+  return endOfDay
+    ? `${Number(month)}/${Number(day)}/${year} 11:59:59 PM`
+    : `${Number(month)}/${Number(day)}/${year} 12:00:00 AM`;
+}
+
+async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: DocumentDirection): Promise<ListingRecord[]> {
+  const zip = await JSZip.loadAsync(zipBuffer);
+  const xlsxName = Object.keys(zip.files).find((n) => n.toLowerCase().endsWith(".xlsx") && !zip.files[n].dir);
+  if (!xlsxName) return [];
+
+  const xlsxBuffer = await zip.files[xlsxName].async("nodebuffer");
+  const xlsx = await JSZip.loadAsync(xlsxBuffer);
+
+  const sharedStringsXml = await xlsx.file("xl/sharedStrings.xml")?.async("string");
+  const sheetXml = await xlsx.file("xl/worksheets/sheet1.xml")?.async("string");
+  if (!sheetXml) return [];
+
+  const sharedStrings = parseSharedStrings(sharedStringsXml || "");
+  const rows = parseSheetRows(sheetXml, sharedStrings);
+  if (rows.length < 2) return [];
+
+  const headers = rows[0].map((h) => h.trim().toLowerCase());
+  const cufeIdx = headers.findIndex((h) => h.includes("cufe") || h.includes("cude") || h.includes("código único") || h.includes("codigo unico"));
+  const folioIdx = headers.findIndex((h) => h === "folio" || h.includes("número") || h.includes("numero"));
+  const groupIdx = headers.findIndex((h) => h === "grupo");
+
+  if (cufeIdx < 0 || folioIdx < 0) return [];
+
+  const expectedGroup = direction === "sent" ? "emitido" : "recibido";
+  const out: ListingRecord[] = [];
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const group = (groupIdx >= 0 ? row[groupIdx] : "").toLowerCase();
+    if (group && !group.includes(expectedGroup)) continue;
+
+    const cufe = (row[cufeIdx] || "").trim().toLowerCase();
+    const docnum = (row[folioIdx] || "").trim();
+    if (!docnum) continue;
+    out.push({ cufe, docnum });
+  }
+
+  const dedup = new Map<string, ListingRecord>();
+  for (const rec of out) {
+    const key = `${rec.docnum}::${rec.cufe}`;
+    if (!dedup.has(key)) dedup.set(key, rec);
+  }
+  return Array.from(dedup.values());
+}
+
+function parseSharedStrings(xml: string): string[] {
+  if (!xml) return [];
+  const strings: string[] = [];
+  const siMatches = xml.match(/<si[\s\S]*?<\/si>/g) || [];
+  for (const si of siMatches) {
+    const textParts = Array.from(si.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)).map((m) => decodeXml(m[1]));
+    strings.push(textParts.join(""));
+  }
+  return strings;
+}
+
+function parseSheetRows(xml: string, sharedStrings: string[]): string[][] {
+  const rows: string[][] = [];
+  const rowMatches = xml.match(/<row[^>]*>[\s\S]*?<\/row>/g) || [];
+
+  for (const rowXml of rowMatches) {
+    const cells = Array.from(rowXml.matchAll(/<c([^>]*)>([\s\S]*?)<\/c>/g));
+    const rowValues: string[] = [];
+
+    for (const cellMatch of cells) {
+      const attrs = cellMatch[1];
+      const body = cellMatch[2];
+      const ref = (attrs.match(/r="([A-Z]+)\d+"/) || [])[1] || "A";
+      const colIndex = colLettersToIndex(ref);
+      while (rowValues.length < colIndex) rowValues.push("");
+
+      const type = (attrs.match(/t="([^"]+)"/) || [])[1] || "";
+      const valueMatch = body.match(/<v>([\s\S]*?)<\/v>/);
+      const inlineMatch = body.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+
+      let value = "";
+      if (type === "s" && valueMatch) {
+        const idx = Number(valueMatch[1]);
+        value = Number.isFinite(idx) && sharedStrings[idx] !== undefined ? sharedStrings[idx] : "";
+      } else if (inlineMatch) {
+        value = decodeXml(inlineMatch[1]);
+      } else if (valueMatch) {
+        value = decodeXml(valueMatch[1]);
+      }
+
+      rowValues[colIndex - 1] = value.trim();
+    }
+
+    if (rowValues.some((v) => v !== "")) rows.push(rowValues);
+  }
+
+  return rows;
+}
+
+function colLettersToIndex(letters: string): number {
+  let index = 0;
+  for (const ch of letters) {
+    index = index * 26 + (ch.charCodeAt(0) - 64);
+  }
+  return index;
+}
+
+function decodeXml(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+async function findDocumentByUniqueCodeOrDocnum(
+  page: Page,
+  cufe: string,
+  docnum: string,
+  seenIds: Set<string>,
+  isSentDocuments: boolean
+): Promise<DocumentInfo | null> {
+  const candidates = [cufe, docnum].filter(Boolean);
+  for (const term of candidates) {
+    try {
+      await page.evaluate((value) => {
+        const input = document.querySelector(
+          "#tableDocuments_filter input, .dataTables_filter input, .dt-search input, input[type='search']"
+        ) as HTMLInputElement | null;
+        if (!input) return;
+        input.value = value;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+        input.dispatchEvent(new Event("keyup", { bubbles: true }));
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+      }, term);
+
+      await delay(900);
+      await waitForTableLoad(page);
+
+      const found = await extractDocsFromPage(page, seenIds, isSentDocuments);
+      if (found.length > 0) {
+        const exact = found.find((d) => (docnum && d.docnum === docnum) || (cufe && d.cufe === cufe));
+        return exact || found[0];
+      }
+    } catch {
+      // continuar con siguiente candidato
+    }
+  }
+
+  return null;
 }
 
 async function goToNextPage(page: Page): Promise<boolean> {
