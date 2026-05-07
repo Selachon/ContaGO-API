@@ -473,9 +473,17 @@ async function hardenPageRuntime(page: Page): Promise<void> {
   // En algunos entornos de transpile, page.evaluate puede serializar helpers
   // como __name. Definirlo en runtime evita el fallo "__name is not defined".
   await page.evaluateOnNewDocument(() => {
-    const w = window as unknown as { __name?: (fn: unknown, _n?: string) => unknown };
-    if (typeof w.__name !== "function") {
-      w.__name = (fn) => fn;
+    const g = globalThis as unknown as { __name?: (fn: unknown, _n?: string) => unknown };
+    if (typeof g.__name !== "function") {
+      g.__name = (fn) => fn;
+    }
+
+    // Asegura identificador global (no solo propiedad) para código estricto
+    // que referencia __name como variable libre.
+    try {
+      (0, eval)("var __name = globalThis.__name;");
+    } catch {
+      // ignore
     }
   });
 }
@@ -1348,57 +1356,61 @@ async function findDocumentByUniqueCodeOrDocnum(
   const candidates = [cufe, docnum].filter(Boolean);
   for (const term of candidates) {
     try {
-      // 1) Intentar por campo específico "Código único" y botón Buscar.
-      const searchedByUniqueCode = await page.evaluate((value) => {
-        const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
-        const target = inputs.find((input) => {
-          const haystack = `${input.id} ${input.name} ${input.placeholder || ""} ${input.getAttribute("aria-label") || ""}`.toLowerCase();
-          return haystack.includes("codigo") || haystack.includes("código") || haystack.includes("unico") || haystack.includes("único") || haystack.includes("cufe") || haystack.includes("cude");
-        });
+      // 1) Intentar por campo específico "Código único" y botón Buscar, sin page.evaluate.
+      const uniqueInputSelectors = [
+        "input[name='UniqueCode']",
+        "input[id*='Unique']",
+        "input[id*='Codigo']",
+        "input[id*='Code']",
+        "input[placeholder*='Código']",
+        "input[placeholder*='Codigo']",
+        "input[placeholder*='CUFE']",
+      ];
+      let searchedByUniqueCode = false;
+      for (const sel of uniqueInputSelectors) {
+        const input = await page.$(sel);
+        if (!input) continue;
+        await input.click({ clickCount: 3 });
+        await page.keyboard.press("Backspace");
+        await input.type(term);
+        searchedByUniqueCode = true;
+        break;
+      }
 
-        if (!target) return false;
-
-        target.value = value;
-        target.dispatchEvent(new Event("input", { bubbles: true }));
-        target.dispatchEvent(new Event("change", { bubbles: true }));
-
-        const buttons = Array.from(document.querySelectorAll("button"));
-        const buscar = buttons.find((btn) => (btn.textContent || "").toLowerCase().includes("buscar"));
-        if (buscar) {
-          (buscar as HTMLButtonElement).click();
-          return true;
+      if (searchedByUniqueCode) {
+        const searchButton = await page.$("button[id*='Search'], button[name*='Search']")
+          || await page.$("button.btn.btn-primary")
+          || await page.$("button[type='submit']");
+        if (searchButton) {
+          await searchButton.click();
+        } else {
+          await page.keyboard.press("Enter");
         }
-
-        return false;
-      }, term);
+      }
 
       if (searchedByUniqueCode) {
         await delay(900);
         await waitForTableLoad(page);
 
-        const foundByUniqueCode = await extractDocsFromPage(page, seenIds, isSentDocuments);
+        const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, seenIds, isSentDocuments);
         if (foundByUniqueCode.length > 0) {
           const exact = foundByUniqueCode.find((d) => (docnum && d.docnum === docnum) || (cufe && d.cufe === cufe));
           return exact || foundByUniqueCode[0];
         }
       }
 
-      // 2) Fallback: buscador global de DataTables.
-      await page.evaluate((value) => {
-        const input = document.querySelector(
-          "#tableDocuments_filter input, .dataTables_filter input, .dt-search input, input[type='search']"
-        ) as HTMLInputElement | null;
-        if (!input) return;
-        input.value = value;
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("keyup", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-      }, term);
+      // 2) Fallback: buscador global de DataTables, sin page.evaluate.
+      const globalSearch = await page.$("#tableDocuments_filter input, .dataTables_filter input, .dt-search input, input[type='search']");
+      if (globalSearch) {
+        await globalSearch.click({ clickCount: 3 });
+        await page.keyboard.press("Backspace");
+        await globalSearch.type(term);
+      }
 
       await delay(900);
       await waitForTableLoad(page);
 
-      const found = await extractDocsFromPage(page, seenIds, isSentDocuments);
+      const found = await extractDocsFromCurrentPageHtml(page, seenIds, isSentDocuments);
       if (found.length > 0) {
         const exact = found.find((d) => (docnum && d.docnum === docnum) || (cufe && d.cufe === cufe));
         return exact || found[0];
@@ -1409,6 +1421,37 @@ async function findDocumentByUniqueCodeOrDocnum(
   }
 
   return null;
+}
+
+async function extractDocsFromCurrentPageHtml(page: Page, seenIds: Set<string>, isSentDocuments: boolean): Promise<DocumentInfo[]> {
+  const html = await page.content();
+  const tbodyMatch = html.match(/<tbody>([\s\S]*?)<\/tbody>/i);
+  if (!tbodyMatch) return [];
+
+  const rows = Array.from(tbodyMatch[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)).map((m) => m[1]);
+  const docs: DocumentInfo[] = [];
+
+  for (const row of rows) {
+    if (/dataTables_empty/i.test(row)) continue;
+    let trackId = "";
+    const m1 = row.match(/trackId=([A-Za-z0-9-]+)/i);
+    const m2 = row.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+    const m3 = row.match(/data-trackid=['\"]([^'\"]+)['\"]/i);
+    trackId = m1?.[1] || m2?.[1] || m3?.[1] || "";
+    if (!trackId || seenIds.has(trackId)) continue;
+
+    const cells = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((c) => stripHtml(c[1]));
+    const docnum = cells[4] || "";
+    const docType = cells[5] || "";
+    const nit = isSentDocuments ? (cells[8] || cells[6] || "") : (cells[6] || cells[8] || "");
+    const cufe = (cells[13] || cells[12] || "").toLowerCase();
+
+    if (shouldIgnoreDocType(docType, isSentDocuments)) continue;
+    seenIds.add(trackId);
+    docs.push({ id: trackId, docnum, nit, cufe, docType });
+  }
+
+  return docs;
 }
 
 async function goToNextPage(page: Page): Promise<boolean> {
