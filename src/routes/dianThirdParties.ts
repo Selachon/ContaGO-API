@@ -8,7 +8,8 @@ import JSZip from "jszip";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
-import { extractDocumentIdsByCufe, runDianExtractionPrecheck } from "../services/dianScraper.js";
+import { getUserNits } from "../services/database.js";
+import { extractDocumentIds, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateThirdPartiesExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData } from "../types/dianExcel.js";
@@ -40,6 +41,17 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   const direction = document_direction === "sent" ? "sent" : "received";
 
   const userId = req.user!.userId;
+  if (!req.user?.isAdmin) {
+    const allowedNits = await getUserNits(userId);
+    let tokenNit = "";
+    try {
+      tokenNit = new URL(token_url).searchParams.get("rk")?.trim() || "";
+    } catch {}
+    const normalizeNit = (nit: string) => nit.replace(/[-\s]/g, "").trim();
+    if (!allowedNits.map(normalizeNit).includes(normalizeNit(tokenNit))) {
+      return res.status(403).json({ status: "error", detalle: `No tienes acceso al NIT ${tokenNit}` });
+    }
+  }
 
   const jobId = session_uid || uuidv4();
   jobTracker.set(jobId, {
@@ -101,7 +113,7 @@ async function processJob(
   job.status = "processing";
 
   await runDianExtractionPrecheck(tokenUrl, startDate, endDate, direction, jobId);
-  const { documents, cookies } = await extractDocumentIdsByCufe(tokenUrl, startDate, endDate, jobId, direction);
+  const { documents, cookies } = await extractDocumentIds(tokenUrl, startDate, endDate, jobId, direction);
   if (!documents.length) throw new Error("No se encontraron documentos en el rango seleccionado");
   setProgress(jobId, { step: "Procesando documentos...", current: 0, total: documents.length });
 

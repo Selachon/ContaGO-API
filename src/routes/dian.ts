@@ -6,7 +6,7 @@ import archiver from "archiver";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import { extractDocumentIdsByCufe, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
+import { extractDocumentIds, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -443,7 +443,7 @@ async function processDownloadJob(
 
     // Paso 2: obtener ids y cookies de sesion DIAN.
     setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
-    const { documents, cookies } = await extractDocumentIdsByCufe(token_url, start_date, end_date, jobId, documentDirection);
+    const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, jobId, documentDirection);
 
     // Checkpoint tras la operacion mas costosa del scraper.
     if (isJobCancelled(jobId)) {

@@ -4,7 +4,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
-import { extractDocumentIdsByCufe, runDianExtractionPrecheck } from "../services/dianScraper.js";
+import { extractDocumentIds, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import {
@@ -378,7 +378,7 @@ async function processExcelJob(
 
     // 2) Extraer ids y cookies de sesion desde DIAN.
     setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
-    const { documents, cookies } = await extractDocumentIdsByCufe(tokenUrl, startDate, endDate, jobId, documentDirection);
+    const { documents, cookies } = await extractDocumentIds(tokenUrl, startDate, endDate, jobId, documentDirection);
     console.log(
       `[Excel] Job ${jobId}: extractDocumentIds devolvio ${documents.length} documentos (${directionLabel})`
     );
