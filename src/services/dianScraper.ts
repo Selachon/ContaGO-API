@@ -755,21 +755,6 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate((isSentDocumentsInPage) => {
-    const extractTrackIdFromText = (raw: string | null | undefined): string | null => {
-      const text = String(raw || "");
-      if (!text) return null;
-
-      const direct = text.match(/trackId=([A-Za-z0-9-]+)/i);
-      if (direct) return direct[1];
-
-      const quoted = text.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
-      if (quoted) return quoted[1];
-
-      const generic = text.match(/['\"]([a-f0-9]{32,128})['\"]/i);
-      if (generic) return generic[1];
-
-      return null;
-    };
 
     const results: Array<{
       id: string;
@@ -814,8 +799,32 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
           fechaGeneracion = el.getAttribute("generationdate") || undefined;
         }
         
-        if (!trackId) trackId = extractTrackIdFromText(el.getAttribute("href"));
-        if (!trackId) trackId = extractTrackIdFromText(el.getAttribute("onclick"));
+        if (!trackId) {
+          const href = String(el.getAttribute("href") || "");
+          const direct = href.match(/trackId=([A-Za-z0-9-]+)/i);
+          if (direct) trackId = direct[1];
+          if (!trackId) {
+            const quoted = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+            if (quoted) trackId = quoted[1];
+          }
+          if (!trackId) {
+            const generic = href.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+            if (generic) trackId = generic[1];
+          }
+        }
+        if (!trackId) {
+          const onclick = String(el.getAttribute("onclick") || "");
+          const direct = onclick.match(/trackId=([A-Za-z0-9-]+)/i);
+          if (direct) trackId = direct[1];
+          if (!trackId) {
+            const quoted = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+            if (quoted) trackId = quoted[1];
+          }
+          if (!trackId) {
+            const generic = onclick.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+            if (generic) trackId = generic[1];
+          }
+        }
         
         if (trackId) break;
       }
@@ -841,15 +850,48 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
       if (!trackId) {
         const links = row.querySelectorAll("a[href]");
         for (const link of links) {
-          trackId = extractTrackIdFromText(link.getAttribute("href"));
-          if (!trackId) trackId = extractTrackIdFromText(link.getAttribute("onclick"));
+          const href = String(link.getAttribute("href") || "");
+          const directHref = href.match(/trackId=([A-Za-z0-9-]+)/i);
+          if (directHref) trackId = directHref[1];
+          if (!trackId) {
+            const quotedHref = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+            if (quotedHref) trackId = quotedHref[1];
+          }
+          if (!trackId) {
+            const genericHref = href.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+            if (genericHref) trackId = genericHref[1];
+          }
+
+          if (!trackId) {
+            const onclick = String(link.getAttribute("onclick") || "");
+            const directOnclick = onclick.match(/trackId=([A-Za-z0-9-]+)/i);
+            if (directOnclick) trackId = directOnclick[1];
+            if (!trackId) {
+              const quotedOnclick = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+              if (quotedOnclick) trackId = quotedOnclick[1];
+            }
+            if (!trackId) {
+              const genericOnclick = onclick.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+              if (genericOnclick) trackId = genericOnclick[1];
+            }
+          }
           if (trackId) break;
         }
       }
 
       // Metodo 5: fallback sobre HTML completo de la fila
       if (!trackId) {
-        trackId = extractTrackIdFromText((row as HTMLElement).outerHTML);
+        const raw = String((row as HTMLElement).outerHTML || "");
+        const direct = raw.match(/trackId=([A-Za-z0-9-]+)/i);
+        if (direct) trackId = direct[1];
+        if (!trackId) {
+          const quoted = raw.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+          if (quoted) trackId = quoted[1];
+        }
+        if (!trackId) {
+          const generic = raw.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+          if (generic) trackId = generic[1];
+        }
       }
       
       if (!trackId) continue;
@@ -1077,13 +1119,11 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
   const folioIdx = headers.findIndex((h) => h === "folio" || h.includes("número") || h.includes("numero") || h.includes("documento"));
   const groupIdx = headers.findIndex((h) => h === "grupo");
 
-  const expectedGroup = direction === "sent" ? "emitido" : "recibido";
   const out: ListingRecord[] = [];
 
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
     const group = (groupIdx >= 0 ? row[groupIdx] : "").toLowerCase();
-    if (group && !group.includes(expectedGroup)) continue;
 
     const fallbackCufe = row.find((v) => /^[a-fA-F0-9]{64,96}$/.test((v || "").trim()));
     const cufe = ((cufeIdx >= 0 ? row[cufeIdx] : fallbackCufe) || "").trim().toLowerCase();
@@ -1096,6 +1136,14 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
 
     if (!cufe) continue;
     if (!docnum) continue;
+
+    // DIAN a veces devuelve listados con "Enviados y Recibidos" aun cuando
+    // se solicitó un GroupCode específico. No descartamos por grupo para
+    // evitar falsos vacíos; el filtro real lo hace la búsqueda por CUFE en la
+    // bandeja objetivo (recibidos o enviados).
+    if (groupIdx >= 0 && !group) {
+      // sin-op: conservar registro
+    }
     out.push({ cufe, docnum });
   }
 
@@ -1120,9 +1168,9 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
 function parseSharedStrings(xml: string): string[] {
   if (!xml) return [];
   const strings: string[] = [];
-  const siMatches = xml.match(/<si[\s\S]*?<\/si>/g) || [];
+  const siMatches = xml.match(/<(?:\w+:)?si[\s\S]*?<\/(?:\w+:)?si>/g) || [];
   for (const si of siMatches) {
-    const textParts = Array.from(si.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)).map((m) => decodeXml(m[1]));
+    const textParts = Array.from(si.matchAll(/<(?:\w+:)?t[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/g)).map((m) => decodeXml(m[1]));
     strings.push(textParts.join(""));
   }
   return strings;
@@ -1130,10 +1178,10 @@ function parseSharedStrings(xml: string): string[] {
 
 function parseSheetRows(xml: string, sharedStrings: string[]): string[][] {
   const rows: string[][] = [];
-  const rowMatches = xml.match(/<row[^>]*>[\s\S]*?<\/row>/g) || [];
+  const rowMatches = xml.match(/<(?:\w+:)?row[^>]*>[\s\S]*?<\/(?:\w+:)?row>/g) || [];
 
   for (const rowXml of rowMatches) {
-    const cells = Array.from(rowXml.matchAll(/<c([^>]*)>([\s\S]*?)<\/c>/g));
+    const cells = Array.from(rowXml.matchAll(/<(?:\w+:)?c([^>]*)>([\s\S]*?)<\/(?:\w+:)?c>/g));
     const rowValues: string[] = [];
 
     for (const cellMatch of cells) {
@@ -1144,8 +1192,8 @@ function parseSheetRows(xml: string, sharedStrings: string[]): string[][] {
       while (rowValues.length < colIndex) rowValues.push("");
 
       const type = (attrs.match(/t="([^"]+)"/) || [])[1] || "";
-      const valueMatch = body.match(/<v>([\s\S]*?)<\/v>/);
-      const inlineMatch = body.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+      const valueMatch = body.match(/<(?:\w+:)?v>([\s\S]*?)<\/(?:\w+:)?v>/);
+      const inlineMatch = body.match(/<(?:\w+:)?t[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/);
 
       let value = "";
       if (type === "s" && valueMatch) {
@@ -1205,8 +1253,10 @@ function findReusableExportLink(
   endDate?: string
 ): string | null {
   if (!startDate || !endDate) return null;
+  const requestedStart = parseIsoDate(startDate);
+  const requestedEnd = parseIsoDate(endDate);
+  if (!requestedStart || !requestedEnd) return null;
 
-  const requestedRange = `Desde ${toDianDisplayDate(startDate)} Hasta ${toDianDisplayDate(endDate)}`.toLowerCase();
   const desiredTypes = direction === "sent" ? ["enviados", "emitidos"] : ["recibidos"];
 
   const tbodyMatch = html.match(/<table[^>]*id="tableExport"[\s\S]*?<tbody>([\s\S]*?)<\/tbody>/i);
@@ -1220,8 +1270,15 @@ function findReusableExportLink(
     const rangeText = stripHtml(tds[2]).toLowerCase();
     const typeText = stripHtml(tds[3]).toLowerCase();
 
-    const typeMatches = desiredTypes.some((dt) => typeText.includes(dt));
-    const rangeMatches = rangeText.includes(requestedRange);
+    const parsedRange = parseExportRange(rangeText);
+    if (!parsedRange) continue;
+
+    // "Enviados y Recibidos" sirve para ambos sentidos.
+    const isBothType = typeText.includes("enviados") && typeText.includes("recibidos");
+    const typeMatches = isBothType || desiredTypes.some((dt) => typeText.includes(dt));
+
+    // El listado reutilizable debe cubrir por completo el rango solicitado.
+    const rangeMatches = parsedRange.start <= requestedStart && parsedRange.end >= requestedEnd;
     if (!typeMatches || !rangeMatches) continue;
 
     const hrefMatch = row.match(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/i);
@@ -1230,6 +1287,20 @@ function findReusableExportLink(
   }
 
   return null;
+}
+
+function parseIsoDate(value: string): number | null {
+  const m = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+function parseExportRange(text: string): { start: number; end: number } | null {
+  const m = text.match(/desde\s+(\d{2})-(\d{2})-(\d{4})\s+hasta\s+(\d{2})-(\d{2})-(\d{4})/i);
+  if (!m) return null;
+  const start = Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  const end = Date.UTC(Number(m[6]), Number(m[5]) - 1, Number(m[4]));
+  return { start, end };
 }
 
 function toDianDisplayDate(dateISO: string): string {
