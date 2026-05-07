@@ -916,7 +916,11 @@ async function extractListingRecordsFromDownloadTab(
       }).then((r) => r.arrayBuffer());
 
       const zipBuffer = Buffer.from(new Uint8Array(downloaded));
-      return await parseListingRecordsFromExportZip(zipBuffer, direction);
+      const reusedRecords = await parseListingRecordsFromExportZip(zipBuffer, direction);
+      if (reusedRecords.length > 0) {
+        return reusedRecords;
+      }
+      console.warn("[DIAN Export] El listado reutilizado no trajo CUFEs válidos; se intentará regenerar.");
     }
 
     const existingRks = new Set(parseDownloadLinksFromExportHtml(exportPageBefore).map((l) => l.rk));
@@ -983,20 +987,44 @@ function toDianExportDate(dateISO: string, endOfDay: boolean = false): string {
 }
 
 async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: DocumentDirection): Promise<ListingRecord[]> {
-  const zip = await JSZip.loadAsync(zipBuffer);
-  const xlsxName = Object.keys(zip.files).find((n) => n.toLowerCase().endsWith(".xlsx") && !zip.files[n].dir);
-  if (!xlsxName) return [];
+  // DIAN puede devolver:
+  // 1) ZIP contenedor con un .xlsx adentro
+  // 2) el .xlsx directamente (que también es un ZIP OOXML)
+  // Este bloque soporta ambos formatos.
+  let xlsxBuffer: Buffer | null = null;
+  const maybeZip = await JSZip.loadAsync(zipBuffer);
 
-  const xlsxBuffer = await zip.files[xlsxName].async("nodebuffer");
+  const embeddedXlsxName = Object.keys(maybeZip.files).find(
+    (n) => n.toLowerCase().endsWith(".xlsx") && !maybeZip.files[n].dir
+  );
+
+  if (embeddedXlsxName) {
+    xlsxBuffer = await maybeZip.files[embeddedXlsxName].async("nodebuffer");
+  } else if (maybeZip.file("xl/workbook.xml")) {
+    // El archivo descargado ya es el .xlsx
+    xlsxBuffer = zipBuffer;
+  }
+
+  if (!xlsxBuffer) {
+    console.warn("[DIAN Export] Formato de archivo no reconocido al parsear listado");
+    return [];
+  }
+
   const xlsx = await JSZip.loadAsync(xlsxBuffer);
 
   const sharedStringsXml = await xlsx.file("xl/sharedStrings.xml")?.async("string");
-  const sheetXml = await xlsx.file("xl/worksheets/sheet1.xml")?.async("string");
+  const sheetPath = Object.keys(xlsx.files).find(
+    (n) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(n) && !xlsx.files[n].dir
+  );
+  const sheetXml = sheetPath ? await xlsx.file(sheetPath)?.async("string") : null;
   if (!sheetXml) return [];
 
   const sharedStrings = parseSharedStrings(sharedStringsXml || "");
   const rows = parseSheetRows(sheetXml, sharedStrings);
-  if (rows.length < 2) return [];
+  if (rows.length < 2) {
+    console.warn("[DIAN Export] XLSX sin filas de datos");
+    return [];
+  }
 
   const headers = rows[0].map((h) => h.trim().toLowerCase());
   const cufeIdx = headers.findIndex((h) => h.includes("cufe") || h.includes("cude") || h.includes("código único") || h.includes("codigo unico"));
@@ -1030,7 +1058,17 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
     const key = `${rec.docnum}::${rec.cufe}`;
     if (!dedup.has(key)) dedup.set(key, rec);
   }
-  return Array.from(dedup.values());
+  const finalRows = Array.from(dedup.values());
+  if (finalRows.length === 0) {
+    console.warn("[DIAN Export] No se pudieron mapear CUFEs desde el XLSX", {
+      cufeIdx,
+      folioIdx,
+      groupIdx,
+      totalRows: rows.length,
+      sampleHeaders: rows[0]?.slice(0, 10),
+    });
+  }
+  return finalRows;
 }
 
 function parseSharedStrings(xml: string): string[] {
