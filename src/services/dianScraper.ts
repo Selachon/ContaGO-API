@@ -291,6 +291,20 @@ export async function runDianExtractionPrecheck(
   documentDirection: DocumentDirection = "received",
   progressUid?: string
 ): Promise<PrecheckResult> {
+  // Temporalmente deshabilitado: DIAN "Descarga de listados" presenta intermitencias.
+  // Se mantiene el flujo principal para no bloquear procesos productivos.
+  const precheckEnabled = String(process.env.DIAN_ENABLE_EXPORT_PRECHECK || "false").toLowerCase() === "true";
+  if (!precheckEnabled) {
+    if (progressUid) {
+      const current = progressTracker.get(progressUid) || { step: "", current: 0, total: 0 };
+      progressTracker.set(progressUid, {
+        ...current,
+        step: "Prevalidación omitida temporalmente",
+      });
+    }
+    return { ok: true, listedCount: 0 };
+  }
+
   const direction = documentDirection || "received";
   const isSent = direction === "sent";
   const directionLabel = isSent ? "emitidos" : "recibidos";
