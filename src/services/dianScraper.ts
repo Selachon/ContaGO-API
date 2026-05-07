@@ -897,6 +897,29 @@ async function extractListingRecordsFromDownloadTab(
     await navigateWithRetry(page, `${baseUrl}/Document/Export`, 2);
     await delay(800);
 
+    const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
+
+    const exportPageBefore = await fetch(`${baseUrl}/Document/Export`, {
+      method: "GET",
+      headers: {
+        Cookie: cookieHeader,
+        Referer: `${baseUrl}/Document/Export`,
+      },
+    }).then((r) => r.text());
+
+    const reusableLink = findReusableExportLink(exportPageBefore, direction, startDate, endDate);
+    if (reusableLink) {
+      console.log(`[DIAN Export] Reutilizando listado existente para rango solicitado: ${reusableLink}`);
+      const downloaded = await fetch(`${baseUrl}${reusableLink}`, {
+        method: "GET",
+        headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
+      }).then((r) => r.arrayBuffer());
+
+      const zipBuffer = Buffer.from(new Uint8Array(downloaded));
+      return await parseListingRecordsFromExportZip(zipBuffer, direction);
+    }
+
+    const existingRks = new Set(parseDownloadLinksFromExportHtml(exportPageBefore).map((l) => l.rk));
     const formData = await page.evaluate(() => {
       const token = (document.querySelector("input[name='__RequestVerificationToken']") as HTMLInputElement | null)?.value || "";
       const type = (document.querySelector("input[name='Type']") as HTMLInputElement | null)?.value || "0";
@@ -906,7 +929,6 @@ async function extractListingRecordsFromDownloadTab(
 
     if (!formData.token) return [];
 
-    const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
     const body = new URLSearchParams();
     body.set("__RequestVerificationToken", formData.token);
     body.set("Type", formData.type || "0");
@@ -1071,6 +1093,64 @@ function decodeXml(value: string): string {
     .replace(/&#39;/g, "'");
 }
 
+function parseDownloadLinksFromExportHtml(html: string): Array<{ href: string; rk: string }> {
+  const links = Array.from(html.matchAll(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/g))
+    .map((m) => m[1].replace(/&amp;/g, "&"));
+
+  const parsed: Array<{ href: string; rk: string }> = [];
+  for (const href of links) {
+    const rkMatch = href.match(/[?&]rk=([^&]+)/i);
+    const rk = rkMatch?.[1] || "";
+    if (!rk) continue;
+    parsed.push({ href, rk });
+  }
+
+  return parsed;
+}
+
+function findReusableExportLink(
+  html: string,
+  direction: DocumentDirection,
+  startDate?: string,
+  endDate?: string
+): string | null {
+  if (!startDate || !endDate) return null;
+
+  const requestedRange = `Desde ${toDianDisplayDate(startDate)} Hasta ${toDianDisplayDate(endDate)}`.toLowerCase();
+  const desiredTypes = direction === "sent" ? ["enviados", "emitidos"] : ["recibidos"];
+
+  const tbodyMatch = html.match(/<table[^>]*id="tableExport"[\s\S]*?<tbody>([\s\S]*?)<\/tbody>/i);
+  if (!tbodyMatch) return null;
+
+  const rows = Array.from(tbodyMatch[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)).map((m) => m[1]);
+  for (const row of rows) {
+    const tds = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((m) => m[1]);
+    if (tds.length < 4) continue;
+
+    const rangeText = stripHtml(tds[2]).toLowerCase();
+    const typeText = stripHtml(tds[3]).toLowerCase();
+
+    const typeMatches = desiredTypes.some((dt) => typeText.includes(dt));
+    const rangeMatches = rangeText.includes(requestedRange);
+    if (!typeMatches || !rangeMatches) continue;
+
+    const hrefMatch = row.match(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/i);
+    if (!hrefMatch) continue;
+    return hrefMatch[1].replace(/&amp;/g, "&");
+  }
+
+  return null;
+}
+
+function toDianDisplayDate(dateISO: string): string {
+  const [year, month, day] = dateISO.split("-");
+  if (!year || !month || !day) return dateISO;
+  return `${day.padStart(2, "0")}-${month.padStart(2, "0")}-${year}`;
+}
+
+function stripHtml(raw: string): string {
+  return raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
 async function findDocumentByUniqueCodeOrDocnum(
   page: Page,
   cufe: string,
