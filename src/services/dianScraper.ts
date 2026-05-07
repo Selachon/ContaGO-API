@@ -952,21 +952,47 @@ async function extractListingRecordsFromDownloadTab(
       body: body.toString(),
     });
 
-    await delay(1500);
-    const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
-      method: "GET",
-      headers: {
-        Cookie: cookieHeader,
-        Referer: `${baseUrl}/Document/Export`,
-      },
-    }).then((r) => r.text());
+    // DIAN genera el archivo en segundo plano. Polling hasta 5 minutos.
+    const pollTimeoutMs = 300_000;
+    const pollEveryMs = 4_000;
+    const startedAt = Date.now();
 
-    const links = Array.from(exportHtml.matchAll(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/g))
-      .map((m) => m[1].replace(/&amp;/g, "&"));
-    if (links.length === 0) return [];
+    let selectedLink: string | null = null;
+    let latestAvailableLink: string | null = null;
 
-    const latestLink = links[0];
-    const downloaded = await fetch(`${baseUrl}${latestLink}`, {
+    while (Date.now() - startedAt < pollTimeoutMs) {
+      const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
+        method: "GET",
+        headers: {
+          Cookie: cookieHeader,
+          Referer: `${baseUrl}/Document/Export`,
+        },
+      }).then((r) => r.text());
+
+      const links = parseDownloadLinksFromExportHtml(exportHtml);
+      if (links.length > 0) {
+        latestAvailableLink = links[0].href;
+      }
+
+      const newlyGenerated = links.find((l) => !existingRks.has(l.rk));
+      if (newlyGenerated) {
+        selectedLink = newlyGenerated.href;
+        break;
+      }
+
+      await delay(pollEveryMs);
+    }
+
+    if (!selectedLink && latestAvailableLink) {
+      console.warn("[DIAN Export] No se detectó rk nuevo en 5 min; se usa el más reciente disponible.");
+      selectedLink = latestAvailableLink;
+    }
+
+    if (!selectedLink) {
+      throw new Error("No se pudo generar/obtener el listado DIAN dentro del tiempo máximo (5 min)");
+    }
+
+    const downloaded = await fetch(`${baseUrl}${selectedLink}`, {
       method: "GET",
       headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
     }).then((r) => r.arrayBuffer());
