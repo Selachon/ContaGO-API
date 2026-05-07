@@ -284,6 +284,119 @@ export async function extractDocumentIds(
   }
 }
 
+/**
+ * Nuevo flujo principal: obtiene CUFEs desde Descarga de listados y luego
+ * consulta documento por documento en la bandeja (recibidos/emitidos).
+ * Mantiene precisión alta y evita pérdidas por paginación larga.
+ */
+export async function extractDocumentIdsByCufe(
+  tokenUrl: string,
+  startDate: string | undefined,
+  endDate: string | undefined,
+  progressUid?: string,
+  documentDirection: DocumentDirection = "received"
+): Promise<ExtractionResult> {
+  const direction = documentDirection || "received";
+  const isSent = direction === "sent";
+  const directionLabel = isSent ? "emitidos" : "recibidos";
+  const updateProgress = (data: Partial<ProgressData>) => {
+    if (progressUid) {
+      const current = progressTracker.get(progressUid) || { step: "", current: 0, total: 0 };
+      progressTracker.set(progressUid, { ...current, ...data });
+    }
+  };
+
+  let browser: Browser | null = null;
+
+  try {
+    updateProgress({ step: "Iniciando navegador...", current: 0, total: 0 });
+    const executablePath = resolveExecutablePath();
+    browser = await launchBrowserWithRetry(executablePath, updateProgress);
+
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+    page.setDefaultTimeout(120000);
+    page.setDefaultNavigationTimeout(120000);
+
+    updateProgress({ step: "Accediendo con token...", current: 0, total: 1 });
+    await navigateWithRetry(page, tokenUrl, 3);
+    await delay(1000);
+
+    if (isLoginPage(page.url())) {
+      throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
+
+    updateProgress({ step: "Descargando listado DIAN por CUFE...", current: 0, total: 1 });
+    const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
+    const cufes = Array.from(new Set(listedRecords.map((r) => (r.cufe || "").trim().toLowerCase()).filter(Boolean)));
+
+    if (cufes.length === 0) {
+      throw new Error("No se encontraron CUFEs válidos en Descarga de listados para ese rango.");
+    }
+
+    const documentUrl = isSent
+      ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+      : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+
+    updateProgress({ step: `Navegando a documentos ${directionLabel}...`, current: 0, total: cufes.length });
+    await navigateWithRetry(page, documentUrl, 3);
+    await delay(600);
+
+    if (startDate && endDate) {
+      updateProgress({ step: "Aplicando rango de fechas...", current: 0, total: cufes.length });
+      await applyDateFilter(page, startDate, endDate);
+    }
+
+    await waitForTableLoad(page);
+
+    const documents: DocumentInfo[] = [];
+    const seenIds = new Set<string>();
+    let failures = 0;
+
+    for (let i = 0; i < cufes.length; i++) {
+      const cufe = cufes[i];
+      updateProgress({
+        step: `Consultando CUFE ${i + 1}/${cufes.length}`,
+        current: i + 1,
+        total: cufes.length,
+      });
+
+      try {
+        const found = await findDocumentByUniqueCodeOrDocnum(page, cufe, "", seenIds, isSent);
+        if (found?.id) {
+          found.cufe = cufe;
+          documents.push(found);
+        } else {
+          failures++;
+          if (failures <= 10) {
+            console.warn(`[DIAN CUFE] Sin resultado para CUFE ${cufe.slice(0, 16)}...`);
+          }
+        }
+      } catch (err) {
+        failures++;
+        if (failures <= 10) {
+          console.warn(`[DIAN CUFE] Error consultando CUFE ${cufe.slice(0, 16)}...`, err);
+        }
+      }
+    }
+
+    const cookies = await page.cookies();
+    const cookieMap: Record<string, string> = {};
+    for (const c of cookies) cookieMap[c.name] = c.value;
+
+    console.log(`[DIAN CUFE] listado=${cufes.length} encontrados=${documents.length} fallidos=${failures}`);
+    updateProgress({
+      step: `Lista por CUFE completada (${documents.length}/${cufes.length})`,
+      current: documents.length,
+      total: cufes.length,
+    });
+
+    return { documents, cookies: cookieMap };
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
 export async function runDianExtractionPrecheck(
   tokenUrl: string,
   startDate: string | undefined,
@@ -968,6 +1081,42 @@ async function findDocumentByUniqueCodeOrDocnum(
   const candidates = [cufe, docnum].filter(Boolean);
   for (const term of candidates) {
     try {
+      // 1) Intentar por campo específico "Código único" y botón Buscar.
+      const searchedByUniqueCode = await page.evaluate((value) => {
+        const inputs = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
+        const target = inputs.find((input) => {
+          const haystack = `${input.id} ${input.name} ${input.placeholder || ""} ${input.getAttribute("aria-label") || ""}`.toLowerCase();
+          return haystack.includes("codigo") || haystack.includes("código") || haystack.includes("unico") || haystack.includes("único") || haystack.includes("cufe") || haystack.includes("cude");
+        });
+
+        if (!target) return false;
+
+        target.value = value;
+        target.dispatchEvent(new Event("input", { bubbles: true }));
+        target.dispatchEvent(new Event("change", { bubbles: true }));
+
+        const buttons = Array.from(document.querySelectorAll("button"));
+        const buscar = buttons.find((btn) => (btn.textContent || "").toLowerCase().includes("buscar"));
+        if (buscar) {
+          (buscar as HTMLButtonElement).click();
+          return true;
+        }
+
+        return false;
+      }, term);
+
+      if (searchedByUniqueCode) {
+        await delay(900);
+        await waitForTableLoad(page);
+
+        const foundByUniqueCode = await extractDocsFromPage(page, seenIds, isSentDocuments);
+        if (foundByUniqueCode.length > 0) {
+          const exact = foundByUniqueCode.find((d) => (docnum && d.docnum === docnum) || (cufe && d.cufe === cufe));
+          return exact || foundByUniqueCode[0];
+        }
+      }
+
+      // 2) Fallback: buscador global de DataTables.
       await page.evaluate((value) => {
         const input = document.querySelector(
           "#tableDocuments_filter input, .dataTables_filter input, .dt-search input, input[type='search']"
