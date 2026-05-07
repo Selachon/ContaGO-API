@@ -8,7 +8,6 @@ import JSZip from "jszip";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
-import { getUserNits } from "../services/database.js";
 import { extractDocumentIds, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateThirdPartiesExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
@@ -41,17 +40,6 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   const direction = document_direction === "sent" ? "sent" : "received";
 
   const userId = req.user!.userId;
-  if (!req.user?.isAdmin) {
-    const allowedNits = await getUserNits(userId);
-    let tokenNit = "";
-    try {
-      tokenNit = new URL(token_url).searchParams.get("rk")?.trim() || "";
-    } catch {}
-    const normalizeNit = (nit: string) => nit.replace(/[-\s]/g, "").trim();
-    if (!allowedNits.map(normalizeNit).includes(normalizeNit(tokenNit))) {
-      return res.status(403).json({ status: "error", detalle: `No tienes acceso al NIT ${tokenNit}` });
-    }
-  }
 
   const jobId = session_uid || uuidv4();
   jobTracker.set(jobId, {

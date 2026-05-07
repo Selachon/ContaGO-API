@@ -22,6 +22,7 @@ import type { AuthResponse, JWTPayload } from "../types/auth.js";
 const router = Router();
 
 const ALLOW_PUBLIC_REGISTER = process.env.ALLOW_PUBLIC_REGISTER === "true";
+const DIAN_THIRD_PARTIES_TOOL_ID = "dian-third-parties-excel";
 
 function getJwtSecret(): string {
   // Garantizado por la validación en index.ts
@@ -225,11 +226,6 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
       .filter(Boolean)
   ));
 
-  if (cleanNits.length === 0) {
-    const response: AuthResponse = { ok: false, message: "Debes proporcionar al menos un NIT" };
-    return res.status(400).json(response);
-  }
-
   const normalizedTools = Array.isArray(purchasedTools)
     ? purchasedTools
     : typeof purchasedTools === "string"
@@ -242,6 +238,13 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
       .map((tool) => tool.trim())
       .filter(Boolean)
   ));
+
+  const canSkipNitRestriction = !!isAdmin || cleanTools.includes(DIAN_THIRD_PARTIES_TOOL_ID);
+
+  if (!canSkipNitRestriction && cleanNits.length === 0) {
+    const response: AuthResponse = { ok: false, message: "Debes proporcionar al menos un NIT" };
+    return res.status(400).json(response);
+  }
 
   const existing = await getUserByEmail(email.toLowerCase().trim());
   if (existing) {
