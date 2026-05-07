@@ -1000,10 +1000,8 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
 
   const headers = rows[0].map((h) => h.trim().toLowerCase());
   const cufeIdx = headers.findIndex((h) => h.includes("cufe") || h.includes("cude") || h.includes("código único") || h.includes("codigo unico"));
-  const folioIdx = headers.findIndex((h) => h === "folio" || h.includes("número") || h.includes("numero"));
+  const folioIdx = headers.findIndex((h) => h === "folio" || h.includes("número") || h.includes("numero") || h.includes("documento"));
   const groupIdx = headers.findIndex((h) => h === "grupo");
-
-  if (cufeIdx < 0 || folioIdx < 0) return [];
 
   const expectedGroup = direction === "sent" ? "emitido" : "recibido";
   const out: ListingRecord[] = [];
@@ -1013,8 +1011,16 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
     const group = (groupIdx >= 0 ? row[groupIdx] : "").toLowerCase();
     if (group && !group.includes(expectedGroup)) continue;
 
-    const cufe = (row[cufeIdx] || "").trim().toLowerCase();
-    const docnum = (row[folioIdx] || "").trim();
+    const fallbackCufe = row.find((v) => /^[a-fA-F0-9]{64,96}$/.test((v || "").trim()));
+    const cufe = ((cufeIdx >= 0 ? row[cufeIdx] : fallbackCufe) || "").trim().toLowerCase();
+
+    let docnum = (folioIdx >= 0 ? row[folioIdx] : "").trim();
+    if (!docnum) {
+      const fallbackDocnum = row.find((v) => /^\d{1,20}$/.test((v || "").trim()));
+      docnum = (fallbackDocnum || "").trim();
+    }
+
+    if (!cufe) continue;
     if (!docnum) continue;
     out.push({ cufe, docnum });
   }
