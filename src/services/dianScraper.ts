@@ -471,6 +471,13 @@ async function launchBrowserWithRetry(
   updateProgress: (data: Partial<ProgressData>) => void
 ): Promise<Browser> {
   let lastError: Error | null = null;
+  const chromiumLibPath = buildChromiumLibPath();
+
+  if (chromiumLibPath) {
+    const currentLd = process.env.LD_LIBRARY_PATH || "";
+    const parts = [chromiumLibPath, currentLd].filter(Boolean);
+    process.env.LD_LIBRARY_PATH = parts.join(":");
+  }
 
   for (let attempt = 1; attempt <= BROWSER_LAUNCH_RETRIES; attempt++) {
     try {
@@ -512,6 +519,19 @@ async function launchBrowserWithRetry(
   throw new Error(
     `No fue posible iniciar Chromium tras ${BROWSER_LAUNCH_RETRIES} intentos. Último error: ${lastError?.message || "desconocido"}`
   );
+}
+
+function buildChromiumLibPath(): string {
+  const base = `${process.cwd()}/.chromium-libs`;
+  const candidates = [
+    `${base}/usr/lib/x86_64-linux-gnu`,
+    `${base}/lib/x86_64-linux-gnu`,
+    `${base}/usr/lib`,
+    `${base}/lib`,
+  ];
+
+  const existing = candidates.filter((p) => fs.existsSync(p));
+  return existing.join(":");
 }
 
 function resolveExecutablePath(): string | null {
