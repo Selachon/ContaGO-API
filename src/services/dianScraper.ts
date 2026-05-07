@@ -897,32 +897,13 @@ async function extractListingRecordsFromDownloadTab(
     await navigateWithRetry(page, `${baseUrl}/Document/Export`, 2);
     await delay(800);
 
-    const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
-
     const exportPageBefore = await fetch(`${baseUrl}/Document/Export`, {
       method: "GET",
       headers: {
-        Cookie: cookieHeader,
+        Cookie: (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; "),
         Referer: `${baseUrl}/Document/Export`,
       },
     }).then((r) => r.text());
-
-    const reusableLink = findReusableExportLink(exportPageBefore, direction, startDate, endDate);
-    if (reusableLink) {
-      console.log(`[DIAN Export] Reutilizando listado existente para rango solicitado: ${reusableLink}`);
-      const downloaded = await fetch(`${baseUrl}${reusableLink}`, {
-        method: "GET",
-        headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
-      }).then((r) => r.arrayBuffer());
-
-      const zipBuffer = Buffer.from(new Uint8Array(downloaded));
-      const reusedRecords = await parseListingRecordsFromExportZip(zipBuffer, direction);
-      if (reusedRecords.length > 0) {
-        return reusedRecords;
-      }
-      console.warn("[DIAN Export] El listado reutilizado no trajo CUFEs válidos; se intentará regenerar.");
-    }
-
     const existingRks = new Set(parseDownloadLinksFromExportHtml(exportPageBefore).map((l) => l.rk));
 
     const formData = await page.evaluate(() => {
@@ -934,6 +915,7 @@ async function extractListingRecordsFromDownloadTab(
 
     if (!formData.token) return [];
 
+    const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
     const body = new URLSearchParams();
     body.set("__RequestVerificationToken", formData.token);
     body.set("Type", formData.type || "0");
@@ -1014,49 +996,27 @@ function toDianExportDate(dateISO: string, endOfDay: boolean = false): string {
 }
 
 async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: DocumentDirection): Promise<ListingRecord[]> {
-  // DIAN puede devolver:
-  // 1) ZIP contenedor con un .xlsx adentro
-  // 2) el .xlsx directamente (que también es un ZIP OOXML)
-  // Este bloque soporta ambos formatos.
-  let xlsxBuffer: Buffer | null = null;
-  const maybeZip = await JSZip.loadAsync(zipBuffer);
+  const zip = await JSZip.loadAsync(zipBuffer);
+  const xlsxName = Object.keys(zip.files).find((n) => n.toLowerCase().endsWith(".xlsx") && !zip.files[n].dir);
+  if (!xlsxName) return [];
 
-  const embeddedXlsxName = Object.keys(maybeZip.files).find(
-    (n) => n.toLowerCase().endsWith(".xlsx") && !maybeZip.files[n].dir
-  );
-
-  if (embeddedXlsxName) {
-    xlsxBuffer = await maybeZip.files[embeddedXlsxName].async("nodebuffer");
-  } else if (maybeZip.file("xl/workbook.xml")) {
-    // El archivo descargado ya es el .xlsx
-    xlsxBuffer = zipBuffer;
-  }
-
-  if (!xlsxBuffer) {
-    console.warn("[DIAN Export] Formato de archivo no reconocido al parsear listado");
-    return [];
-  }
-
+  const xlsxBuffer = await zip.files[xlsxName].async("nodebuffer");
   const xlsx = await JSZip.loadAsync(xlsxBuffer);
 
   const sharedStringsXml = await xlsx.file("xl/sharedStrings.xml")?.async("string");
-  const sheetPath = Object.keys(xlsx.files).find(
-    (n) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(n) && !xlsx.files[n].dir
-  );
-  const sheetXml = sheetPath ? await xlsx.file(sheetPath)?.async("string") : null;
+  const sheetXml = await xlsx.file("xl/worksheets/sheet1.xml")?.async("string");
   if (!sheetXml) return [];
 
   const sharedStrings = parseSharedStrings(sharedStringsXml || "");
   const rows = parseSheetRows(sheetXml, sharedStrings);
-  if (rows.length < 2) {
-    console.warn("[DIAN Export] XLSX sin filas de datos");
-    return [];
-  }
+  if (rows.length < 2) return [];
 
   const headers = rows[0].map((h) => h.trim().toLowerCase());
   const cufeIdx = headers.findIndex((h) => h.includes("cufe") || h.includes("cude") || h.includes("código único") || h.includes("codigo unico"));
-  const folioIdx = headers.findIndex((h) => h === "folio" || h.includes("número") || h.includes("numero") || h.includes("documento"));
+  const folioIdx = headers.findIndex((h) => h === "folio" || h.includes("número") || h.includes("numero"));
   const groupIdx = headers.findIndex((h) => h === "grupo");
+
+  if (cufeIdx < 0 || folioIdx < 0) return [];
 
   const expectedGroup = direction === "sent" ? "emitido" : "recibido";
   const out: ListingRecord[] = [];
@@ -1066,16 +1026,8 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
     const group = (groupIdx >= 0 ? row[groupIdx] : "").toLowerCase();
     if (group && !group.includes(expectedGroup)) continue;
 
-    const fallbackCufe = row.find((v) => /^[a-fA-F0-9]{64,96}$/.test((v || "").trim()));
-    const cufe = ((cufeIdx >= 0 ? row[cufeIdx] : fallbackCufe) || "").trim().toLowerCase();
-
-    let docnum = (folioIdx >= 0 ? row[folioIdx] : "").trim();
-    if (!docnum) {
-      const fallbackDocnum = row.find((v) => /^\d{1,20}$/.test((v || "").trim()));
-      docnum = (fallbackDocnum || "").trim();
-    }
-
-    if (!cufe) continue;
+    const cufe = (row[cufeIdx] || "").trim().toLowerCase();
+    const docnum = (row[folioIdx] || "").trim();
     if (!docnum) continue;
     out.push({ cufe, docnum });
   }
@@ -1085,17 +1037,7 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
     const key = `${rec.docnum}::${rec.cufe}`;
     if (!dedup.has(key)) dedup.set(key, rec);
   }
-  const finalRows = Array.from(dedup.values());
-  if (finalRows.length === 0) {
-    console.warn("[DIAN Export] No se pudieron mapear CUFEs desde el XLSX", {
-      cufeIdx,
-      folioIdx,
-      groupIdx,
-      totalRows: rows.length,
-      sampleHeaders: rows[0]?.slice(0, 10),
-    });
-  }
-  return finalRows;
+  return Array.from(dedup.values());
 }
 
 function parseSharedStrings(xml: string): string[] {
@@ -1177,50 +1119,6 @@ function parseDownloadLinksFromExportHtml(html: string): Array<{ href: string; r
   }
 
   return parsed;
-}
-
-function findReusableExportLink(
-  html: string,
-  direction: DocumentDirection,
-  startDate?: string,
-  endDate?: string
-): string | null {
-  if (!startDate || !endDate) return null;
-
-  const requestedRange = `Desde ${toDianDisplayDate(startDate)} Hasta ${toDianDisplayDate(endDate)}`.toLowerCase();
-  const desiredTypes = direction === "sent" ? ["enviados", "emitidos"] : ["recibidos"];
-
-  const tbodyMatch = html.match(/<table[^>]*id="tableExport"[\s\S]*?<tbody>([\s\S]*?)<\/tbody>/i);
-  if (!tbodyMatch) return null;
-
-  const rows = Array.from(tbodyMatch[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)).map((m) => m[1]);
-  for (const row of rows) {
-    const tds = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((m) => m[1]);
-    if (tds.length < 4) continue;
-
-    const rangeText = stripHtml(tds[2]).toLowerCase();
-    const typeText = stripHtml(tds[3]).toLowerCase();
-
-    const typeMatches = desiredTypes.some((dt) => typeText.includes(dt));
-    const rangeMatches = rangeText.includes(requestedRange);
-    if (!typeMatches || !rangeMatches) continue;
-
-    const hrefMatch = row.match(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/i);
-    if (!hrefMatch) continue;
-    return hrefMatch[1].replace(/&amp;/g, "&");
-  }
-
-  return null;
-}
-
-function toDianDisplayDate(dateISO: string): string {
-  const [year, month, day] = dateISO.split("-");
-  if (!year || !month || !day) return dateISO;
-  return `${day.padStart(2, "0")}-${month.padStart(2, "0")}-${year}`;
-}
-
-function stripHtml(raw: string): string {
-  return raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
 
 async function findDocumentByUniqueCodeOrDocnum(
