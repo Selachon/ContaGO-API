@@ -4,7 +4,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
-import { extractDocumentIds } from "../services/dianScraper.js";
+import { extractDocumentIds, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import {
@@ -372,7 +372,11 @@ async function processExcelJob(
   try {
     if (isJobCancelled(jobId)) return;
 
-    // 1) Extraer ids y cookies de sesion desde DIAN.
+    // 1) Prevalidación rápida para fallar temprano.
+    setProgress(jobId, { step: `Prevalidando documentos ${directionLabel}...`, current: 0, total: 1 });
+    await runDianExtractionPrecheck(tokenUrl, startDate, endDate, documentDirection, jobId);
+
+    // 2) Extraer ids y cookies de sesion desde DIAN.
     setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
     const { documents, cookies } = await extractDocumentIds(tokenUrl, startDate, endDate, jobId, documentDirection);
     console.log(

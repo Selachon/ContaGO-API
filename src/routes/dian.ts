@@ -6,7 +6,7 @@ import archiver from "archiver";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import { extractDocumentIds, progressTracker } from "../services/dianScraper.js";
+import { extractDocumentIds, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -437,7 +437,11 @@ async function processDownloadJob(
       return;
     }
 
-    // Paso 1: obtener ids y cookies de sesion DIAN.
+    // Paso 1: prevalidación rápida para evitar esperas largas con fallo tardío.
+    setProgress(jobId, { step: `Prevalidando documentos ${directionLabel}...`, current: 0, total: 1 });
+    await runDianExtractionPrecheck(token_url, start_date, end_date, documentDirection, jobId);
+
+    // Paso 2: obtener ids y cookies de sesion DIAN.
     setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
     const { documents, cookies } = await extractDocumentIds(token_url, start_date, end_date, jobId, documentDirection);
 
