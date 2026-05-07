@@ -63,6 +63,7 @@ export async function extractDocumentIds(
     browser = await launchBrowserWithRetry(executablePath, updateProgress);
 
     const page = await browser.newPage();
+    await hardenPageRuntime(page);
     await page.setViewport({ width: 1280, height: 800 });
 
     // Timeout alto para ambientes con latencia variable (2 minutos).
@@ -314,6 +315,7 @@ export async function extractDocumentIdsByCufe(
     browser = await launchBrowserWithRetry(executablePath, updateProgress);
 
     const page = await browser.newPage();
+    await hardenPageRuntime(page);
     await page.setViewport({ width: 1280, height: 800 });
     page.setDefaultTimeout(120000);
     page.setDefaultNavigationTimeout(120000);
@@ -420,6 +422,7 @@ export async function runDianExtractionPrecheck(
       updateProgress({ step: "Prevalidando listado DIAN...", current: 0, total: 1 });
       browser = await launchBrowserWithRetry(resolveExecutablePath(), updateProgress);
       const page = await browser.newPage();
+      await hardenPageRuntime(page);
       await page.setViewport({ width: 1280, height: 800 });
       page.setDefaultTimeout(120000);
       page.setDefaultNavigationTimeout(120000);
@@ -464,6 +467,17 @@ export async function runDianExtractionPrecheck(
   } finally {
     if (browser) await browser.close();
   }
+}
+
+async function hardenPageRuntime(page: Page): Promise<void> {
+  // En algunos entornos de transpile, page.evaluate puede serializar helpers
+  // como __name. Definirlo en runtime evita el fallo "__name is not defined".
+  await page.evaluateOnNewDocument(() => {
+    const w = window as unknown as { __name?: (fn: unknown, _n?: string) => unknown };
+    if (typeof w.__name !== "function") {
+      w.__name = (fn) => fn;
+    }
+  });
 }
 
 async function launchBrowserWithRetry(
@@ -969,20 +983,31 @@ async function extractListingRecordsFromDownloadTab(
       },
     }).then((r) => r.text());
 
-    const reusableLink = findReusableExportLink(exportPageBefore, direction, startDate, endDate);
-    if (reusableLink) {
-      console.log(`[DIAN Export] Reutilizando listado existente para rango solicitado: ${reusableLink}`);
-      const downloaded = await fetch(`${baseUrl}${reusableLink}`, {
-        method: "GET",
-        headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
-      }).then((r) => r.arrayBuffer());
+    const reusableLinks = findReusableExportLinks(exportPageBefore, direction, startDate, endDate);
+    if (reusableLinks.length > 0) {
+      console.log(`[DIAN Export] Se encontraron ${reusableLinks.length} listados reutilizables para el rango.`);
+      for (let i = 0; i < reusableLinks.length; i++) {
+        const reusableLink = reusableLinks[i];
+        try {
+          console.log(`[DIAN Export] Reutilizando listado #${i + 1}: ${reusableLink}`);
+          const downloaded = await fetch(`${baseUrl}${reusableLink}`, {
+            method: "GET",
+            headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
+          }).then((r) => r.arrayBuffer());
 
-      const zipBuffer = Buffer.from(new Uint8Array(downloaded));
-      const reusedRecords = await parseListingRecordsFromExportZip(zipBuffer, direction);
-      if (reusedRecords.length > 0) {
-        return reusedRecords;
+          const zipBuffer = Buffer.from(new Uint8Array(downloaded));
+          const reusedRecords = await parseListingRecordsFromExportZip(zipBuffer, direction);
+          if (reusedRecords.length > 0) {
+            return reusedRecords;
+          }
+
+          console.warn(`[DIAN Export] Listado reutilizado #${i + 1} sin CUFEs válidos.`);
+        } catch (reuseErr) {
+          console.warn(`[DIAN Export] Falló descarga de listado reutilizado #${i + 1}:`, reuseErr);
+        }
       }
-      console.warn("[DIAN Export] El listado reutilizado no trajo CUFEs válidos; se intentará regenerar.");
+
+      console.warn("[DIAN Export] Ningún listado reutilizable fue válido; se intentará regenerar.");
     }
 
     const existingRks = new Set(parseDownloadLinksFromExportHtml(exportPageBefore).map((l) => l.rk));
@@ -1246,23 +1271,24 @@ function parseDownloadLinksFromExportHtml(html: string): Array<{ href: string; r
   return parsed;
 }
 
-function findReusableExportLink(
+function findReusableExportLinks(
   html: string,
   direction: DocumentDirection,
   startDate?: string,
   endDate?: string
-): string | null {
-  if (!startDate || !endDate) return null;
+): string[] {
+  if (!startDate || !endDate) return [];
   const requestedStart = parseIsoDate(startDate);
   const requestedEnd = parseIsoDate(endDate);
-  if (!requestedStart || !requestedEnd) return null;
+  if (!requestedStart || !requestedEnd) return [];
 
   const desiredTypes = direction === "sent" ? ["enviados", "emitidos"] : ["recibidos"];
 
   const tbodyMatch = html.match(/<table[^>]*id="tableExport"[\s\S]*?<tbody>([\s\S]*?)<\/tbody>/i);
-  if (!tbodyMatch) return null;
+  if (!tbodyMatch) return [];
 
   const rows = Array.from(tbodyMatch[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)).map((m) => m[1]);
+  const matches: string[] = [];
   for (const row of rows) {
     const tds = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((m) => m[1]);
     if (tds.length < 4) continue;
@@ -1283,10 +1309,10 @@ function findReusableExportLink(
 
     const hrefMatch = row.match(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/i);
     if (!hrefMatch) continue;
-    return hrefMatch[1].replace(/&amp;/g, "&");
+    matches.push(hrefMatch[1].replace(/&amp;/g, "&"));
   }
 
-  return null;
+  return matches;
 }
 
 function parseIsoDate(value: string): number | null {
