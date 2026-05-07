@@ -607,22 +607,11 @@ const IGNORED_DOC_TYPES = [
   "respuesta aplicación",
 ];
 
-// Tipos de documento adicionales que deben ser ignorados solo para documentos emitidos
-const IGNORED_DOC_TYPES_SENT_ONLY = [
-  "nomina individual",
-  "nómina individual",
-];
-
 function shouldIgnoreDocType(docType: string, isSentDocuments: boolean = false): boolean {
   const normalized = docType.toLowerCase().trim();
   
   // Siempre ignorar estos tipos
   if (IGNORED_DOC_TYPES.some(ignored => normalized.includes(ignored))) {
-    return true;
-  }
-  
-  // Para documentos emitidos, también ignorar nóminas
-  if (isSentDocuments && IGNORED_DOC_TYPES_SENT_ONLY.some(ignored => normalized.includes(ignored))) {
     return true;
   }
   
@@ -633,6 +622,22 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate((isSentDocumentsInPage) => {
+    const extractTrackIdFromText = (raw: string | null | undefined): string | null => {
+      const text = String(raw || "");
+      if (!text) return null;
+
+      const direct = text.match(/trackId=([A-Za-z0-9-]+)/i);
+      if (direct) return direct[1];
+
+      const quoted = text.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+      if (quoted) return quoted[1];
+
+      const generic = text.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+      if (generic) return generic[1];
+
+      return null;
+    };
+
     const results: Array<{
       id: string;
       docnum: string;
@@ -658,7 +663,8 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
         ".download-document, .download-support-document, .download-eventos, " +
         ".download-equivalente-document, .download-individual-payroll, " +
         "a[href*='DownloadZipFiles'], a[href*='trackId'], " +
-        "[data-trackid], [data-id], [id^='doc-'], [id*='track']"
+        "[data-trackid], [data-id], [id^='doc-'], [id*='track'], " +
+        "[onclick*='DownloadZipFiles'], [onclick*='trackId']"
       );
       
       for (const el of downloadElements) {
@@ -675,11 +681,8 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
           fechaGeneracion = el.getAttribute("generationdate") || undefined;
         }
         
-        if (!trackId) {
-          const href = el.getAttribute("href") || "";
-          const match = href.match(/trackId=([A-Za-z0-9-]+)/i);
-          if (match) trackId = match[1];
-        }
+        if (!trackId) trackId = extractTrackIdFromText(el.getAttribute("href"));
+        if (!trackId) trackId = extractTrackIdFromText(el.getAttribute("onclick"));
         
         if (trackId) break;
       }
@@ -705,13 +708,15 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
       if (!trackId) {
         const links = row.querySelectorAll("a[href]");
         for (const link of links) {
-          const href = link.getAttribute("href") || "";
-          const match = href.match(/trackId=([A-Za-z0-9-]+)/i);
-          if (match) {
-            trackId = match[1];
-            break;
-          }
+          trackId = extractTrackIdFromText(link.getAttribute("href"));
+          if (!trackId) trackId = extractTrackIdFromText(link.getAttribute("onclick"));
+          if (trackId) break;
         }
+      }
+
+      // Metodo 5: fallback sobre HTML completo de la fila
+      if (!trackId) {
+        trackId = extractTrackIdFromText((row as HTMLElement).outerHTML);
       }
       
       if (!trackId) continue;
@@ -1073,7 +1078,8 @@ async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<voi
         const elements = row.querySelectorAll(
           ".download-document, .download-support-document, .download-eventos, " +
           ".download-equivalente-document, .download-individual-payroll, " +
-          "[data-trackid], [data-id], a[href*='trackId']"
+          "[data-trackid], [data-id], a[href*='trackId'], " +
+          "a[href*='DownloadZipFiles'], [onclick*='DownloadZipFiles'], [onclick*='trackId']"
         );
         
         for (const el of elements) {
@@ -1083,6 +1089,13 @@ async function waitForTableChange(page: Page, seenIds: Set<string>): Promise<voi
             const href = el.getAttribute("href") || "";
             const match = href.match(/trackId=([A-Za-z0-9-]+)/i);
             if (match) tid = match[1];
+          }
+
+          if (!tid) {
+            const onclick = el.getAttribute("onclick") || "";
+            const matchOnclick = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i)
+              || onclick.match(/trackId=([A-Za-z0-9-]+)/i);
+            if (matchOnclick) tid = matchOnclick[1];
           }
           
           if (tid && !seen.includes(tid)) {
