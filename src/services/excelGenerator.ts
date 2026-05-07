@@ -114,6 +114,7 @@ function patchSentHeaders(sharedStringsXml: string): string {
 function patchIclHeaders(sharedStringsXml: string): string {
   return sharedStringsXml
     .replace(/<t>Descuento Global \(-\)<\/t>/g, "<t>Valor ICL</t>")
+    .replace(/<t>Recargo Global \(\+\)<\/t>/g, "<t>Valor IC Porcentual</t>")
     .replace(/<t>% IC<\/t>/g, "<t>% ICL</t>");
 }
 
@@ -126,6 +127,7 @@ function patchTable1HeadersForSent(tableXml: string): string {
 function patchTable1HeadersForIcl(tableXml: string): string {
   return tableXml
     .replace(/name="Descuento Global \(-\)"/g, 'name="Valor ICL"')
+    .replace(/name="Recargo Global \(\+\)"/g, 'name="Valor IC Porcentual"')
     .replace(/name="% IC"/g, 'name="% ICL"');
 }
 
@@ -267,7 +269,7 @@ export async function generateExcelFile(
     c += numCell(`O${rowNum}`, taxes["ICUI"] ?? 0, STYLE_CURRENCY);
     c += numCell(`P${rowNum}`, taxes["IC"] ?? 0, STYLE_CURRENCY);
     c += numCell(`Q${rowNum}`, taxes["ICL"] ?? 0, STYLE_CURRENCY);
-    c += numCell(`R${rowNum}`, 0, STYLE_CURRENCY);
+    c += numCell(`R${rowNum}`, taxes["IC Porcentual"] ?? 0, STYLE_CURRENCY);
     c += numCell(`S${rowNum}`, typeof inv.total === "number" ? inv.total : 0, STYLE_CURRENCY);
 
     if (includeDriveColumn && inv.driveUrl && !inv.driveUrl.includes("ERROR")) {

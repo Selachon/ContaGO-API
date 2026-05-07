@@ -897,6 +897,15 @@ async function extractListingRecordsFromDownloadTab(
     await navigateWithRetry(page, `${baseUrl}/Document/Export`, 2);
     await delay(800);
 
+    const exportPageBefore = await fetch(`${baseUrl}/Document/Export`, {
+      method: "GET",
+      headers: {
+        Cookie: (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; "),
+        Referer: `${baseUrl}/Document/Export`,
+      },
+    }).then((r) => r.text());
+    const existingRks = new Set(parseDownloadLinksFromExportHtml(exportPageBefore).map((l) => l.rk));
+
     const formData = await page.evaluate(() => {
       const token = (document.querySelector("input[name='__RequestVerificationToken']") as HTMLInputElement | null)?.value || "";
       const type = (document.querySelector("input[name='Type']") as HTMLInputElement | null)?.value || "0";
@@ -926,21 +935,47 @@ async function extractListingRecordsFromDownloadTab(
       body: body.toString(),
     });
 
-    await delay(1500);
-    const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
-      method: "GET",
-      headers: {
-        Cookie: cookieHeader,
-        Referer: `${baseUrl}/Document/Export`,
-      },
-    }).then((r) => r.text());
+    // DIAN genera el archivo de forma asíncrona. Polling hasta 2 minutos.
+    const pollTimeoutMs = 300_000;
+    const pollEveryMs = 4_000;
+    const startPoll = Date.now();
+    let latestAvailableLink: string | null = null;
+    let selectedLink: string | null = null;
 
-    const links = Array.from(exportHtml.matchAll(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/g))
-      .map((m) => m[1].replace(/&amp;/g, "&"));
-    if (links.length === 0) return [];
+    while (Date.now() - startPoll < pollTimeoutMs) {
+      const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
+        method: "GET",
+        headers: {
+          Cookie: cookieHeader,
+          Referer: `${baseUrl}/Document/Export`,
+        },
+      }).then((r) => r.text());
 
-    const latestLink = links[0];
-    const downloaded = await fetch(`${baseUrl}${latestLink}`, {
+      const links = parseDownloadLinksFromExportHtml(exportHtml);
+      if (links.length > 0) {
+        latestAvailableLink = links[0].href;
+      }
+
+      const newlyGenerated = links.find((l) => !existingRks.has(l.rk));
+      if (newlyGenerated) {
+        selectedLink = newlyGenerated.href;
+        break;
+      }
+
+      await delay(pollEveryMs);
+    }
+
+    // Fallback: usar el más reciente disponible si no pudimos distinguir uno nuevo.
+    if (!selectedLink && latestAvailableLink) {
+      console.warn("[DIAN Export] No se detectó nuevo rk en 120s; usando último archivo disponible.");
+      selectedLink = latestAvailableLink;
+    }
+
+    if (!selectedLink) {
+      throw new Error("No se pudo obtener archivo de listado DIAN en el tiempo de espera (120s)");
+    }
+
+    const downloaded = await fetch(`${baseUrl}${selectedLink}`, {
       method: "GET",
       headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
     }).then((r) => r.arrayBuffer());
@@ -1069,6 +1104,21 @@ function decodeXml(value: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
+}
+
+function parseDownloadLinksFromExportHtml(html: string): Array<{ href: string; rk: string }> {
+  const links = Array.from(html.matchAll(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/g))
+    .map((m) => m[1].replace(/&amp;/g, "&"));
+
+  const parsed: Array<{ href: string; rk: string }> = [];
+  for (const href of links) {
+    const rkMatch = href.match(/[?&]rk=([^&]+)/i);
+    const rk = rkMatch?.[1] || "";
+    if (!rk) continue;
+    parsed.push({ href, rk });
+  }
+
+  return parsed;
 }
 
 async function findDocumentByUniqueCodeOrDocnum(
