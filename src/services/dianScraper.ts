@@ -291,20 +291,6 @@ export async function runDianExtractionPrecheck(
   documentDirection: DocumentDirection = "received",
   progressUid?: string
 ): Promise<PrecheckResult> {
-  // Temporalmente deshabilitado: DIAN "Descarga de listados" presenta intermitencias.
-  // Se mantiene el flujo principal para no bloquear procesos productivos.
-  const precheckEnabled = String(process.env.DIAN_ENABLE_EXPORT_PRECHECK || "false").toLowerCase() === "true";
-  if (!precheckEnabled) {
-    if (progressUid) {
-      const current = progressTracker.get(progressUid) || { step: "", current: 0, total: 0 };
-      progressTracker.set(progressUid, {
-        ...current,
-        step: "Prevalidación omitida temporalmente",
-      });
-    }
-    return { ok: true, listedCount: 0 };
-  }
-
   const direction = documentDirection || "received";
   const isSent = direction === "sent";
   const directionLabel = isSent ? "emitidos" : "recibidos";
@@ -317,46 +303,51 @@ export async function runDianExtractionPrecheck(
 
   let browser: Browser | null = null;
   try {
-    updateProgress({ step: "Prevalidando listado DIAN...", current: 0, total: 1 });
-    browser = await launchBrowserWithRetry(resolveExecutablePath(), updateProgress);
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
-    page.setDefaultTimeout(120000);
-    page.setDefaultNavigationTimeout(120000);
+    try {
+      updateProgress({ step: "Prevalidando listado DIAN...", current: 0, total: 1 });
+      browser = await launchBrowserWithRetry(resolveExecutablePath(), updateProgress);
+      const page = await browser.newPage();
+      await page.setViewport({ width: 1280, height: 800 });
+      page.setDefaultTimeout(120000);
+      page.setDefaultNavigationTimeout(120000);
 
-    await navigateWithRetry(page, tokenUrl, 3);
-    if (isLoginPage(page.url())) {
-      throw new Error("PRECHECK_FAILED: token inválido o expirado.");
+      await navigateWithRetry(page, tokenUrl, 3);
+      if (isLoginPage(page.url())) {
+        throw new Error("token inválido o expirado durante precheck");
+      }
+
+      const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
+      if (listedRecords.length === 0) {
+        throw new Error("listado DIAN sin registros válidos para el rango");
+      }
+
+      const documentUrl = isSent
+        ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+        : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+      await navigateWithRetry(page, documentUrl, 2);
+      await waitForTableLoad(page);
+      await setPageLength(page, 100);
+      await waitForFullTableLoad(page, 100);
+
+      const sample = listedRecords[0];
+      const found = await findDocumentByUniqueCodeOrDocnum(page, sample.cufe, sample.docnum, new Set<string>(), isSent);
+      if (!found?.id) {
+        throw new Error(`no se pudo ubicar muestra ${sample.docnum} por CUFE/Folio`);
+      }
+
+      updateProgress({
+        step: `Prevalidación OK (${listedRecords.length} en listado ${directionLabel})`,
+        current: 1,
+        total: 1,
+      });
+
+      return { ok: true, listedCount: listedRecords.length };
+    } catch (precheckErr) {
+      const msg = precheckErr instanceof Error ? precheckErr.message : String(precheckErr);
+      console.warn(`[DIAN Precheck] Falló validación por listado (${directionLabel}): ${msg}. Continuando flujo normal.`);
+      updateProgress({ step: "Prevalidación por listado no disponible, continuando...", current: 1, total: 1 });
+      return { ok: true, listedCount: 0 };
     }
-
-    const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
-    if (listedRecords.length === 0) {
-      throw new Error("PRECHECK_FAILED: el listado DIAN no devolvió registros válidos para ese rango.");
-    }
-
-    const documentUrl = isSent
-      ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
-      : "https://catalogo-vpfe.dian.gov.co/Document/Received";
-    await navigateWithRetry(page, documentUrl, 2);
-    await waitForTableLoad(page);
-    await setPageLength(page, 100);
-    await waitForFullTableLoad(page, 100);
-
-    const sample = listedRecords[0];
-    const found = await findDocumentByUniqueCodeOrDocnum(page, sample.cufe, sample.docnum, new Set<string>(), isSent);
-    if (!found?.id) {
-      throw new Error(
-        `PRECHECK_FAILED: no se pudo ubicar un documento de muestra (${sample.docnum}) por CUFE/Folio antes de iniciar.`
-      );
-    }
-
-    updateProgress({
-      step: `Prevalidación OK (${listedRecords.length} en listado ${directionLabel})`,
-      current: 1,
-      total: 1,
-    });
-
-    return { ok: true, listedCount: listedRecords.length };
   } finally {
     if (browser) await browser.close();
   }
