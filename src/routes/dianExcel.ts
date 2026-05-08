@@ -362,6 +362,12 @@ async function processExcelJob(
   job.startedAt = Date.now();
   const isSentDocs = documentDirection === "sent";
   const directionLabel = isSentDocs ? "emitidos" : "recibidos";
+  let tokenNit = "";
+  try {
+    tokenNit = new URL(tokenUrl).searchParams.get("rk")?.trim() || "";
+  } catch {
+    tokenNit = "";
+  }
 
   const tempDir = path.join(DOWNLOADS_DIR, `excel-${jobId}`);
   const excelPath = path.join(DOWNLOADS_DIR, `${jobId}.xlsx`);
@@ -378,7 +384,18 @@ async function processExcelJob(
 
     // 2) Extraer ids y cookies de sesion desde DIAN.
     setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
-    const { documents, cookies } = await extractDocumentIdsByCufe(tokenUrl, startDate, endDate, jobId, documentDirection);
+    const { documents, cookies } = await extractDocumentIdsByCufe(
+      tokenUrl,
+      startDate,
+      endDate,
+      jobId,
+      documentDirection,
+      (p) => setProgress(jobId, {
+        step: p.step,
+        current: p.current,
+        total: p.total,
+      })
+    );
     console.log(
       `[Excel] Job ${jobId}: extractDocumentIds devolvio ${documents.length} documentos (${directionLabel})`
     );
@@ -783,7 +800,8 @@ async function processExcelJob(
 
     // 5) Publicar estado final para polling/descarga.
     job.status = "completed";
-    const filePrefix = isSentDocs ? "Facturas Emitidas DIAN" : "Facturas DIAN";
+    const basePrefix = isSentDocs ? "Facturas Emitidas DIAN" : "Facturas DIAN";
+    const filePrefix = tokenNit ? `${tokenNit} - ${basePrefix}` : basePrefix;
     job.excelName = generateExcelFilename(startDate, endDate, filePrefix);
     job.completedAt = Date.now();
     job.invoicesProcessed = successCount;

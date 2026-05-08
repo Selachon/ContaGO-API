@@ -11,6 +11,13 @@ interface ExtractionResult {
   cookies: Record<string, string>;
 }
 
+type OnDocumentFound = (ctx: {
+  doc: DocumentInfo;
+  index: number;
+  total: number;
+  cookies: Record<string, string>;
+}) => Promise<void> | void;
+
 interface PrecheckResult {
   ok: true;
   listedCount: number;
@@ -234,7 +241,7 @@ export async function extractDocumentIds(
 
         let rescued = 0;
         for (const rec of missing) {
-          const found = await findDocumentByUniqueCodeOrDocnum(page, rec.cufe, rec.docnum, seenIds, isSent);
+          const found = await findDocumentByUniqueCodeOrDocnum(page, rec.cufe, rec.docnum, seenIds, isSent, startDate, endDate);
           if (found) {
             if (!byId.has(found.id)) {
               byId.set(found.id, found);
@@ -296,7 +303,8 @@ export async function extractDocumentIdsByCufe(
   endDate: string | undefined,
   progressUid?: string,
   documentDirection: DocumentDirection = "received",
-  onProgress?: (data: Partial<ProgressData>) => void
+  onProgress?: (data: Partial<ProgressData>) => void,
+  onDocumentFound?: OnDocumentFound
 ): Promise<ExtractionResult> {
   const direction = documentDirection || "received";
   const isSent = direction === "sent";
@@ -359,6 +367,10 @@ export async function extractDocumentIdsByCufe(
 
     await waitForTableLoad(page);
 
+    const cookies = await page.cookies();
+    const cookieMap: Record<string, string> = {};
+    for (const c of cookies) cookieMap[c.name] = c.value;
+
     const documents: DocumentInfo[] = [];
     const seenIds = new Set<string>();
     let failures = 0;
@@ -366,16 +378,24 @@ export async function extractDocumentIdsByCufe(
     for (let i = 0; i < cufes.length; i++) {
       const cufe = cufes[i];
       updateProgress({
-        step: `Consultando CUFE ${i + 1}/${cufes.length}`,
-        current: i + 1,
-        total: cufes.length,
+        step: `Buscando documento para iniciar descarga (CUFE ${i + 1})...`,
+        current: 0,
+        total: 0,
       });
 
       try {
-        const found = await findDocumentByUniqueCodeOrDocnum(page, cufe, "", seenIds, isSent);
+        const found = await findDocumentByUniqueCodeOrDocnum(page, cufe, "", seenIds, isSent, startDate, endDate);
         if (found?.id) {
           found.cufe = cufe;
           documents.push(found);
+          if (onDocumentFound) {
+            await onDocumentFound({
+              doc: found,
+              index: i + 1,
+              total: cufes.length,
+              cookies: cookieMap,
+            });
+          }
         } else {
           failures++;
           if (failures <= 10) {
@@ -390,29 +410,29 @@ export async function extractDocumentIdsByCufe(
       }
     }
 
-    const cookies = await page.cookies();
-    const cookieMap: Record<string, string> = {};
-    for (const c of cookies) cookieMap[c.name] = c.value;
+    const finalDocuments = documents;
 
-    console.log(`[DIAN CUFE] listado=${cufes.length} encontrados=${documents.length} fallidos=${failures}`);
+    console.log(`[DIAN CUFE] listado=${cufes.length} encontrados=${finalDocuments.length} fallidos=${failures}`);
 
-    if (documents.length === 0) {
-      console.warn("[DIAN CUFE] Cero resultados por CUFE; activando fallback de extracción paginada legacy.");
+    if (finalDocuments.length === 0) {
+      const msg =
+        "[DIAN CUFE] Cero resultados por CUFE. Se detiene el proceso sin fallback legacy (flujo estricto CUFE por CUFE).";
+      console.error(msg);
       updateProgress({
-        step: "Fallback: usando extracción paginada legacy...",
+        step: "Sin resultados por CUFE (sin fallback legacy)",
         current: 0,
-        total: 1,
+        total: cufes.length,
       });
-      return await extractDocumentIds(tokenUrl, startDate, endDate, progressUid, documentDirection);
+      throw new Error(msg);
     }
 
     updateProgress({
-      step: `Lista por CUFE completada (${documents.length}/${cufes.length})`,
-      current: documents.length,
-      total: cufes.length,
+      step: `Preparación completada (${finalDocuments.length} IDs listos)` ,
+      current: 0,
+      total: 0,
     });
 
-    return { documents, cookies: cookieMap };
+    return { documents: finalDocuments, cookies: cookieMap };
   } finally {
     if (browser) await browser.close();
   }
@@ -465,7 +485,7 @@ export async function runDianExtractionPrecheck(
       await waitForFullTableLoad(page, 100);
 
       const sample = listedRecords[0];
-      const found = await findDocumentByUniqueCodeOrDocnum(page, sample.cufe, sample.docnum, new Set<string>(), isSent);
+      const found = await findDocumentByUniqueCodeOrDocnum(page, sample.cufe, sample.docnum, new Set<string>(), isSent, startDate, endDate);
       if (!found?.id) {
         throw new Error(`no se pudo ubicar muestra ${sample.docnum} por CUFE/Folio`);
       }
@@ -608,66 +628,55 @@ function resolveExecutablePath(): string | null {
   return null;
 }
 
-async function applyDateFilter(page: Page, startDate: string, endDate: string): Promise<void> {
+async function applyDateFilter(page: Page, startDate: string, endDate: string, triggerSearch: boolean = true): Promise<void> {
   try {
-    // Seleccion flexible para cambios menores en el DOM de DIAN.
+    // Selector explícito del rango visible (evita caer en hidden StartDate/EndDate).
     const rangeInput = await page.$(
-      "#dashboard-report-range input, " +
-      "input[placeholder*='Rango'], " +
-      "input[aria-label*='Rango'], " +
-      "input[placeholder*='Fecha'], " +
-      "input[aria-label*='Fecha'], " +
-      "input[name*='date'], " +
-      "input[name*='fecha'], " +
-      "input[id*='range']"
+      "#dashboard-report-range, " +
+      "input#dashboard-report-range, " +
+      "input[type='text'][placeholder*='Rango'], " +
+      "input[type='text'][aria-label*='Rango'], " +
+      "input[type='text'][placeholder*='Fecha'], " +
+      "input[type='text'][aria-label*='Fecha'], " +
+      "input[type='text'][id*='range']"
     );
 
     if (rangeInput) {
-      const sDate = startDate.replace(/-/g, "/");
-      const eDate = endDate.replace(/-/g, "/");
+      const [sy, sm, sd] = startDate.split("-");
+      const [ey, em, ed] = endDate.split("-");
+      const sDate = sy && sm && sd ? `${sy}/${sm}/${sd}` : startDate;
+      const eDate = ey && em && ed ? `${ey}/${em}/${ed}` : endDate;
       const rangoCompleto = `${sDate} - ${eDate}`;
 
-      await rangeInput.click({ clickCount: 3 }); // Seleccionar todo
+      await rangeInput.click({ clickCount: 3 });
       await rangeInput.type(rangoCompleto);
-      await page.keyboard.press("Enter");
       await delay(450);
+
+      // Refuerza los campos que DIAN usa en el POST del formulario.
+      // No forzamos campos ocultos; se respeta el comportamiento UI real de DIAN.
     } else {
       console.log("No se encontró input de rango - continuando sin escribir fechas.");
     }
 
-    // Click en Buscar con manejo de navegacion que puede invalidar el contexto.
-    try {
-      const clickPromise = page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll("button"));
-        const btn = buttons.find((b) => b.textContent?.trim().includes("Buscar"));
-        if (btn) {
-          (btn as HTMLElement).click();
-          return true;
-        }
-        return false;
-      });
-      
-      // Timeout corto para no bloquear si no existe boton compatible.
-      const clicked = await Promise.race([
-        clickPromise,
-        delay(2000).then(() => false)
-      ]);
-      
-      if (clicked) {
-        // La accion puede disparar recarga parcial o completa.
-        await delay(500);
-        await waitForTableLoad(page);
+    if (!triggerSearch) return;
+
+    // Click en Buscar del form documents-form y esperar recarga.
+    const searchButton =
+      (await page.$("form#documents-form button[type='submit']")) ||
+      (await page.$("button.btn.btn-success.btn-radian-success")) ||
+      (await page.$("button[type='submit']"));
+
+    if (searchButton) {
+      try {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => null),
+          searchButton.click(),
+        ]);
+      } catch {
+        // continuar con espera de tabla
       }
-    } catch (navErr: unknown) {
-      // "context was destroyed" es esperado cuando hay navegacion.
-      const errMsg = navErr instanceof Error ? navErr.message : String(navErr);
-      if (errMsg.includes("context was destroyed") || errMsg.includes("navigation")) {
-        console.log("Navegación detectada después de aplicar filtro de fechas - esperando recarga...");
-        await delay(1000);
-        await waitForTableLoad(page);
-      } else {
-        throw navErr;
-      }
+      await delay(500);
+      await waitForTableLoad(page);
     }
   } catch (err) {
     console.error("Error aplicando rango de fechas:", err);
@@ -1072,8 +1081,6 @@ async function extractListingRecordsFromDownloadTab(
     const startedAt = Date.now();
 
     let selectedLink: string | null = null;
-    let latestAvailableLink: string | null = null;
-
     while (Date.now() - startedAt < pollTimeoutMs) {
       const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
         method: "GET",
@@ -1084,10 +1091,6 @@ async function extractListingRecordsFromDownloadTab(
       }).then((r) => r.text());
 
       const links = parseDownloadLinksFromExportHtml(exportHtml);
-      if (links.length > 0) {
-        latestAvailableLink = links[0].href;
-      }
-
       const newlyGenerated = links.find((l) => !existingRks.has(l.rk));
       if (newlyGenerated) {
         selectedLink = newlyGenerated.href;
@@ -1097,13 +1100,8 @@ async function extractListingRecordsFromDownloadTab(
       await delay(pollEveryMs);
     }
 
-    if (!selectedLink && latestAvailableLink) {
-      console.warn("[DIAN Export] No se detectó rk nuevo en 5 min; se usa el más reciente disponible.");
-      selectedLink = latestAvailableLink;
-    }
-
     if (!selectedLink) {
-      throw new Error("No se pudo generar/obtener el listado DIAN dentro del tiempo máximo (5 min)");
+      throw new Error("No se detectó un listado nuevo para el rango solicitado dentro de 5 minutos.");
     }
 
     const downloaded = await fetch(`${baseUrl}${selectedLink}`, {
@@ -1330,8 +1328,8 @@ function findReusableExportLinks(
     const isBothType = typeText.includes("enviados") && typeText.includes("recibidos");
     const typeMatches = isBothType || desiredTypes.some((dt) => typeText.includes(dt));
 
-    // El listado reutilizable debe cubrir por completo el rango solicitado.
-    const rangeMatches = parsedRange.start <= requestedStart && parsedRange.end >= requestedEnd;
+    // Reutilizar solo si el rango del listado coincide exactamente.
+    const rangeMatches = parsedRange.start === requestedStart && parsedRange.end === requestedEnd;
     if (!typeMatches || !rangeMatches) continue;
 
     const hrefMatch = row.match(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/i);
@@ -1370,24 +1368,32 @@ async function findDocumentByUniqueCodeOrDocnum(
   cufe: string,
   docnum: string,
   seenIds: Set<string>,
-  isSentDocuments: boolean
+  isSentDocuments: boolean,
+  startDate?: string,
+  endDate?: string
 ): Promise<DocumentInfo | null> {
   const candidates = [cufe, docnum].filter(Boolean);
   for (const term of candidates) {
     try {
-      // 1) Intentar por campo específico "Código único" y botón Buscar, sin page.evaluate.
+      // 1) Flujo UI directo: mismo rango + Código único + Buscar
+      if (startDate && endDate) {
+        await applyDateFilter(page, startDate, endDate, false);
+      }
+
       const uniqueInputSelectors = [
         "#DocumentKey",
         "input[name='DocumentKey']",
-        "input[name='UniqueCode']",
-        "input[id*='Unique']",
-        "input[id*='Codigo']",
-        "input[id*='Code']",
-        "input[placeholder*='Código']",
-        "input[placeholder*='Codigo']",
-        "input[placeholder*='CUFE']",
       ];
       let searchedByUniqueCode = false;
+
+      // Limpiar filtros que interfieren con la búsqueda por CUFE.
+      try { await page.$eval("#SerieAndNumber", (el) => { (el as HTMLInputElement).value = ""; }); } catch {}
+      try { await page.$eval("#SenderCode", (el) => { (el as HTMLInputElement).value = ""; }); } catch {}
+      try { await page.select("#DocumentTypeId", "00"); } catch {}
+      try { await page.select("#Status", "0"); } catch {}
+      try { await page.select("#RadianStatus", "0"); } catch {}
+      try { await page.select("#ReferencesType", "00"); } catch {}
+
       for (const sel of uniqueInputSelectors) {
         const input = await page.$(sel);
         if (!input) continue;
@@ -1399,9 +1405,11 @@ async function findDocumentByUniqueCodeOrDocnum(
       }
 
       if (searchedByUniqueCode) {
-        const searchButton = await page.$("button[id*='Search'], button[name*='Search']")
-          || await page.$("button.btn.btn-primary")
-          || await page.$("button[type='submit']");
+        const searchButton =
+          (await page.$("form#documents-form button[type='submit']")) ||
+          (await page.$("button.btn.btn-success.btn-radian-success")) ||
+          (await page.$("button[id*='Search'], button[name*='Search']")) ||
+          (await page.$("button[type='submit']"));
         if (searchButton) {
           await searchButton.click();
         } else {
@@ -1420,7 +1428,7 @@ async function findDocumentByUniqueCodeOrDocnum(
         }
       }
 
-      // 2) Fallback: buscador global de DataTables, sin page.evaluate.
+      // 2) Fallback: buscador global de DataTables en la página actual.
       const globalSearch = await page.$("#tableDocuments_filter input, .dataTables_filter input, .dt-search input, input[type='search']");
       if (globalSearch) {
         await globalSearch.click({ clickCount: 3 });
@@ -1446,7 +1454,16 @@ async function findDocumentByUniqueCodeOrDocnum(
 
 async function extractDocsFromCurrentPageHtml(page: Page, seenIds: Set<string>, isSentDocuments: boolean): Promise<DocumentInfo[]> {
   const html = await page.content();
-  const tbodyMatch = html.match(/<tbody>([\s\S]*?)<\/tbody>/i);
+  return extractDocsFromHtml(html, seenIds, isSentDocuments);
+}
+
+function extractDocsFromHtml(html: string, seenIds: Set<string>, isSentDocuments: boolean): DocumentInfo[] {
+  // Tomar exclusivamente la tabla de documentos DIAN para evitar leer tbody
+  // de otros componentes del layout.
+  const tableMatch = html.match(/<table[^>]*id=["']tableDocuments["'][^>]*>([\s\S]*?)<\/table>/i);
+  if (!tableMatch) return [];
+
+  const tbodyMatch = tableMatch[1].match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
   if (!tbodyMatch) return [];
 
   const rows = Array.from(tbodyMatch[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)).map((m) => m[1]);
@@ -1458,7 +1475,10 @@ async function extractDocsFromCurrentPageHtml(page: Page, seenIds: Set<string>, 
     const m1 = row.match(/trackId=([A-Za-z0-9-]+)/i);
     const m2 = row.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
     const m3 = row.match(/data-trackid=['\"]([^'\"]+)['\"]/i);
-    trackId = m1?.[1] || m2?.[1] || m3?.[1] || "";
+    const m4 = row.match(/data-id=['\"]([^'\"]+)['\"]/i);
+    const m5 = row.match(/<button[^>]*\sid=['\"]([^'\"]+)['\"]/i);
+    const m6 = row.match(/<tr[^>]*\sdata-id=['\"]([^'\"]+)['\"]/i);
+    trackId = m1?.[1] || m2?.[1] || m3?.[1] || m4?.[1] || m5?.[1] || m6?.[1] || "";
     if (!trackId || seenIds.has(trackId)) continue;
 
     const cells = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((c) => stripHtml(c[1]));
