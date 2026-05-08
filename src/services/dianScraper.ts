@@ -28,6 +28,10 @@ interface ListingRecord {
   docnum: string;
 }
 
+function normalizeCufe(value: string): string {
+  return (value || "").replace(/[^A-Fa-f0-9]/g, "").trim();
+}
+
 interface ExtractOptions {
   tokenUrl: string;
   startDate?: string;
@@ -241,7 +245,7 @@ export async function extractDocumentIds(
 
         let rescued = 0;
         for (const rec of missing) {
-          const found = await findDocumentByUniqueCodeOrDocnum(page, rec.cufe, rec.docnum, seenIds, isSent, startDate, endDate);
+          const found = await findDocumentByUniqueCodeOrDocnum(page, rec.cufe, rec.docnum, seenIds, isSent);
           if (found) {
             if (!byId.has(found.id)) {
               byId.set(found.id, found);
@@ -340,7 +344,7 @@ export async function extractDocumentIdsByCufe(
 
     updateProgress({ step: "Descargando listado DIAN por CUFE...", current: 0, total: 1 });
     const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
-    const cufes = Array.from(new Set(listedRecords.map((r) => (r.cufe || "").trim().toLowerCase()).filter(Boolean)));
+    const cufes = Array.from(new Set(listedRecords.map((r) => normalizeCufe(r.cufe || "")).filter(Boolean)));
 
     if (cufes.length === 0) {
       throw new Error("No se encontraron CUFEs válidos en Descarga de listados para ese rango.");
@@ -356,59 +360,167 @@ export async function extractDocumentIdsByCufe(
       ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
       : "https://catalogo-vpfe.dian.gov.co/Document/Received";
 
+    const requestedWorkers = Number(process.env.DIAN_CUFE_WORKERS || 4);
+    const workerCount = Math.max(1, Math.min(Number.isFinite(requestedWorkers) ? requestedWorkers : 2, 4));
     updateProgress({ step: `Navegando a documentos ${directionLabel}...`, current: 0, total: cufes.length });
+
+    // Página base (se mantiene para compatibilidad y fallback de cookies).
     await navigateWithRetry(page, documentUrl, 3);
     await delay(600);
-
     if (startDate && endDate) {
       updateProgress({ step: "Aplicando rango de fechas...", current: 0, total: cufes.length });
-      await applyDateFilter(page, startDate, endDate);
+      await applyDateFilter(page, startDate, endDate, false);
     }
-
     await waitForTableLoad(page);
 
-    const cookies = await page.cookies();
-    const cookieMap: Record<string, string> = {};
-    for (const c of cookies) cookieMap[c.name] = c.value;
+    const baseCookies = await page.cookies();
+    const baseCookieMap: Record<string, string> = {};
+    for (const c of baseCookies) baseCookieMap[c.name] = c.value;
 
     const documents: DocumentInfo[] = [];
     const seenIds = new Set<string>();
     let failures = 0;
 
-    for (let i = 0; i < cufes.length; i++) {
-      const cufe = cufes[i];
-      updateProgress({
-        step: `Buscando documento para iniciar descarga (CUFE ${i + 1})...`,
-        current: 0,
-        total: 0,
-      });
+    if (!browser) {
+      throw new Error("No se pudo inicializar el navegador para validación CUFE.");
+    }
+    const activeBrowser = browser;
 
-      try {
-        const found = await findDocumentByUniqueCodeOrDocnum(page, cufe, "", seenIds, isSent, startDate, endDate);
-        if (found?.id) {
-          found.cufe = cufe;
-          documents.push(found);
-          if (onDocumentFound) {
-            await onDocumentFound({
-              doc: found,
-              index: i + 1,
-              total: cufes.length,
-              cookies: cookieMap,
-            });
+    let processed = 0;
+    let nextIndex = 0;
+    let lastProgressAt = 0;
+
+    const workerPages: Page[] = [];
+    const workerCookies: Record<string, string>[] = [];
+
+    const initWorkerPage = async (): Promise<{ page: Page; cookies: Record<string, string> }> => {
+      const wp = await activeBrowser.newPage();
+      await hardenPageRuntime(wp);
+      await wp.setViewport({ width: 1280, height: 800 });
+      wp.setDefaultTimeout(120000);
+      wp.setDefaultNavigationTimeout(120000);
+
+      await navigateWithRetry(wp, tokenUrl, 3);
+      await delay(250);
+      if (isLoginPage(wp.url())) {
+        throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+      }
+
+      await navigateWithRetry(wp, documentUrl, 3);
+      await delay(250);
+      if (startDate && endDate) {
+        // Ajustar rango sin disparar búsqueda aún; cada CUFE ejecuta su propio
+        // submit y evita esperas largas redundantes durante inicialización.
+        await applyDateFilter(wp, startDate, endDate, false);
+      }
+      await waitForTableLoad(wp);
+
+      const wc = await wp.cookies();
+      const wcMap: Record<string, string> = {};
+      for (const c of wc) wcMap[c.name] = c.value;
+
+      return { page: wp, cookies: wcMap };
+    };
+
+    for (let w = 0; w < workerCount; w++) {
+      const worker = await initWorkerPage();
+      workerPages.push(worker.page);
+      workerCookies.push(worker.cookies);
+    }
+
+    console.log(`[DIAN CUFE] Workers activos: ${workerCount}`);
+
+    const runWorker = async (workerIdx: number) => {
+      let wp = workerPages[workerIdx];
+      let wc = workerCookies[workerIdx] || baseCookieMap;
+      let processedByWorker = 0;
+      const recycleEvery = Math.max(50, Number(process.env.DIAN_CUFE_RECYCLE_EVERY || 250));
+
+      while (true) {
+        const i = nextIndex;
+        if (i >= cufes.length) break;
+        nextIndex++;
+
+        const cufe = cufes[i];
+        try {
+          const maxAttempts = 2;
+          let found: DocumentInfo | null = null;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              found = await findDocumentByUniqueCodeOrDocnum(wp, cufe, "", seenIds, isSent);
+              break;
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              const recoverable =
+                msg.includes("detached Frame") ||
+                msg.includes("Execution context was destroyed") ||
+                msg.includes("Target closed") ||
+                msg.includes("Session closed") ||
+                msg.includes("Protocol error");
+
+              if (!recoverable || attempt >= maxAttempts) throw err;
+
+              try { await wp.close(); } catch {}
+              const refreshed = await initWorkerPage();
+              wp = refreshed.page;
+              wc = refreshed.cookies;
+              workerPages[workerIdx] = wp;
+              workerCookies[workerIdx] = wc;
+            }
           }
-        } else {
+
+          if (found?.id) {
+            found.cufe = cufe;
+            documents.push(found);
+            if (onDocumentFound) {
+              await onDocumentFound({
+                doc: found,
+                index: i + 1,
+                total: cufes.length,
+                cookies: wc,
+              });
+            }
+          } else {
+            failures++;
+            if (failures <= 10) {
+              console.warn(`[DIAN CUFE] Sin resultado para CUFE ${cufe.slice(0, 16)}...`);
+            }
+          }
+        } catch (err) {
           failures++;
           if (failures <= 10) {
-            console.warn(`[DIAN CUFE] Sin resultado para CUFE ${cufe.slice(0, 16)}...`);
+            console.warn(`[DIAN CUFE] Error consultando CUFE ${cufe.slice(0, 16)}...`, err);
+          }
+        } finally {
+          processed++;
+          processedByWorker++;
+
+          const now = Date.now();
+          const shouldFlushProgress =
+            processed === cufes.length || now - lastProgressAt >= 400 || processed % 10 === 0;
+          if (shouldFlushProgress) {
+            lastProgressAt = now;
+            updateProgress({
+              step: `Validando CUFEs (${processed}/${cufes.length})...`,
+              current: processed,
+              total: cufes.length,
+            });
+          }
+
+          if (processedByWorker > 0 && processedByWorker % recycleEvery === 0) {
+            try { await wp.close(); } catch {}
+            const refreshed = await initWorkerPage();
+            wp = refreshed.page;
+            wc = refreshed.cookies;
+            workerPages[workerIdx] = wp;
+            workerCookies[workerIdx] = wc;
           }
         }
-      } catch (err) {
-        failures++;
-        if (failures <= 10) {
-          console.warn(`[DIAN CUFE] Error consultando CUFE ${cufe.slice(0, 16)}...`, err);
-        }
       }
-    }
+    };
+
+    await Promise.all(workerPages.map((_, idx) => runWorker(idx)));
+    await Promise.all(workerPages.map(async (wp) => { try { await wp.close(); } catch {} }));
 
     const finalDocuments = documents;
 
@@ -432,7 +544,7 @@ export async function extractDocumentIdsByCufe(
       total: 0,
     });
 
-    return { documents: finalDocuments, cookies: cookieMap };
+    return { documents: finalDocuments, cookies: baseCookieMap };
   } finally {
     if (browser) await browser.close();
   }
@@ -485,7 +597,7 @@ export async function runDianExtractionPrecheck(
       await waitForFullTableLoad(page, 100);
 
       const sample = listedRecords[0];
-      const found = await findDocumentByUniqueCodeOrDocnum(page, sample.cufe, sample.docnum, new Set<string>(), isSent, startDate, endDate);
+      const found = await findDocumentByUniqueCodeOrDocnum(page, sample.cufe, sample.docnum, new Set<string>(), isSent);
       if (!found?.id) {
         throw new Error(`no se pudo ubicar muestra ${sample.docnum} por CUFE/Folio`);
       }
@@ -801,7 +913,12 @@ function shouldIgnoreDocType(docType: string, isSentDocuments: boolean = false):
   return false;
 }
 
-async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocuments: boolean = false): Promise<DocumentInfo[]> {
+async function extractDocsFromPage(
+  page: Page,
+  seenIds: Set<string>,
+  isSentDocuments: boolean = false,
+  ignoreDocTypeFilter: boolean = true
+): Promise<DocumentInfo[]> {
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate((isSentDocumentsInPage) => {
@@ -851,10 +968,10 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
         
         if (!trackId) {
           const href = String(el.getAttribute("href") || "");
-          const direct = href.match(/trackId=([A-Za-z0-9-]+)/i);
+          const direct = href.match(/trackId=([^&'"\s]+)/i);
           if (direct) trackId = direct[1];
           if (!trackId) {
-            const quoted = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+            const quoted = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
             if (quoted) trackId = quoted[1];
           }
           if (!trackId) {
@@ -864,10 +981,10 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
         }
         if (!trackId) {
           const onclick = String(el.getAttribute("onclick") || "");
-          const direct = onclick.match(/trackId=([A-Za-z0-9-]+)/i);
+          const direct = onclick.match(/trackId=([^&'"\s]+)/i);
           if (direct) trackId = direct[1];
           if (!trackId) {
-            const quoted = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+            const quoted = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
             if (quoted) trackId = quoted[1];
           }
           if (!trackId) {
@@ -901,10 +1018,10 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
         const links = row.querySelectorAll("a[href]");
         for (const link of links) {
           const href = String(link.getAttribute("href") || "");
-          const directHref = href.match(/trackId=([A-Za-z0-9-]+)/i);
+          const directHref = href.match(/trackId=([^&'"\s]+)/i);
           if (directHref) trackId = directHref[1];
           if (!trackId) {
-            const quotedHref = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+            const quotedHref = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
             if (quotedHref) trackId = quotedHref[1];
           }
           if (!trackId) {
@@ -914,10 +1031,10 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
 
           if (!trackId) {
             const onclick = String(link.getAttribute("onclick") || "");
-            const directOnclick = onclick.match(/trackId=([A-Za-z0-9-]+)/i);
+            const directOnclick = onclick.match(/trackId=([^&'"\s]+)/i);
             if (directOnclick) trackId = directOnclick[1];
             if (!trackId) {
-              const quotedOnclick = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+              const quotedOnclick = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
               if (quotedOnclick) trackId = quotedOnclick[1];
             }
             if (!trackId) {
@@ -932,10 +1049,10 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
       // Metodo 5: fallback sobre HTML completo de la fila
       if (!trackId) {
         const raw = String((row as HTMLElement).outerHTML || "");
-        const direct = raw.match(/trackId=([A-Za-z0-9-]+)/i);
+        const direct = raw.match(/trackId=([^&'"\s]+)/i);
         if (direct) trackId = direct[1];
         if (!trackId) {
-          const quoted = raw.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+          const quoted = raw.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
           if (quoted) trackId = quoted[1];
         }
         if (!trackId) {
@@ -959,7 +1076,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
         tds[fallbackNitIndex]?.textContent?.trim() ||
         "";
 
-      const cufe = (tds[13]?.textContent?.trim() || tds[12]?.textContent?.trim() || "").toLowerCase();
+      const cufe = tds[13]?.textContent?.trim() || tds[12]?.textContent?.trim() || "";
 
       results.push({ id: trackId, docnum, nit, cufe, docType, documentTypeId, fechaValidacion, fechaGeneracion });
     }
@@ -971,8 +1088,8 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
   
   for (const item of items) {
     if (!seenIds.has(item.id)) {
-      // Filtrar Application Response y otros tipos no relevantes
-      if (shouldIgnoreDocType(item.docType, isSentDocuments)) {
+      // Filtrar tipos no relevantes solo cuando se solicita explícitamente.
+      if (ignoreDocTypeFilter && shouldIgnoreDocType(item.docType, isSentDocuments)) {
         skippedCount++;
         continue;
       }
@@ -991,7 +1108,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
     }
   }
   
-  if (skippedCount > 0) {
+  if (ignoreDocTypeFilter && skippedCount > 0) {
     console.log(`  -> Omitidos ${skippedCount} documentos tipo "Application Response"`);
   }
 
@@ -1034,6 +1151,7 @@ async function extractListingRecordsFromDownloadTab(
           const zipBuffer = Buffer.from(new Uint8Array(downloaded));
           const reusedRecords = await parseListingRecordsFromExportZip(zipBuffer, direction);
           if (reusedRecords.length > 0) {
+            console.log(`[DIAN Export] Reutilizado OK #${i + 1}: ${reusedRecords.length} CUFEs (${direction}).`);
             return reusedRecords;
           }
 
@@ -1111,7 +1229,11 @@ async function extractListingRecordsFromDownloadTab(
     const zipBuffer = Buffer.from(new Uint8Array(downloaded));
 
     return await parseListingRecordsFromExportZip(zipBuffer, direction);
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("TOKEN_EXPIRED")) {
+      throw err;
+    }
     return [];
   }
 }
@@ -1166,34 +1288,36 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
 
   const headers = rows[0].map((h) => h.trim().toLowerCase());
   const cufeIdx = headers.findIndex((h) => h.includes("cufe") || h.includes("cude") || h.includes("código único") || h.includes("codigo unico"));
-  const folioIdx = headers.findIndex((h) => h === "folio" || h.includes("número") || h.includes("numero") || h.includes("documento"));
+  const folioIdx = headers.findIndex((h) => h === "folio");
   const groupIdx = headers.findIndex((h) => h === "grupo");
 
+  if (cufeIdx < 0 || folioIdx < 0) {
+    console.warn("[DIAN Export] Encabezados esperados no encontrados", {
+      cufeIdx,
+      folioIdx,
+      headers: rows[0],
+    });
+    return [];
+  }
+
   const out: ListingRecord[] = [];
+
+  const expectedGroupText = direction === "sent" ? "emitid" : "recibid";
 
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
     const group = (groupIdx >= 0 ? row[groupIdx] : "").toLowerCase();
 
-    const fallbackCufe = row.find((v) => /^[a-fA-F0-9]{64,96}$/.test((v || "").trim()));
-    const cufe = ((cufeIdx >= 0 ? row[cufeIdx] : fallbackCufe) || "").trim().toLowerCase();
+    // Si viene grupo, filtrar estrictamente por dirección solicitada.
+    if (group && !group.includes(expectedGroupText)) continue;
 
-    let docnum = (folioIdx >= 0 ? row[folioIdx] : "").trim();
-    if (!docnum) {
-      const fallbackDocnum = row.find((v) => /^\d{1,20}$/.test((v || "").trim()));
-      docnum = (fallbackDocnum || "").trim();
-    }
+    const cufe = normalizeCufe(row[cufeIdx] || "");
+
+    const docnum = (folioIdx >= 0 ? row[folioIdx] : "").trim();
 
     if (!cufe) continue;
     if (!docnum) continue;
 
-    // DIAN a veces devuelve listados con "Enviados y Recibidos" aun cuando
-    // se solicitó un GroupCode específico. No descartamos por grupo para
-    // evitar falsos vacíos; el filtro real lo hace la búsqueda por CUFE en la
-    // bandeja objetivo (recibidos o enviados).
-    if (groupIdx >= 0 && !group) {
-      // sin-op: conservar registro
-    }
     out.push({ cufe, docnum });
   }
 
@@ -1307,7 +1431,7 @@ function findReusableExportLinks(
   const requestedEnd = parseIsoDate(endDate);
   if (!requestedStart || !requestedEnd) return [];
 
-  const desiredTypes = direction === "sent" ? ["enviados", "emitidos"] : ["recibidos"];
+    const desiredTypes = direction === "sent" ? ["enviados", "emitidos"] : ["recibidos"];
 
   const tbodyMatch = html.match(/<table[^>]*id="tableExport"[\s\S]*?<tbody>([\s\S]*?)<\/tbody>/i);
   if (!tbodyMatch) return [];
@@ -1324,7 +1448,8 @@ function findReusableExportLinks(
     const parsedRange = parseExportRange(rangeText);
     if (!parsedRange) continue;
 
-    // "Enviados y Recibidos" sirve para ambos sentidos.
+    // "Enviados y Recibidos" se puede reutilizar siempre que luego se filtre
+    // por columna "Grupo" en el parser del XLSX según dirección solicitada.
     const isBothType = typeText.includes("enviados") && typeText.includes("recibidos");
     const typeMatches = isBothType || desiredTypes.some((dt) => typeText.includes(dt));
 
@@ -1337,6 +1462,8 @@ function findReusableExportLinks(
     matches.push(hrefMatch[1].replace(/&amp;/g, "&"));
   }
 
+  // La tabla de export normalmente lista más nuevo primero; priorizar ese orden
+  // mantiene el comportamiento manual (tomar la primera fila visible que coincide).
   return matches;
 }
 
@@ -1363,22 +1490,20 @@ function toDianDisplayDate(dateISO: string): string {
 function stripHtml(raw: string): string {
   return raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 }
+
 async function findDocumentByUniqueCodeOrDocnum(
   page: Page,
   cufe: string,
   docnum: string,
   seenIds: Set<string>,
   isSentDocuments: boolean,
-  startDate?: string,
-  endDate?: string
+  searchTriggeredByCaller: boolean = false
 ): Promise<DocumentInfo | null> {
-  const candidates = [cufe, docnum].filter(Boolean);
+  const candidates = [cufe].filter(Boolean);
   for (const term of candidates) {
     try {
-      // 1) Flujo UI directo: mismo rango + Código único + Buscar
-      if (startDate && endDate) {
-        await applyDateFilter(page, startDate, endDate, false);
-      }
+      // 1) Flujo UI directo igual al manual: Código único + Buscar.
+      // No tocar otros filtros para no alterar el estado de la búsqueda.
 
       const uniqueInputSelectors = [
         "#DocumentKey",
@@ -1386,66 +1511,152 @@ async function findDocumentByUniqueCodeOrDocnum(
       ];
       let searchedByUniqueCode = false;
 
-      // Limpiar filtros que interfieren con la búsqueda por CUFE.
-      try { await page.$eval("#SerieAndNumber", (el) => { (el as HTMLInputElement).value = ""; }); } catch {}
-      try { await page.$eval("#SenderCode", (el) => { (el as HTMLInputElement).value = ""; }); } catch {}
-      try { await page.select("#DocumentTypeId", "00"); } catch {}
-      try { await page.select("#Status", "0"); } catch {}
-      try { await page.select("#RadianStatus", "0"); } catch {}
-      try { await page.select("#ReferencesType", "00"); } catch {}
-
       for (const sel of uniqueInputSelectors) {
         const input = await page.$(sel);
         if (!input) continue;
-        await input.click({ clickCount: 3 });
-        await page.keyboard.press("Backspace");
-        await input.type(term);
+
+        // Escritura robusta del CUFE sin depender de eventos de teclado/click
+        // (reduce timeouts Runtime.callFunctionOn en cargas altas).
+        await page.$eval(sel, (el, value) => {
+          const i = el as HTMLInputElement;
+          i.value = String(value || "");
+          i.dispatchEvent(new Event("input", { bubbles: true }));
+          i.dispatchEvent(new Event("change", { bubbles: true }));
+        }, term);
+
+        const inputValue = await page.$eval(sel, (el) => (el as HTMLInputElement).value || "");
+        if (normalizeCufe(inputValue) !== normalizeCufe(term)) {
+          console.warn("[DIAN CUFE] El campo Código único no conservó el valor esperado", {
+            expected: normalizeCufe(term).slice(0, 16),
+            actual: normalizeCufe(inputValue).slice(0, 16),
+          });
+        }
+
         searchedByUniqueCode = true;
         break;
       }
 
-      if (searchedByUniqueCode) {
-        const searchButton =
-          (await page.$("form#documents-form button[type='submit']")) ||
-          (await page.$("button.btn.btn-success.btn-radian-success")) ||
-          (await page.$("button[id*='Search'], button[name*='Search']")) ||
-          (await page.$("button[type='submit']"));
-        if (searchButton) {
-          await searchButton.click();
-        } else {
-          await page.keyboard.press("Enter");
+      if (searchedByUniqueCode && !searchTriggeredByCaller) {
+        const submitted = await page.evaluate(() => {
+          const form = document.querySelector("form#documents-form") as HTMLFormElement | null;
+          if (!form) return false;
+          if (typeof form.requestSubmit === "function") {
+            form.requestSubmit();
+            return true;
+          }
+          form.submit();
+          return true;
+        }).catch(() => false);
+
+        if (!submitted) {
+          const searchButton =
+            (await page.$("form#documents-form button.btn.btn-success.btn-radian-success")) ||
+            (await page.$("form#documents-form button[type='submit']")) ||
+            (await page.$("button.btn.btn-success.btn-radian-success")) ||
+            (await page.$("button[type='submit']"));
+          if (searchButton) {
+            await searchButton.click();
+          } else {
+            await page.keyboard.press("Enter");
+          }
         }
       }
 
       if (searchedByUniqueCode) {
-        await delay(900);
+        await delay(80);
         await waitForTableLoad(page);
 
-        const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, seenIds, isSentDocuments);
+        // Usar un set temporal en búsqueda puntual para no descartar un resultado
+        // válido por deduplicación previa de otro CUFE.
+        const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, new Set<string>(), isSentDocuments);
         if (foundByUniqueCode.length > 0) {
-          const exact = foundByUniqueCode.find((d) => (docnum && d.docnum === docnum) || (cufe && d.cufe === cufe));
-          return exact || foundByUniqueCode[0];
+          const exact = foundByUniqueCode.find((d) =>
+            (docnum && d.docnum === docnum) ||
+            (cufe && normalizeCufe(d.cufe || "") === normalizeCufe(cufe))
+          );
+          const selected = exact || foundByUniqueCode[0];
+          if (!seenIds.has(selected.id)) seenIds.add(selected.id);
+          return selected;
+        }
+
+        const visibleRows = await page.evaluate(() =>
+          document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)").length
+        );
+        if (visibleRows > 0) {
+          // Fallback ultra directo: tomar la primera fila visible exactamente
+          // como en uso manual (si hay una fila, descargar esa).
+          const firstRowDoc = await page.evaluate((isSentDocumentsInPage) => {
+            const row = document.querySelector("#tableDocuments tbody tr:not(.dataTables_empty)") as HTMLTableRowElement | null;
+            if (!row) return null;
+
+            let trackId = "";
+            const pickFrom = row.querySelectorAll(
+              ".download-document, .download-support-document, .download-eventos, .download-equivalente-document, .download-individual-payroll, [data-trackid], [data-id], [id], a[href*='trackId'], a[href*='DownloadZipFiles'], [onclick*='DownloadZipFiles'], [onclick*='trackId']"
+            );
+
+            for (const el of pickFrom) {
+              const id = (el as HTMLElement).id || "";
+              const d1 = el.getAttribute("data-trackid") || "";
+              const d2 = el.getAttribute("data-id") || "";
+              const href = el.getAttribute("href") || "";
+              const onclick = el.getAttribute("onclick") || "";
+              const m1 = href.match(/trackId=([^&'"\s]+)/i);
+              const m2 = onclick.match(/trackId=([^&'"\s]+)/i);
+              const m3 = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+              const m4 = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+              trackId = id || d1 || d2 || m1?.[1] || m2?.[1] || m3?.[1] || m4?.[1] || "";
+              if (trackId) break;
+            }
+
+            if (!trackId) {
+              trackId = row.getAttribute("data-id") || row.getAttribute("data-trackid") || row.id || "";
+            }
+            if (!trackId) return null;
+
+            const tds = row.querySelectorAll("td");
+            const docnum = tds[4]?.textContent?.trim() || "";
+            const docType = tds[5]?.textContent?.trim() || "";
+            const nit = isSentDocumentsInPage
+              ? (tds[8]?.textContent?.trim() || tds[6]?.textContent?.trim() || "")
+              : (tds[6]?.textContent?.trim() || tds[8]?.textContent?.trim() || "");
+            const cufeValue = tds[13]?.textContent?.trim() || tds[12]?.textContent?.trim() || "";
+
+            return { id: trackId, docnum, nit, cufe: cufeValue, docType };
+          }, isSentDocuments);
+
+          if (firstRowDoc?.id) {
+            if (!seenIds.has(firstRowDoc.id)) seenIds.add(firstRowDoc.id);
+            return firstRowDoc;
+          }
+
+          // Fallback final: en muchos casos DIAN usa el CUFE como trackId del botón.
+          // Si hay fila visible y no se pudo extraer id por DOM, continuar con CUFE
+          // como identificador para no perder el documento.
+          const docnumFromFirstRow = await page.evaluate(() => {
+            const row = document.querySelector("#tableDocuments tbody tr:not(.dataTables_empty)") as HTMLTableRowElement | null;
+            if (!row) return "";
+            const tds = row.querySelectorAll("td");
+            return tds[4]?.textContent?.trim() || "";
+          });
+
+          const cufeAsId = normalizeCufe(cufe || "");
+          if (cufeAsId) {
+            if (!seenIds.has(cufeAsId)) seenIds.add(cufeAsId);
+            return {
+              id: cufeAsId,
+              docnum: docnumFromFirstRow,
+              nit: "",
+              cufe,
+              docType: "",
+            };
+          }
+
+          throw new Error(`Resultado visible sin trackId extraíble para CUFE ${cufe.slice(0, 16)}...`);
         }
       }
-
-      // 2) Fallback: buscador global de DataTables en la página actual.
-      const globalSearch = await page.$("#tableDocuments_filter input, .dataTables_filter input, .dt-search input, input[type='search']");
-      if (globalSearch) {
-        await globalSearch.click({ clickCount: 3 });
-        await page.keyboard.press("Backspace");
-        await globalSearch.type(term);
-      }
-
-      await delay(900);
-      await waitForTableLoad(page);
-
-      const found = await extractDocsFromCurrentPageHtml(page, seenIds, isSentDocuments);
-      if (found.length > 0) {
-        const exact = found.find((d) => (docnum && d.docnum === docnum) || (cufe && d.cufe === cufe));
-        return exact || found[0];
-      }
-    } catch {
-      // continuar con siguiente candidato
+    } catch (err) {
+      // Propagar para no ocultar errores técnicos de extracción/estado.
+      throw err;
     }
   }
 
@@ -1453,8 +1664,9 @@ async function findDocumentByUniqueCodeOrDocnum(
 }
 
 async function extractDocsFromCurrentPageHtml(page: Page, seenIds: Set<string>, isSentDocuments: boolean): Promise<DocumentInfo[]> {
-  const html = await page.content();
-  return extractDocsFromHtml(html, seenIds, isSentDocuments);
+  // Reusar el extractor DOM principal (más robusto para trackId y variantes de botones)
+  // también en búsqueda CUFE puntual.
+  return extractDocsFromPage(page, seenIds, isSentDocuments, false);
 }
 
 function extractDocsFromHtml(html: string, seenIds: Set<string>, isSentDocuments: boolean): DocumentInfo[] {
@@ -1472,8 +1684,8 @@ function extractDocsFromHtml(html: string, seenIds: Set<string>, isSentDocuments
   for (const row of rows) {
     if (/dataTables_empty/i.test(row)) continue;
     let trackId = "";
-    const m1 = row.match(/trackId=([A-Za-z0-9-]+)/i);
-    const m2 = row.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
+    const m1 = row.match(/trackId=([^&'"\s]+)/i);
+    const m2 = row.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
     const m3 = row.match(/data-trackid=['\"]([^'\"]+)['\"]/i);
     const m4 = row.match(/data-id=['\"]([^'\"]+)['\"]/i);
     const m5 = row.match(/<button[^>]*\sid=['\"]([^'\"]+)['\"]/i);
@@ -1485,7 +1697,7 @@ function extractDocsFromHtml(html: string, seenIds: Set<string>, isSentDocuments
     const docnum = cells[4] || "";
     const docType = cells[5] || "";
     const nit = isSentDocuments ? (cells[8] || cells[6] || "") : (cells[6] || cells[8] || "");
-    const cufe = (cells[13] || cells[12] || "").toLowerCase();
+    const cufe = cells[13] || cells[12] || "";
 
     if (shouldIgnoreDocType(docType, isSentDocuments)) continue;
     seenIds.add(trackId);
@@ -1666,6 +1878,24 @@ async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3
       
       // Espera adicional para que scripts asíncronos carguen
       await delay(1500);
+
+      const currentUrl = page.url();
+      if (isLoginPage(currentUrl)) {
+        const tokenExpiredError = new Error(
+          "TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN."
+        );
+
+        // Regla operativa solicitada: si al segundo intento redirige a User/Login,
+        // informar expiración de token de inmediato.
+        if (attempt >= 2) {
+          throw tokenExpiredError;
+        }
+
+        lastError = tokenExpiredError;
+        console.log(`Redirección a login detectada en intento ${attempt}, reintentando...`);
+        await delay(1200);
+        continue;
+      }
       
       console.log(`Navegación exitosa en intento ${attempt}`);
       return;

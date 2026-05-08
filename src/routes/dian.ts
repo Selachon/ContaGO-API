@@ -441,9 +441,83 @@ async function processDownloadJob(
     setProgress(jobId, { step: `Prevalidando documentos ${directionLabel}...`, current: 0, total: 1 });
     await runDianExtractionPrecheck(token_url, start_date, end_date, documentDirection, jobId);
 
-    // Paso 2: obtener ids y cookies de sesion DIAN.
-    setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
-    const { documents, cookies } = await extractDocumentIdsByCufe(token_url, start_date, end_date, jobId, documentDirection);
+    // Paso 2: obtener id por CUFE y descargar de inmediato 1 a 1.
+    setProgress(jobId, { step: `Obteniendo listado DIAN ${directionLabel}...`, current: 0, total: 1 });
+
+    // Carpeta temporal por job para aislar artefactos.
+    fs.mkdirSync(tempDir, { recursive: true });
+
+    const usedNames = new Set<string>();
+    let successCount = 0;
+    let errorCount = 0;
+    const downloadWorkers = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 4), 6));
+    const activeDownloads = new Set<Promise<void>>();
+
+    const baseUrlNormal = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
+    const baseUrlEquivalente = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId=";
+
+    const { documents } = await extractDocumentIdsByCufe(
+      token_url,
+      start_date,
+      end_date,
+      jobId,
+      documentDirection,
+      (p) => setProgress(jobId, {
+        step: p.step || `Validando CUFEs (0/0)...`,
+        current: p.current ?? 0,
+        total: p.total ?? 0,
+      }),
+      async ({ doc, index, total, cookies }) => {
+        if (isJobCancelled(jobId)) return;
+
+        const task = (async () => {
+          const docId = doc.id;
+          const left = sanitizeFilename(doc.nit) || "SinNIT";
+          const right = sanitizeFilename(doc.docnum) || docId;
+          let filename = `${left} - ${right}.zip`;
+          if (usedNames.has(filename)) {
+            filename = `${left} - ${right} (${docId.slice(0, 8)}).zip`;
+          }
+          usedNames.add(filename);
+          const destPath = path.join(tempDir, filename);
+
+          setProgress(jobId, {
+            step: `Descargando factura ${index} de ${total}...`,
+            current: index,
+            total,
+          });
+
+          try {
+            let downloadUrl: string;
+            const isEquivalente = doc.documentTypeId === "20" ||
+              doc.docType?.toLowerCase().includes("equivalente") ||
+              doc.docType?.toLowerCase().includes("pos");
+
+            if (isEquivalente && doc.fechaValidacion && doc.fechaGeneracion) {
+              downloadUrl = `${baseUrlEquivalente}${docId}&documentTypeId=${doc.documentTypeId || "20"}&FechaValidacionDIAN=${doc.fechaValidacion}&FechaGeneracionDIAN=${doc.fechaGeneracion}`;
+            } else {
+              downloadUrl = `${baseUrlNormal}${docId}`;
+            }
+
+            await downloadFile(downloadUrl, destPath, cookies);
+            successCount++;
+          } catch (err) {
+            errorCount++;
+            console.error(`[${jobId}] Error descargando ${docId}:`, err);
+          }
+        })();
+
+        activeDownloads.add(task);
+        task.finally(() => activeDownloads.delete(task));
+        if (activeDownloads.size >= downloadWorkers) {
+          await Promise.race(activeDownloads);
+        }
+      }
+    );
+
+    if (activeDownloads.size > 0) {
+      await Promise.all(activeDownloads);
+    }
 
     // Checkpoint tras la operacion mas costosa del scraper.
     if (isJobCancelled(jobId)) {
@@ -466,73 +540,6 @@ async function processDownloadJob(
     }
 
     const totalDocs = documents.length;
-    setProgress(jobId, { step: "Iniciando descargas...", current: 0, total: totalDocs });
-
-    // Carpeta temporal por job para aislar artefactos.
-    fs.mkdirSync(tempDir, { recursive: true });
-
-    // URLs base para diferentes tipos de documentos DIAN
-    const baseUrlNormal = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
-    const baseUrlEquivalente = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId=";
-    
-    const usedNames = new Set<string>();
-    let successCount = 0;
-    let errorCount = 0;
-
-    for (let i = 0; i < documents.length; i++) {
-      // Checkpoint por iteracion para cancelacion reactiva.
-      if (isJobCancelled(jobId)) {
-        console.log(`[${jobId}] Job cancelado durante descarga (${i}/${totalDocs})`);
-        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
-        return;
-      }
-
-      const doc = documents[i];
-      const docId = doc.id;
-
-      const left = sanitizeFilename(doc.nit) || "SinNIT";
-      const right = sanitizeFilename(doc.docnum) || docId;
-      let filename = `${left} - ${right}.zip`;
-
-      if (usedNames.has(filename)) {
-        filename = `${left} - ${right} (${docId.slice(0, 8)}).zip`;
-      }
-      usedNames.add(filename);
-
-      const destPath = path.join(tempDir, filename);
-
-      try {
-        setProgress(jobId, {
-          step: `Descargando ${i + 1} de ${totalDocs}`,
-          current: i + 1,
-          total: totalDocs,
-        });
-
-        // Construir URL según tipo de documento
-        let downloadUrl: string;
-        const isEquivalente = doc.documentTypeId === "20" || 
-                              doc.docType?.toLowerCase().includes("equivalente") ||
-                              doc.docType?.toLowerCase().includes("pos");
-        
-        if (isEquivalente && doc.fechaValidacion && doc.fechaGeneracion) {
-          // Documentos equivalentes POS requieren endpoint especial con fechas
-          downloadUrl = `${baseUrlEquivalente}${docId}&documentTypeId=${doc.documentTypeId || "20"}&FechaValidacionDIAN=${doc.fechaValidacion}&FechaGeneracionDIAN=${doc.fechaGeneracion}`;
-          console.log(`[${jobId}] Descargando doc ${i + 1}/${totalDocs} (equivalente): id=${docId.slice(0, 16)}..., tipo=${doc.docType}`);
-        } else {
-          // Facturas electrónicas normales
-          downloadUrl = `${baseUrlNormal}${docId}`;
-          console.log(`[${jobId}] Descargando doc ${i + 1}/${totalDocs}: id=${docId.slice(0, 16)}..., tipo=${doc.docType}`);
-        }
-        
-        await downloadFile(downloadUrl, destPath, cookies);
-        successCount++;
-        console.log(`[${jobId}] Descargado ${i + 1}/${totalDocs}: ${filename}`);
-      } catch (err) {
-        errorCount++;
-        console.error(`[${jobId}] Error descargando ${docId}:`, err);
-        // Se registra error y se continua con el resto del lote.
-      }
-    }
 
     // Evita trabajo adicional si el usuario cancelo al final de la descarga.
     if (isJobCancelled(jobId)) {

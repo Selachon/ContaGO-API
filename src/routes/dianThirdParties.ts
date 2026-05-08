@@ -113,7 +113,18 @@ async function processJob(
   job.status = "processing";
 
   await runDianExtractionPrecheck(tokenUrl, startDate, endDate, direction, jobId);
-  const { documents, cookies } = await extractDocumentIdsByCufe(tokenUrl, startDate, endDate, jobId, direction);
+  const { documents, cookies } = await extractDocumentIdsByCufe(
+    tokenUrl,
+    startDate,
+    endDate,
+    jobId,
+    direction,
+    (p) => setProgress(jobId, {
+      step: p.step,
+      current: p.current,
+      total: p.total,
+    })
+  );
   if (!documents.length) throw new Error("No se encontraron documentos en el rango seleccionado");
   setProgress(jobId, { step: "Procesando documentos...", current: 0, total: documents.length });
 

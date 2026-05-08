@@ -179,6 +179,15 @@ function patchSheet2HeaderWithIcl(sheetXml: string): string {
     );
 }
 
+function nextRelationshipId(relsXml: string): number {
+  let maxId = 0;
+  for (const m of relsXml.matchAll(/Id="rId(\d+)"/g)) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > maxId) maxId = n;
+  }
+  return maxId + 1;
+}
+
 // Style indices added to styles.xml (appended after the 7 existing xfs, indices 0-6)
 const STYLE_CURRENCY = 7; // numFmtId 164 → #,##0.00
 const STYLE_PERCENT = 8;  // numFmtId 165 → 0.00"%"
@@ -237,13 +246,20 @@ export async function generateExcelFile(
   let sheet1Rows: string[] = [];
   let sheet1DriveRels: Array<{ id: string; url: string }> = [];
   let sheet1Hyperlinks: string[] = [];
-  let rIdCounter = 2; // rId1 is already used by the table relationship
+  let baseSheet1Rels = await zip.file("xl/worksheets/_rels/sheet1.xml.rels")?.async("string");
+  if (!baseSheet1Rels) {
+    baseSheet1Rels =
+      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>';
+  }
+  let rIdCounter = nextRelationshipId(baseSheet1Rels);
 
   const docNumberToRow = new Map<string, number>();
 
   sorted.forEach((inv, idx) => {
     const rowNum = 3 + idx;
-    docNumberToRow.set(inv.docNumber, rowNum);
+    const rowDocNumber = (inv.docNumber || inv.trackId || "N/A").trim();
+    docNumberToRow.set(rowDocNumber, rowNum);
 
     const partyNit = isSentDocuments ? inv.receiverNit : inv.issuerNit;
     const partyName = isSentDocuments ? inv.receiverName : inv.issuerName;
@@ -254,7 +270,7 @@ export async function generateExcelFile(
     let c = "";
     c += numCell(`A${rowNum}`, idx + 1);
     c += txtCell(`B${rowNum}`, inv.documentType);
-    c += txtCell(`C${rowNum}`, inv.docNumber);
+    c += txtCell(`C${rowNum}`, rowDocNumber);
     c += txtCell(`D${rowNum}`, partyNit);
     c += txtCell(`E${rowNum}`, partyName);
     c += txtCell(`F${rowNum}`, inv.issueDate);
@@ -301,7 +317,7 @@ export async function generateExcelFile(
   zip.file("xl/worksheets/sheet1.xml", sheet1Xml);
 
   if (sheet1DriveRels.length > 0) {
-    let rels1 = await zip.file("xl/worksheets/_rels/sheet1.xml.rels")!.async("string");
+    let rels1 = baseSheet1Rels;
     const newRels = sheet1DriveRels
       .map(
         (r) =>
@@ -323,21 +339,22 @@ export async function generateExcelFile(
   let detRow = 3;
 
   for (const inv of sorted) {
-    const mainRow = docNumberToRow.get(inv.docNumber) || 3;
+    const invDocNumber = (inv.docNumber || inv.trackId || "N/A").trim();
+    const mainRow = docNumberToRow.get(invDocNumber) || 3;
     for (const li of inv.lineItems || []) {
       const rowNum = detRow++;
       const td: Record<string, { amount: number; percent: number }> = {};
       for (const t of li.taxes || []) if (t.taxName) td[t.taxName] = { amount: t.amount, percent: t.percent };
 
       sheet2Hyperlinks.push(
-        `<hyperlink ref="B${rowNum}" location="'Facturas DIAN'!C${mainRow}" display="${xmlEsc(inv.docNumber)}"/>`
+        `<hyperlink ref="B${rowNum}" location="'Facturas DIAN'!C${mainRow}" display="${xmlEsc(invDocNumber)}"/>`
       );
 
       const totalTax = (li.taxes || []).reduce((s, t) => s + t.amount, 0);
 
       let c = "";
       c += numCell(`A${rowNum}`, li.lineNumber);
-      c += txtCell(`B${rowNum}`, inv.docNumber);
+      c += txtCell(`B${rowNum}`, invDocNumber);
       c += txtCell(`C${rowNum}`, li.description);
       c += numCell(`D${rowNum}`, li.quantity);
       c += numCell(`E${rowNum}`, li.totalUnitPrice, STYLE_CURRENCY);

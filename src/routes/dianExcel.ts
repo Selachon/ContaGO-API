@@ -419,12 +419,6 @@ async function processExcelJob(
     job.documentsFoundAt = Date.now();
     const totalBatches = Math.ceil(totalDocs / BATCH_SIZE);
     console.log(`[Excel] Job ${jobId}: ${totalDocs} documentos en ${totalBatches} tandas de ${BATCH_SIZE}`);
-    
-    setProgress(jobId, { 
-      step: `${totalDocs} documentos encontrados. Iniciando descarga...`, 
-      current: 0, 
-      total: totalDocs 
-    });
 
     fs.mkdirSync(tempDir, { recursive: true });
     const stagingFilePath = path.join(tempDir, "invoices-staging.jsonl");
@@ -467,8 +461,9 @@ async function processExcelJob(
 
     // 3) Procesar cada documento de forma independiente, en tandas.
     job.downloadStartedAt = Date.now();
-    console.log(`[Excel] Job ${jobId}: checkpoint descargas iniciadas`);
-    setProgress(jobId, { step: "Iniciando descargas...", current: 0, total: totalDocs });
+    const validationSeconds = Math.max(0, Math.round((job.downloadStartedAt - (job.startedAt || job.downloadStartedAt)) / 1000));
+    console.log(`[Excel] Job ${jobId}: tiempo de validación ${validationSeconds}s`);
+    setProgress(jobId, { step: `Tiempo de validación: ${validationSeconds}s`, current: 0, total: totalDocs });
 
     const invoices: InvoiceData[] = USE_STAGING_PIPELINE ? [] : [];
     let successCount = 0;
@@ -476,6 +471,20 @@ async function processExcelJob(
     let skippedCount = 0;
     let consecutiveErrors = 0;
     const MAX_CONSECUTIVE_ERRORS = 10; // Si hay 10 errores seguidos, pausar y reintentar
+    const downloadWorkers = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 4), 4));
+    const zipPrefetch = new Map<number, Promise<Buffer>>();
+
+    const scheduleZipPrefetch = (docIndex: number) => {
+      if (docIndex < 0 || docIndex >= documents.length) return;
+      if (zipPrefetch.has(docIndex)) return;
+      const trackId = documents[docIndex]?.id;
+      if (!trackId) return;
+      zipPrefetch.set(docIndex, downloadZipFile(trackId, cookies));
+    };
+
+    for (let p = 0; p < Math.min(downloadWorkers, documents.length); p++) {
+      scheduleZipPrefetch(p);
+    }
 
     for (let i = 0; i < documents.length; i++) {
       if (isJobCancelled(jobId)) {
@@ -488,9 +497,7 @@ async function processExcelJob(
       const posInBatch = (i % BATCH_SIZE) + 1;
       
       // Mensaje de progreso más descriptivo
-      const progressMsg = totalBatches > 1
-        ? `Procesando ${i + 1}/${totalDocs} (tanda ${currentBatch}/${totalBatches})`
-        : `Procesando factura ${i + 1} de ${totalDocs}`;
+      const progressMsg = `Descargando factura ${i + 1} de ${totalDocs}...`;
       
       setProgress(jobId, {
         step: progressMsg,
@@ -508,8 +515,11 @@ async function processExcelJob(
       }
 
       try {
-        // 3.1) Descargar ZIP del trackId.
-        const zipBuffer = await downloadZipFile(doc.id, cookies);
+        // 3.1) Descargar ZIP del trackId (con prefetch concurrente).
+        const prefetchedZip = zipPrefetch.get(i) || downloadZipFile(doc.id, cookies);
+        const zipBuffer = await prefetchedZip;
+        zipPrefetch.delete(i);
+        scheduleZipPrefetch(i + downloadWorkers);
 
         // 3.2) Extraer XML y PDF del ZIP.
         const { xmlBuffer, xmlFilename, pdfBuffer, pdfFilename } = await extractFilesFromZip(zipBuffer);
@@ -682,7 +692,7 @@ async function processExcelJob(
           documentType: invoiceData.documentType || "Factura Electrónica",
           cufe: invoiceData.cufe || "N/A",
           trackId: doc.id,
-          docNumber: doc.docnum,
+          docNumber: invoiceData.docNumber || doc.docnum || doc.id,
           driveUrl,
           zipFilename: `${invoiceData.issuerNit || doc.nit} - ${doc.docnum}.zip`,
         };
@@ -746,7 +756,7 @@ async function processExcelJob(
           documentType: "N/A",
           cufe: "N/A",
           trackId: doc.id,
-          docNumber: doc.docnum,
+          docNumber: doc.docnum || doc.id,
           zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
           error: errMsg,
         };
