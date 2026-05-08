@@ -295,12 +295,14 @@ export async function extractDocumentIdsByCufe(
   startDate: string | undefined,
   endDate: string | undefined,
   progressUid?: string,
-  documentDirection: DocumentDirection = "received"
+  documentDirection: DocumentDirection = "received",
+  onProgress?: (data: Partial<ProgressData>) => void
 ): Promise<ExtractionResult> {
   const direction = documentDirection || "received";
   const isSent = direction === "sent";
   const directionLabel = isSent ? "emitidos" : "recibidos";
   const updateProgress = (data: Partial<ProgressData>) => {
+    onProgress?.(data);
     if (progressUid) {
       const current = progressTracker.get(progressUid) || { step: "", current: 0, total: 0 };
       progressTracker.set(progressUid, { ...current, ...data });
@@ -335,6 +337,12 @@ export async function extractDocumentIdsByCufe(
     if (cufes.length === 0) {
       throw new Error("No se encontraron CUFEs válidos en Descarga de listados para ese rango.");
     }
+
+    updateProgress({
+      step: `Listado listo: ${cufes.length} CUFEs para procesar`,
+      current: 0,
+      total: cufes.length,
+    });
 
     const documentUrl = isSent
       ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
@@ -387,6 +395,17 @@ export async function extractDocumentIdsByCufe(
     for (const c of cookies) cookieMap[c.name] = c.value;
 
     console.log(`[DIAN CUFE] listado=${cufes.length} encontrados=${documents.length} fallidos=${failures}`);
+
+    if (documents.length === 0) {
+      console.warn("[DIAN CUFE] Cero resultados por CUFE; activando fallback de extracción paginada legacy.");
+      updateProgress({
+        step: "Fallback: usando extracción paginada legacy...",
+        current: 0,
+        total: 1,
+      });
+      return await extractDocumentIds(tokenUrl, startDate, endDate, progressUid, documentDirection);
+    }
+
     updateProgress({
       step: `Lista por CUFE completada (${documents.length}/${cufes.length})`,
       current: documents.length,
@@ -1358,6 +1377,8 @@ async function findDocumentByUniqueCodeOrDocnum(
     try {
       // 1) Intentar por campo específico "Código único" y botón Buscar, sin page.evaluate.
       const uniqueInputSelectors = [
+        "#DocumentKey",
+        "input[name='DocumentKey']",
         "input[name='UniqueCode']",
         "input[id*='Unique']",
         "input[id*='Codigo']",
