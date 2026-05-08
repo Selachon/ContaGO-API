@@ -6,8 +6,7 @@ import archiver from "archiver";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import multer from "multer";
-import { extractDocumentIdsByCufe, progressTracker, runDianExtractionPrecheck, parseListingRecordsFromExportZip } from "../services/dianScraper.js";
+import { extractDocumentIdsByCufe, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -41,19 +40,6 @@ const DOWNLOAD_REQUEST_TIMEOUT_MS = Number(process.env.DIAN_DOWNLOAD_TIMEOUT_MS 
 const JOB_TTL_MS = Number(process.env.DIAN_JOB_TTL_MS || 3 * 60 * 60 * 1000);
 // Tiempo maximo de stream SSE para descargas largas.
 const SSE_TIMEOUT_SECONDS = Number(process.env.DIAN_SSE_TIMEOUT_SECONDS || 10_800);
-
-// Multer en memoria para recibir el Excel del usuario sin escribir a disco temporalmente.
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 },
-  fileFilter: (_req, file, cb) => {
-    if (!file.originalname.match(/\.(xlsx|zip)$/i)) {
-      cb(new Error("Solo se aceptan archivos .xlsx o .zip") as unknown as null, false);
-    } else {
-      cb(null, true);
-    }
-  },
-});
 
 // Crear carpeta de trabajo al iniciar el proceso.
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -427,8 +413,7 @@ async function processDownloadJob(
   consolidate_pdf: boolean | undefined,
   include_pdf_folder: boolean | undefined,
   include_xml_folder: boolean | undefined,
-  documentDirection: "received" | "sent" = "received",
-  preloadedCufes?: string[]
+  documentDirection: "received" | "sent" = "received"
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
@@ -452,13 +437,9 @@ async function processDownloadJob(
       return;
     }
 
-    // Paso 1: prevalidación (omitida cuando se aportan CUFEs desde Excel manual).
-    if (!preloadedCufes || preloadedCufes.length === 0) {
-      setProgress(jobId, { step: `Prevalidando documentos ${directionLabel}...`, current: 0, total: 1 });
-      await runDianExtractionPrecheck(token_url, start_date, end_date, documentDirection, jobId);
-    } else {
-      setProgress(jobId, { step: `Listado manual: ${preloadedCufes.length} CUFEs listos`, current: 0, total: preloadedCufes.length });
-    }
+    // Paso 1: prevalidación rápida para evitar esperas largas con fallo tardío.
+    setProgress(jobId, { step: `Prevalidando documentos ${directionLabel}...`, current: 0, total: 1 });
+    await runDianExtractionPrecheck(token_url, start_date, end_date, documentDirection, jobId);
 
     // Paso 2: obtener id por CUFE y descargar de inmediato 1 a 1.
     setProgress(jobId, { step: `Obteniendo listado DIAN ${directionLabel}...`, current: 0, total: 1 });
@@ -531,8 +512,7 @@ async function processDownloadJob(
         if (activeDownloads.size >= downloadWorkers) {
           await Promise.race(activeDownloads);
         }
-      },
-      preloadedCufes
+      }
     );
 
     if (activeDownloads.size > 0) {
@@ -893,122 +873,5 @@ function createZip(sourceDir: string, destPath: string): Promise<void> {
     archive.finalize();
   });
 }
-
-// Endpoint para modo "Excel manual": el usuario sube el .xlsx descargado de DIAN
-// y el servidor extrae los CUFEs sin navegar al portal de exportación.
-router.post(
-  "/download-from-excel",
-  upload.single("excel_file"),
-  validateDianUrl,
-  async (req: Request, res: Response) => {
-    if (!req.file) {
-      return res.status(400).json({ status: "error", detalle: "Se requiere el archivo Excel (excel_file)" });
-    }
-
-    const token_url: string = req.body.token_url;
-    const document_direction = req.body.document_direction === "sent" ? "sent" : "received";
-    const consolidate_pdf = req.body.consolidate_pdf === "true";
-    const include_pdf_folder = req.body.include_pdf_folder === "true";
-    const include_xml_folder = req.body.include_xml_folder === "true";
-    const start_date: string | undefined = req.body.start_date || undefined;
-    const end_date: string | undefined = req.body.end_date || undefined;
-    const session_uid: string | undefined = req.body.session_uid || undefined;
-
-    if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
-      return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
-    }
-    if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
-      return res.status(400).json({ status: "error", detalle: "end_date debe tener formato YYYY-MM-DD" });
-    }
-
-    // Validación de NIT igual que en download-documents.
-    if (!req.user?.isAdmin) {
-      const allowedNits = await getUserNits(req.user!.userId);
-      if (allowedNits.length === 0) {
-        return res.status(403).json({
-          status: "error",
-          detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
-        });
-      }
-
-      let tokenNit = "";
-      try {
-        const parsed = new URL(token_url);
-        tokenNit = parsed.searchParams.get("rk")?.trim() || "";
-      } catch {
-        tokenNit = "";
-      }
-
-      if (!tokenNit) {
-        return res.status(400).json({ status: "error", detalle: "El token_url no contiene rk (NIT)." });
-      }
-
-      const normalizeNit = (nit: string) => nit.replace(/[-\s]/g, "").trim();
-      const normalizedTokenNit = normalizeNit(tokenNit);
-      const normalizedAllowed = allowedNits.map(normalizeNit);
-
-      if (!normalizedAllowed.includes(normalizedTokenNit)) {
-        return res.status(403).json({ status: "error", detalle: `No tienes acceso al NIT ${tokenNit}` });
-      }
-    }
-
-    // Parsear Excel subido para extraer CUFEs.
-    let preloadedCufes: string[] = [];
-    try {
-      const records = await parseListingRecordsFromExportZip(req.file.buffer, document_direction as "received" | "sent");
-      preloadedCufes = Array.from(new Set(records.map((r) => r.cufe).filter(Boolean)));
-      if (preloadedCufes.length === 0) {
-        return res.status(400).json({
-          status: "error",
-          detalle: "El archivo Excel no contiene CUFEs válidos para la dirección seleccionada. Verifica que el Excel corresponda al tipo de documento (recibidos/emitidos).",
-        });
-      }
-      console.log(`[Excel manual] ${preloadedCufes.length} CUFEs extraídos del archivo ${req.file.originalname}`);
-    } catch (parseErr) {
-      console.error("[Excel manual] Error parseando Excel:", parseErr);
-      return res.status(400).json({
-        status: "error",
-        detalle: "No se pudo leer el archivo Excel. Verifica que sea el archivo de descarga de listados de DIAN (.xlsx o .zip).",
-      });
-    }
-
-    const jobId = session_uid || uuidv4();
-    const job: JobData = {
-      status: "pending",
-      progress: { step: "Iniciando con Excel manual...", current: 0, total: preloadedCufes.length },
-      userId: req.user!.userId,
-      createdAt: Date.now(),
-    };
-    jobTracker.set(jobId, job);
-    setProgress(jobId, job.progress);
-
-    res.json({
-      status: "accepted",
-      jobId,
-      cufeCount: preloadedCufes.length,
-      message: `${preloadedCufes.length} CUFEs listos. Descarga iniciada en background. Usa /dian/job-status/${jobId} para consultar el progreso.`,
-    });
-
-    processDownloadJob(
-      jobId,
-      token_url,
-      start_date,
-      end_date,
-      consolidate_pdf,
-      include_pdf_folder,
-      include_xml_folder,
-      document_direction as "received" | "sent",
-      preloadedCufes
-    ).catch((err) => {
-      console.error(`Error en job ${jobId} (Excel manual):`, err);
-      const j = jobTracker.get(jobId);
-      if (j) {
-        j.status = "error";
-        j.error = err.message || "Error desconocido";
-        setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: j.error });
-      }
-    });
-  }
-);
 
 export default router;
