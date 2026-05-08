@@ -8,7 +8,7 @@ import JSZip from "jszip";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
-import { extractDocumentIds, runDianExtractionPrecheck } from "../services/dianScraper.js";
+import { extractDocumentIdsByCufe, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateThirdPartiesExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData } from "../types/dianExcel.js";
@@ -101,7 +101,18 @@ async function processJob(
   job.status = "processing";
 
   await runDianExtractionPrecheck(tokenUrl, startDate, endDate, direction, jobId);
-  const { documents, cookies } = await extractDocumentIds(tokenUrl, startDate, endDate, jobId, direction);
+  const { documents, cookies } = await extractDocumentIdsByCufe(
+    tokenUrl,
+    startDate,
+    endDate,
+    jobId,
+    direction,
+    (p) => setProgress(jobId, {
+      step: p.step,
+      current: p.current,
+      total: p.total,
+    })
+  );
   if (!documents.length) throw new Error("No se encontraron documentos en el rango seleccionado");
   setProgress(jobId, { step: "Procesando documentos...", current: 0, total: documents.length });
 

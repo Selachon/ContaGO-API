@@ -11,6 +11,13 @@ interface ExtractionResult {
   cookies: Record<string, string>;
 }
 
+type OnDocumentFound = (ctx: {
+  doc: DocumentInfo;
+  index: number;
+  total: number;
+  cookies: Record<string, string>;
+}) => Promise<void> | void;
+
 interface PrecheckResult {
   ok: true;
   listedCount: number;
@@ -19,6 +26,10 @@ interface PrecheckResult {
 interface ListingRecord {
   cufe: string;
   docnum: string;
+}
+
+function normalizeCufe(value: string): string {
+  return (value || "").replace(/[^A-Fa-f0-9]/g, "").trim();
 }
 
 interface ExtractOptions {
@@ -63,6 +74,7 @@ export async function extractDocumentIds(
     browser = await launchBrowserWithRetry(executablePath, updateProgress);
 
     const page = await browser.newPage();
+    await hardenPageRuntime(page);
     await page.setViewport({ width: 1280, height: 800 });
 
     // Timeout alto para ambientes con latencia variable (2 minutos).
@@ -284,6 +296,260 @@ export async function extractDocumentIds(
   }
 }
 
+/**
+ * Nuevo flujo principal: obtiene CUFEs desde Descarga de listados y luego
+ * consulta documento por documento en la bandeja (recibidos/emitidos).
+ * Mantiene precisión alta y evita pérdidas por paginación larga.
+ */
+export async function extractDocumentIdsByCufe(
+  tokenUrl: string,
+  startDate: string | undefined,
+  endDate: string | undefined,
+  progressUid?: string,
+  documentDirection: DocumentDirection = "received",
+  onProgress?: (data: Partial<ProgressData>) => void,
+  onDocumentFound?: OnDocumentFound
+): Promise<ExtractionResult> {
+  const direction = documentDirection || "received";
+  const isSent = direction === "sent";
+  const directionLabel = isSent ? "emitidos" : "recibidos";
+  const updateProgress = (data: Partial<ProgressData>) => {
+    onProgress?.(data);
+    if (progressUid) {
+      const current = progressTracker.get(progressUid) || { step: "", current: 0, total: 0 };
+      progressTracker.set(progressUid, { ...current, ...data });
+    }
+  };
+
+  let browser: Browser | null = null;
+
+  try {
+    updateProgress({ step: "Iniciando navegador...", current: 0, total: 0 });
+    const executablePath = resolveExecutablePath();
+    browser = await launchBrowserWithRetry(executablePath, updateProgress);
+
+    const page = await browser.newPage();
+    await hardenPageRuntime(page);
+    await page.setViewport({ width: 1280, height: 800 });
+    page.setDefaultTimeout(120000);
+    page.setDefaultNavigationTimeout(120000);
+
+    updateProgress({ step: "Accediendo con token...", current: 0, total: 1 });
+    await navigateWithRetry(page, tokenUrl, 3);
+    await delay(1000);
+
+    if (isLoginPage(page.url())) {
+      throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
+
+    updateProgress({ step: "Descargando listado DIAN por CUFE...", current: 0, total: 1 });
+    const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
+    const cufes = Array.from(new Set(listedRecords.map((r) => normalizeCufe(r.cufe || "")).filter(Boolean)));
+
+    if (cufes.length === 0) {
+      throw new Error("No se encontraron CUFEs válidos en Descarga de listados para ese rango.");
+    }
+
+    updateProgress({
+      step: `Listado listo: ${cufes.length} CUFEs para procesar`,
+      current: 0,
+      total: cufes.length,
+    });
+
+    const documentUrl = isSent
+      ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+      : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+
+    const requestedWorkers = Number(process.env.DIAN_CUFE_WORKERS || 4);
+    const workerCount = Math.max(1, Math.min(Number.isFinite(requestedWorkers) ? requestedWorkers : 2, 4));
+    updateProgress({ step: `Navegando a documentos ${directionLabel}...`, current: 0, total: cufes.length });
+
+    // Página base (se mantiene para compatibilidad y fallback de cookies).
+    await navigateWithRetry(page, documentUrl, 3);
+    await delay(600);
+    if (startDate && endDate) {
+      updateProgress({ step: "Aplicando rango de fechas...", current: 0, total: cufes.length });
+      await applyDateFilter(page, startDate, endDate, false);
+    }
+    await waitForTableLoad(page);
+
+    const baseCookies = await page.cookies();
+    const baseCookieMap: Record<string, string> = {};
+    for (const c of baseCookies) baseCookieMap[c.name] = c.value;
+
+    const documents: DocumentInfo[] = [];
+    const seenIds = new Set<string>();
+    let failures = 0;
+
+    if (!browser) {
+      throw new Error("No se pudo inicializar el navegador para validación CUFE.");
+    }
+    const activeBrowser = browser;
+
+    let processed = 0;
+    let nextIndex = 0;
+    let lastProgressAt = 0;
+
+    const workerPages: Page[] = [];
+    const workerCookies: Record<string, string>[] = [];
+
+    const initWorkerPage = async (): Promise<{ page: Page; cookies: Record<string, string> }> => {
+      const wp = await activeBrowser.newPage();
+      await hardenPageRuntime(wp);
+      await wp.setViewport({ width: 1280, height: 800 });
+      wp.setDefaultTimeout(120000);
+      wp.setDefaultNavigationTimeout(120000);
+
+      await navigateWithRetry(wp, tokenUrl, 3);
+      await delay(250);
+      if (isLoginPage(wp.url())) {
+        throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+      }
+
+      await navigateWithRetry(wp, documentUrl, 3);
+      await delay(250);
+      if (startDate && endDate) {
+        // Ajustar rango sin disparar búsqueda aún; cada CUFE ejecuta su propio
+        // submit y evita esperas largas redundantes durante inicialización.
+        await applyDateFilter(wp, startDate, endDate, false);
+      }
+      await waitForTableLoad(wp);
+
+      const wc = await wp.cookies();
+      const wcMap: Record<string, string> = {};
+      for (const c of wc) wcMap[c.name] = c.value;
+
+      return { page: wp, cookies: wcMap };
+    };
+
+    for (let w = 0; w < workerCount; w++) {
+      const worker = await initWorkerPage();
+      workerPages.push(worker.page);
+      workerCookies.push(worker.cookies);
+    }
+
+    console.log(`[DIAN CUFE] Workers activos: ${workerCount}`);
+
+    const runWorker = async (workerIdx: number) => {
+      let wp = workerPages[workerIdx];
+      let wc = workerCookies[workerIdx] || baseCookieMap;
+      let processedByWorker = 0;
+      const recycleEvery = Math.max(50, Number(process.env.DIAN_CUFE_RECYCLE_EVERY || 250));
+
+      while (true) {
+        const i = nextIndex;
+        if (i >= cufes.length) break;
+        nextIndex++;
+
+        const cufe = cufes[i];
+        try {
+          const maxAttempts = 2;
+          let found: DocumentInfo | null = null;
+          for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+              found = await findDocumentByUniqueCodeOrDocnum(wp, cufe, "", seenIds, isSent);
+              break;
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              const recoverable =
+                msg.includes("detached Frame") ||
+                msg.includes("Execution context was destroyed") ||
+                msg.includes("Target closed") ||
+                msg.includes("Session closed") ||
+                msg.includes("Protocol error");
+
+              if (!recoverable || attempt >= maxAttempts) throw err;
+
+              try { await wp.close(); } catch {}
+              const refreshed = await initWorkerPage();
+              wp = refreshed.page;
+              wc = refreshed.cookies;
+              workerPages[workerIdx] = wp;
+              workerCookies[workerIdx] = wc;
+            }
+          }
+
+          if (found?.id) {
+            found.cufe = cufe;
+            documents.push(found);
+            if (onDocumentFound) {
+              await onDocumentFound({
+                doc: found,
+                index: i + 1,
+                total: cufes.length,
+                cookies: wc,
+              });
+            }
+          } else {
+            failures++;
+            if (failures <= 10) {
+              console.warn(`[DIAN CUFE] Sin resultado para CUFE ${cufe.slice(0, 16)}...`);
+            }
+          }
+        } catch (err) {
+          failures++;
+          if (failures <= 10) {
+            console.warn(`[DIAN CUFE] Error consultando CUFE ${cufe.slice(0, 16)}...`, err);
+          }
+        } finally {
+          processed++;
+          processedByWorker++;
+
+          const now = Date.now();
+          const shouldFlushProgress =
+            processed === cufes.length || now - lastProgressAt >= 400 || processed % 10 === 0;
+          if (shouldFlushProgress) {
+            lastProgressAt = now;
+            updateProgress({
+              step: `Validando CUFEs (${processed}/${cufes.length})...`,
+              current: processed,
+              total: cufes.length,
+            });
+          }
+
+          if (processedByWorker > 0 && processedByWorker % recycleEvery === 0) {
+            try { await wp.close(); } catch {}
+            const refreshed = await initWorkerPage();
+            wp = refreshed.page;
+            wc = refreshed.cookies;
+            workerPages[workerIdx] = wp;
+            workerCookies[workerIdx] = wc;
+          }
+        }
+      }
+    };
+
+    await Promise.all(workerPages.map((_, idx) => runWorker(idx)));
+    await Promise.all(workerPages.map(async (wp) => { try { await wp.close(); } catch {} }));
+
+    const finalDocuments = documents;
+
+    console.log(`[DIAN CUFE] listado=${cufes.length} encontrados=${finalDocuments.length} fallidos=${failures}`);
+
+    if (finalDocuments.length === 0) {
+      const msg =
+        "[DIAN CUFE] Cero resultados por CUFE. Se detiene el proceso sin fallback legacy (flujo estricto CUFE por CUFE).";
+      console.error(msg);
+      updateProgress({
+        step: "Sin resultados por CUFE (sin fallback legacy)",
+        current: 0,
+        total: cufes.length,
+      });
+      throw new Error(msg);
+    }
+
+    updateProgress({
+      step: `Preparación completada (${finalDocuments.length} IDs listos)` ,
+      current: 0,
+      total: 0,
+    });
+
+    return { documents: finalDocuments, cookies: baseCookieMap };
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
 export async function runDianExtractionPrecheck(
   tokenUrl: string,
   startDate: string | undefined,
@@ -307,6 +573,7 @@ export async function runDianExtractionPrecheck(
       updateProgress({ step: "Prevalidando listado DIAN...", current: 0, total: 1 });
       browser = await launchBrowserWithRetry(resolveExecutablePath(), updateProgress);
       const page = await browser.newPage();
+      await hardenPageRuntime(page);
       await page.setViewport({ width: 1280, height: 800 });
       page.setDefaultTimeout(120000);
       page.setDefaultNavigationTimeout(120000);
@@ -353,11 +620,37 @@ export async function runDianExtractionPrecheck(
   }
 }
 
+async function hardenPageRuntime(page: Page): Promise<void> {
+  // En algunos entornos de transpile, page.evaluate puede serializar helpers
+  // como __name. Definirlo en runtime evita el fallo "__name is not defined".
+  await page.evaluateOnNewDocument(() => {
+    const g = globalThis as unknown as { __name?: (fn: unknown, _n?: string) => unknown };
+    if (typeof g.__name !== "function") {
+      g.__name = (fn) => fn;
+    }
+
+    // Asegura identificador global (no solo propiedad) para código estricto
+    // que referencia __name como variable libre.
+    try {
+      (0, eval)("var __name = globalThis.__name;");
+    } catch {
+      // ignore
+    }
+  });
+}
+
 async function launchBrowserWithRetry(
   executablePath: string | null,
   updateProgress: (data: Partial<ProgressData>) => void
 ): Promise<Browser> {
   let lastError: Error | null = null;
+  const chromiumLibPath = buildChromiumLibPath();
+
+  if (chromiumLibPath) {
+    const currentLd = process.env.LD_LIBRARY_PATH || "";
+    const parts = [chromiumLibPath, currentLd].filter(Boolean);
+    process.env.LD_LIBRARY_PATH = parts.join(":");
+  }
 
   for (let attempt = 1; attempt <= BROWSER_LAUNCH_RETRIES; attempt++) {
     try {
@@ -401,6 +694,19 @@ async function launchBrowserWithRetry(
   );
 }
 
+function buildChromiumLibPath(): string {
+  const base = `${process.cwd()}/.chromium-libs`;
+  const candidates = [
+    `${base}/usr/lib/x86_64-linux-gnu`,
+    `${base}/lib/x86_64-linux-gnu`,
+    `${base}/usr/lib`,
+    `${base}/lib`,
+  ];
+
+  const existing = candidates.filter((p) => fs.existsSync(p));
+  return existing.join(":");
+}
+
 function resolveExecutablePath(): string | null {
   if (!process.env.PUPPETEER_CACHE_DIR) {
     process.env.PUPPETEER_CACHE_DIR = `${process.cwd()}/.cache/puppeteer`;
@@ -434,66 +740,55 @@ function resolveExecutablePath(): string | null {
   return null;
 }
 
-async function applyDateFilter(page: Page, startDate: string, endDate: string): Promise<void> {
+async function applyDateFilter(page: Page, startDate: string, endDate: string, triggerSearch: boolean = true): Promise<void> {
   try {
-    // Seleccion flexible para cambios menores en el DOM de DIAN.
+    // Selector explícito del rango visible (evita caer en hidden StartDate/EndDate).
     const rangeInput = await page.$(
-      "#dashboard-report-range input, " +
-      "input[placeholder*='Rango'], " +
-      "input[aria-label*='Rango'], " +
-      "input[placeholder*='Fecha'], " +
-      "input[aria-label*='Fecha'], " +
-      "input[name*='date'], " +
-      "input[name*='fecha'], " +
-      "input[id*='range']"
+      "#dashboard-report-range, " +
+      "input#dashboard-report-range, " +
+      "input[type='text'][placeholder*='Rango'], " +
+      "input[type='text'][aria-label*='Rango'], " +
+      "input[type='text'][placeholder*='Fecha'], " +
+      "input[type='text'][aria-label*='Fecha'], " +
+      "input[type='text'][id*='range']"
     );
 
     if (rangeInput) {
-      const sDate = startDate.replace(/-/g, "/");
-      const eDate = endDate.replace(/-/g, "/");
+      const [sy, sm, sd] = startDate.split("-");
+      const [ey, em, ed] = endDate.split("-");
+      const sDate = sy && sm && sd ? `${sy}/${sm}/${sd}` : startDate;
+      const eDate = ey && em && ed ? `${ey}/${em}/${ed}` : endDate;
       const rangoCompleto = `${sDate} - ${eDate}`;
 
-      await rangeInput.click({ clickCount: 3 }); // Seleccionar todo
+      await rangeInput.click({ clickCount: 3 });
       await rangeInput.type(rangoCompleto);
-      await page.keyboard.press("Enter");
       await delay(450);
+
+      // Refuerza los campos que DIAN usa en el POST del formulario.
+      // No forzamos campos ocultos; se respeta el comportamiento UI real de DIAN.
     } else {
       console.log("No se encontró input de rango - continuando sin escribir fechas.");
     }
 
-    // Click en Buscar con manejo de navegacion que puede invalidar el contexto.
-    try {
-      const clickPromise = page.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll("button"));
-        const btn = buttons.find((b) => b.textContent?.trim().includes("Buscar"));
-        if (btn) {
-          (btn as HTMLElement).click();
-          return true;
-        }
-        return false;
-      });
-      
-      // Timeout corto para no bloquear si no existe boton compatible.
-      const clicked = await Promise.race([
-        clickPromise,
-        delay(2000).then(() => false)
-      ]);
-      
-      if (clicked) {
-        // La accion puede disparar recarga parcial o completa.
-        await delay(500);
-        await waitForTableLoad(page);
+    if (!triggerSearch) return;
+
+    // Click en Buscar del form documents-form y esperar recarga.
+    const searchButton =
+      (await page.$("form#documents-form button[type='submit']")) ||
+      (await page.$("button.btn.btn-success.btn-radian-success")) ||
+      (await page.$("button[type='submit']"));
+
+    if (searchButton) {
+      try {
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => null),
+          searchButton.click(),
+        ]);
+      } catch {
+        // continuar con espera de tabla
       }
-    } catch (navErr: unknown) {
-      // "context was destroyed" es esperado cuando hay navegacion.
-      const errMsg = navErr instanceof Error ? navErr.message : String(navErr);
-      if (errMsg.includes("context was destroyed") || errMsg.includes("navigation")) {
-        console.log("Navegación detectada después de aplicar filtro de fechas - esperando recarga...");
-        await delay(1000);
-        await waitForTableLoad(page);
-      } else {
-        throw navErr;
-      }
+      await delay(500);
+      await waitForTableLoad(page);
     }
   } catch (err) {
     console.error("Error aplicando rango de fechas:", err);
@@ -618,25 +913,15 @@ function shouldIgnoreDocType(docType: string, isSentDocuments: boolean = false):
   return false;
 }
 
-async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocuments: boolean = false): Promise<DocumentInfo[]> {
+async function extractDocsFromPage(
+  page: Page,
+  seenIds: Set<string>,
+  isSentDocuments: boolean = false,
+  ignoreDocTypeFilter: boolean = true
+): Promise<DocumentInfo[]> {
   const docs: DocumentInfo[] = [];
 
   const items = await page.evaluate((isSentDocumentsInPage) => {
-    const extractTrackIdFromText = (raw: string | null | undefined): string | null => {
-      const text = String(raw || "");
-      if (!text) return null;
-
-      const direct = text.match(/trackId=([A-Za-z0-9-]+)/i);
-      if (direct) return direct[1];
-
-      const quoted = text.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([A-Za-z0-9-]+)['\"]/i);
-      if (quoted) return quoted[1];
-
-      const generic = text.match(/['\"]([a-f0-9]{32,128})['\"]/i);
-      if (generic) return generic[1];
-
-      return null;
-    };
 
     const results: Array<{
       id: string;
@@ -681,8 +966,32 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
           fechaGeneracion = el.getAttribute("generationdate") || undefined;
         }
         
-        if (!trackId) trackId = extractTrackIdFromText(el.getAttribute("href"));
-        if (!trackId) trackId = extractTrackIdFromText(el.getAttribute("onclick"));
+        if (!trackId) {
+          const href = String(el.getAttribute("href") || "");
+          const direct = href.match(/trackId=([^&'"\s]+)/i);
+          if (direct) trackId = direct[1];
+          if (!trackId) {
+            const quoted = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+            if (quoted) trackId = quoted[1];
+          }
+          if (!trackId) {
+            const generic = href.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+            if (generic) trackId = generic[1];
+          }
+        }
+        if (!trackId) {
+          const onclick = String(el.getAttribute("onclick") || "");
+          const direct = onclick.match(/trackId=([^&'"\s]+)/i);
+          if (direct) trackId = direct[1];
+          if (!trackId) {
+            const quoted = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+            if (quoted) trackId = quoted[1];
+          }
+          if (!trackId) {
+            const generic = onclick.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+            if (generic) trackId = generic[1];
+          }
+        }
         
         if (trackId) break;
       }
@@ -708,15 +1017,48 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
       if (!trackId) {
         const links = row.querySelectorAll("a[href]");
         for (const link of links) {
-          trackId = extractTrackIdFromText(link.getAttribute("href"));
-          if (!trackId) trackId = extractTrackIdFromText(link.getAttribute("onclick"));
+          const href = String(link.getAttribute("href") || "");
+          const directHref = href.match(/trackId=([^&'"\s]+)/i);
+          if (directHref) trackId = directHref[1];
+          if (!trackId) {
+            const quotedHref = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+            if (quotedHref) trackId = quotedHref[1];
+          }
+          if (!trackId) {
+            const genericHref = href.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+            if (genericHref) trackId = genericHref[1];
+          }
+
+          if (!trackId) {
+            const onclick = String(link.getAttribute("onclick") || "");
+            const directOnclick = onclick.match(/trackId=([^&'"\s]+)/i);
+            if (directOnclick) trackId = directOnclick[1];
+            if (!trackId) {
+              const quotedOnclick = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+              if (quotedOnclick) trackId = quotedOnclick[1];
+            }
+            if (!trackId) {
+              const genericOnclick = onclick.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+              if (genericOnclick) trackId = genericOnclick[1];
+            }
+          }
           if (trackId) break;
         }
       }
 
       // Metodo 5: fallback sobre HTML completo de la fila
       if (!trackId) {
-        trackId = extractTrackIdFromText((row as HTMLElement).outerHTML);
+        const raw = String((row as HTMLElement).outerHTML || "");
+        const direct = raw.match(/trackId=([^&'"\s]+)/i);
+        if (direct) trackId = direct[1];
+        if (!trackId) {
+          const quoted = raw.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+          if (quoted) trackId = quoted[1];
+        }
+        if (!trackId) {
+          const generic = raw.match(/['\"]([a-f0-9]{32,128})['\"]/i);
+          if (generic) trackId = generic[1];
+        }
       }
       
       if (!trackId) continue;
@@ -734,7 +1076,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
         tds[fallbackNitIndex]?.textContent?.trim() ||
         "";
 
-      const cufe = (tds[13]?.textContent?.trim() || tds[12]?.textContent?.trim() || "").toLowerCase();
+      const cufe = tds[13]?.textContent?.trim() || tds[12]?.textContent?.trim() || "";
 
       results.push({ id: trackId, docnum, nit, cufe, docType, documentTypeId, fechaValidacion, fechaGeneracion });
     }
@@ -746,8 +1088,8 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
   
   for (const item of items) {
     if (!seenIds.has(item.id)) {
-      // Filtrar Application Response y otros tipos no relevantes
-      if (shouldIgnoreDocType(item.docType, isSentDocuments)) {
+      // Filtrar tipos no relevantes solo cuando se solicita explícitamente.
+      if (ignoreDocTypeFilter && shouldIgnoreDocType(item.docType, isSentDocuments)) {
         skippedCount++;
         continue;
       }
@@ -766,7 +1108,7 @@ async function extractDocsFromPage(page: Page, seenIds: Set<string>, isSentDocum
     }
   }
   
-  if (skippedCount > 0) {
+  if (ignoreDocTypeFilter && skippedCount > 0) {
     console.log(`  -> Omitidos ${skippedCount} documentos tipo "Application Response"`);
   }
 
@@ -784,6 +1126,45 @@ async function extractListingRecordsFromDownloadTab(
     await navigateWithRetry(page, `${baseUrl}/Document/Export`, 2);
     await delay(800);
 
+    const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
+
+    const exportPageBefore = await fetch(`${baseUrl}/Document/Export`, {
+      method: "GET",
+      headers: {
+        Cookie: cookieHeader,
+        Referer: `${baseUrl}/Document/Export`,
+      },
+    }).then((r) => r.text());
+
+    const reusableLinks = findReusableExportLinks(exportPageBefore, direction, startDate, endDate);
+    if (reusableLinks.length > 0) {
+      console.log(`[DIAN Export] Se encontraron ${reusableLinks.length} listados reutilizables para el rango.`);
+      for (let i = 0; i < reusableLinks.length; i++) {
+        const reusableLink = reusableLinks[i];
+        try {
+          console.log(`[DIAN Export] Reutilizando listado #${i + 1}: ${reusableLink}`);
+          const downloaded = await fetch(`${baseUrl}${reusableLink}`, {
+            method: "GET",
+            headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
+          }).then((r) => r.arrayBuffer());
+
+          const zipBuffer = Buffer.from(new Uint8Array(downloaded));
+          const reusedRecords = await parseListingRecordsFromExportZip(zipBuffer, direction);
+          if (reusedRecords.length > 0) {
+            console.log(`[DIAN Export] Reutilizado OK #${i + 1}: ${reusedRecords.length} CUFEs (${direction}).`);
+            return reusedRecords;
+          }
+
+          console.warn(`[DIAN Export] Listado reutilizado #${i + 1} sin CUFEs válidos.`);
+        } catch (reuseErr) {
+          console.warn(`[DIAN Export] Falló descarga de listado reutilizado #${i + 1}:`, reuseErr);
+        }
+      }
+
+      console.warn("[DIAN Export] Ningún listado reutilizable fue válido; se intentará regenerar.");
+    }
+
+    const existingRks = new Set(parseDownloadLinksFromExportHtml(exportPageBefore).map((l) => l.rk));
     const formData = await page.evaluate(() => {
       const token = (document.querySelector("input[name='__RequestVerificationToken']") as HTMLInputElement | null)?.value || "";
       const type = (document.querySelector("input[name='Type']") as HTMLInputElement | null)?.value || "0";
@@ -793,7 +1174,6 @@ async function extractListingRecordsFromDownloadTab(
 
     if (!formData.token) return [];
 
-    const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
     const body = new URLSearchParams();
     body.set("__RequestVerificationToken", formData.token);
     body.set("Type", formData.type || "0");
@@ -813,28 +1193,47 @@ async function extractListingRecordsFromDownloadTab(
       body: body.toString(),
     });
 
-    await delay(1500);
-    const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
-      method: "GET",
-      headers: {
-        Cookie: cookieHeader,
-        Referer: `${baseUrl}/Document/Export`,
-      },
-    }).then((r) => r.text());
+    // DIAN genera el archivo en segundo plano. Polling hasta 5 minutos.
+    const pollTimeoutMs = 300_000;
+    const pollEveryMs = 4_000;
+    const startedAt = Date.now();
 
-    const links = Array.from(exportHtml.matchAll(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/g))
-      .map((m) => m[1].replace(/&amp;/g, "&"));
-    if (links.length === 0) return [];
+    let selectedLink: string | null = null;
+    while (Date.now() - startedAt < pollTimeoutMs) {
+      const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
+        method: "GET",
+        headers: {
+          Cookie: cookieHeader,
+          Referer: `${baseUrl}/Document/Export`,
+        },
+      }).then((r) => r.text());
 
-    const latestLink = links[0];
-    const downloaded = await fetch(`${baseUrl}${latestLink}`, {
+      const links = parseDownloadLinksFromExportHtml(exportHtml);
+      const newlyGenerated = links.find((l) => !existingRks.has(l.rk));
+      if (newlyGenerated) {
+        selectedLink = newlyGenerated.href;
+        break;
+      }
+
+      await delay(pollEveryMs);
+    }
+
+    if (!selectedLink) {
+      throw new Error("No se detectó un listado nuevo para el rango solicitado dentro de 5 minutos.");
+    }
+
+    const downloaded = await fetch(`${baseUrl}${selectedLink}`, {
       method: "GET",
       headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
     }).then((r) => r.arrayBuffer());
     const zipBuffer = Buffer.from(new Uint8Array(downloaded));
 
     return await parseListingRecordsFromExportZip(zipBuffer, direction);
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("TOKEN_EXPIRED")) {
+      throw err;
+    }
     return [];
   }
 }
@@ -848,39 +1247,77 @@ function toDianExportDate(dateISO: string, endOfDay: boolean = false): string {
 }
 
 async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: DocumentDirection): Promise<ListingRecord[]> {
-  const zip = await JSZip.loadAsync(zipBuffer);
-  const xlsxName = Object.keys(zip.files).find((n) => n.toLowerCase().endsWith(".xlsx") && !zip.files[n].dir);
-  if (!xlsxName) return [];
+  // DIAN puede devolver:
+  // 1) ZIP contenedor con un .xlsx adentro
+  // 2) el .xlsx directamente (que también es un ZIP OOXML)
+  // Este bloque soporta ambos formatos.
+  let xlsxBuffer: Buffer | null = null;
+  const maybeZip = await JSZip.loadAsync(zipBuffer);
 
-  const xlsxBuffer = await zip.files[xlsxName].async("nodebuffer");
+  const embeddedXlsxName = Object.keys(maybeZip.files).find(
+    (n) => n.toLowerCase().endsWith(".xlsx") && !maybeZip.files[n].dir
+  );
+
+  if (embeddedXlsxName) {
+    xlsxBuffer = await maybeZip.files[embeddedXlsxName].async("nodebuffer");
+  } else if (maybeZip.file("xl/workbook.xml")) {
+    // El archivo descargado ya es el .xlsx
+    xlsxBuffer = zipBuffer;
+  }
+
+  if (!xlsxBuffer) {
+    console.warn("[DIAN Export] Formato de archivo no reconocido al parsear listado");
+    return [];
+  }
+
   const xlsx = await JSZip.loadAsync(xlsxBuffer);
 
   const sharedStringsXml = await xlsx.file("xl/sharedStrings.xml")?.async("string");
-  const sheetXml = await xlsx.file("xl/worksheets/sheet1.xml")?.async("string");
+  const sheetPath = Object.keys(xlsx.files).find(
+    (n) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(n) && !xlsx.files[n].dir
+  );
+  const sheetXml = sheetPath ? await xlsx.file(sheetPath)?.async("string") : null;
   if (!sheetXml) return [];
 
   const sharedStrings = parseSharedStrings(sharedStringsXml || "");
   const rows = parseSheetRows(sheetXml, sharedStrings);
-  if (rows.length < 2) return [];
+  if (rows.length < 2) {
+    console.warn("[DIAN Export] XLSX sin filas de datos");
+    return [];
+  }
 
   const headers = rows[0].map((h) => h.trim().toLowerCase());
   const cufeIdx = headers.findIndex((h) => h.includes("cufe") || h.includes("cude") || h.includes("código único") || h.includes("codigo unico"));
-  const folioIdx = headers.findIndex((h) => h === "folio" || h.includes("número") || h.includes("numero"));
+  const folioIdx = headers.findIndex((h) => h === "folio");
   const groupIdx = headers.findIndex((h) => h === "grupo");
 
-  if (cufeIdx < 0 || folioIdx < 0) return [];
+  if (cufeIdx < 0 || folioIdx < 0) {
+    console.warn("[DIAN Export] Encabezados esperados no encontrados", {
+      cufeIdx,
+      folioIdx,
+      headers: rows[0],
+    });
+    return [];
+  }
 
-  const expectedGroup = direction === "sent" ? "emitido" : "recibido";
   const out: ListingRecord[] = [];
+
+  const expectedGroupText = direction === "sent" ? "emitid" : "recibid";
 
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
     const group = (groupIdx >= 0 ? row[groupIdx] : "").toLowerCase();
-    if (group && !group.includes(expectedGroup)) continue;
 
-    const cufe = (row[cufeIdx] || "").trim().toLowerCase();
-    const docnum = (row[folioIdx] || "").trim();
+    // Si viene grupo, filtrar estrictamente por dirección solicitada.
+    if (group && !group.includes(expectedGroupText)) continue;
+
+    const cufe = normalizeCufe(row[cufeIdx] || "");
+
+    const docnum = (folioIdx >= 0 ? row[folioIdx] : "").trim();
+
+    if (!cufe) continue;
     if (!docnum) continue;
+
     out.push({ cufe, docnum });
   }
 
@@ -889,15 +1326,25 @@ async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: Do
     const key = `${rec.docnum}::${rec.cufe}`;
     if (!dedup.has(key)) dedup.set(key, rec);
   }
-  return Array.from(dedup.values());
+  const finalRows = Array.from(dedup.values());
+  if (finalRows.length === 0) {
+    console.warn("[DIAN Export] No se pudieron mapear CUFEs desde el XLSX", {
+      cufeIdx,
+      folioIdx,
+      groupIdx,
+      totalRows: rows.length,
+      sampleHeaders: rows[0]?.slice(0, 10),
+    });
+  }
+  return finalRows;
 }
 
 function parseSharedStrings(xml: string): string[] {
   if (!xml) return [];
   const strings: string[] = [];
-  const siMatches = xml.match(/<si[\s\S]*?<\/si>/g) || [];
+  const siMatches = xml.match(/<(?:\w+:)?si[\s\S]*?<\/(?:\w+:)?si>/g) || [];
   for (const si of siMatches) {
-    const textParts = Array.from(si.matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)).map((m) => decodeXml(m[1]));
+    const textParts = Array.from(si.matchAll(/<(?:\w+:)?t[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/g)).map((m) => decodeXml(m[1]));
     strings.push(textParts.join(""));
   }
   return strings;
@@ -905,10 +1352,10 @@ function parseSharedStrings(xml: string): string[] {
 
 function parseSheetRows(xml: string, sharedStrings: string[]): string[][] {
   const rows: string[][] = [];
-  const rowMatches = xml.match(/<row[^>]*>[\s\S]*?<\/row>/g) || [];
+  const rowMatches = xml.match(/<(?:\w+:)?row[^>]*>[\s\S]*?<\/(?:\w+:)?row>/g) || [];
 
   for (const rowXml of rowMatches) {
-    const cells = Array.from(rowXml.matchAll(/<c([^>]*)>([\s\S]*?)<\/c>/g));
+    const cells = Array.from(rowXml.matchAll(/<(?:\w+:)?c([^>]*)>([\s\S]*?)<\/(?:\w+:)?c>/g));
     const rowValues: string[] = [];
 
     for (const cellMatch of cells) {
@@ -919,8 +1366,8 @@ function parseSheetRows(xml: string, sharedStrings: string[]): string[][] {
       while (rowValues.length < colIndex) rowValues.push("");
 
       const type = (attrs.match(/t="([^"]+)"/) || [])[1] || "";
-      const valueMatch = body.match(/<v>([\s\S]*?)<\/v>/);
-      const inlineMatch = body.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+      const valueMatch = body.match(/<(?:\w+:)?v>([\s\S]*?)<\/(?:\w+:)?v>/);
+      const inlineMatch = body.match(/<(?:\w+:)?t[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/);
 
       let value = "";
       if (type === "s" && valueMatch) {
@@ -958,41 +1405,306 @@ function decodeXml(value: string): string {
     .replace(/&#39;/g, "'");
 }
 
+function parseDownloadLinksFromExportHtml(html: string): Array<{ href: string; rk: string }> {
+  const links = Array.from(html.matchAll(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/g))
+    .map((m) => m[1].replace(/&amp;/g, "&"));
+
+  const parsed: Array<{ href: string; rk: string }> = [];
+  for (const href of links) {
+    const rkMatch = href.match(/[?&]rk=([^&]+)/i);
+    const rk = rkMatch?.[1] || "";
+    if (!rk) continue;
+    parsed.push({ href, rk });
+  }
+
+  return parsed;
+}
+
+function findReusableExportLinks(
+  html: string,
+  direction: DocumentDirection,
+  startDate?: string,
+  endDate?: string
+): string[] {
+  if (!startDate || !endDate) return [];
+  const requestedStart = parseIsoDate(startDate);
+  const requestedEnd = parseIsoDate(endDate);
+  if (!requestedStart || !requestedEnd) return [];
+
+    const desiredTypes = direction === "sent" ? ["enviados", "emitidos"] : ["recibidos"];
+
+  const tbodyMatch = html.match(/<table[^>]*id="tableExport"[\s\S]*?<tbody>([\s\S]*?)<\/tbody>/i);
+  if (!tbodyMatch) return [];
+
+  const rows = Array.from(tbodyMatch[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)).map((m) => m[1]);
+  const matches: string[] = [];
+  for (const row of rows) {
+    const tds = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((m) => m[1]);
+    if (tds.length < 4) continue;
+
+    const rangeText = stripHtml(tds[2]).toLowerCase();
+    const typeText = stripHtml(tds[3]).toLowerCase();
+
+    const parsedRange = parseExportRange(rangeText);
+    if (!parsedRange) continue;
+
+    // "Enviados y Recibidos" se puede reutilizar siempre que luego se filtre
+    // por columna "Grupo" en el parser del XLSX según dirección solicitada.
+    const isBothType = typeText.includes("enviados") && typeText.includes("recibidos");
+    const typeMatches = isBothType || desiredTypes.some((dt) => typeText.includes(dt));
+
+    // Reutilizar solo si el rango del listado coincide exactamente.
+    const rangeMatches = parsedRange.start === requestedStart && parsedRange.end === requestedEnd;
+    if (!typeMatches || !rangeMatches) continue;
+
+    const hrefMatch = row.match(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/i);
+    if (!hrefMatch) continue;
+    matches.push(hrefMatch[1].replace(/&amp;/g, "&"));
+  }
+
+  // La tabla de export normalmente lista más nuevo primero; priorizar ese orden
+  // mantiene el comportamiento manual (tomar la primera fila visible que coincide).
+  return matches;
+}
+
+function parseIsoDate(value: string): number | null {
+  const m = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
+function parseExportRange(text: string): { start: number; end: number } | null {
+  const m = text.match(/desde\s+(\d{2})-(\d{2})-(\d{4})\s+hasta\s+(\d{2})-(\d{2})-(\d{4})/i);
+  if (!m) return null;
+  const start = Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+  const end = Date.UTC(Number(m[6]), Number(m[5]) - 1, Number(m[4]));
+  return { start, end };
+}
+
+function toDianDisplayDate(dateISO: string): string {
+  const [year, month, day] = dateISO.split("-");
+  if (!year || !month || !day) return dateISO;
+  return `${day.padStart(2, "0")}-${month.padStart(2, "0")}-${year}`;
+}
+
+function stripHtml(raw: string): string {
+  return raw.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+}
+
 async function findDocumentByUniqueCodeOrDocnum(
   page: Page,
   cufe: string,
   docnum: string,
   seenIds: Set<string>,
-  isSentDocuments: boolean
+  isSentDocuments: boolean,
+  searchTriggeredByCaller: boolean = false
 ): Promise<DocumentInfo | null> {
-  const candidates = [cufe, docnum].filter(Boolean);
+  const candidates = [cufe].filter(Boolean);
   for (const term of candidates) {
     try {
-      await page.evaluate((value) => {
-        const input = document.querySelector(
-          "#tableDocuments_filter input, .dataTables_filter input, .dt-search input, input[type='search']"
-        ) as HTMLInputElement | null;
-        if (!input) return;
-        input.value = value;
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-        input.dispatchEvent(new Event("keyup", { bubbles: true }));
-        input.dispatchEvent(new Event("change", { bubbles: true }));
-      }, term);
+      // 1) Flujo UI directo igual al manual: Código único + Buscar.
+      // No tocar otros filtros para no alterar el estado de la búsqueda.
 
-      await delay(900);
-      await waitForTableLoad(page);
+      const uniqueInputSelectors = [
+        "#DocumentKey",
+        "input[name='DocumentKey']",
+      ];
+      let searchedByUniqueCode = false;
 
-      const found = await extractDocsFromPage(page, seenIds, isSentDocuments);
-      if (found.length > 0) {
-        const exact = found.find((d) => (docnum && d.docnum === docnum) || (cufe && d.cufe === cufe));
-        return exact || found[0];
+      for (const sel of uniqueInputSelectors) {
+        const input = await page.$(sel);
+        if (!input) continue;
+
+        // Escritura robusta del CUFE sin depender de eventos de teclado/click
+        // (reduce timeouts Runtime.callFunctionOn en cargas altas).
+        await page.$eval(sel, (el, value) => {
+          const i = el as HTMLInputElement;
+          i.value = String(value || "");
+          i.dispatchEvent(new Event("input", { bubbles: true }));
+          i.dispatchEvent(new Event("change", { bubbles: true }));
+        }, term);
+
+        const inputValue = await page.$eval(sel, (el) => (el as HTMLInputElement).value || "");
+        if (normalizeCufe(inputValue) !== normalizeCufe(term)) {
+          console.warn("[DIAN CUFE] El campo Código único no conservó el valor esperado", {
+            expected: normalizeCufe(term).slice(0, 16),
+            actual: normalizeCufe(inputValue).slice(0, 16),
+          });
+        }
+
+        searchedByUniqueCode = true;
+        break;
       }
-    } catch {
-      // continuar con siguiente candidato
+
+      if (searchedByUniqueCode && !searchTriggeredByCaller) {
+        const submitted = await page.evaluate(() => {
+          const form = document.querySelector("form#documents-form") as HTMLFormElement | null;
+          if (!form) return false;
+          if (typeof form.requestSubmit === "function") {
+            form.requestSubmit();
+            return true;
+          }
+          form.submit();
+          return true;
+        }).catch(() => false);
+
+        if (!submitted) {
+          const searchButton =
+            (await page.$("form#documents-form button.btn.btn-success.btn-radian-success")) ||
+            (await page.$("form#documents-form button[type='submit']")) ||
+            (await page.$("button.btn.btn-success.btn-radian-success")) ||
+            (await page.$("button[type='submit']"));
+          if (searchButton) {
+            await searchButton.click();
+          } else {
+            await page.keyboard.press("Enter");
+          }
+        }
+      }
+
+      if (searchedByUniqueCode) {
+        await delay(80);
+        await waitForTableLoad(page);
+
+        // Usar un set temporal en búsqueda puntual para no descartar un resultado
+        // válido por deduplicación previa de otro CUFE.
+        const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, new Set<string>(), isSentDocuments);
+        if (foundByUniqueCode.length > 0) {
+          const exact = foundByUniqueCode.find((d) =>
+            (docnum && d.docnum === docnum) ||
+            (cufe && normalizeCufe(d.cufe || "") === normalizeCufe(cufe))
+          );
+          const selected = exact || foundByUniqueCode[0];
+          if (!seenIds.has(selected.id)) seenIds.add(selected.id);
+          return selected;
+        }
+
+        const visibleRows = await page.evaluate(() =>
+          document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)").length
+        );
+        if (visibleRows > 0) {
+          // Fallback ultra directo: tomar la primera fila visible exactamente
+          // como en uso manual (si hay una fila, descargar esa).
+          const firstRowDoc = await page.evaluate((isSentDocumentsInPage) => {
+            const row = document.querySelector("#tableDocuments tbody tr:not(.dataTables_empty)") as HTMLTableRowElement | null;
+            if (!row) return null;
+
+            let trackId = "";
+            const pickFrom = row.querySelectorAll(
+              ".download-document, .download-support-document, .download-eventos, .download-equivalente-document, .download-individual-payroll, [data-trackid], [data-id], [id], a[href*='trackId'], a[href*='DownloadZipFiles'], [onclick*='DownloadZipFiles'], [onclick*='trackId']"
+            );
+
+            for (const el of pickFrom) {
+              const id = (el as HTMLElement).id || "";
+              const d1 = el.getAttribute("data-trackid") || "";
+              const d2 = el.getAttribute("data-id") || "";
+              const href = el.getAttribute("href") || "";
+              const onclick = el.getAttribute("onclick") || "";
+              const m1 = href.match(/trackId=([^&'"\s]+)/i);
+              const m2 = onclick.match(/trackId=([^&'"\s]+)/i);
+              const m3 = href.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+              const m4 = onclick.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+              trackId = id || d1 || d2 || m1?.[1] || m2?.[1] || m3?.[1] || m4?.[1] || "";
+              if (trackId) break;
+            }
+
+            if (!trackId) {
+              trackId = row.getAttribute("data-id") || row.getAttribute("data-trackid") || row.id || "";
+            }
+            if (!trackId) return null;
+
+            const tds = row.querySelectorAll("td");
+            const docnum = tds[4]?.textContent?.trim() || "";
+            const docType = tds[5]?.textContent?.trim() || "";
+            const nit = isSentDocumentsInPage
+              ? (tds[8]?.textContent?.trim() || tds[6]?.textContent?.trim() || "")
+              : (tds[6]?.textContent?.trim() || tds[8]?.textContent?.trim() || "");
+            const cufeValue = tds[13]?.textContent?.trim() || tds[12]?.textContent?.trim() || "";
+
+            return { id: trackId, docnum, nit, cufe: cufeValue, docType };
+          }, isSentDocuments);
+
+          if (firstRowDoc?.id) {
+            if (!seenIds.has(firstRowDoc.id)) seenIds.add(firstRowDoc.id);
+            return firstRowDoc;
+          }
+
+          // Fallback final: en muchos casos DIAN usa el CUFE como trackId del botón.
+          // Si hay fila visible y no se pudo extraer id por DOM, continuar con CUFE
+          // como identificador para no perder el documento.
+          const docnumFromFirstRow = await page.evaluate(() => {
+            const row = document.querySelector("#tableDocuments tbody tr:not(.dataTables_empty)") as HTMLTableRowElement | null;
+            if (!row) return "";
+            const tds = row.querySelectorAll("td");
+            return tds[4]?.textContent?.trim() || "";
+          });
+
+          const cufeAsId = normalizeCufe(cufe || "");
+          if (cufeAsId) {
+            if (!seenIds.has(cufeAsId)) seenIds.add(cufeAsId);
+            return {
+              id: cufeAsId,
+              docnum: docnumFromFirstRow,
+              nit: "",
+              cufe,
+              docType: "",
+            };
+          }
+
+          throw new Error(`Resultado visible sin trackId extraíble para CUFE ${cufe.slice(0, 16)}...`);
+        }
+      }
+    } catch (err) {
+      // Propagar para no ocultar errores técnicos de extracción/estado.
+      throw err;
     }
   }
 
   return null;
+}
+
+async function extractDocsFromCurrentPageHtml(page: Page, seenIds: Set<string>, isSentDocuments: boolean): Promise<DocumentInfo[]> {
+  // Reusar el extractor DOM principal (más robusto para trackId y variantes de botones)
+  // también en búsqueda CUFE puntual.
+  return extractDocsFromPage(page, seenIds, isSentDocuments, false);
+}
+
+function extractDocsFromHtml(html: string, seenIds: Set<string>, isSentDocuments: boolean): DocumentInfo[] {
+  // Tomar exclusivamente la tabla de documentos DIAN para evitar leer tbody
+  // de otros componentes del layout.
+  const tableMatch = html.match(/<table[^>]*id=["']tableDocuments["'][^>]*>([\s\S]*?)<\/table>/i);
+  if (!tableMatch) return [];
+
+  const tbodyMatch = tableMatch[1].match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/i);
+  if (!tbodyMatch) return [];
+
+  const rows = Array.from(tbodyMatch[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)).map((m) => m[1]);
+  const docs: DocumentInfo[] = [];
+
+  for (const row of rows) {
+    if (/dataTables_empty/i.test(row)) continue;
+    let trackId = "";
+    const m1 = row.match(/trackId=([^&'"\s]+)/i);
+    const m2 = row.match(/DownloadZipFiles(?:Equivalente)?\s*\(\s*['\"]([^'\"]+)['\"]/i);
+    const m3 = row.match(/data-trackid=['\"]([^'\"]+)['\"]/i);
+    const m4 = row.match(/data-id=['\"]([^'\"]+)['\"]/i);
+    const m5 = row.match(/<button[^>]*\sid=['\"]([^'\"]+)['\"]/i);
+    const m6 = row.match(/<tr[^>]*\sdata-id=['\"]([^'\"]+)['\"]/i);
+    trackId = m1?.[1] || m2?.[1] || m3?.[1] || m4?.[1] || m5?.[1] || m6?.[1] || "";
+    if (!trackId || seenIds.has(trackId)) continue;
+
+    const cells = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((c) => stripHtml(c[1]));
+    const docnum = cells[4] || "";
+    const docType = cells[5] || "";
+    const nit = isSentDocuments ? (cells[8] || cells[6] || "") : (cells[6] || cells[8] || "");
+    const cufe = cells[13] || cells[12] || "";
+
+    if (shouldIgnoreDocType(docType, isSentDocuments)) continue;
+    seenIds.add(trackId);
+    docs.push({ id: trackId, docnum, nit, cufe, docType });
+  }
+
+  return docs;
 }
 
 async function goToNextPage(page: Page): Promise<boolean> {
@@ -1166,6 +1878,24 @@ async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3
       
       // Espera adicional para que scripts asíncronos carguen
       await delay(1500);
+
+      const currentUrl = page.url();
+      if (isLoginPage(currentUrl)) {
+        const tokenExpiredError = new Error(
+          "TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN."
+        );
+
+        // Regla operativa solicitada: si al segundo intento redirige a User/Login,
+        // informar expiración de token de inmediato.
+        if (attempt >= 2) {
+          throw tokenExpiredError;
+        }
+
+        lastError = tokenExpiredError;
+        console.log(`Redirección a login detectada en intento ${attempt}, reintentando...`);
+        await delay(1200);
+        continue;
+      }
       
       console.log(`Navegación exitosa en intento ${attempt}`);
       return;

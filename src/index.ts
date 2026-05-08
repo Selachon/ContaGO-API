@@ -13,7 +13,9 @@ import googleAuthRoutes from "./routes/googleAuth.js";
 import adminRoutes from "./routes/admin.js";
 import siigoRoutes from "./routes/siigo.js";
 import causationRoutes from "./routes/causation.js";
+import rutConsultaRoutes from "./routes/rutConsulta.js";
 import { connectMongo, seedAdminUser } from "./services/database.js";
+import { ensureIndexes as ensureBrowserJobIndexes } from "./services/rutBrowserJobService.js";
 
 // ============================================
 // Validar variables de entorno obligatorias
@@ -63,6 +65,7 @@ app.use("/dian-excel", dianExcelRoutes);
 app.use("/dian-third-parties", dianThirdPartiesRoutes);
 app.use("/integrations/siigo", siigoRoutes);
 app.use("/causation", causationRoutes);
+app.use("/rut-consulta", rutConsultaRoutes);
 
 // Health check
 app.get("/", (_req, res) => {
@@ -97,6 +100,7 @@ async function ensurePuppeteer(): Promise<void> {
 ensurePuppeteer()
   .then(connectMongo)
   .then(seedAdminUser)
+  .then(ensureBrowserJobIndexes)
   .then(() => {
     app.listen(PORT, () => {
       console.log(`ContaGO API running on port ${PORT}`);
