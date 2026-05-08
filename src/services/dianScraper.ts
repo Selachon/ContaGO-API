@@ -308,7 +308,8 @@ export async function extractDocumentIdsByCufe(
   progressUid?: string,
   documentDirection: DocumentDirection = "received",
   onProgress?: (data: Partial<ProgressData>) => void,
-  onDocumentFound?: OnDocumentFound
+  onDocumentFound?: OnDocumentFound,
+  preloadedCufes?: string[]
 ): Promise<ExtractionResult> {
   const direction = documentDirection || "received";
   const isSent = direction === "sent";
@@ -342,12 +343,18 @@ export async function extractDocumentIdsByCufe(
       throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
     }
 
-    updateProgress({ step: "Descargando listado DIAN por CUFE...", current: 0, total: 1 });
-    const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
-    const cufes = Array.from(new Set(listedRecords.map((r) => normalizeCufe(r.cufe || "")).filter(Boolean)));
-
-    if (cufes.length === 0) {
-      throw new Error("No se encontraron CUFEs válidos en Descarga de listados para ese rango.");
+    let cufes: string[];
+    if (preloadedCufes && preloadedCufes.length > 0) {
+      cufes = Array.from(new Set(preloadedCufes.map(normalizeCufe).filter(Boolean)));
+      updateProgress({ step: `Listado manual cargado: ${cufes.length} CUFEs`, current: 0, total: cufes.length });
+      console.log(`[DIAN CUFE] Usando ${cufes.length} CUFEs precargados desde Excel manual`);
+    } else {
+      updateProgress({ step: "Descargando listado DIAN por CUFE...", current: 0, total: 1 });
+      const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
+      cufes = Array.from(new Set(listedRecords.map((r) => normalizeCufe(r.cufe || "")).filter(Boolean)));
+      if (cufes.length === 0) {
+        throw new Error("No se encontraron CUFEs válidos en Descarga de listados para ese rango.");
+      }
     }
 
     updateProgress({
@@ -1261,7 +1268,7 @@ function toDianExportDate(dateISO: string, endOfDay: boolean = false): string {
     : `${Number(month)}/${Number(day)}/${year} 12:00:00 AM`;
 }
 
-async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: DocumentDirection): Promise<ListingRecord[]> {
+export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: DocumentDirection): Promise<ListingRecord[]> {
   // DIAN puede devolver:
   // 1) ZIP contenedor con un .xlsx adentro
   // 2) el .xlsx directamente (que también es un ZIP OOXML)
