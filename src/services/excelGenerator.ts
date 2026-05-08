@@ -132,51 +132,87 @@ function patchTable1HeadersForIcl(tableXml: string): string {
 }
 
 function removeDriveColumnFromTable1(tableXml: string): string {
+  // After patchTableRef set ref to A2:W{n}, revert to A2:V{n} when no Drive column.
   return tableXml
-    .replace('ref="A2:U3"', 'ref="A2:T3"')
-    .replace('autoFilter ref="A2:U3"', 'autoFilter ref="A2:T3"')
+    .replace(/ref="A2:W(\d+)"/g, 'ref="A2:V$1"')
+    .replace(/autoFilter ref="A2:W(\d+)"/g, 'autoFilter ref="A2:V$1"')
     .replace('tableColumns count="21"', 'tableColumns count="20"')
     .replace(/<tableColumn[^>]*name="Enlace factura"\/>/g, "");
 }
 
-function patchSheet1HeaderWithoutDrive(sheetXml: string): string {
-  const row2Regex = /<row r="2"[^>]*>.*?<\/row>/;
-  return sheetXml
-    .replace('spans="1:21"', 'spans="1:20"')
+// Adds IBUA and ADV columns to table1 before "Valor total".
+function patchTable1ForIbuaAdv(tableXml: string, includeDrive: boolean): string {
+  const baseCount = includeDrive ? 21 : 20;
+  return tableXml
+    .replace(`tableColumns count="${baseCount}"`, `tableColumns count="${baseCount + 2}"`)
     .replace(
-      row2Regex,
-      (row2) =>
-        row2
-          .replace('spans="1:21"', 'spans="1:20"')
-          .replace(/<c r="T2"[^>]*>.*?<\/c>/, '<c r="T2" s="3" t="inlineStr"><is><t>CUFE</t></is></c>')
-          .replace(/<c r="U2"[^>]*>.*?<\/c>/, "")
+      /<tableColumn([^>]*)name="Valor total"\/>/,
+      '<tableColumn id="99" name="IBUA"/><tableColumn id="100" name="ADV"/><tableColumn$1name="Valor total"/>'
     );
 }
 
-function patchTable2ForIcl(tableXml: string): string {
-  let out = tableXml
-    .replace('ref="A2:R3"', 'ref="A2:V3"')
-    .replace('autoFilter ref="A2:R3"', 'autoFilter ref="A2:V3"')
-    .replace('tableColumns count="18"', 'tableColumns count="22"')
-    .replace(
-      /<tableColumn([^>]*)name="Precio unitario \(incluye impuestos\)"\/>/g,
-      '<tableColumn$1name="IC Porcentual"/><tableColumn id="19" name="% IC Porcentual"/><tableColumn id="20" name="ICL"/><tableColumn id="21" name="% ICL"/><tableColumn id="22" name="Precio unitario (incluye impuestos)"/>'
-    );
-  return out;
-}
-
-function patchSheet2HeaderWithIcl(sheetXml: string): string {
+// Rebuilds sheet1 row2 to account for IBUA/ADV inserted before Valor total.
+function patchSheet1Header(sheetXml: string, includeDrive: boolean): string {
+  const endSpan = includeDrive ? 23 : 22;
   const row2Regex = /<row r="2"[^>]*>.*?<\/row>/;
   return sheetXml
-    .replace('spans="1:18"', 'spans="1:22"')
-    .replace(
-      row2Regex,
-      (row2) =>
-        row2
-          .replace('spans="1:18"', 'spans="1:22"')
-          .replace(/<c r="R2"[^>]*>.*?<\/c>/, '<c r="R2" s="3" t="inlineStr"><is><t>IC Porcentual</t></is></c>')
-          .replace('</row>', '<c r="S2" s="3" t="inlineStr"><is><t>% IC Porcentual</t></is></c><c r="T2" s="3" t="inlineStr"><is><t>ICL</t></is></c><c r="U2" s="3" t="inlineStr"><is><t>% ICL</t></is></c><c r="V2" s="3" t="inlineStr"><is><t>Precio unitario (incluye impuestos)</t></is></c></row>')
+    .replace(/spans="1:\d+"/, `spans="1:${endSpan}"`)
+    .replace(row2Regex, (row2) =>
+      row2
+        .replace(/spans="1:\d+"/, `spans="1:${endSpan}"`)
+        // Remove old S2 (Valor total), T2 (Enlace), U2 (CUFE) — they shift right.
+        .replace(/<c r="S2"[^>]*>.*?<\/c>/, "")
+        .replace(/<c r="T2"[^>]*>.*?<\/c>/, "")
+        .replace(/<c r="U2"[^>]*>.*?<\/c>/, "")
+        // Append new headers in the correct positions before </row>.
+        .replace(
+          "</row>",
+          '<c r="S2" s="2" t="inlineStr"><is><t>IBUA</t></is></c>' +
+          '<c r="T2" s="2" t="inlineStr"><is><t>ADV</t></is></c>' +
+          '<c r="U2" s="2" t="inlineStr"><is><t>Valor total</t></is></c>' +
+          (includeDrive
+            ? '<c r="V2" s="2" t="inlineStr"><is><t>Enlace factura</t></is></c>' +
+              '<c r="W2" s="2" t="inlineStr"><is><t>CUFE</t></is></c>'
+            : '<c r="V2" s="2" t="inlineStr"><is><t>CUFE</t></is></c>') +
+          "</row>"
+        )
     );
+}
+
+function patchTable2(tableXml: string): string {
+  return tableXml
+    .replace('tableColumns count="18"', 'tableColumns count="27"')
+    .replace(
+      /<tableColumn([^>]*)name="Numero Factura"\/>/,
+      '<tableColumn$1name="Numero Factura"/><tableColumn id="28" name="Tipo de documento"/>'
+    )
+    .replace(
+      /<tableColumn([^>]*)name="Precio unitario \(incluye impuestos\)"\/>/,
+      '<tableColumn id="19" name="IC Porcentual"/><tableColumn id="20" name="% IC Porcentual"/>' +
+      '<tableColumn id="21" name="ICL"/><tableColumn id="22" name="% ICL"/>' +
+      '<tableColumn id="23" name="IBUA"/><tableColumn id="24" name="% IBUA"/>' +
+      '<tableColumn id="25" name="ADV"/><tableColumn id="26" name="% ADV"/>' +
+      '<tableColumn$1name="Precio unitario (incluye impuestos)"/>'
+    );
+}
+
+function patchSheet2Header(sheetXml: string): string {
+  const headers = [
+    "Item", "Numero Factura", "Tipo de documento", "Concepto", "Cantidad",
+    "Base del impuesto", "Descuento detalle", "Recargo detalle",
+    "IVA", "% IVA", "INC", "% INC", "Bolsas", "% Bolsas",
+    "ICUI", "% ICUI", "IC", "% IC",
+    "IC Porcentual", "% IC Porcentual", "ICL", "% ICL",
+    "IBUA", "% IBUA", "ADV", "% ADV",
+    "Precio unitario (incluye impuestos)",
+  ];
+  const row2Cells = headers
+    .map((h, i) => `<c r="${colLetter(i + 1)}2" s="3" t="inlineStr"><is><t>${xmlEsc(h)}</t></is></c>`)
+    .join("");
+  const row2Regex = /<row r="2"[^>]*>.*?<\/row>/;
+  return sheetXml
+    .replace(/spans="1:\d+"/g, 'spans="1:27"')
+    .replace(row2Regex, `<row r="2" spans="1:27">${row2Cells}</row>`);
 }
 
 // Style indices added to styles.xml (appended after the 7 existing xfs, indices 0-6)
@@ -228,11 +264,11 @@ export async function generateExcelFile(
   const sorted = sortInvoicesByDate(invoices);
 
   // ── 3. Sheet 1 — Facturas DIAN ───────────────────────────────────────────
-  // Fixed column positions (1-indexed, matching template table columns A–U)
   // A=ID  B=Tipo doc  C=Num Factura  D=NIT Emisor  E=Razon Social
   // F=Fecha  G=Concepto  H=Forma pago  I=Subtotal  J=Desc detalle
   // K=Recargo detalle  L=IVA  M=INC  N=Bolsas  O=ICUI  P=IC
-  // Q=Desc Global  R=Recargo Global  S=Valor total  T=Enlace  U=CUFE
+  // Q=ICL  R=IC Porcentual  S=IBUA  T=ADV  U=Valor total
+  // V=Enlace [con Drive]  W=CUFE [con Drive] / V=CUFE [sin Drive]
 
   let sheet1Rows: string[] = [];
   let sheet1DriveRels: Array<{ id: string; url: string }> = [];
@@ -270,17 +306,19 @@ export async function generateExcelFile(
     c += numCell(`P${rowNum}`, taxes["IC"] ?? 0, STYLE_CURRENCY);
     c += numCell(`Q${rowNum}`, taxes["ICL"] ?? 0, STYLE_CURRENCY);
     c += numCell(`R${rowNum}`, taxes["IC Porcentual"] ?? 0, STYLE_CURRENCY);
-    c += numCell(`S${rowNum}`, typeof inv.total === "number" ? inv.total : 0, STYLE_CURRENCY);
+    c += numCell(`S${rowNum}`, taxes["IBUA"] ?? 0, STYLE_CURRENCY);
+    c += numCell(`T${rowNum}`, taxes["ADV"] ?? 0, STYLE_CURRENCY);
+    c += numCell(`U${rowNum}`, typeof inv.total === "number" ? inv.total : 0, STYLE_CURRENCY);
 
     if (includeDriveColumn && inv.driveUrl && !inv.driveUrl.includes("ERROR")) {
       const relId = `rId${rIdCounter++}`;
       sheet1DriveRels.push({ id: relId, url: inv.driveUrl });
-      sheet1Hyperlinks.push(`<hyperlink ref="T${rowNum}" r:id="${relId}" display="Ver factura"/>`);
-      c += txtCell(`T${rowNum}`, "Ver factura");
+      sheet1Hyperlinks.push(`<hyperlink ref="V${rowNum}" r:id="${relId}" display="Ver factura"/>`);
+      c += txtCell(`V${rowNum}`, "Ver factura");
     }
 
-    if (includeDriveColumn) c += txtCell(`U${rowNum}`, inv.cufe);
-    else c += txtCell(`T${rowNum}`, inv.cufe);
+    if (includeDriveColumn) c += txtCell(`W${rowNum}`, inv.cufe);
+    else c += txtCell(`V${rowNum}`, inv.cufe);
 
     sheet1Rows.push(`<row r="${rowNum}">${c}</row>`);
   });
@@ -294,10 +332,8 @@ export async function generateExcelFile(
     sheet1Hyperlinks.length > 0
       ? `<hyperlinks>${sheet1Hyperlinks.join("")}</hyperlinks>`
       : null;
-  sheet1Xml = patchSheetXml(sheet1Xml, s1SheetData, s1Hyperlinks, sheet1LastRow, includeDriveColumn ? "U" : "T");
-  if (!includeDriveColumn) {
-    sheet1Xml = patchSheet1HeaderWithoutDrive(sheet1Xml);
-  }
+  sheet1Xml = patchSheetXml(sheet1Xml, s1SheetData, s1Hyperlinks, sheet1LastRow, includeDriveColumn ? "W" : "V");
+  sheet1Xml = patchSheet1Header(sheet1Xml, includeDriveColumn);
   zip.file("xl/worksheets/sheet1.xml", sheet1Xml);
 
   if (sheet1DriveRels.length > 0) {
@@ -313,10 +349,11 @@ export async function generateExcelFile(
   }
 
   // ── 4. Sheet 2 — Detallado ───────────────────────────────────────────────
-  // A=Item  B=Num Factura  C=Concepto  D=Cantidad  E=Base impuesto
-  // F=Desc detalle  G=Recargo detalle  H=IVA  I=%IVA  J=INC  K=%INC
-  // L=Bolsas  M=%Bolsas  N=ICUI  O=%ICUI  P=IC  Q=%IC
-  // R=IC Porcentual  S=% IC Porcentual  T=ICL  U=%ICL  V=Precio unitario
+  // A=Item  B=Num Factura  C=Tipo doc  D=Concepto  E=Cantidad
+  // F=Base impuesto  G=Desc detalle  H=Recargo detalle
+  // I=IVA  J=%IVA  K=INC  L=%INC  M=Bolsas  N=%Bolsas
+  // O=ICUI  P=%ICUI  Q=IC  R=%IC  S=IC Porcentual  T=%IC Porcentual
+  // U=ICL  V=%ICL  W=IBUA  X=%IBUA  Y=ADV  Z=%ADV  AA=Precio unitario
 
   let sheet2Rows: string[] = [];
   let sheet2Hyperlinks: string[] = [];
@@ -338,26 +375,31 @@ export async function generateExcelFile(
       let c = "";
       c += numCell(`A${rowNum}`, li.lineNumber);
       c += txtCell(`B${rowNum}`, inv.docNumber);
-      c += txtCell(`C${rowNum}`, li.description);
-      c += numCell(`D${rowNum}`, li.quantity);
-      c += numCell(`E${rowNum}`, li.totalUnitPrice, STYLE_CURRENCY);
-      c += numCell(`F${rowNum}`, li.discount, STYLE_CURRENCY);
-      c += numCell(`G${rowNum}`, li.surcharge, STYLE_CURRENCY);
-      c += numCell(`H${rowNum}`, td["IVA"]?.amount ?? 0, STYLE_CURRENCY);
-      c += numCell(`I${rowNum}`, td["IVA"]?.percent ?? 0, STYLE_PERCENT);
-      c += numCell(`J${rowNum}`, td["INC"]?.amount ?? 0, STYLE_CURRENCY);
-      c += numCell(`K${rowNum}`, td["INC"]?.percent ?? 0, STYLE_PERCENT);
-      c += numCell(`L${rowNum}`, td["Bolsas"]?.amount ?? 0, STYLE_CURRENCY);
-      c += numCell(`M${rowNum}`, td["Bolsas"]?.percent ?? 0, STYLE_PERCENT);
-      c += numCell(`N${rowNum}`, td["ICUI"]?.amount ?? 0, STYLE_CURRENCY);
-      c += numCell(`O${rowNum}`, td["ICUI"]?.percent ?? 0, STYLE_PERCENT);
-      c += numCell(`P${rowNum}`, td["IC"]?.amount ?? 0, STYLE_CURRENCY);
-      c += numCell(`Q${rowNum}`, td["IC"]?.percent ?? 0, STYLE_PERCENT);
-      c += numCell(`R${rowNum}`, td["IC Porcentual"]?.amount ?? 0, STYLE_CURRENCY);
-      c += numCell(`S${rowNum}`, td["IC Porcentual"]?.percent ?? 0, STYLE_PERCENT);
-      c += numCell(`T${rowNum}`, td["ICL"]?.amount ?? 0, STYLE_CURRENCY);
-      c += numCell(`U${rowNum}`, td["ICL"]?.percent ?? 0, STYLE_PERCENT);
-      c += numCell(`V${rowNum}`, li.totalUnitPrice + totalTax, STYLE_CURRENCY);
+      c += txtCell(`C${rowNum}`, inv.documentType);
+      c += txtCell(`D${rowNum}`, li.description);
+      c += numCell(`E${rowNum}`, li.quantity);
+      c += numCell(`F${rowNum}`, li.totalUnitPrice, STYLE_CURRENCY);
+      c += numCell(`G${rowNum}`, li.discount, STYLE_CURRENCY);
+      c += numCell(`H${rowNum}`, li.surcharge, STYLE_CURRENCY);
+      c += numCell(`I${rowNum}`, td["IVA"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`J${rowNum}`, td["IVA"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`K${rowNum}`, td["INC"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`L${rowNum}`, td["INC"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`M${rowNum}`, td["Bolsas"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`N${rowNum}`, td["Bolsas"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`O${rowNum}`, td["ICUI"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`P${rowNum}`, td["ICUI"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`Q${rowNum}`, td["IC"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`R${rowNum}`, td["IC"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`S${rowNum}`, td["IC Porcentual"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`T${rowNum}`, td["IC Porcentual"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`U${rowNum}`, td["ICL"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`V${rowNum}`, td["ICL"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`W${rowNum}`, td["IBUA"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`X${rowNum}`, td["IBUA"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`Y${rowNum}`, td["ADV"]?.amount ?? 0, STYLE_CURRENCY);
+      c += numCell(`Z${rowNum}`, td["ADV"]?.percent ?? 0, STYLE_PERCENT);
+      c += numCell(`AA${rowNum}`, li.totalUnitPrice + totalTax, STYLE_CURRENCY);
 
       sheet2Rows.push(`<row r="${rowNum}">${c}</row>`);
     }
@@ -372,8 +414,8 @@ export async function generateExcelFile(
     sheet2Hyperlinks.length > 0
       ? `<hyperlinks>${sheet2Hyperlinks.join("")}</hyperlinks>`
       : null;
-  sheet2Xml = patchSheetXml(sheet2Xml, s2SheetData, s2Hyperlinks, sheet2LastRow, "V");
-  sheet2Xml = patchSheet2HeaderWithIcl(sheet2Xml);
+  sheet2Xml = patchSheetXml(sheet2Xml, s2SheetData, s2Hyperlinks, sheet2LastRow, "AA");
+  sheet2Xml = patchSheet2Header(sheet2Xml);
   zip.file("xl/worksheets/sheet2.xml", sheet2Xml);
 
   // ── 5. Sheet 3 — Datos de terceros ───────────────────────────────────────
@@ -458,16 +500,17 @@ export async function generateExcelFile(
 
   // ── 6. Patch table refs ──────────────────────────────────────────────────
   const table1Xml = await zip.file("xl/tables/table1.xml")!.async("string");
-  const table1RefPatched = patchTableRef(table1Xml, includeDriveColumn ? "U" : "T", sheet1LastRow);
+  const table1RefPatched = patchTableRef(table1Xml, includeDriveColumn ? "W" : "V", sheet1LastRow);
   let finalTable1 = patchTable1HeadersForIcl(table1RefPatched);
   if (isSentDocuments) finalTable1 = patchTable1HeadersForSent(finalTable1);
   if (!includeDriveColumn) {
     finalTable1 = removeDriveColumnFromTable1(finalTable1);
   }
+  finalTable1 = patchTable1ForIbuaAdv(finalTable1, includeDriveColumn);
   zip.file("xl/tables/table1.xml", finalTable1);
   const table2Xml = await zip.file("xl/tables/table2.xml")!.async("string");
-  const table2RefPatched = patchTableRef(table2Xml, "V", sheet2LastRow);
-  zip.file("xl/tables/table2.xml", patchTable2ForIcl(table2RefPatched));
+  const table2RefPatched = patchTableRef(table2Xml, "AA", sheet2LastRow);
+  zip.file("xl/tables/table2.xml", patchTable2(table2RefPatched));
   zip.file("xl/tables/table3.xml", patchTableRef(await zip.file("xl/tables/table3.xml")!.async("string"), "J", sheet3LastRow));
 
   // ── 7. Write output ──────────────────────────────────────────────────────
