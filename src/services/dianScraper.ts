@@ -379,7 +379,10 @@ export async function extractDocumentIdsByCufe(
 
     const documents: DocumentInfo[] = [];
     const seenIds = new Set<string>();
+    const acceptedDocIds = new Set<string>();
+    const acceptedCufes = new Set<string>();
     let failures = 0;
+    let duplicatesSkipped = 0;
 
     if (!browser) {
       throw new Error("No se pudo inicializar el navegador para validación CUFE.");
@@ -471,14 +474,24 @@ export async function extractDocumentIdsByCufe(
 
           if (found?.id) {
             found.cufe = cufe;
-            documents.push(found);
-            if (onDocumentFound) {
-              await onDocumentFound({
-                doc: found,
-                index: i + 1,
-                total: cufes.length,
-                cookies: wc,
-              });
+            const normalizedFoundCufe = normalizeCufe(found.cufe || cufe);
+
+            // Regla estricta: jamás permitir duplicados en el resultado final.
+            // Si se repite ID o CUFE, se omite sin descargar nuevamente.
+            if (acceptedDocIds.has(found.id) || (normalizedFoundCufe && acceptedCufes.has(normalizedFoundCufe))) {
+              duplicatesSkipped++;
+            } else {
+              acceptedDocIds.add(found.id);
+              if (normalizedFoundCufe) acceptedCufes.add(normalizedFoundCufe);
+              documents.push(found);
+              if (onDocumentFound) {
+                await onDocumentFound({
+                  doc: found,
+                  index: i + 1,
+                  total: cufes.length,
+                  cookies: wc,
+                });
+              }
             }
           } else {
             failures++;
@@ -524,7 +537,9 @@ export async function extractDocumentIdsByCufe(
 
     const finalDocuments = documents;
 
-    console.log(`[DIAN CUFE] listado=${cufes.length} encontrados=${finalDocuments.length} fallidos=${failures}`);
+    console.log(
+      `[DIAN CUFE] listado=${cufes.length} encontrados=${finalDocuments.length} fallidos=${failures} duplicados_omitidos=${duplicatesSkipped}`
+    );
 
     if (finalDocuments.length === 0) {
       const msg =
