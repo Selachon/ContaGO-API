@@ -17,11 +17,10 @@ function normalizeNit(nit: string | null | undefined): string {
   return raw.replace(/[^0-9A-Za-z]/g, "").toUpperCase() || "N/A";
 }
 
-// Style helpers applied directly to cells / columns
 const HEADER_FILL: ExcelJS.Fill = {
   type: "pattern",
   pattern: "solid",
-  fgColor: { argb: "FF1F3864" }, // dark blue
+  fgColor: { argb: "FF1F3864" },
 };
 
 const HEADER_FONT: Partial<ExcelJS.Font> = {
@@ -41,37 +40,91 @@ function applyHeaderRow(row: ExcelJS.Row): void {
   row.height = 30;
 }
 
-function setCurrencyFmt(col: ExcelJS.Column | Partial<ExcelJS.Column>): void {
-  col.numFmt = "#,##0.00";
+const NUM_FMT = "#,##0.00";
+const PCT_FMT = "0.00%";
+
+// All numeric columns use #,##0.00 — user can convert to % manually in Excel as needed.
+// "%" columns store the raw percentage value (e.g. 19, not 0.19) so the number is readable.
+const CURRENCY_HEADERS = new Set([
+  "Subtotal", "Descuento", "Recargo",
+  "IVA", "% IVA", "INC", "% INC", "Bolsas", "% Bolsas",
+  "ICUI", "% ICUI", "IC", "IC Porcentual", "% IC Porcentual",
+  "ICL", "IBUA", "% IBUA", "ADV",
+  "Total",
+  "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle",
+  "Precio unitario (incluye impuestos)",
+]);
+
+// Computes format column indices from the actual headers array so indices can never drift.
+function computeFormatCols(headers: string[]): { currencyCols: number[]; percentCols: number[] } {
+  const currencyCols: number[] = [];
+  headers.forEach((h, i) => {
+    if (CURRENCY_HEADERS.has(h)) currencyCols.push(i + 1);
+  });
+  return { currencyCols, percentCols: [] }; // no percent cell format — all numeric as #,##0.00
 }
 
-function setPercentFmt(col: ExcelJS.Column | Partial<ExcelJS.Column>): void {
-  col.numFmt = "0.00%";
+// Applies numFmt directly to cells — more reliable than column-level style in ExcelJS.
+function applyFormats(row: ExcelJS.Row, currencyCols: number[], percentCols: number[]): void {
+  for (const ci of currencyCols) row.getCell(ci).numFmt = NUM_FMT;
+  for (const ci of percentCols) row.getCell(ci).numFmt = PCT_FMT;
+}
+
+// Freezes the first two rows (decorative spacer + header) so they stay visible on scroll.
+function freezeHeaderRows(ws: ExcelJS.Worksheet): void {
+  ws.views = [{ state: "frozen" as const, xSplit: 0, ySplit: 2, topLeftCell: "A3", activeCell: "A3" }];
+}
+
+// Auto-fits column widths based on actual cell content after data is written.
+function autoFitColumns(ws: ExcelJS.Worksheet, minWidth = 8, maxWidth = 70): void {
+  const colMaxLens: number[] = [];
+
+  ws.eachRow({ includeEmpty: false }, (row) => {
+    row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      let len: number;
+      const v = cell.value;
+      if (v === null || v === undefined) {
+        len = 0;
+      } else if (typeof v === "object" && v !== null && "text" in v) {
+        len = String((v as ExcelJS.CellHyperlinkValue).text).length;
+      } else if (typeof v === "number") {
+        // Estimate formatted length (commas + 2 decimal places)
+        len = String(Math.round(Math.abs(v))).length + 5;
+      } else {
+        len = String(v).length;
+      }
+      if (!colMaxLens[colNumber] || len > colMaxLens[colNumber]) {
+        colMaxLens[colNumber] = len;
+      }
+    });
+  });
+
+  colMaxLens.forEach((maxLen, colNumber) => {
+    if (colNumber > 0) {
+      ws.getColumn(colNumber).width = Math.min(Math.max(maxLen + 2, minWidth), maxWidth);
+    }
+  });
 }
 
 // ── Sheet 1: Facturas DIAN ────────────────────────────────────────────────────
+//
+// A: No.               B: Tipo documento      C: Número factura
+// D: NIT Emisor        E: Razón Social Emisor
+// F: NIT Receptor      G: Razón Social Receptor
+// H: Fecha             I: Concepto            J: Forma de pago
+// K: Subtotal          L: Descuento           M: Recargo
+// N: IVA               O: INC                 P: Bolsas
+// Q: ICUI              R: IC                  S: ICL
+// T: IC Porcentual     U: IBUA                V: ADV
+// W: Total             [X: Enlace Drive]      Y/X: CUFE
 
-/**
- * Sheet 1 columns (always both issuer and receiver):
- * A  No.          B  Tipo documento     C  Número factura
- * D  NIT Emisor   E  Razón Social Emisor
- * F  NIT Receptor G  Razón Social Receptor
- * H  Fecha        I  Concepto           J  Forma de pago
- * K  Subtotal     L  Descuento          M  Recargo
- * N  IVA          O  INC                P  Bolsas
- * Q  ICUI         R  IC                 S  ICL
- * T  IC Porcentual U  IBUA              V  ADV
- * W  Total        [X  Enlace Drive — solo si includeDriveColumn]
- * Y/X  CUFE
- */
 function buildSheet1(
   ws: ExcelJS.Worksheet,
   invoices: InvoiceData[],
   includeDriveColumn: boolean
 ): void {
-  ws.getRow(1).height = 5; // decorative spacer row (empty)
+  ws.getRow(1).height = 5;
 
-  // Build header labels
   const baseHeaders = [
     "No.", "Tipo documento", "Número factura",
     "NIT Emisor", "Razón Social Emisor",
@@ -85,55 +138,18 @@ function buildSheet1(
   baseHeaders.push("CUFE");
 
   const headerRow = ws.getRow(2);
-  headerRow.values = ["", ...baseHeaders]; // ExcelJS row values are 1-indexed via array pos [1..n]
+  headerRow.values = ["", ...baseHeaders];
   applyHeaderRow(headerRow);
+  freezeHeaderRows(ws);
 
-  // Column widths and formats
-  const colWidths: number[] = [
-    6,   // A No.
-    22,  // B Tipo documento
-    28,  // C Número factura
-    18,  // D NIT Emisor
-    35,  // E Razón Social Emisor
-    18,  // F NIT Receptor
-    35,  // G Razón Social Receptor
-    14,  // H Fecha
-    40,  // I Concepto
-    20,  // J Forma de pago
-    16,  // K Subtotal
-    14,  // L Descuento
-    14,  // M Recargo
-    14,  // N IVA
-    14,  // O INC
-    14,  // P Bolsas
-    14,  // Q ICUI
-    14,  // R IC
-    14,  // S ICL
-    18,  // T IC Porcentual
-    14,  // U IBUA
-    14,  // V ADV
-    16,  // W Total
-  ];
-  if (includeDriveColumn) colWidths.push(20); // X Enlace Drive
-  colWidths.push(80); // CUFE (last)
+  const { currencyCols, percentCols } = computeFormatCols(baseHeaders);
 
-  colWidths.forEach((w, i) => {
-    ws.getColumn(i + 1).width = w;
-  });
-
-  // Currency columns: K(11) L(12) M(13) N(14) O(15) P(16) Q(17) R(18) S(19) T(20) U(21) V(22) W(23)
-  const currencyCols = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23];
-  for (const ci of currencyCols) {
-    setCurrencyFmt(ws.getColumn(ci));
-  }
-
-  // Data rows start at row 3
   let rowNum = 3;
   for (const inv of invoices) {
     const td = Object.fromEntries((inv.taxes || []).map((t) => [t.taxName, t]));
 
     const rowData: (string | number | ExcelJS.CellHyperlinkValue)[] = [
-      rowNum - 2, // No.
+      rowNum - 2,
       inv.documentType || "",
       (inv.docNumber || inv.trackId || "").trim(),
       inv.issuerNit || "",
@@ -165,27 +181,28 @@ function buildSheet1(
         rowData.push("");
       }
     }
-
     rowData.push(inv.cufe || "");
 
     const row = ws.getRow(rowNum);
     row.values = ["", ...rowData];
+    applyFormats(row, currencyCols, percentCols);
     rowNum++;
   }
 }
 
 // ── Sheet 2: Detallado ────────────────────────────────────────────────────────
+//
+// A: Item              B: Número Factura      C: Tipo documento    D: Concepto
+// E: Cantidad          F: Base del impuesto   G: Descuento detalle H: Recargo detalle
+// I: IVA               J: % IVA               K: INC               L: % INC
+// M: Bolsas            N: % Bolsas            O: ICUI              P: % ICUI
+// Q: IC                (sin % IC — impuesto por grados de alcohol, sin % fijo)
+// R: IC Porcentual     S: % IC Porcentual
+// T: ICL               (sin % ICL — ídem)
+// U: IBUA              V: % IBUA
+// W: ADV               (sin % ADV)
+// X: Precio unitario (incluye impuestos)
 
-/**
- * Sheet 2 columns (line items):
- * A  Item            B  Número Factura    C  Tipo documento  D  Concepto
- * E  Cantidad        F  Base del impuesto G  Descuento detalle H Recargo detalle
- * I  IVA             J  % IVA             K  INC             L  % INC
- * M  Bolsas          N  % Bolsas         O  ICUI            P  % ICUI
- * Q  IC              R  % IC             S  IC Porcentual   T  % IC Porcentual
- * U  ICL             V  % ICL            W  IBUA            X  % IBUA
- * Y  ADV             Z  % ADV            AA Precio unitario (incluye impuestos)
- */
 function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
   ws.getRow(1).height = 5;
 
@@ -193,41 +210,20 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
     "Item", "Número Factura", "Tipo documento", "Concepto",
     "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle",
     "IVA", "% IVA", "INC", "% INC", "Bolsas", "% Bolsas",
-    "ICUI", "% ICUI", "IC", "% IC",
-    "IC Porcentual", "% IC Porcentual", "ICL", "% ICL",
-    "IBUA", "% IBUA", "ADV", "% ADV",
+    "ICUI", "% ICUI", "IC",
+    "IC Porcentual", "% IC Porcentual",
+    "ICL",
+    "IBUA", "% IBUA",
+    "ADV",
     "Precio unitario (incluye impuestos)",
   ];
 
   const headerRow = ws.getRow(2);
   headerRow.values = ["", ...headers];
   applyHeaderRow(headerRow);
+  freezeHeaderRows(ws);
 
-  const colWidths = [
-    6, 28, 22, 40,         // A B C D
-    10, 16, 14, 14,        // E F G H
-    14, 10, 14, 10,        // I J K L
-    14, 10, 14, 10,        // M N O P
-    14, 10, 18, 12,        // Q R S T
-    14, 10, 14, 10,        // U V W X
-    14, 10,                // Y Z
-    26,                    // AA
-  ];
-  colWidths.forEach((w, i) => {
-    ws.getColumn(i + 1).width = w;
-  });
-
-  // Currency columns: F(6) G(7) H(8) I(9) K(11) M(13) O(15) Q(17) S(19) U(21) W(23) Y(25) AA(27)
-  const currencyCols = [6, 7, 8, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27];
-  for (const ci of currencyCols) {
-    setCurrencyFmt(ws.getColumn(ci));
-  }
-
-  // Percent columns: J(10) L(12) N(14) P(16) R(18) T(20) V(22) X(24) Z(26)
-  const percentCols = [10, 12, 14, 16, 18, 20, 22, 24, 26];
-  for (const ci of percentCols) {
-    setPercentFmt(ws.getColumn(ci));
-  }
+  const { currencyCols, percentCols } = computeFormatCols(headers);
 
   let rowNum = 3;
   for (const inv of invoices) {
@@ -237,37 +233,35 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
       const totalTax = (li.taxes || []).reduce((s, t) => s + t.amount, 0);
 
       const rowData: (string | number)[] = [
-        li.lineNumber,
-        invDocNumber,
-        inv.documentType || "",
-        li.description || "",
-        li.quantity,
-        li.totalUnitPrice,
-        li.discount,
-        li.surcharge,
-        td["IVA"]?.amount ?? 0,
-        (td["IVA"]?.percent ?? 0) / 100,
-        td["INC"]?.amount ?? 0,
-        (td["INC"]?.percent ?? 0) / 100,
-        td["Bolsas"]?.amount ?? 0,
-        (td["Bolsas"]?.percent ?? 0) / 100,
-        td["ICUI"]?.amount ?? 0,
-        (td["ICUI"]?.percent ?? 0) / 100,
-        td["IC"]?.amount ?? 0,
-        (td["IC"]?.percent ?? 0) / 100,
-        td["IC Porcentual"]?.amount ?? 0,
-        (td["IC Porcentual"]?.percent ?? 0) / 100,
-        td["ICL"]?.amount ?? 0,
-        (td["ICL"]?.percent ?? 0) / 100,
-        td["IBUA"]?.amount ?? 0,
-        (td["IBUA"]?.percent ?? 0) / 100,
-        td["ADV"]?.amount ?? 0,
-        (td["ADV"]?.percent ?? 0) / 100,
-        li.totalUnitPrice + totalTax,
+        li.lineNumber,           // A  Item
+        invDocNumber,            // B  Número Factura
+        inv.documentType || "",  // C  Tipo documento
+        li.description || "",    // D  Concepto
+        li.quantity,             // E  Cantidad
+        li.totalUnitPrice,                   // F  Base del impuesto
+        li.discount,                         // G  Descuento detalle
+        li.surcharge,                        // H  Recargo detalle
+        td["IVA"]?.amount ?? 0,                     // I  IVA
+        (td["IVA"]?.percent ?? 0) / 100,            // J  % IVA (0.19 → usuario convierte a %)
+        td["INC"]?.amount ?? 0,                     // K  INC
+        (td["INC"]?.percent ?? 0) / 100,            // L  % INC
+        td["Bolsas"]?.amount ?? 0,                  // M  Bolsas
+        (td["Bolsas"]?.percent ?? 0) / 100,         // N  % Bolsas
+        td["ICUI"]?.amount ?? 0,                    // O  ICUI
+        (td["ICUI"]?.percent ?? 0) / 100,           // P  % ICUI
+        td["IC"]?.amount ?? 0,                      // Q  IC (sin % IC)
+        td["IC Porcentual"]?.amount ?? 0,           // R  IC Porcentual
+        (td["IC Porcentual"]?.percent ?? 0) / 100,  // S  % IC Porcentual
+        td["ICL"]?.amount ?? 0,                     // T  ICL (sin % ICL)
+        td["IBUA"]?.amount ?? 0,                    // U  IBUA
+        (td["IBUA"]?.percent ?? 0) / 100,           // V  % IBUA
+        td["ADV"]?.amount ?? 0,                     // W  ADV (sin % ADV)
+        li.totalUnitPrice + totalTax,        // X  Precio unitario (incluye impuestos)
       ];
 
       const row = ws.getRow(rowNum);
       row.values = ["", ...rowData];
+      applyFormats(row, currencyCols, percentCols);
       rowNum++;
     }
   }
@@ -275,11 +269,6 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
 
 // ── Sheet 3: Datos de terceros ────────────────────────────────────────────────
 
-/**
- * Sheet 3 columns: NIT, Razón Social, Nombre Comercial, Resp. Tributaria,
- *                  País, Departamento, Ciudad, Dirección, Teléfono, Correo
- * Lists ALL NITs appearing in invoices (both issuers and receivers).
- */
 function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
   ws.getRow(1).height = 5;
 
@@ -291,11 +280,7 @@ function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
   const headerRow = ws.getRow(2);
   headerRow.values = ["", ...headers];
   applyHeaderRow(headerRow);
-
-  const colWidths = [20, 40, 35, 30, 16, 22, 22, 40, 18, 35];
-  colWidths.forEach((w, i) => {
-    ws.getColumn(i + 1).width = w;
-  });
+  freezeHeaderRows(ws);
 
   type ThirdPartyRow = {
     nit: string; name: string; commercial: string; taxResp: string;
@@ -368,8 +353,11 @@ export async function generateExcelFile(
   const ws3 = workbook.addWorksheet("Datos de terceros");
 
   buildSheet1(ws1, sorted, includeDriveColumn);
+  autoFitColumns(ws1);
   buildSheet2(ws2, sorted);
+  autoFitColumns(ws2);
   buildSheet3(ws3, sorted);
+  autoFitColumns(ws3);
 
   await workbook.xlsx.writeFile(outputPath);
 }
@@ -402,6 +390,7 @@ export async function generateThirdPartiesExcelFile(
 
   const ws3 = workbook.addWorksheet("Datos de terceros");
   buildSheet3(ws3, sorted);
+  autoFitColumns(ws3);
 
   await workbook.xlsx.writeFile(outputPath);
 }

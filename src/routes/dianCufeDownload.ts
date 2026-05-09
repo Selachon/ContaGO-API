@@ -7,7 +7,7 @@ import multer from "multer";
 import JSZip from "jszip";
 import { downloadDocumentsByCufe } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
-import { generateCufeExcel } from "../services/cufeExcelGenerator.js";
+import { generateExcelFile } from "../services/excelGenerator.js";
 import {
   getOrCreateRootFolder,
   uploadInvoiceFilesToDrive,
@@ -249,8 +249,6 @@ router.post(
   }
 );
 
-const TEMPLATE_PATH = path.join(__dirname, "../../templates/dian-excel-template.xlsx");
-
 async function processCufeDownloadJob(
   jobId: string,
   tokenUrl: string,
@@ -416,8 +414,7 @@ async function processCufeDownloadJob(
     setProgress(jobId, { step: "Generando Excel...", current: cufes.length, total: cufes.length });
 
     const invoices = cufes.map((cufe) => invoiceMap.get(cufe)!);
-    const excelBuffer = await generateCufeExcel(invoices, TEMPLATE_PATH, useInlineDriveLinks);
-    fs.writeFileSync(outputPath, excelBuffer);
+    await generateExcelFile(invoices as InvoiceData[], outputPath, useInlineDriveLinks, direction === "sent");
 
     const outputName = buildOutputName(invoices, direction, startDate, endDate);
     job.outputName = outputName;
