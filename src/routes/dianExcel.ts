@@ -567,18 +567,6 @@ async function processExcelJob(
           economicActivity: invoiceData.receiverEconomicActivity || "N/A",
         };
 
-        if (isSentDocs) {
-          const docNitNorm = normalizeNitForMatch(doc.nit);
-          const issuerNitNorm = normalizeNitForMatch(issuer.nit);
-          const receiverNitNorm = normalizeNitForMatch(receiver.nit);
-
-          if (docNitNorm && issuerNitNorm === docNitNorm && receiverNitNorm !== docNitNorm) {
-            const originalIssuer = issuer;
-            issuer = receiver;
-            receiver = originalIssuer;
-            console.log(`[Excel] Job ${jobId}: swap emisor/receptor aplicado para doc ${doc.docnum} (${doc.docType || "N/A"})`);
-          }
-        }
 
         // 3.4) Subir archivos a Drive con estructura de carpetas.
         let driveUrl: string | undefined;

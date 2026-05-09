@@ -209,7 +209,7 @@ function patchSheet2Header(sheetXml: string): string {
   const row2Cells = headers
     .map((h, i) => `<c r="${colLetter(i + 1)}2" s="3" t="inlineStr"><is><t>${xmlEsc(h)}</t></is></c>`)
     .join("");
-  const row2Regex = /<row r="2"[^>]*>.*?<\/row>/;
+  const row2Regex = /<row r="2"[^>]*>[\s\S]*?<\/row>/;
   return sheetXml
     .replace(/spans="1:\d+"/g, 'spans="1:27"')
     .replace(row2Regex, `<row r="2" spans="1:27">${row2Cells}</row>`);
