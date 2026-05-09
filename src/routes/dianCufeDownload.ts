@@ -351,7 +351,8 @@ async function processCufeDownloadJob(
               invoiceData.issueDate!,
               driveConfig,
               userId,
-              onTokenRefresh
+              onTokenRefresh,
+              direction === "sent" ? "sent" : "received"
             );
             invoiceData.driveUrl = uploadResult.pdfUrl || uploadResult.folderUrl;
           } catch (driveErr) {
@@ -447,7 +448,8 @@ async function processCufeDownloadJob(
               item.issueDate,
               driveConfig,
               userId,
-              onTokenRefresh
+              onTokenRefresh,
+              direction === "sent" ? "sent" : "received"
             );
           } catch (driveErr) {
             console.warn(`[CUFE DL] Error carga diferida ${item.docnum}:`, driveErr);

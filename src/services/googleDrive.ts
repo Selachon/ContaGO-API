@@ -235,25 +235,20 @@ export async function getOrCreateFolder(
   return await createFolder(drive, ROOT_FOLDER_NAME);
 }
 
-// Obtener o crear estructura de carpetas: Raíz/NIT Receptor/Año/Mes/NumFactura - NIT Emisor
-async function getOrCreateInvoiceFolder(
+// Obtener o crear estructura de carpetas: Raíz/Año/Mes/Dirección/TipoArchivo
+// directionLabel: "Emitidas" | "Recibidas"   fileType: "PDF" | "XML"
+async function getOrCreateTypeFolder(
   drive: drive_v3.Drive,
   rootFolderId: string,
-  receiverNit: string,
   year: string,
   month: string,
-  invoiceFolderName: string
+  directionLabel: string,
+  fileType: "PDF" | "XML"
 ): Promise<string> {
-  // NIT Receptor (solo NIT, sin razón social para evitar duplicados)
-  let receiverFolderId = await findFolderByName(drive, receiverNit, rootFolderId);
-  if (!receiverFolderId) {
-    receiverFolderId = await createFolder(drive, receiverNit, rootFolderId);
-  }
-
   // Año
-  let yearFolderId = await findFolderByName(drive, year, receiverFolderId);
+  let yearFolderId = await findFolderByName(drive, year, rootFolderId);
   if (!yearFolderId) {
-    yearFolderId = await createFolder(drive, year, receiverFolderId);
+    yearFolderId = await createFolder(drive, year, rootFolderId);
   }
 
   // Mes
@@ -262,13 +257,19 @@ async function getOrCreateInvoiceFolder(
     monthFolderId = await createFolder(drive, month, yearFolderId);
   }
 
-  // Carpeta de factura (NumFactura - NIT Emisor)
-  let invoiceFolderId = await findFolderByName(drive, invoiceFolderName, monthFolderId);
-  if (!invoiceFolderId) {
-    invoiceFolderId = await createFolder(drive, invoiceFolderName, monthFolderId);
+  // Emitidas | Recibidas
+  let directionFolderId = await findFolderByName(drive, directionLabel, monthFolderId);
+  if (!directionFolderId) {
+    directionFolderId = await createFolder(drive, directionLabel, monthFolderId);
   }
 
-  return invoiceFolderId;
+  // PDF | XML
+  let typeFolderId = await findFolderByName(drive, fileType, directionFolderId);
+  if (!typeFolderId) {
+    typeFolderId = await createFolder(drive, fileType, directionFolderId);
+  }
+
+  return typeFolderId;
 }
 
 // Buscar archivo por nombre en una carpeta específica
@@ -312,49 +313,44 @@ export async function checkInvoiceExistsInDrive(
   docNumber: string,
   issuerNit: string,
   receiverNit: string,
-  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
+  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>,
+  direction: "sent" | "received" = "received"
 ): Promise<ExistingInvoiceFiles> {
   try {
     const drive = await getDriveClient(driveConfig, onTokenRefresh);
     const rootFolderId = await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
 
-    // Parsear fecha
     const { year, monthName } = parseInvoiceDate(issueDate);
-    const invoiceFolderName = `${docNumber} - ${issuerNit}`;
+    const directionLabel = direction === "sent" ? "Emitidas" : "Recibidas";
 
-    // Verificar si existe la carpeta del receptor (solo NIT)
-    const receiverFolderId = await findFolderByName(drive, receiverNit, rootFolderId);
-    if (!receiverFolderId) {
-      return { exists: false };
-    }
-
-    // Verificar si existe la carpeta del año
-    const yearFolderId = await findFolderByName(drive, year, receiverFolderId);
-    if (!yearFolderId) {
-      return { exists: false };
-    }
+    // Navigate: root / year / month / direction
+    const yearFolderId = await findFolderByName(drive, year, rootFolderId);
+    if (!yearFolderId) return { exists: false };
 
     const monthFolderId = await findFolderByName(drive, monthName, yearFolderId);
-    if (!monthFolderId) {
-      return { exists: false };
-    }
+    if (!monthFolderId) return { exists: false };
 
-    const invoiceFolderId = await findFolderByName(drive, invoiceFolderName, monthFolderId);
-    if (!invoiceFolderId) {
-      return { exists: false };
-    }
+    const directionFolderId = await findFolderByName(drive, directionLabel, monthFolderId);
+    if (!directionFolderId) return { exists: false };
 
-    // Buscar archivos PDF y XML en la carpeta
-    const pdfFile = await findFileInFolder(drive, `${docNumber}.pdf`, invoiceFolderId);
-    const xmlFile = await findFileInFolder(drive, `${docNumber}.xml`, invoiceFolderId);
+    // Check PDF folder
+    const pdfFolderId = await findFolderByName(drive, "PDF", directionFolderId);
+    const pdfFile = pdfFolderId
+      ? await findFileInFolder(drive, `${docNumber}.pdf`, pdfFolderId)
+      : null;
 
-    // Si al menos uno existe, la factura ya está
+    // Check XML folder
+    const xmlFolderId = await findFolderByName(drive, "XML", directionFolderId);
+    const xmlFile = xmlFolderId
+      ? await findFileInFolder(drive, `${docNumber}.xml`, xmlFolderId)
+      : null;
+
     if (pdfFile || xmlFile) {
       return {
         exists: true,
         pdfUrl: pdfFile?.webViewLink,
         xmlUrl: xmlFile?.webViewLink,
-        folderUrl: `https://drive.google.com/drive/folders/${invoiceFolderId}`,
+        folderUrl: `https://drive.google.com/drive/folders/${directionFolderId}`,
       };
     }
 
@@ -400,7 +396,7 @@ export interface UploadResult {
   wasSkipped: boolean;
 }
 
-// Subir PDF y XML a Drive con estructura de carpetas
+// Subir PDF y XML a Drive con estructura: Raíz/Año/Mes/Emitidas|Recibidas/PDF|XML/{docNumber}.ext
 export async function uploadInvoiceFilesToDrive(
   pdfBuffer: Buffer | null,
   xmlBuffer: Buffer | null,
@@ -410,26 +406,30 @@ export async function uploadInvoiceFilesToDrive(
   issueDate: string, // Formato DD/MM/YYYY o YYYY-MM-DD
   driveConfig: GoogleDriveConfig,
   userId: string,
-  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
+  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>,
+  direction: "sent" | "received" = "received"
 ): Promise<UploadResult> {
   const drive = await getDriveClient(driveConfig, onTokenRefresh);
   const rootFolderId = await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
 
-  // Parsear fecha para estructura de carpetas
   const { year, monthName } = parseInvoiceDate(issueDate);
-  const invoiceFolderName = `${docNumber} - ${issuerNit}`;
+  const directionLabel = direction === "sent" ? "Emitidas" : "Recibidas";
 
-  // Obtener o crear estructura de carpetas
-  const invoiceFolderId = await getOrCreateInvoiceFolder(
-    drive,
-    rootFolderId,
-    receiverNit,
-    year,
-    monthName,
-    invoiceFolderName
+  // Get direction folder (root/year/month/direction) for folderUrl
+  // We derive it by getting or creating the PDF type folder first (it ensures the direction folder exists).
+  const pdfTypeFolderId = await getOrCreateTypeFolder(
+    drive, rootFolderId, year, monthName, directionLabel, "PDF"
   );
 
-  const folderUrl = `https://drive.google.com/drive/folders/${invoiceFolderId}`;
+  // Get the direction folder id for the returned folderUrl by going one level up from PDF folder.
+  // We navigate again to find direction folder (already exists after creating PDF folder above).
+  const yearFolderId = await findFolderByName(drive, year, rootFolderId);
+  const monthFolderId = yearFolderId ? await findFolderByName(drive, monthName, yearFolderId) : null;
+  const directionFolderId = monthFolderId ? await findFolderByName(drive, directionLabel, monthFolderId) : null;
+  const folderUrl = directionFolderId
+    ? `https://drive.google.com/drive/folders/${directionFolderId}`
+    : `https://drive.google.com/drive/folders/${pdfTypeFolderId}`;
+
   let pdfUrl: string | undefined;
   let xmlUrl: string | undefined;
   let wasSkipped = false;
@@ -437,7 +437,7 @@ export async function uploadInvoiceFilesToDrive(
   // Subir PDF si existe
   if (pdfBuffer) {
     const pdfFilename = `${docNumber}.pdf`;
-    const existingPdf = await findFileInFolder(drive, pdfFilename, invoiceFolderId);
+    const existingPdf = await findFileInFolder(drive, pdfFilename, pdfTypeFolderId);
 
     if (existingPdf) {
       pdfUrl = existingPdf.webViewLink;
@@ -445,14 +445,8 @@ export async function uploadInvoiceFilesToDrive(
     } else {
       const stream = Readable.from(pdfBuffer);
       const response = await drive.files.create({
-        requestBody: {
-          name: pdfFilename,
-          parents: [invoiceFolderId],
-        },
-        media: {
-          mimeType: "application/pdf",
-          body: stream,
-        },
+        requestBody: { name: pdfFilename, parents: [pdfTypeFolderId] },
+        media: { mimeType: "application/pdf", body: stream },
         fields: "id, webViewLink",
       });
       pdfUrl = response.data.webViewLink || `https://drive.google.com/file/d/${response.data.id}/view`;
@@ -461,8 +455,11 @@ export async function uploadInvoiceFilesToDrive(
 
   // Subir XML si existe
   if (xmlBuffer) {
+    const xmlTypeFolderId = await getOrCreateTypeFolder(
+      drive, rootFolderId, year, monthName, directionLabel, "XML"
+    );
     const xmlFilename = `${docNumber}.xml`;
-    const existingXml = await findFileInFolder(drive, xmlFilename, invoiceFolderId);
+    const existingXml = await findFileInFolder(drive, xmlFilename, xmlTypeFolderId);
 
     if (existingXml) {
       xmlUrl = existingXml.webViewLink;
@@ -470,14 +467,8 @@ export async function uploadInvoiceFilesToDrive(
     } else {
       const stream = Readable.from(xmlBuffer);
       const response = await drive.files.create({
-        requestBody: {
-          name: xmlFilename,
-          parents: [invoiceFolderId],
-        },
-        media: {
-          mimeType: "application/xml",
-          body: stream,
-        },
+        requestBody: { name: xmlFilename, parents: [xmlTypeFolderId] },
+        media: { mimeType: "application/xml", body: stream },
         fields: "id, webViewLink",
       });
       xmlUrl = response.data.webViewLink || `https://drive.google.com/file/d/${response.data.id}/view`;

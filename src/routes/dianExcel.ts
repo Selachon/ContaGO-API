@@ -605,7 +605,8 @@ async function processExcelJob(
                 invoiceData.issueDate!,
                 driveConfig,
                 userId,
-                onTokenRefresh
+                onTokenRefresh,
+                documentDirection === "sent" ? "sent" : "received"
               );
 
               driveUrl = uploadResult.pdfUrl || uploadResult.folderUrl;
@@ -815,7 +816,7 @@ async function processExcelJob(
     console.log(`[Excel] Job ${jobId} completado: ${successCount} facturas, ${skippedCount} existentes, ${errorCount} errores`);
 
     if (runDeferredDriveUpload && driveConfig) {
-      void runDriveUploadInBackground(jobId, userId, driveConfig, deferredUploads, onTokenRefresh, tempDir);
+      void runDriveUploadInBackground(jobId, userId, driveConfig, deferredUploads, onTokenRefresh, tempDir, documentDirection);
     }
 
   } catch (err) {
@@ -881,7 +882,8 @@ async function runDriveUploadInBackground(
   driveConfig: GoogleDriveConfig,
   uploads: DeferredDriveUploadItem[],
   onTokenRefresh: (newAccessToken: string, expiryDate: number) => Promise<void>,
-  tempDir: string
+  tempDir: string,
+  direction: "received" | "sent" = "received"
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
@@ -906,7 +908,8 @@ async function runDriveUploadInBackground(
         item.issueDate,
         driveConfig,
         userId,
-        onTokenRefresh
+        onTokenRefresh,
+        direction === "sent" ? "sent" : "received"
       );
 
       job.driveUploadCurrent = i + 1;
