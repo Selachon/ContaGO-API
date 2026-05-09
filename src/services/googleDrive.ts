@@ -531,6 +531,28 @@ export async function uploadPdfToDrive(
   return response.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view`;
 }
 
+// Subir un archivo genérico (Excel, ZIP, etc.) a la carpeta raíz de ContaGO en Drive.
+export async function uploadFileToDrive(
+  fileBuffer: Buffer,
+  filename: string,
+  mimeType: string,
+  driveConfig: GoogleDriveConfig,
+  userId: string,
+  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
+): Promise<string> {
+  const drive = await getDriveClient(driveConfig, onTokenRefresh);
+  const folderId = await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
+
+  const stream = Readable.from(fileBuffer);
+  const response = await drive.files.create({
+    requestBody: { name: filename, parents: [folderId] },
+    media: { mimeType, body: stream },
+    fields: "id, webViewLink",
+  });
+
+  return response.data.webViewLink || `https://drive.google.com/file/d/${response.data.id}/view`;
+}
+
 // Revocar acceso
 export async function revokeAccess(driveConfig: GoogleDriveConfig): Promise<void> {
   try {

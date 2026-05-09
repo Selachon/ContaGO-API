@@ -1,0 +1,555 @@
+import { Router, Request, Response } from "express";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import { v4 as uuidv4 } from "uuid";
+import multer from "multer";
+import JSZip from "jszip";
+import { downloadDocumentsByCufe } from "../services/dianScraper.js";
+import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
+import { generateCufeExcel } from "../services/cufeExcelGenerator.js";
+import {
+  getOrCreateRootFolder,
+  uploadInvoiceFilesToDrive,
+} from "../services/googleDrive.js";
+import { requireAuth } from "../middleware/auth.js";
+import { requireToolAccess } from "../middleware/requireToolAccess.js";
+import { validateDianUrl } from "../middleware/validateDianUrl.js";
+import { getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
+import { encryptToken } from "../utils/encryption.js";
+import type { ProgressData, DocumentDirection } from "../types/dian.js";
+import type { InvoiceData } from "../types/dianExcel.js";
+
+const ES_MONTHS = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+
+function formatDateES(isoDate: string): string {
+  const [y, m, d] = isoDate.split("-");
+  const mon = ES_MONTHS[parseInt(m, 10) - 1] || m;
+  return `${mon} ${d} ${y}`;
+}
+
+function buildOutputName(invoices: Partial<InvoiceData>[], direction: DocumentDirection, startDate?: string, endDate?: string): string {
+  const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
+  const nit = (direction === "sent"
+    ? invoices.find((inv) => inv?.issuerNit)?.issuerNit
+    : invoices.find((inv) => inv?.receiverNit)?.receiverNit) || "SinNIT";
+  const safeNit = nit.replace(/[^a-zA-Z0-9]/g, "");
+  const startFmt = startDate ? formatDateES(startDate) : "";
+  const endFmt = endDate ? formatDateES(endDate) : "";
+  const range = startFmt && endFmt ? `${startFmt} - ${endFmt}` : startFmt || endFmt || new Date().toISOString().slice(0, 10);
+  return `${safeNit} - Facturas ${dirLabel} DIAN ${range}.xlsx`;
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
+const JOB_TTL_MS = 3 * 60 * 60 * 1000;
+const TOOL_ID = "dian-cufe-downloader";
+
+if (!fs.existsSync(DOWNLOADS_DIR)) {
+  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+}
+
+interface JobData {
+  status: "pending" | "processing" | "completed" | "error" | "cancelled";
+  progress: ProgressData;
+  userId: string;
+  outputPath?: string;
+  outputName?: string;
+  outputMime?: string;
+  error?: string;
+  createdAt: number;
+  tempDir?: string;
+  driveFolderUrl?: string;
+}
+
+const jobTracker = new Map<string, JobData>();
+
+function isJobCancelled(jobId: string): boolean {
+  return jobTracker.get(jobId)?.status === "cancelled";
+}
+
+function setProgress(jobId: string, data: ProgressData): void {
+  const job = jobTracker.get(jobId);
+  if (job) job.progress = data;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [jobId, job] of jobTracker) {
+    if (now - job.createdAt > JOB_TTL_MS) {
+      if (job.outputPath && fs.existsSync(job.outputPath)) {
+        try { fs.unlinkSync(job.outputPath); } catch {}
+      }
+      if (job.tempDir && fs.existsSync(job.tempDir)) {
+        try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch {}
+      }
+      jobTracker.delete(jobId);
+    }
+  }
+}, 60_000);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024, files: 1 },
+});
+
+const router = Router();
+
+router.use((req, res, next) => {
+  if (req.path.startsWith("/job-status/") && typeof req.query.token === "string") {
+    req.headers.authorization = `Bearer ${req.query.token}`;
+  }
+  requireAuth(req, res, next);
+});
+
+router.use(requireToolAccess(TOOL_ID));
+
+router.get("/job-status/:jobId", (req: Request, res: Response) => {
+  const { jobId } = req.params;
+  if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+  }
+  const job = jobTracker.get(jobId);
+  if (!job) return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado" });
+  }
+  res.json({ status: job.status, progress: job.progress, error: job.error, outputName: job.outputName, driveFolderUrl: job.driveFolderUrl });
+});
+
+router.get("/job-download/:jobId", (req: Request, res: Response) => {
+  const { jobId } = req.params;
+  if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+  }
+  const job = jobTracker.get(jobId);
+  if (!job) return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado" });
+  }
+  if (job.status !== "completed") {
+    return res.status(400).json({ status: "error", detalle: `Job no completado (${job.status})` });
+  }
+  if (!job.outputPath || !fs.existsSync(job.outputPath)) {
+    return res.status(404).json({ status: "error", detalle: "Archivo no encontrado" });
+  }
+  res.setHeader("Content-Type", job.outputMime || "application/octet-stream");
+  res.setHeader("Content-Disposition", `attachment; filename="${job.outputName || "resultado.xlsx"}"`);
+  const stream = fs.createReadStream(job.outputPath);
+  stream.pipe(res);
+  stream.on("end", () => {
+    setTimeout(() => {
+      if (job.outputPath && fs.existsSync(job.outputPath)) {
+        try { fs.unlinkSync(job.outputPath); } catch {}
+      }
+      jobTracker.delete(jobId);
+    }, 10_000);
+  });
+});
+
+router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
+  const { jobId } = req.params;
+  if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+  }
+  const job = jobTracker.get(jobId);
+  if (!job) return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado" });
+  }
+  if (job.status === "completed" || job.status === "cancelled") {
+    return res.status(400).json({ status: "error", detalle: `Job ya está ${job.status}` });
+  }
+  job.status = "cancelled";
+  setProgress(jobId, { step: "Cancelado", current: 0, total: 0, detalle: "Cancelado por el usuario" });
+  if (job.tempDir && fs.existsSync(job.tempDir)) {
+    try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch {}
+  }
+  res.json({ status: "cancelled" });
+});
+
+router.post(
+  "/start",
+  upload.single("excel"),
+  validateDianUrl,
+  async (req: Request, res: Response) => {
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ status: "error", detalle: "Debes adjuntar un archivo Excel" });
+    }
+
+    const { token_url, start_date, end_date, document_direction, drive_connection_id, include_drive_links, upload_to_drive } = req.body as {
+      token_url: string;
+      start_date?: string;
+      end_date?: string;
+      document_direction?: string;
+      drive_connection_id?: string;
+      include_drive_links?: boolean;
+      upload_to_drive?: boolean;
+    };
+
+    if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
+      return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
+    }
+    if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
+      return res.status(400).json({ status: "error", detalle: "end_date debe tener formato YYYY-MM-DD" });
+    }
+
+    const direction: DocumentDirection = document_direction === "sent" ? "sent" : "received";
+
+    let cufes: string[];
+    try {
+      cufes = await extractCufesFromExcel(file.buffer);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return res.status(400).json({ status: "error", detalle: `Error leyendo Excel: ${msg}` });
+    }
+
+    if (cufes.length === 0) {
+      return res.status(400).json({
+        status: "error",
+        detalle: "La columna B del Excel está vacía o no contiene valores.",
+      });
+    }
+
+    const jobId = uuidv4().replace(/-/g, "").slice(0, 12);
+    const job: JobData = {
+      status: "pending",
+      progress: { step: "Iniciando...", current: 0, total: cufes.length },
+      userId: req.user!.userId,
+      createdAt: Date.now(),
+    };
+    jobTracker.set(jobId, job);
+
+    res.json({
+      status: "accepted",
+      jobId,
+      totalCufes: cufes.length,
+      message: `${cufes.length} CUFEs encontrados. Usa /dian-cufe/job-status/${jobId} para consultar el progreso.`,
+    });
+
+    processCufeDownloadJob(jobId, token_url, cufes, start_date, end_date, direction, req.user!.userId, drive_connection_id, !!include_drive_links, upload_to_drive !== false).catch((err) => {
+      console.error(`[CUFE DL] Job ${jobId} error:`, err);
+      const j = jobTracker.get(jobId);
+      if (j) {
+        j.status = "error";
+        j.error = err.message || "Error desconocido";
+        setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: j.error });
+      }
+    });
+  }
+);
+
+const TEMPLATE_PATH = path.join(__dirname, "../../templates/dian-excel-template.xlsx");
+
+async function processCufeDownloadJob(
+  jobId: string,
+  tokenUrl: string,
+  cufes: string[],
+  startDate: string | undefined,
+  endDate: string | undefined,
+  direction: DocumentDirection,
+  userId: string,
+  driveConnectionId: string | undefined,
+  includeDriveLinks: boolean,
+  uploadToDrive: boolean
+): Promise<void> {
+  const job = jobTracker.get(jobId);
+  if (!job) return;
+
+  job.status = "processing";
+
+  const sessionId = uuidv4();
+  const tempDir = path.join(DOWNLOADS_DIR, sessionId);
+  const outputPath = path.join(DOWNLOADS_DIR, `${sessionId}.xlsx`);
+  job.tempDir = tempDir;
+  job.outputPath = outputPath;
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  // Pre-populate map with one slot per CUFE — ensures all appear in Excel even if data is partial
+  const invoiceMap = new Map<string, Partial<InvoiceData>>();
+  for (const cufe of cufes) {
+    invoiceMap.set(cufe, { cufe });
+  }
+
+  // Resolve Drive config once upfront
+  const driveConfig = driveConnectionId ? await getUserGoogleDriveById(userId, driveConnectionId) : null;
+  const hasDrive = !!driveConfig;
+  const doUploadInvoices = uploadToDrive && hasDrive;
+  const useInlineDriveLinks = includeDriveLinks && doUploadInvoices;
+  const runDeferredDriveUpload = doUploadInvoices && !useInlineDriveLinks;
+  const deferredUploads: { xmlBuffer: Buffer; docnum: string; issuerNit: string; receiverNit: string; issueDate: string; }[] = [];
+
+  const onTokenRefresh = async (newAccessToken: string, expiryDate: number) => {
+    const encryptedToken = encryptToken(newAccessToken);
+    await updateUserDriveTokens(userId, encryptedToken, new Date(expiryDate).toISOString(), driveConnectionId);
+  };
+
+  if (hasDrive && driveConfig) {
+    try {
+      const rootId = await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
+      job.driveFolderUrl = `https://drive.google.com/drive/folders/${rootId}`;
+    } catch (err) {
+      console.warn("[CUFE DL] No se pudo crear carpeta Drive:", err);
+    }
+  }
+
+  async function downloadAndFill(batch: string[], dir: string, phaseLabel: string): Promise<void> {
+    const { results } = await downloadDocumentsByCufe(
+      tokenUrl, batch, startDate, endDate, direction, dir,
+      (progress) => setProgress(jobId, {
+        step: `${phaseLabel}: ${progress.step || "..."}`,
+        current: progress.current ?? 0,
+        total: progress.total ?? batch.length,
+      }),
+      () => isJobCancelled(jobId)
+    );
+
+    if (isJobCancelled(jobId)) return;
+
+    const successful = results.filter((r) => r.success && r.destPath);
+    for (let i = 0; i < successful.length; i++) {
+      if (isJobCancelled(jobId)) return;
+      const result = successful[i];
+      setProgress(jobId, {
+        step: `${phaseLabel}: procesando XML ${i + 1}/${successful.length}...`,
+        current: i + 1,
+        total: successful.length,
+      });
+      try {
+        const zipBuffer = fs.readFileSync(result.destPath!);
+        const { xmlBuffer } = await extractXmlFromZip(zipBuffer);
+        if (!xmlBuffer) {
+          console.warn(`[CUFE DL] Sin XML en ZIP: ${result.destPath}`);
+          continue;
+        }
+        const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
+          id: result.trackId || result.cufe,
+          docnum: result.docnum || "",
+        });
+
+        const hasValidData = !!(invoiceData.issueDate && invoiceData.docNumber);
+
+        // Inline Drive upload: upload now and embed link in Excel column
+        if (useInlineDriveLinks && driveConfig && hasValidData) {
+          try {
+            const uploadResult = await uploadInvoiceFilesToDrive(
+              null,
+              xmlBuffer,
+              invoiceData.docNumber!,
+              invoiceData.issuerNit || result.nit,
+              invoiceData.receiverNit || "",
+              invoiceData.issueDate!,
+              driveConfig,
+              userId,
+              onTokenRefresh
+            );
+            invoiceData.driveUrl = uploadResult.pdfUrl || uploadResult.folderUrl;
+          } catch (driveErr) {
+            console.warn(`[CUFE DL] Drive upload error ${result.cufe.slice(0, 16)}:`, driveErr);
+          }
+        }
+
+        // Deferred Drive upload: collect for background upload after Excel is ready
+        if (runDeferredDriveUpload && hasValidData) {
+          deferredUploads.push({
+            xmlBuffer,
+            docnum: invoiceData.docNumber!,
+            issuerNit: invoiceData.issuerNit || result.nit,
+            receiverNit: invoiceData.receiverNit || "",
+            issueDate: invoiceData.issueDate!,
+          });
+        }
+
+        invoiceMap.set(result.cufe, invoiceData);
+      } catch (err) {
+        console.warn(`[CUFE DL] Error XML ${result.cufe.slice(0, 16)}:`, err);
+      }
+    }
+  }
+
+  function hasData(cufe: string): boolean {
+    const inv = invoiceMap.get(cufe);
+    return !!(inv?.issuerNit || inv?.docNumber);
+  }
+
+  try {
+    if (isJobCancelled(jobId)) return;
+
+    // Phase 1: Download + parse all CUFEs
+    await downloadAndFill(cufes, tempDir, "Descarga");
+
+    if (isJobCancelled(jobId)) return;
+
+    // Phase 2: Retry CUFEs that still have no parsed data
+    const pendingCufes = cufes.filter((c) => !hasData(c));
+    if (pendingCufes.length > 0) {
+      console.log(`[CUFE DL] Reintentando ${pendingCufes.length} documentos sin datos...`);
+      const tempDir2 = path.join(DOWNLOADS_DIR, `${sessionId}_retry`);
+      fs.mkdirSync(tempDir2, { recursive: true });
+      try {
+        setProgress(jobId, {
+          step: `Reintentando ${pendingCufes.length} documentos sin datos...`,
+          current: cufes.length - pendingCufes.length,
+          total: cufes.length,
+        });
+        await downloadAndFill(pendingCufes, tempDir2, "Reintento");
+      } finally {
+        try { fs.rmSync(tempDir2, { recursive: true, force: true }); } catch {}
+      }
+    }
+
+    if (isJobCancelled(jobId)) return;
+
+    // Phase 3: Generate Excel with ALL CUFEs in original order (partial rows included)
+    const filledCount = cufes.filter(hasData).length;
+    setProgress(jobId, { step: "Generando Excel...", current: cufes.length, total: cufes.length });
+
+    const invoices = cufes.map((cufe) => invoiceMap.get(cufe)!);
+    const excelBuffer = await generateCufeExcel(invoices, TEMPLATE_PATH, useInlineDriveLinks);
+    fs.writeFileSync(outputPath, excelBuffer);
+
+    const outputName = buildOutputName(invoices, direction, startDate, endDate);
+    job.outputName = outputName;
+    job.outputMime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+    job.status = "completed";
+    setProgress(jobId, {
+      step: `Completado: ${filledCount}/${cufes.length} con datos${filledCount < cufes.length ? `, ${cufes.length - filledCount} sin datos (incluidos en Excel)` : ""}`,
+      current: cufes.length,
+      total: cufes.length,
+    });
+
+    console.log(`[CUFE DL] Job ${jobId}: ${filledCount}/${cufes.length} con datos`);
+
+    // Phase 4: Deferred Drive upload — run in background after job is marked completed
+    if (runDeferredDriveUpload && driveConfig && deferredUploads.length > 0) {
+      void (async () => {
+        console.log(`[CUFE DL] Iniciando carga diferida a Drive: ${deferredUploads.length} documentos`);
+        for (const item of deferredUploads) {
+          if (isJobCancelled(jobId)) break;
+          try {
+            await uploadInvoiceFilesToDrive(
+              null,
+              item.xmlBuffer,
+              item.docnum,
+              item.issuerNit,
+              item.receiverNit,
+              item.issueDate,
+              driveConfig,
+              userId,
+              onTokenRefresh
+            );
+          } catch (driveErr) {
+            console.warn(`[CUFE DL] Error carga diferida ${item.docnum}:`, driveErr);
+          }
+        }
+        console.log(`[CUFE DL] Carga diferida a Drive completada`);
+      })();
+    }
+  } catch (err) {
+    if (!isJobCancelled(jobId)) {
+      const msg = err instanceof Error ? err.message : String(err);
+      job.status = "error";
+      job.error = msg;
+      setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: msg });
+    }
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function extractXmlFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buffer | null }> {
+  const zip = await JSZip.loadAsync(zipBuffer);
+  for (const [filename, file] of Object.entries(zip.files)) {
+    if (!file.dir && filename.toLowerCase().endsWith(".xml")) {
+      return { xmlBuffer: await file.async("nodebuffer") };
+    }
+  }
+  return { xmlBuffer: null };
+}
+
+/**
+ * Extrae el contenido de la columna B del primer sheet del Excel.
+ * Omite la fila 1 (encabezado) y devuelve todos los valores no vacíos.
+ */
+async function extractCufesFromExcel(buffer: Buffer): Promise<string[]> {
+  const zip = await JSZip.loadAsync(buffer);
+
+  const allFiles = Object.keys(zip.files);
+  console.log("[Excel CUFE] Archivos en el zip:", allFiles.join(", "));
+
+  // Construir tabla de shared strings: índice → texto
+  const sharedStrings: string[] = [];
+  const ssPath = allFiles.find((f) => f.toLowerCase().endsWith("sharedstrings.xml")) || "";
+  const ssFile = ssPath ? zip.file(ssPath) : null;
+  if (ssFile) {
+    const ssXml = await ssFile.async("string");
+    console.log("[Excel CUFE] sharedStrings primeros 300 chars:", ssXml.slice(0, 300));
+    // Elementos pueden tener prefijo de namespace (ej: x:si, x:t)
+    for (const siMatch of ssXml.matchAll(/<(?:\w+:)?si\b[^>]*>([\s\S]*?)<\/(?:\w+:)?si>/g)) {
+      const siContent = siMatch[1];
+      const texts: string[] = [];
+      for (const tMatch of siContent.matchAll(/<(?:\w+:)?t\b[^>]*>([^<]*)<\/(?:\w+:)?t>/g)) {
+        texts.push(tMatch[1]);
+      }
+      sharedStrings.push(texts.join(""));
+    }
+    console.log(`[Excel CUFE] ${sharedStrings.length} shared strings cargados`);
+    if (sharedStrings.length > 0) {
+      console.log("[Excel CUFE] Primeros 3 shared strings:", sharedStrings.slice(0, 3));
+    }
+  } else {
+    console.log("[Excel CUFE] No se encontró sharedStrings.xml");
+  }
+
+  // Localizar la primera hoja
+  const sheetPath =
+    allFiles.find((f) => /xl\/worksheets\/sheet1\.xml$/i.test(f)) ||
+    allFiles.find((f) => /xl\/worksheets\/sheet\d+\.xml$/i.test(f));
+
+  if (!sheetPath) throw new Error("No se encontró ninguna hoja en el Excel");
+
+  const sheetXml = await zip.file(sheetPath)!.async("string");
+  console.log("[Excel CUFE] Sheet primeros 500 chars:", sheetXml.slice(0, 500));
+
+  const values: string[] = [];
+
+  // Recorrer todas las celdas de columna B (r="B2", r="B3", ...), omitir B1 (encabezado)
+  for (const cellMatch of sheetXml.matchAll(/<(?:\w+:)?c\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?c>/g)) {
+    const attrs = cellMatch[1];
+    const cellContent = cellMatch[2];
+
+    // Extraer referencia de celda
+    const rMatch = attrs.match(/\br="([A-Z]+)(\d+)"/);
+    if (!rMatch) continue;
+    const col = rMatch[1];
+    const rowNum = parseInt(rMatch[2], 10);
+
+    if (col !== "B") continue;
+    if (rowNum <= 1) continue; // saltar encabezado
+
+    let value = "";
+
+    if (attrs.includes('t="s"')) {
+      const vMatch = cellContent.match(/<(?:\w+:)?v>(\d+)<\/(?:\w+:)?v>/);
+      if (vMatch) value = sharedStrings[parseInt(vMatch[1], 10)] || "";
+    } else if (attrs.includes('t="inlineStr"') || cellContent.includes(":is>") || cellContent.includes("<is>")) {
+      const tMatch = cellContent.match(/<(?:\w+:)?t\b[^>]*>([^<]*)<\/(?:\w+:)?t>/);
+      if (tMatch) value = tMatch[1];
+    } else {
+      const vMatch = cellContent.match(/<(?:\w+:)?v>([^<]*)<\/(?:\w+:)?v>/);
+      if (vMatch) value = vMatch[1];
+    }
+
+    value = value.trim();
+    if (value) values.push(value);
+  }
+
+  console.log(`[Excel CUFE] ${values.length} valores extraídos de columna B`);
+  if (values.length > 0) console.log("[Excel CUFE] Primer valor:", values[0].slice(0, 40));
+
+  return values;
+}
+
+export default router;

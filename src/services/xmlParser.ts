@@ -59,6 +59,7 @@ export async function extractInvoiceDataFromXml(
 
     // Extraer otros datos
     const { issueDate, issueDateISO } = extractIssueDate(invoice);
+    const xmlDocNumber = extractDocumentNumber(invoice, docInfo.docnum);
     const { subtotal, iva, total, taxes, discount, surcharge } = extractTotals(invoice);
     const lineItems = extractLineItems(invoice);
     const concepts = extractConcepts(lineItems);
@@ -106,7 +107,7 @@ export async function extractInvoiceDataFromXml(
       cufe,
       paymentMethod,
       trackId: docInfo.id,
-      docNumber: docInfo.docnum,
+      docNumber: xmlDocNumber,
     };
   } catch (err) {
     console.error(`Error parseando XML ${docInfo.docnum}:`, err);
@@ -154,6 +155,19 @@ export async function extractInvoiceDataFromXml(
       docNumber: docInfo.docnum,
       error: (err as Error).message,
     };
+  }
+}
+
+function extractDocumentNumber(invoice: any, fallback?: string): string {
+  try {
+    const idRaw = getText(invoice?.ID || "").trim();
+    const prefixRaw = getText(invoice?.Prefix || "").trim();
+    const prefixed = `${prefixRaw}${idRaw}`.trim();
+    if (prefixed) return prefixed;
+    if (idRaw) return idRaw;
+    return (fallback || "").trim() || "N/A";
+  } catch {
+    return (fallback || "").trim() || "N/A";
   }
 }
 
