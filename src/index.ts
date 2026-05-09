@@ -13,6 +13,8 @@ import googleAuthRoutes from "./routes/googleAuth.js";
 import adminRoutes from "./routes/admin.js";
 import siigoRoutes from "./routes/siigo.js";
 import causationRoutes from "./routes/causation.js";
+import dianCufeRoutes from "./routes/dianCufeDownload.js";
+import dianMassDownloadRoutes from "./routes/dianMassDownload.js";
 import { connectMongo, seedAdminUser } from "./services/database.js";
 
 // ============================================
@@ -61,6 +63,8 @@ app.use("/admin", adminRoutes);
 app.use("/dian", dianRoutes);
 app.use("/dian-excel", dianExcelRoutes);
 app.use("/dian-third-parties", dianThirdPartiesRoutes);
+app.use("/dian-cufe", dianCufeRoutes);
+app.use("/dian-mass-download", dianMassDownloadRoutes);
 app.use("/integrations/siigo", siigoRoutes);
 app.use("/causation", causationRoutes);
 

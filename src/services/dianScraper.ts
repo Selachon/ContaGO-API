@@ -1,5 +1,6 @@
 import puppeteer, { Browser, Page, Cookie } from "puppeteer";
 import fs from "fs";
+import path from "path";
 import JSZip from "jszip";
 import type { DocumentInfo, ProgressData, DocumentDirection } from "../types/dian.js";
 
@@ -1956,4 +1957,168 @@ async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3
   }
   
   throw lastError || new Error(`Navegación falló después de ${maxRetries} intentos`);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Descarga por CUFE desde Excel (flujo simplificado, secuencial)
+// ─────────────────────────────────────────────────────────────
+
+export interface CufeDownloadItem {
+  cufe: string;
+  trackId: string | null;
+  destPath: string | null;
+  docnum: string;
+  nit: string;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Para cada CUFE de la lista:
+ *  1. Ingresa el CUFE en el campo "Código único" del portal DIAN.
+ *  2. Envía el formulario de búsqueda.
+ *  3. Extrae el trackId del único resultado.
+ *  4. Descarga el ZIP al directorio temporal.
+ *
+ * El rango de fechas se aplica UNA SOLA VEZ antes del bucle.
+ */
+export async function downloadDocumentsByCufe(
+  tokenUrl: string,
+  cufes: string[],
+  startDate: string | undefined,
+  endDate: string | undefined,
+  direction: DocumentDirection = "received",
+  tempDir: string,
+  onProgress?: (data: Partial<ProgressData>) => void,
+  checkCancelled?: () => boolean
+): Promise<{ results: CufeDownloadItem[]; downloaded: number; failed: number }> {
+  const update = (data: Partial<ProgressData>) => onProgress?.(data);
+  const cancelled = () => checkCancelled?.() ?? false;
+  const isSent = direction === "sent";
+  const documentUrl = isSent
+    ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+    : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+
+  let browser: Browser | null = null;
+  const results: CufeDownloadItem[] = [];
+  let downloaded = 0;
+  let failed = 0;
+
+  try {
+    update({ step: "Iniciando navegador...", current: 0, total: cufes.length });
+    browser = await launchBrowserWithRetry(resolveExecutablePath(), update);
+
+    const page = await browser.newPage();
+    await hardenPageRuntime(page);
+    await page.setViewport({ width: 1280, height: 800 });
+    page.setDefaultTimeout(120000);
+    page.setDefaultNavigationTimeout(120000);
+
+    update({ step: "Accediendo con token..." });
+    await navigateWithRetry(page, tokenUrl, 3);
+    await delay(1000);
+    if (isLoginPage(page.url())) {
+      throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
+
+    update({ step: `Navegando a documentos ${isSent ? "emitidos" : "recibidos"}...` });
+    await navigateWithRetry(page, documentUrl, 3);
+    await delay(600);
+    if (isLoginPage(page.url())) {
+      throw new Error("TOKEN_EXPIRED: La sesión ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
+
+    if (startDate && endDate) {
+      update({ step: "Aplicando rango de fechas..." });
+      await applyDateFilter(page, startDate, endDate, false);
+    }
+    await waitForTableLoad(page);
+
+    const seenIds = new Set<string>();
+
+    for (let i = 0; i < cufes.length; i++) {
+      if (cancelled()) {
+        console.log("[CUFE DL] Job cancelado durante bucle");
+        break;
+      }
+
+      const cufe = cufes[i];
+      update({
+        step: `Descargando ${i + 1}/${cufes.length}...`,
+        current: i + 1,
+        total: cufes.length,
+      });
+
+      try {
+        const doc = await findDocumentByUniqueCodeOrDocnum(page, cufe, "", seenIds, isSent);
+
+        if (!doc) {
+          const errMsg = "Sin resultados para este CUFE";
+          console.warn(`[CUFE DL] ${errMsg}: ${cufe.slice(0, 16)}...`);
+          results.push({ cufe, trackId: null, destPath: null, docnum: "", nit: "", success: false, error: errMsg });
+          failed++;
+          continue;
+        }
+
+        const isEquivalente = !!(doc.documentTypeId) || (doc.docType?.toLowerCase().includes("equivalente") ?? false);
+        const trackId = doc.id;
+        const { docnum, nit } = doc;
+
+        const baseUrl = isEquivalente
+          ? "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId="
+          : "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
+        const downloadUrl = `${baseUrl}${trackId}`;
+
+        const safeNit = (nit || "SinNIT").replace(/[^a-zA-Z0-9_\-]/g, "_");
+        const safeDoc = (docnum || trackId.slice(0, 12)).replace(/[^a-zA-Z0-9_\-]/g, "_");
+        const filename = `${safeNit} - ${safeDoc}.zip`;
+        const destPath = path.join(tempDir, filename);
+
+        const cookieArr = await page.cookies();
+        const cookieHeader = cookieArr.map((c) => `${c.name}=${c.value}`).join("; ");
+
+        await fetchZipToFile(downloadUrl, destPath, cookieHeader);
+
+        results.push({ cufe, trackId, destPath, docnum, nit, success: true });
+        downloaded++;
+        console.log(`[CUFE DL] OK ${i + 1}/${cufes.length}: ${docnum}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[CUFE DL] Error CUFE ${cufe.slice(0, 16)}...: ${msg}`);
+        results.push({ cufe, trackId: null, destPath: null, docnum: "", nit: "", success: false, error: msg });
+        failed++;
+      }
+    }
+
+    return { results, downloaded, failed };
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+async function fetchZipToFile(url: string, destPath: string, cookieHeader: string): Promise<void> {
+  const MAX_RETRIES = 3;
+  const TIMEOUT_MS = 180_000;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    try {
+      const resp = await fetch(url, {
+        headers: { Cookie: cookieHeader },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const buf = await resp.arrayBuffer();
+      fs.writeFileSync(destPath, Buffer.from(buf));
+      return;
+    } catch (err) {
+      clearTimeout(timer);
+      lastError = err as Error;
+      if (attempt < MAX_RETRIES) await delay(2000 * attempt);
+    }
+  }
+  throw lastError || new Error("Descarga fallida");
 }

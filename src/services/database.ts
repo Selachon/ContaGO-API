@@ -129,11 +129,25 @@ export async function verifyPassword(user: User, password: string): Promise<bool
 // Purchase functions
 // ============================================
 
+// Maps decommissioned tool IDs to the new ones that replace them.
+// When a user has the old ID, the new ID is automatically included in their purchased tools.
+const TOOL_SUCCESSOR: Record<string, string> = {
+  "dian-downloader": "dian-mass-download",
+  "dian-excel-exporter": "dian-cufe-downloader",
+};
+
 export async function getUserPurchases(userId: string): Promise<string[]> {
   try {
     const oid = new ObjectId(userId);
     const record = await usersCollection().findOne({ _id: oid }, { projection: { purchasedTools: 1 } });
-    return record?.purchasedTools || [];
+    const tools: string[] = record?.purchasedTools || [];
+    // Expand decommissioned IDs to their successors so existing users keep access
+    const expanded = new Set(tools);
+    for (const tool of tools) {
+      const successor = TOOL_SUCCESSOR[tool];
+      if (successor) expanded.add(successor);
+    }
+    return [...expanded];
   } catch {
     return [];
   }
@@ -152,10 +166,11 @@ export async function addPurchase(userId: string, toolId: string): Promise<boole
   }
 }
 
-export async function hasPurchase(userId: string, toolId: string): Promise<boolean> {
+export async function hasPurchase(userId: string, toolId: string, aliases: string[] = []): Promise<boolean> {
   try {
     const oid = new ObjectId(userId);
-    const record = await usersCollection().findOne({ _id: oid, purchasedTools: toolId });
+    const idsToCheck = aliases.length > 0 ? [toolId, ...aliases] : [toolId];
+    const record = await usersCollection().findOne({ _id: oid, purchasedTools: { $in: idsToCheck } });
     return !!record;
   } catch {
     return false;
