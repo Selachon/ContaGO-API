@@ -307,17 +307,13 @@ const DATE_SCAN_COLS = ["A","C","D","E","F","G","H","I","J","K"];
 
 function buildLimitMessage(total: number, dates: string[]): string {
   const partes = Math.ceil(total / 700);
-  const hasDates = dates.length > 0 && dates.some(Boolean);
-  if (hasDates) {
-    const rangos = Array.from({ length: partes }, (_, i) => {
-      const start = dates[i * 700] || "";
-      const end = dates[Math.min((i + 1) * 700 - 1, total - 1)] || "";
-      const count = Math.min(700, total - i * 700);
-      return `${start} a ${end} (${count} facturas)`;
-    }).join(" — ");
-    return `El Excel excede el límite de 750. Prueba el rango ${rangos}`;
-  }
-  return `El Excel excede el límite de 750. Divídelo en ${partes} partes de ~700 CUFEs`;
+  const rangos = Array.from({ length: partes }, (_, i) => {
+    const start = dates[i * 700] || "";
+    const end = dates[Math.min((i + 1) * 700 - 1, total - 1)] || "";
+    const count = Math.min(700, total - i * 700);
+    return `${start} a ${end} (${count} facturas)`;
+  }).join(" — ");
+  return `El Excel excede el límite de 750. Prueba el rango ${rangos}`;
 }
 
 async function extractCufesFromExcel(buffer: Buffer): Promise<{ cufes: string[]; dates: string[] }> {
@@ -379,7 +375,7 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{ cufes: string[];
     const hits = sample.filter((r) => DATE_RE.test(rows.get(r)?.get(col) || "")).length;
     if (hits > bestScore) { bestScore = hits; dateCol = col; }
   }
-  if (bestScore < Math.ceil(sample.length * 0.4)) dateCol = "";
+  if (bestScore === 0) dateCol = "";
 
   const cufes: string[] = [];
   const dates: string[] = [];
