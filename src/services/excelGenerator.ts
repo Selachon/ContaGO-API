@@ -179,21 +179,24 @@ function patchSheet1Header(sheetXml: string, includeDrive: boolean): string {
     );
 }
 
+const SHEET2_COLUMNS = [
+  "Item", "Numero Factura", "Tipo de documento", "Concepto",
+  "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle",
+  "IVA", "% IVA", "INC", "% INC", "Bolsas", "% Bolsas",
+  "ICUI", "% ICUI", "IC", "% IC",
+  "IC Porcentual", "% IC Porcentual", "ICL", "% ICL",
+  "IBUA", "% IBUA", "ADV", "% ADV",
+  "Precio unitario (incluye impuestos)",
+];
+
 function patchTable2(tableXml: string): string {
-  return tableXml
-    .replace('tableColumns count="18"', 'tableColumns count="27"')
-    .replace(
-      /<tableColumn([^>]*)name="Numero Factura"\/>/,
-      '<tableColumn$1name="Numero Factura"/><tableColumn id="28" name="Tipo de documento"/>'
-    )
-    .replace(
-      /<tableColumn([^>]*)name="Precio unitario \(incluye impuestos\)"\/>/,
-      '<tableColumn id="19" name="IC Porcentual"/><tableColumn id="20" name="% IC Porcentual"/>' +
-      '<tableColumn id="21" name="ICL"/><tableColumn id="22" name="% ICL"/>' +
-      '<tableColumn id="23" name="IBUA"/><tableColumn id="24" name="% IBUA"/>' +
-      '<tableColumn id="25" name="ADV"/><tableColumn id="26" name="% ADV"/>' +
-      '<tableColumn$1name="Precio unitario (incluye impuestos)"/>'
-    );
+  const colDefs = SHEET2_COLUMNS
+    .map((name, i) => `<tableColumn id="${i + 1}" name="${xmlEsc(name)}"/>`)
+    .join("");
+  return tableXml.replace(
+    /<tableColumns[^>]*>[\s\S]*?<\/tableColumns>/,
+    `<tableColumns count="${SHEET2_COLUMNS.length}">${colDefs}</tableColumns>`
+  );
 }
 
 function patchSheet2Header(sheetXml: string): string {
