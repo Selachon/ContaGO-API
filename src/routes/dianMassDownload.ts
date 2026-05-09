@@ -179,6 +179,20 @@ router.post(
       });
     }
 
+    const MAX_CUFES = 750;
+    if (cufes.length > MAX_CUFES) {
+      const partes = Math.ceil(cufes.length / 700);
+      const sugerencias = Array.from({ length: partes }, (_, i) => {
+        const desde = i * 700 + 2;
+        const hasta = Math.min((i + 1) * 700 + 1, cufes.length + 1);
+        return `Parte ${i + 1}: filas ${desde}–${hasta}`;
+      }).join(", ");
+      return res.status(400).json({
+        status: "error",
+        detalle: `Tu Excel tiene ${cufes.length} CUFEs, pero el límite por proceso es 750. Divídelo en ${partes} partes de ~700 CUFEs cada una. Sugerencia: ${sugerencias}.`,
+      });
+    }
+
     const jobId = uuidv4().replace(/-/g, "").slice(0, 12);
     const job: JobData = {
       status: "pending",
