@@ -198,8 +198,9 @@ router.post(
     const direction: DocumentDirection = document_direction === "sent" ? "sent" : "received";
 
     let cufes: string[];
+    let excelDates: string[];
     try {
-      cufes = await extractCufesFromExcel(file.buffer);
+      ({ cufes, dates: excelDates } = await extractCufesFromExcel(file.buffer));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return res.status(400).json({ status: "error", detalle: `Error leyendo Excel: ${msg}` });
@@ -214,15 +215,9 @@ router.post(
 
     const MAX_CUFES = 750;
     if (cufes.length > MAX_CUFES) {
-      const partes = Math.ceil(cufes.length / 700);
-      const sugerencias = Array.from({ length: partes }, (_, i) => {
-        const desde = i * 700 + 2;
-        const hasta = Math.min((i + 1) * 700 + 1, cufes.length + 1);
-        return `Parte ${i + 1}: filas ${desde}–${hasta}`;
-      }).join(", ");
       return res.status(400).json({
         status: "error",
-        detalle: `Tu Excel tiene ${cufes.length} CUFEs, pero el límite por proceso es 750. Divídelo en ${partes} partes de ~700 CUFEs cada una. Sugerencia: ${sugerencias}.`,
+        detalle: buildLimitMessage(cufes.length, excelDates),
       });
     }
 
@@ -487,64 +482,61 @@ async function extractXmlFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buffer
  * Extrae el contenido de la columna B del primer sheet del Excel.
  * Omite la fila 1 (encabezado) y devuelve todos los valores no vacíos.
  */
-async function extractCufesFromExcel(buffer: Buffer): Promise<string[]> {
+const DATE_RE = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$|^\d{4}[\/\-]\d{2}[\/\-]\d{2}$/;
+const DATE_SCAN_COLS = ["A","C","D","E","F","G","H","I","J","K"];
+
+function buildLimitMessage(total: number, dates: string[]): string {
+  const partes = Math.ceil(total / 700);
+  const hasDates = dates.length > 0 && dates.some(Boolean);
+  if (hasDates) {
+    const rangos = Array.from({ length: partes }, (_, i) => {
+      const start = dates[i * 700] || "";
+      const end = dates[Math.min((i + 1) * 700 - 1, total - 1)] || "";
+      const count = Math.min(700, total - i * 700);
+      return `${start} a ${end} (${count} facturas)`;
+    }).join(" — ");
+    return `El Excel excede el límite de 750. Prueba el rango ${rangos}`;
+  }
+  return `El Excel excede el límite de 750. Divídelo en ${partes} partes de ~700 CUFEs`;
+}
+
+async function extractCufesFromExcel(buffer: Buffer): Promise<{ cufes: string[]; dates: string[] }> {
   const zip = await JSZip.loadAsync(buffer);
-
   const allFiles = Object.keys(zip.files);
-  console.log("[Excel CUFE] Archivos en el zip:", allFiles.join(", "));
 
-  // Construir tabla de shared strings: índice → texto
   const sharedStrings: string[] = [];
   const ssPath = allFiles.find((f) => f.toLowerCase().endsWith("sharedstrings.xml")) || "";
   const ssFile = ssPath ? zip.file(ssPath) : null;
   if (ssFile) {
     const ssXml = await ssFile.async("string");
-    console.log("[Excel CUFE] sharedStrings primeros 300 chars:", ssXml.slice(0, 300));
-    // Elementos pueden tener prefijo de namespace (ej: x:si, x:t)
     for (const siMatch of ssXml.matchAll(/<(?:\w+:)?si\b[^>]*>([\s\S]*?)<\/(?:\w+:)?si>/g)) {
-      const siContent = siMatch[1];
       const texts: string[] = [];
-      for (const tMatch of siContent.matchAll(/<(?:\w+:)?t\b[^>]*>([^<]*)<\/(?:\w+:)?t>/g)) {
+      for (const tMatch of siMatch[1].matchAll(/<(?:\w+:)?t\b[^>]*>([^<]*)<\/(?:\w+:)?t>/g)) {
         texts.push(tMatch[1]);
       }
       sharedStrings.push(texts.join(""));
     }
-    console.log(`[Excel CUFE] ${sharedStrings.length} shared strings cargados`);
-    if (sharedStrings.length > 0) {
-      console.log("[Excel CUFE] Primeros 3 shared strings:", sharedStrings.slice(0, 3));
-    }
-  } else {
-    console.log("[Excel CUFE] No se encontró sharedStrings.xml");
   }
 
-  // Localizar la primera hoja
   const sheetPath =
     allFiles.find((f) => /xl\/worksheets\/sheet1\.xml$/i.test(f)) ||
     allFiles.find((f) => /xl\/worksheets\/sheet\d+\.xml$/i.test(f));
-
   if (!sheetPath) throw new Error("No se encontró ninguna hoja en el Excel");
 
   const sheetXml = await zip.file(sheetPath)!.async("string");
-  console.log("[Excel CUFE] Sheet primeros 500 chars:", sheetXml.slice(0, 500));
 
-  const values: string[] = [];
-
-  // Recorrer todas las celdas de columna B (r="B2", r="B3", ...), omitir B1 (encabezado)
+  // Collect all cell values by (row, col)
+  const rows: Map<number, Map<string, string>> = new Map();
   for (const cellMatch of sheetXml.matchAll(/<(?:\w+:)?c\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?c>/g)) {
     const attrs = cellMatch[1];
     const cellContent = cellMatch[2];
-
-    // Extraer referencia de celda
     const rMatch = attrs.match(/\br="([A-Z]+)(\d+)"/);
     if (!rMatch) continue;
-    const col = rMatch[1];
-    const rowNum = parseInt(rMatch[2], 10);
-
-    if (col !== "B") continue;
-    if (rowNum <= 1) continue; // saltar encabezado
+    const [, col, rowStr] = rMatch;
+    const rowNum = parseInt(rowStr, 10);
+    if (rowNum <= 1) continue;
 
     let value = "";
-
     if (attrs.includes('t="s"')) {
       const vMatch = cellContent.match(/<(?:\w+:)?v>(\d+)<\/(?:\w+:)?v>/);
       if (vMatch) value = sharedStrings[parseInt(vMatch[1], 10)] || "";
@@ -555,15 +547,33 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<string[]> {
       const vMatch = cellContent.match(/<(?:\w+:)?v>([^<]*)<\/(?:\w+:)?v>/);
       if (vMatch) value = vMatch[1];
     }
-
     value = value.trim();
-    if (value) values.push(value);
+    if (!rows.has(rowNum)) rows.set(rowNum, new Map());
+    rows.get(rowNum)!.set(col, value);
   }
 
-  console.log(`[Excel CUFE] ${values.length} valores extraídos de columna B`);
-  if (values.length > 0) console.log("[Excel CUFE] Primer valor:", values[0].slice(0, 40));
+  // Detect which column has dates by sampling first 15 data rows
+  const sortedRows = [...rows.keys()].sort((a, b) => a - b);
+  const sample = sortedRows.slice(0, 15);
+  let dateCol = "";
+  let bestScore = 0;
+  for (const col of DATE_SCAN_COLS) {
+    const hits = sample.filter((r) => DATE_RE.test(rows.get(r)?.get(col) || "")).length;
+    if (hits > bestScore) { bestScore = hits; dateCol = col; }
+  }
+  if (bestScore < Math.ceil(sample.length * 0.4)) dateCol = "";
 
-  return values;
+  const cufes: string[] = [];
+  const dates: string[] = [];
+  for (const rowNum of sortedRows) {
+    const cufe = rows.get(rowNum)?.get("B") || "";
+    if (!cufe) continue;
+    cufes.push(cufe);
+    dates.push(dateCol ? (rows.get(rowNum)?.get(dateCol) || "") : "");
+  }
+
+  console.log(`[Excel CUFE] ${cufes.length} CUFEs, dateCol="${dateCol}", bestScore=${bestScore}`);
+  return { cufes, dates };
 }
 
 export default router;
