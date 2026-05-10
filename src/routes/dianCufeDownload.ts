@@ -28,11 +28,18 @@ function formatDateES(isoDate: string): string {
   return `${mon} ${d} ${y}`;
 }
 
+function parseBoolParam(v: unknown, defaultVal: boolean): boolean {
+  if (v === true || v === "true") return true;
+  if (v === false || v === "false") return false;
+  return defaultVal;
+}
+
 function buildOutputName(invoices: Partial<InvoiceData>[], direction: DocumentDirection, startDate?: string, endDate?: string): string {
   const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
+  const isFactura = (inv: Partial<InvoiceData>) => /factura/i.test(inv.documentType ?? "");
   const nit = (direction === "sent"
-    ? invoices.find((inv) => inv?.issuerNit)?.issuerNit
-    : invoices.find((inv) => inv?.receiverNit)?.receiverNit) || "SinNIT";
+    ? (invoices.find((inv) => inv?.issuerNit && isFactura(inv)) ?? invoices.find((inv) => inv?.issuerNit))?.issuerNit
+    : (invoices.find((inv) => inv?.receiverNit && isFactura(inv)) ?? invoices.find((inv) => inv?.receiverNit))?.receiverNit) || "SinNIT";
   const safeNit = nit.replace(/[^a-zA-Z0-9]/g, "");
   const startFmt = startDate ? formatDateES(startDate) : "";
   const endFmt = endDate ? formatDateES(endDate) : "";
@@ -190,11 +197,10 @@ router.post(
       return res.status(400).json({ status: "error", detalle: "Debes adjuntar un archivo Excel" });
     }
 
-    const { token_url, start_date, end_date, document_direction, drive_connection_id, include_drive_links, upload_to_drive } = req.body as {
+    const { token_url, start_date, end_date, drive_connection_id, include_drive_links, upload_to_drive } = req.body as {
       token_url: string;
       start_date?: string;
       end_date?: string;
-      document_direction?: string;
       drive_connection_id?: string;
       include_drive_links?: boolean;
       upload_to_drive?: boolean;
@@ -207,18 +213,31 @@ router.post(
       return res.status(400).json({ status: "error", detalle: "end_date debe tener formato YYYY-MM-DD" });
     }
 
-    const direction: DocumentDirection = document_direction === "sent" ? "sent" : "received";
-
-    let cufes: string[];
-    let excelDates: string[];
+    let downloadCufes: string[];
+    let allCufes: string[];
+    let allDates: string[];
+    let skippedEntries: Array<{cufe: string; reason: string}>;
+    let direction: DocumentDirection;
     try {
-      ({ cufes, dates: excelDates } = await extractCufesFromExcel(file.buffer));
+      const excelBuffer = await resolveExcelBuffer(file);
+      const result = await extractCufesFromExcel(excelBuffer);
+      if (result.mixedDirections) {
+        return res.status(400).json({ status: "error", detalle: "El listado contiene documentos emitidos y recibidos. Por favor sube solo un grupo." });
+      }
+      if (!result.detectedDirection) {
+        return res.status(400).json({ status: "error", detalle: "No se pudo determinar el tipo de documentos. Asegúrate de usar el listado exportado desde la DIAN (debe tener columna 'Grupo')." });
+      }
+      downloadCufes = result.cufes;
+      allCufes = result.allCufes;
+      allDates = result.dates;
+      skippedEntries = result.skippedEntries;
+      direction = result.detectedDirection;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return res.status(400).json({ status: "error", detalle: `Error leyendo Excel: ${msg}` });
+      return res.status(400).json({ status: "error", detalle: `Error leyendo archivo: ${msg}` });
     }
 
-    if (cufes.length === 0) {
+    if (allCufes.length === 0) {
       return res.status(400).json({
         status: "error",
         detalle: "La columna B del Excel está vacía o no contiene valores.",
@@ -226,17 +245,17 @@ router.post(
     }
 
     const MAX_CUFES = 750;
-    if (cufes.length > MAX_CUFES) {
+    if (downloadCufes.length > MAX_CUFES) {
       return res.status(400).json({
         status: "error",
-        detalle: buildLimitMessage(cufes.length, excelDates),
+        detalle: buildLimitMessage(downloadCufes.length, allDates),
       });
     }
 
     const jobId = uuidv4().replace(/-/g, "").slice(0, 12);
     const job: JobData = {
       status: "pending",
-      progress: { step: "Iniciando...", current: 0, total: cufes.length },
+      progress: { step: "Iniciando...", current: 0, total: allCufes.length },
       userId: req.user!.userId,
       createdAt: Date.now(),
     };
@@ -245,11 +264,11 @@ router.post(
     res.json({
       status: "accepted",
       jobId,
-      totalCufes: cufes.length,
-      message: `${cufes.length} CUFEs encontrados. Usa /dian-cufe/job-status/${jobId} para consultar el progreso.`,
+      totalCufes: allCufes.length,
+      message: `${allCufes.length} CUFEs encontrados. Usa /dian-cufe/job-status/${jobId} para consultar el progreso.`,
     });
 
-    processCufeDownloadJob(jobId, token_url, cufes, start_date, end_date, direction, req.user!.userId, drive_connection_id, !!include_drive_links, upload_to_drive !== false).catch((err) => {
+    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, skippedEntries, start_date, end_date, direction, req.user!.userId, drive_connection_id, parseBoolParam(include_drive_links, false), parseBoolParam(upload_to_drive, true)).catch((err) => {
       console.error(`[CUFE DL] Job ${jobId} error:`, err);
       const j = jobTracker.get(jobId);
       if (j) {
@@ -264,7 +283,9 @@ router.post(
 async function processCufeDownloadJob(
   jobId: string,
   tokenUrl: string,
-  cufes: string[],
+  allCufes: string[],       // all CUFEs in original order — drives Excel output
+  downloadCufes: string[],  // subset to actually scrape/download
+  skippedEntries: Array<{cufe: string; reason: string}>,
   startDate: string | undefined,
   endDate: string | undefined,
   direction: DocumentDirection,
@@ -285,10 +306,17 @@ async function processCufeDownloadJob(
   job.outputPath = outputPath;
   fs.mkdirSync(tempDir, { recursive: true });
 
-  // Pre-populate map with one slot per CUFE — ensures all appear in Excel even if data is partial
+  // Pre-populate map for all CUFEs — skipped ones get a note; downloadable ones get a placeholder
   const invoiceMap = new Map<string, Partial<InvoiceData>>();
-  for (const cufe of cufes) {
-    invoiceMap.set(cufe, { cufe });
+  const skippedSet = new Set(skippedEntries.map((s) => s.cufe));
+  const skippedReasonMap = new Map(skippedEntries.map((s) => [s.cufe, s.reason]));
+  for (const cufe of allCufes) {
+    if (skippedSet.has(cufe)) {
+      const reason = skippedReasonMap.get(cufe)!;
+      invoiceMap.set(cufe, { cufe, documentType: reason, taxes: [], lineItems: [] });
+    } else {
+      invoiceMap.set(cufe, { cufe });
+    }
   }
 
   // Resolve Drive config once upfront
@@ -319,7 +347,7 @@ async function processCufeDownloadJob(
       (progress) => setProgress(jobId, {
         step: `${phaseLabel}: ${progress.step || "..."}`,
         current: progress.current ?? 0,
-        total: progress.total ?? batch.length,
+        total: progress.total ?? allCufes.length,
       }),
       () => isJobCancelled(jobId)
     );
@@ -397,13 +425,13 @@ async function processCufeDownloadJob(
   try {
     if (isJobCancelled(jobId)) return;
 
-    // Phase 1: Download + parse all CUFEs
-    await downloadAndFill(cufes, tempDir, "Descarga");
+    // Phase 1: Download + parse processable CUFEs (skipped ones already pre-filled)
+    await downloadAndFill(downloadCufes, tempDir, "Descarga");
 
     if (isJobCancelled(jobId)) return;
 
-    // Phase 2: Retry CUFEs that still have no parsed data
-    const pendingCufes = cufes.filter((c) => !hasData(c));
+    // Phase 2: Retry only downloadable CUFEs that still have no parsed data
+    const pendingCufes = downloadCufes.filter((c) => !hasData(c));
     if (pendingCufes.length > 0) {
       console.log(`[CUFE DL] Reintentando ${pendingCufes.length} documentos sin datos...`);
       const tempDir2 = path.join(DOWNLOADS_DIR, `${sessionId}_retry`);
@@ -411,8 +439,8 @@ async function processCufeDownloadJob(
       try {
         setProgress(jobId, {
           step: `Reintentando ${pendingCufes.length} documentos sin datos...`,
-          current: cufes.length - pendingCufes.length,
-          total: cufes.length,
+          current: downloadCufes.length - pendingCufes.length,
+          total: allCufes.length,
         });
         await downloadAndFill(pendingCufes, tempDir2, "Reintento");
       } finally {
@@ -422,11 +450,11 @@ async function processCufeDownloadJob(
 
     if (isJobCancelled(jobId)) return;
 
-    // Phase 3: Generate Excel with ALL CUFEs in original order (partial rows included)
-    const filledCount = cufes.filter(hasData).length;
-    setProgress(jobId, { step: "Generando Excel...", current: cufes.length, total: cufes.length });
+    // Phase 3: Generate Excel with ALL CUFEs in original order (includes skipped rows with notes)
+    const filledCount = downloadCufes.filter(hasData).length;
+    setProgress(jobId, { step: "Generando Excel...", current: allCufes.length, total: allCufes.length });
 
-    const invoices = cufes.map((cufe) => invoiceMap.get(cufe)!);
+    const invoices = allCufes.map((cufe) => invoiceMap.get(cufe)!);
     await generateExcelFile(invoices as InvoiceData[], outputPath, useInlineDriveLinks, direction === "sent");
 
     const outputName = buildOutputName(invoices, direction, startDate, endDate);
@@ -434,13 +462,15 @@ async function processCufeDownloadJob(
     job.outputMime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
     job.status = "completed";
+    const skippedCount = skippedEntries.length;
+    const skipNote = skippedCount > 0 ? `, ${skippedCount} omitidos (nómina/AR)` : "";
     setProgress(jobId, {
-      step: `Completado: ${filledCount}/${cufes.length} con datos${filledCount < cufes.length ? `, ${cufes.length - filledCount} sin datos (incluidos en Excel)` : ""}`,
-      current: cufes.length,
-      total: cufes.length,
+      step: `Completado: ${filledCount}/${downloadCufes.length} con datos${filledCount < downloadCufes.length ? `, ${downloadCufes.length - filledCount} sin datos` : ""}${skipNote}`,
+      current: allCufes.length,
+      total: allCufes.length,
     });
 
-    console.log(`[CUFE DL] Job ${jobId}: ${filledCount}/${cufes.length} con datos`);
+    console.log(`[CUFE DL] Job ${jobId}: ${filledCount}/${downloadCufes.length} con datos, ${skippedCount} omitidos`);
 
     // Phase 4: Deferred Drive upload — run in background after job is marked completed
     if (runDeferredDriveUpload && driveConfig && deferredUploads.length > 0) {
@@ -505,10 +535,19 @@ async function extractFilesFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buff
   return { xmlBuffer, pdfBuffer };
 }
 
-/**
- * Extrae el contenido de la columna B del primer sheet del Excel.
- * Omite la fila 1 (encabezado) y devuelve todos los valores no vacíos.
- */
+async function resolveExcelBuffer(file: Express.Multer.File): Promise<Buffer> {
+  if (file.originalname.toLowerCase().endsWith(".zip")) {
+    const zip = await JSZip.loadAsync(file.buffer);
+    for (const [filename, entry] of Object.entries(zip.files)) {
+      if (!entry.dir && /\.(xlsx|xls)$/i.test(filename)) {
+        return entry.async("nodebuffer");
+      }
+    }
+    throw new Error("No se encontró un archivo Excel (.xlsx) dentro del ZIP.");
+  }
+  return file.buffer;
+}
+
 const DATE_RE = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$|^\d{4}[\/\-]\d{2}[\/\-]\d{2}$/;
 const DATE_SCAN_COLS = ["A","C","D","E","F","G","H","I","J","K"];
 
@@ -523,7 +562,24 @@ function buildLimitMessage(total: number, dates: string[]): string {
   return `El Excel excede el límite de 750. Prueba el rango ${rangos}`;
 }
 
-async function extractCufesFromExcel(buffer: Buffer): Promise<{ cufes: string[]; dates: string[] }> {
+function classifyGrupo(grupoVal: string): "sent" | "received" | "nomina" | "applicationResponse" | "unknown" {
+  // Normalize accents for reliable matching
+  const norm = grupoVal.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+  if (norm.includes("nomin")) return "nomina";
+  if (norm.includes("application") || norm.includes("respuesta de aplic")) return "applicationResponse";
+  if (/emitid/.test(norm)) return "sent";
+  if (/recibid/.test(norm)) return "received";
+  return "unknown";
+}
+
+async function extractCufesFromExcel(buffer: Buffer): Promise<{
+  cufes: string[];          // only processable (downloadable) CUFEs
+  allCufes: string[];       // all CUFEs in original order
+  dates: string[];
+  detectedDirection: DocumentDirection | null;
+  mixedDirections: boolean;
+  skippedEntries: Array<{cufe: string; reason: string}>;
+}> {
   const zip = await JSZip.loadAsync(buffer);
   const allFiles = Object.keys(zip.files);
 
@@ -548,7 +604,6 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{ cufes: string[];
 
   const sheetXml = await zip.file(sheetPath)!.async("string");
 
-  // Collect all cell values by (row, col)
   const rows: Map<number, Map<string, string>> = new Map();
   for (const cellMatch of sheetXml.matchAll(/<(?:\w+:)?c\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?c>/g)) {
     const attrs = cellMatch[1];
@@ -557,7 +612,6 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{ cufes: string[];
     if (!rMatch) continue;
     const [, col, rowStr] = rMatch;
     const rowNum = parseInt(rowStr, 10);
-    if (rowNum <= 1) continue;
 
     let value = "";
     if (attrs.includes('t="s"')) {
@@ -575,8 +629,33 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{ cufes: string[];
     rows.get(rowNum)!.set(col, value);
   }
 
-  // Detect which column has dates by sampling first 15 data rows
-  const sortedRows = [...rows.keys()].sort((a, b) => a - b);
+  // Detect "Grupo" column from header row 1
+  let grupoCol = "";
+  const headerRow = rows.get(1);
+  if (headerRow) {
+    for (const [col, val] of headerRow) {
+      if (/^grupo$/i.test(val)) { grupoCol = col; break; }
+    }
+  }
+
+  const sortedRows = [...rows.keys()].filter((r) => r > 1).sort((a, b) => a - b);
+
+  // Classify each row and detect direction (ignoring nomina/AR rows)
+  let detectedDirection: DocumentDirection | null = null;
+  let mixedDirections = false;
+  const dirSet = new Set<DocumentDirection>();
+  const rowClassMap = new Map<number, ReturnType<typeof classifyGrupo>>();
+  for (const rowNum of sortedRows) {
+    const grupoVal = grupoCol ? (rows.get(rowNum)?.get(grupoCol) || "") : "";
+    const cls = grupoVal ? classifyGrupo(grupoVal) : "unknown";
+    rowClassMap.set(rowNum, cls);
+    if (cls === "sent") dirSet.add("sent");
+    else if (cls === "received") dirSet.add("received");
+  }
+  if (dirSet.size === 1) detectedDirection = dirSet.has("sent") ? "sent" : "received";
+  else if (dirSet.size > 1) mixedDirections = true;
+
+  // Detect date column by sampling first 15 data rows
   const sample = sortedRows.slice(0, 15);
   let dateCol = "";
   let bestScore = 0;
@@ -586,17 +665,29 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{ cufes: string[];
   }
   if (bestScore === 0) dateCol = "";
 
-  const cufes: string[] = [];
+  const cufes: string[] = [];        // processable
+  const allCufes: string[] = [];     // all in original order
   const dates: string[] = [];
+  const skippedEntries: Array<{cufe: string; reason: string}> = [];
+
   for (const rowNum of sortedRows) {
     const cufe = rows.get(rowNum)?.get("B") || "";
     if (!cufe) continue;
-    cufes.push(cufe);
-    dates.push(dateCol ? (rows.get(rowNum)?.get(dateCol) || "") : "");
+    const date = dateCol ? (rows.get(rowNum)?.get(dateCol) || "") : "";
+    const cls = rowClassMap.get(rowNum) ?? "unknown";
+    allCufes.push(cufe);
+    dates.push(date);
+    if (cls === "nomina") {
+      skippedEntries.push({ cufe, reason: "Nómina Individual: CUFE no procesable por esta herramienta" });
+    } else if (cls === "applicationResponse") {
+      skippedEntries.push({ cufe, reason: "Application Response: CUFE no procesable por esta herramienta" });
+    } else {
+      cufes.push(cufe);
+    }
   }
 
-  console.log(`[Excel CUFE] ${cufes.length} CUFEs, dateCol="${dateCol}", bestScore=${bestScore}`);
-  return { cufes, dates };
+  console.log(`[Excel CUFE] total=${allCufes.length} processable=${cufes.length} skipped=${skippedEntries.length} direction="${detectedDirection}" mixed=${mixedDirections}`);
+  return { cufes, allCufes, dates, detectedDirection, mixedDirections, skippedEntries };
 }
 
 export default router;
