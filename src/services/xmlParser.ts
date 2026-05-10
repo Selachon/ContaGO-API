@@ -7,6 +7,43 @@ interface DocInfo {
   docType?: string; // Tipo de documento de la tabla DIAN (ej: "Documento soporte", "Factura electrónica")
 }
 
+const NON_INVOICE_TYPE_MAP: Record<string, string> = {
+  NominaIndividual: "Nómina Individual Electrónica",
+  NominaIndividualDeAjuste: "Nómina Individual de Ajuste",
+  ApplicationResponse: "Application Response",
+  AttachedDocument: "Documento Adjunto DIAN",
+  DespatchAdvice: "Aviso de Despacho",
+  ReceiptAdvice: "Aviso de Recepción",
+};
+
+function detectDocType(parsed: Record<string, unknown>): string {
+  for (const [key, label] of Object.entries(NON_INVOICE_TYPE_MAP)) {
+    if (parsed[key]) return label;
+  }
+  const firstKey = Object.keys(parsed).find((k) => k !== "?xml");
+  return firstKey ?? "Documento no procesable";
+}
+
+function detectDocTypeFromRawXml(xml: string): string {
+  const clean = xml.replace(/<\?[^>]*\?>/g, "");
+  const m = clean.match(/<([A-Za-z][A-Za-z0-9]*(?::[A-Za-z][A-Za-z0-9]*)?)/);
+  if (!m) return "Documento no procesable";
+  const tag = m[1].includes(":") ? m[1].split(":")[1] : m[1];
+  return NON_INVOICE_TYPE_MAP[tag] ?? tag;
+}
+
+function buildSkipResult(docInfo: DocInfo, docType: string): Partial<InvoiceData> {
+  return {
+    documentType: docType,
+    concepts: `CUFE corresponde a "${docType}"`,
+    cufe: docInfo.id,
+    trackId: docInfo.id,
+    docNumber: docInfo.docnum || "",
+    taxes: [],
+    lineItems: [],
+  };
+}
+
 /**
  * Extrae datos estructurados de un XML de factura electrónica DIAN (UBL 2.1)
  */
@@ -14,8 +51,9 @@ export async function extractInvoiceDataFromXml(
   xmlBuffer: Buffer,
   docInfo: DocInfo
 ): Promise<Partial<InvoiceData>> {
+  let xmlString = "";
   try {
-    const xmlString = xmlBuffer.toString("utf-8");
+    xmlString = xmlBuffer.toString("utf-8");
 
     const parser = new XMLParser({
       ignoreAttributes: false,
@@ -30,7 +68,7 @@ export async function extractInvoiceDataFromXml(
     // El documento puede ser Invoice (factura), CreditNote o DebitNote
     const invoice = parsed.Invoice || parsed.CreditNote || parsed.DebitNote;
     if (!invoice) {
-      throw new Error("No se encontró Invoice, CreditNote o DebitNote en el XML");
+      return buildSkipResult(docInfo, detectDocType(parsed));
     }
 
     const isNotaCredito = !!parsed.CreditNote;
@@ -111,50 +149,8 @@ export async function extractInvoiceDataFromXml(
     };
   } catch (err) {
     console.error(`Error parseando XML ${docInfo.docnum}:`, err);
-    return {
-      issuerNit: "N/A",
-      issuerName: "N/A",
-      issuerEmail: "N/A",
-      issuerPhone: "N/A",
-      issuerAddress: "N/A",
-      issuerCity: "N/A",
-      issuerDepartment: "N/A",
-      issuerCountry: "N/A",
-      issuerCommercialName: "N/A",
-      issuerTaxpayerType: "N/A",
-      issuerFiscalRegime: "N/A",
-      issuerTaxResponsibility: "N/A",
-      issuerEconomicActivity: "N/A",
-      receiverNit: "N/A",
-      receiverName: "N/A",
-      receiverEmail: "N/A",
-      receiverPhone: "N/A",
-      receiverAddress: "N/A",
-      receiverCity: "N/A",
-      receiverDepartment: "N/A",
-      receiverCountry: "N/A",
-      receiverCommercialName: "N/A",
-      receiverTaxpayerType: "N/A",
-      receiverFiscalRegime: "N/A",
-      receiverTaxResponsibility: "N/A",
-      receiverEconomicActivity: "N/A",
-      issueDate: "N/A",
-      issueDateISO: "9999-12-31",
-      subtotal: 0,
-      iva: 0,
-      total: 0,
-      taxes: [],
-      discount: 0,
-      surcharge: 0,
-      concepts: "ERROR: No se pudo leer el XML",
-      lineItems: [],
-      documentType: "N/A",
-      cufe: "N/A",
-      paymentMethod: "N/A",
-      trackId: docInfo.id,
-      docNumber: docInfo.docnum,
-      error: (err as Error).message,
-    };
+    const docType = xmlString ? detectDocTypeFromRawXml(xmlString) : "Documento no procesable";
+    return buildSkipResult(docInfo, docType);
   }
 }
 
