@@ -22,7 +22,7 @@ import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../s
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig } from "../types/dianExcel.js";
 
 interface DeferredDriveUploadItem {
-  pdfPath: string;
+  pdfPath: string | null;
   xmlPath: string;
   docnum: string;
   issuerNit: string;
@@ -626,9 +626,12 @@ async function processExcelJob(
           const safeDocNum = doc.docnum.replace(/[^a-zA-Z0-9._-]/g, "_");
           const itemPrefix = `${String(i + 1).padStart(6, "0")}-${safeDocNum}`;
           const xmlPath = path.join(pendingDir, `${itemPrefix}.xml`);
-          const pdfPath = path.join(pendingDir, `${itemPrefix}.pdf`);
           fs.writeFileSync(xmlPath, xmlBuffer);
-          fs.writeFileSync(pdfPath, pdfBuffer || Buffer.alloc(0));
+          let pdfPath: string | null = null;
+          if (pdfBuffer && pdfBuffer.length > 0) {
+            pdfPath = path.join(pendingDir, `${itemPrefix}.pdf`);
+            fs.writeFileSync(pdfPath, pdfBuffer);
+          }
           deferredUploads.push({
             pdfPath,
             xmlPath,
@@ -896,7 +899,8 @@ async function runDriveUploadInBackground(
     for (let i = 0; i < uploads.length; i++) {
       if (isJobCancelled(jobId)) return;
       const item = uploads[i];
-      const pdfBuffer = fs.existsSync(item.pdfPath) ? fs.readFileSync(item.pdfPath) : null;
+      const pdfRaw = item.pdfPath && fs.existsSync(item.pdfPath) ? fs.readFileSync(item.pdfPath) : null;
+      const pdfBuffer = pdfRaw && pdfRaw.length > 0 ? pdfRaw : null;
       const xmlBuffer = fs.readFileSync(item.xmlPath);
 
       await uploadInvoiceFilesToDrive(

@@ -60,6 +60,9 @@ interface JobData {
   createdAt: number;
   tempDir?: string;
   driveFolderUrl?: string;
+  driveUploadStatus?: "uploading" | "done" | "error";
+  driveUploadCurrent?: number;
+  driveUploadTotal?: number;
 }
 
 const jobTracker = new Map<string, JobData>();
@@ -114,7 +117,16 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
   if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
     return res.status(403).json({ status: "error", detalle: "No autorizado" });
   }
-  res.json({ status: job.status, progress: job.progress, error: job.error, outputName: job.outputName, driveFolderUrl: job.driveFolderUrl });
+  res.json({
+    status: job.status,
+    progress: job.progress,
+    error: job.error,
+    outputName: job.outputName,
+    driveFolderUrl: job.driveFolderUrl,
+    driveUploadStatus: job.driveUploadStatus,
+    driveUploadCurrent: job.driveUploadCurrent,
+    driveUploadTotal: job.driveUploadTotal,
+  });
 });
 
 router.get("/job-download/:jobId", (req: Request, res: Response) => {
@@ -285,7 +297,7 @@ async function processCufeDownloadJob(
   const doUploadInvoices = uploadToDrive && hasDrive;
   const useInlineDriveLinks = includeDriveLinks && doUploadInvoices;
   const runDeferredDriveUpload = doUploadInvoices && !useInlineDriveLinks;
-  const deferredUploads: { xmlBuffer: Buffer; docnum: string; issuerNit: string; receiverNit: string; issueDate: string; }[] = [];
+  const deferredUploads: { xmlBuffer: Buffer; pdfBuffer: Buffer | null; docnum: string; issuerNit: string; receiverNit: string; issueDate: string; }[] = [];
 
   const onTokenRefresh = async (newAccessToken: string, expiryDate: number) => {
     const encryptedToken = encryptToken(newAccessToken);
@@ -325,7 +337,7 @@ async function processCufeDownloadJob(
       });
       try {
         const zipBuffer = fs.readFileSync(result.destPath!);
-        const { xmlBuffer } = await extractXmlFromZip(zipBuffer);
+        const { xmlBuffer, pdfBuffer } = await extractFilesFromZip(zipBuffer);
         if (!xmlBuffer) {
           console.warn(`[CUFE DL] Sin XML en ZIP: ${result.destPath}`);
           continue;
@@ -341,7 +353,7 @@ async function processCufeDownloadJob(
         if (useInlineDriveLinks && driveConfig && hasValidData) {
           try {
             const uploadResult = await uploadInvoiceFilesToDrive(
-              null,
+              pdfBuffer,
               xmlBuffer,
               invoiceData.docNumber!,
               invoiceData.issuerNit || result.nit,
@@ -362,6 +374,7 @@ async function processCufeDownloadJob(
         if (runDeferredDriveUpload && hasValidData) {
           deferredUploads.push({
             xmlBuffer,
+            pdfBuffer,
             docnum: invoiceData.docNumber!,
             issuerNit: invoiceData.issuerNit || result.nit,
             receiverNit: invoiceData.receiverNit || "",
@@ -431,28 +444,39 @@ async function processCufeDownloadJob(
 
     // Phase 4: Deferred Drive upload — run in background after job is marked completed
     if (runDeferredDriveUpload && driveConfig && deferredUploads.length > 0) {
+      job.driveUploadStatus = "uploading";
+      job.driveUploadCurrent = 0;
+      job.driveUploadTotal = deferredUploads.length;
       void (async () => {
         console.log(`[CUFE DL] Iniciando carga diferida a Drive: ${deferredUploads.length} documentos`);
-        for (const item of deferredUploads) {
-          if (isJobCancelled(jobId)) break;
-          try {
-            await uploadInvoiceFilesToDrive(
-              null,
-              item.xmlBuffer,
-              item.docnum,
-              item.issuerNit,
-              item.receiverNit,
-              item.issueDate,
-              driveConfig,
-              userId,
-              onTokenRefresh,
-              direction === "sent" ? "sent" : "received"
-            );
-          } catch (driveErr) {
-            console.warn(`[CUFE DL] Error carga diferida ${item.docnum}:`, driveErr);
+        try {
+          for (let idx = 0; idx < deferredUploads.length; idx++) {
+            if (isJobCancelled(jobId)) break;
+            const item = deferredUploads[idx];
+            try {
+              await uploadInvoiceFilesToDrive(
+                item.pdfBuffer,
+                item.xmlBuffer,
+                item.docnum,
+                item.issuerNit,
+                item.receiverNit,
+                item.issueDate,
+                driveConfig,
+                userId,
+                onTokenRefresh,
+                direction === "sent" ? "sent" : "received"
+              );
+            } catch (driveErr) {
+              console.warn(`[CUFE DL] Error carga diferida ${item.docnum}:`, driveErr);
+            }
+            job.driveUploadCurrent = idx + 1;
           }
+          job.driveUploadStatus = "done";
+          console.log(`[CUFE DL] Carga diferida a Drive completada`);
+        } catch (err) {
+          job.driveUploadStatus = "error";
+          console.error(`[CUFE DL] Error en carga diferida:`, err);
         }
-        console.log(`[CUFE DL] Carga diferida a Drive completada`);
       })();
     }
   } catch (err) {
@@ -467,14 +491,18 @@ async function processCufeDownloadJob(
   }
 }
 
-async function extractXmlFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buffer | null }> {
+async function extractFilesFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buffer | null; pdfBuffer: Buffer | null }> {
   const zip = await JSZip.loadAsync(zipBuffer);
+  let xmlBuffer: Buffer | null = null;
+  let pdfBuffer: Buffer | null = null;
   for (const [filename, file] of Object.entries(zip.files)) {
-    if (!file.dir && filename.toLowerCase().endsWith(".xml")) {
-      return { xmlBuffer: await file.async("nodebuffer") };
-    }
+    if (file.dir) continue;
+    const lower = filename.toLowerCase();
+    if (lower.endsWith(".xml") && !xmlBuffer) xmlBuffer = await file.async("nodebuffer");
+    if (lower.endsWith(".pdf") && !pdfBuffer) pdfBuffer = await file.async("nodebuffer");
+    if (xmlBuffer && pdfBuffer) break;
   }
-  return { xmlBuffer: null };
+  return { xmlBuffer, pdfBuffer };
 }
 
 /**
