@@ -235,20 +235,27 @@ export async function getOrCreateFolder(
   return await createFolder(drive, ROOT_FOLDER_NAME);
 }
 
-// Obtener o crear estructura de carpetas: Raíz/Año/Mes/Dirección/TipoArchivo
+// Obtener o crear estructura de carpetas: Raíz/NIT/Año/Mes/Dirección/TipoArchivo
 // directionLabel: "Emitidas" | "Recibidas"   fileType: "PDF" | "XML"
 async function getOrCreateTypeFolder(
   drive: drive_v3.Drive,
   rootFolderId: string,
+  nit: string,
   year: string,
   month: string,
   directionLabel: string,
   fileType: "PDF" | "XML"
 ): Promise<string> {
+  // NIT
+  let nitFolderId = await findFolderByName(drive, nit, rootFolderId);
+  if (!nitFolderId) {
+    nitFolderId = await createFolder(drive, nit, rootFolderId);
+  }
+
   // Año
-  let yearFolderId = await findFolderByName(drive, year, rootFolderId);
+  let yearFolderId = await findFolderByName(drive, year, nitFolderId);
   if (!yearFolderId) {
-    yearFolderId = await createFolder(drive, year, rootFolderId);
+    yearFolderId = await createFolder(drive, year, nitFolderId);
   }
 
   // Mes
@@ -322,9 +329,13 @@ export async function checkInvoiceExistsInDrive(
 
     const { year, monthName } = parseInvoiceDate(issueDate);
     const directionLabel = direction === "sent" ? "Emitidas" : "Recibidas";
+    const nit = direction === "sent" ? issuerNit : receiverNit;
 
-    // Navigate: root / year / month / direction
-    const yearFolderId = await findFolderByName(drive, year, rootFolderId);
+    // Navigate: root / nit / year / month / direction
+    const nitFolderId = await findFolderByName(drive, nit, rootFolderId);
+    if (!nitFolderId) return { exists: false };
+
+    const yearFolderId = await findFolderByName(drive, year, nitFolderId);
     if (!yearFolderId) return { exists: false };
 
     const monthFolderId = await findFolderByName(drive, monthName, yearFolderId);
@@ -414,16 +425,17 @@ export async function uploadInvoiceFilesToDrive(
 
   const { year, monthName } = parseInvoiceDate(issueDate);
   const directionLabel = direction === "sent" ? "Emitidas" : "Recibidas";
+  // NIT of the "own company": issuer for sent docs, receiver for received docs
+  const nit = (direction === "sent" ? issuerNit : receiverNit) || "SinNIT";
 
-  // Get direction folder (root/year/month/direction) for folderUrl
-  // We derive it by getting or creating the PDF type folder first (it ensures the direction folder exists).
+  // Get direction folder (root/nit/year/month/direction) for folderUrl
   const pdfTypeFolderId = await getOrCreateTypeFolder(
-    drive, rootFolderId, year, monthName, directionLabel, "PDF"
+    drive, rootFolderId, nit, year, monthName, directionLabel, "PDF"
   );
 
-  // Get the direction folder id for the returned folderUrl by going one level up from PDF folder.
-  // We navigate again to find direction folder (already exists after creating PDF folder above).
-  const yearFolderId = await findFolderByName(drive, year, rootFolderId);
+  // Navigate back to the direction folder for the returned folderUrl
+  const nitFolderId = await findFolderByName(drive, nit, rootFolderId);
+  const yearFolderId = nitFolderId ? await findFolderByName(drive, year, nitFolderId) : null;
   const monthFolderId = yearFolderId ? await findFolderByName(drive, monthName, yearFolderId) : null;
   const directionFolderId = monthFolderId ? await findFolderByName(drive, directionLabel, monthFolderId) : null;
   const folderUrl = directionFolderId
@@ -456,7 +468,7 @@ export async function uploadInvoiceFilesToDrive(
   // Subir XML si existe
   if (xmlBuffer) {
     const xmlTypeFolderId = await getOrCreateTypeFolder(
-      drive, rootFolderId, year, monthName, directionLabel, "XML"
+      drive, rootFolderId, nit, year, monthName, directionLabel, "XML"
     );
     const xmlFilename = `${docNumber}.xml`;
     const existingXml = await findFileInFolder(drive, xmlFilename, xmlTypeFolderId);
