@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { ObjectId } from "mongodb";
+import ExcelJS from "exceljs";
 import {
   listUsers,
   getUserById,
@@ -8,6 +9,7 @@ import {
   reactivateUser,
   logAdminAction,
   getAuditLogs,
+  getAllUsersForExport,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
 import { TOOL_SUCCESSOR } from "../services/database.js";
@@ -253,6 +255,75 @@ router.post("/users/:id/reactivate", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[Admin] Error reactivando usuario:", err);
     res.status(500).json({ ok: false, message: "Error interno al reactivar usuario" });
+  }
+});
+
+// ============================================
+// GET /admin/users/export - Exportar todos los usuarios como Excel
+// ============================================
+router.get("/users/export", async (req: Request, res: Response) => {
+  try {
+    const users = await getAllUsersForExport();
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Usuarios");
+
+    ws.columns = [
+      { header: "Nombre", key: "name", width: 28 },
+      { header: "Email", key: "email", width: 32 },
+      { header: "Estado", key: "status", width: 12 },
+      { header: "Admin", key: "isAdmin", width: 8 },
+      { header: "Teléfono", key: "phone", width: 16 },
+      { header: "Herramientas", key: "purchasedTools", width: 40 },
+      { header: "NITs", key: "nits", width: 40 },
+      { header: "Valor pago", key: "paymentAmount", width: 14 },
+      { header: "Forma de pago", key: "paymentMethod", width: 22 },
+      { header: "Inicio licencia", key: "licenseStartDate", width: 16 },
+      { header: "Fin licencia", key: "licenseEndDate", width: 16 },
+      { header: "Empresas en plan", key: "companiesInPlan", width: 18 },
+      { header: "Factura ref.", key: "invoiceRef", width: 20 },
+      { header: "Fecha creación", key: "createdAt", width: 20 },
+    ];
+
+    // Header style
+    ws.getRow(1).eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2563EB" } };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+    });
+    ws.getRow(1).height = 20;
+
+    for (const u of users) {
+      ws.addRow({
+        name: u.name,
+        email: u.email,
+        status: u.status === "active" ? "Activo" : "Suspendido",
+        isAdmin: u.isAdmin ? "Sí" : "No",
+        phone: u.phone ?? "",
+        purchasedTools: u.purchasedTools.join(", "),
+        nits: u.nits.join(", "),
+        paymentAmount: u.paymentAmount ?? "",
+        paymentMethod: u.paymentMethod ?? "",
+        licenseStartDate: u.licenseStartDate ?? "",
+        licenseEndDate: u.licenseEndDate ?? "",
+        companiesInPlan: u.companiesInPlan ?? "",
+        invoiceRef: u.invoiceRef ?? "",
+        createdAt: u.createdAt ? new Date(u.createdAt).toLocaleDateString("es-CO") : "",
+      });
+    }
+
+    // Freeze header row
+    ws.views = [{ state: "frozen", ySplit: 1 }];
+
+    const filename = `usuarios_contago_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error("[Admin] Error exportando usuarios:", err);
+    res.status(500).json({ ok: false, message: "Error al exportar usuarios" });
   }
 });
 

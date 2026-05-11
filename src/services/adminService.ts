@@ -262,6 +262,14 @@ export async function logAdminAction(params: LogActionParams): Promise<void> {
   }
 }
 
+export async function getAllUsersForExport(): Promise<AdminUser[]> {
+  const records = await usersCollection()
+    .find({}, { projection: { password_hash: 0, google_drive: 0, google_drives: 0 } })
+    .sort({ created_at: -1 })
+    .toArray();
+  return records.map(mapUserToAdmin);
+}
+
 export async function getAuditLogs(params: {
   page: number;
   limit: number;
