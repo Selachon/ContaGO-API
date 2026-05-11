@@ -9,8 +9,8 @@ import {
   logAdminAction,
   getAuditLogs,
 } from "../services/adminService.js";
-import { TOOL_SUCCESSOR } from "../services/database.js";
 import { requireAuth } from "../middleware/auth.js";
+import { TOOL_SUCCESSOR } from "../services/database.js";
 
 const router = Router();
 
