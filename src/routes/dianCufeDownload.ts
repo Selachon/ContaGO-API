@@ -34,12 +34,17 @@ function parseBoolParam(v: unknown, defaultVal: boolean): boolean {
   return defaultVal;
 }
 
+function getOwnNit(inv: Partial<InvoiceData>, direction: DocumentDirection): string {
+  if (direction === "received") return inv.receiverNit || "";
+  return inv.isDocumentoSoporte ? (inv.receiverNit || "") : (inv.issuerNit || "");
+}
+
 function buildOutputName(invoices: Partial<InvoiceData>[], direction: DocumentDirection, startDate?: string, endDate?: string): string {
   const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
   const isFactura = (inv: Partial<InvoiceData>) => /factura/i.test(inv.documentType ?? "");
-  const nit = (direction === "sent"
-    ? (invoices.find((inv) => inv?.issuerNit && isFactura(inv)) ?? invoices.find((inv) => inv?.issuerNit))?.issuerNit
-    : (invoices.find((inv) => inv?.receiverNit && isFactura(inv)) ?? invoices.find((inv) => inv?.receiverNit))?.receiverNit) || "SinNIT";
+  const candidates = invoices.map((inv) => getOwnNit(inv, direction)).filter(Boolean);
+  const nitFromFactura = invoices.filter((inv) => isFactura(inv)).map((inv) => getOwnNit(inv, direction)).find(Boolean);
+  const nit = nitFromFactura || candidates[0] || "SinNIT";
   const safeNit = nit.replace(/[^a-zA-Z0-9]/g, "");
   const startFmt = startDate ? formatDateES(startDate) : "";
   const endFmt = endDate ? formatDateES(endDate) : "";
@@ -325,7 +330,7 @@ async function processCufeDownloadJob(
   const doUploadInvoices = uploadToDrive && hasDrive;
   const useInlineDriveLinks = includeDriveLinks && doUploadInvoices;
   const runDeferredDriveUpload = doUploadInvoices && !useInlineDriveLinks;
-  const deferredUploads: { xmlBuffer: Buffer; pdfBuffer: Buffer | null; docnum: string; issuerNit: string; receiverNit: string; issueDate: string; }[] = [];
+  const deferredUploads: { xmlBuffer: Buffer; pdfBuffer: Buffer | null; docnum: string; ownNit: string; issueDate: string; }[] = [];
 
   const onTokenRefresh = async (newAccessToken: string, expiryDate: number) => {
     const encryptedToken = encryptToken(newAccessToken);
@@ -384,8 +389,7 @@ async function processCufeDownloadJob(
               pdfBuffer,
               xmlBuffer,
               invoiceData.docNumber!,
-              invoiceData.issuerNit || "",
-              invoiceData.receiverNit || "",
+              getOwnNit(invoiceData, direction),
               invoiceData.issueDate!,
               driveConfig,
               userId,
@@ -404,8 +408,7 @@ async function processCufeDownloadJob(
             xmlBuffer,
             pdfBuffer,
             docnum: invoiceData.docNumber!,
-            issuerNit: invoiceData.issuerNit || "",
-            receiverNit: invoiceData.receiverNit || "",
+            ownNit: getOwnNit(invoiceData, direction),
             issueDate: invoiceData.issueDate!,
           });
         }
@@ -488,8 +491,7 @@ async function processCufeDownloadJob(
                 item.pdfBuffer,
                 item.xmlBuffer,
                 item.docnum,
-                item.issuerNit,
-                item.receiverNit,
+                item.ownNit,
                 item.issueDate,
                 driveConfig,
                 userId,

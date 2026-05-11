@@ -77,11 +77,16 @@ export async function extractInvoiceDataFromXml(
     // Determinar el tipo de documento:
     // 1. Si viene de la tabla DIAN (docType), usarlo directamente
     // 2. Si no, deducirlo del XML (Nota Crédito vs Factura Electrónica)
+    const profileId = getText(invoice.ProfileID || "");
+    const isDocumentoSoporte = /soporte/i.test(profileId);
+
     const documentType = docInfo.docType || (isNotaCredito
       ? "Nota Crédito"
       : isNotaDebito
         ? "Nota Débito"
-        : "Factura Electrónica");
+        : isDocumentoSoporte
+          ? "Documento Soporte"
+          : "Factura Electrónica");
 
     // Extraer datos del emisor (AccountingSupplierParty)
     const supplierParty = invoice.AccountingSupplierParty?.Party;
@@ -142,6 +147,7 @@ export async function extractInvoiceDataFromXml(
       concepts,
       lineItems,
       documentType,
+      isDocumentoSoporte,
       cufe,
       paymentMethod,
       trackId: docInfo.id,

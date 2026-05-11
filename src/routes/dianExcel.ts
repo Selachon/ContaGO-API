@@ -25,9 +25,13 @@ interface DeferredDriveUploadItem {
   pdfPath: string | null;
   xmlPath: string;
   docnum: string;
-  issuerNit: string;
-  receiverNit: string;
+  ownNit: string;
   issueDate: string;
+}
+
+function getOwnNit(issuerNit: string, receiverNit: string, isDocumentoSoporte: boolean, direction: "sent" | "received"): string {
+  if (direction === "received") return receiverNit;
+  return isDocumentoSoporte ? receiverNit : issuerNit;
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -583,8 +587,7 @@ async function processExcelJob(
               userId,
               invoiceData.issueDate!,
               doc.docnum,
-              invoiceData.issuerNit || doc.nit,
-              receiver.nit,
+              getOwnNit(invoiceData.issuerNit || doc.nit, receiver.nit, !!invoiceData.isDocumentoSoporte, documentDirection === "sent" ? "sent" : "received"),
               onTokenRefresh
             );
 
@@ -600,8 +603,7 @@ async function processExcelJob(
                 pdfBuffer,
                 xmlBuffer,
                 doc.docnum,
-                invoiceData.issuerNit || doc.nit,
-                receiver.nit,
+                getOwnNit(invoiceData.issuerNit || doc.nit, receiver.nit, !!invoiceData.isDocumentoSoporte, documentDirection === "sent" ? "sent" : "received"),
                 invoiceData.issueDate!,
                 driveConfig,
                 userId,
@@ -636,8 +638,7 @@ async function processExcelJob(
             pdfPath,
             xmlPath,
             docnum: doc.docnum,
-            issuerNit: invoiceData.issuerNit || doc.nit,
-            receiverNit: receiver.nit,
+            ownNit: getOwnNit(invoiceData.issuerNit || doc.nit, receiver.nit, !!invoiceData.isDocumentoSoporte, documentDirection === "sent" ? "sent" : "received"),
             issueDate: invoiceData.issueDate || "N/A",
           });
           job.driveUploadTotal = deferredUploads.length;
@@ -682,6 +683,7 @@ async function processExcelJob(
           concepts: invoiceData.concepts || "N/A",
           lineItems: invoiceData.lineItems || [],
           documentType: invoiceData.documentType || "Factura Electrónica",
+          isDocumentoSoporte: invoiceData.isDocumentoSoporte || false,
           cufe: invoiceData.cufe || "N/A",
           trackId: doc.id,
           docNumber: invoiceData.docNumber || doc.docnum || doc.id,
@@ -907,8 +909,7 @@ async function runDriveUploadInBackground(
         pdfBuffer,
         xmlBuffer,
         item.docnum,
-        item.issuerNit,
-        item.receiverNit,
+        item.ownNit,
         item.issueDate,
         driveConfig,
         userId,

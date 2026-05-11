@@ -69,6 +69,7 @@ export interface InvoiceData {
   total: number;
   concepts: string;
   documentType: string; // Tipo de documento de DIAN (ej: "Factura electrónica", "Nota Crédito", "Documento soporte")
+  isDocumentoSoporte?: boolean;
   cufe: string;
   driveUrl?: string;
 

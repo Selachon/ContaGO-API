@@ -310,9 +310,11 @@ async function processMassDownloadJob(
             const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, { id: result.trackId || result.cufe, docnum: docNumber });
             const issuerNit = invoiceData.issuerNit || "";
             const receiverNit = invoiceData.receiverNit || "";
-            // For received docs → identify by issuer (who sent to me); for sent → by receiver (who I sent to)
-            nit = direction === "received" ? issuerNit : receiverNit;
-            if (!ownerNit) ownerNit = direction === "received" ? receiverNit : issuerNit;
+            const isDS = !!invoiceData.isDocumentoSoporte;
+            // Counterpart NIT (for filenames): received→issuerNit, sent→receiverNit, DS sent→issuerNit (natural person)
+            nit = (direction === "received" || isDS) ? issuerNit : receiverNit;
+            // Own-company NIT (for ZIP filename): received→receiverNit, sent→issuerNit, DS sent→receiverNit
+            if (!ownerNit) ownerNit = (direction === "sent" && !isDS) ? issuerNit : receiverNit;
             docNumber = invoiceData.docNumber || docNumber;
           } catch {}
 

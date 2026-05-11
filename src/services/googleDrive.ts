@@ -318,8 +318,7 @@ export async function checkInvoiceExistsInDrive(
   userId: string,
   issueDate: string, // Formato DD/MM/YYYY o YYYY-MM-DD
   docNumber: string,
-  issuerNit: string,
-  receiverNit: string,
+  ownNit: string,
   onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>,
   direction: "sent" | "received" = "received"
 ): Promise<ExistingInvoiceFiles> {
@@ -329,7 +328,7 @@ export async function checkInvoiceExistsInDrive(
 
     const { year, monthName } = parseInvoiceDate(issueDate);
     const directionLabel = direction === "sent" ? "Emitidas" : "Recibidas";
-    const nit = direction === "sent" ? issuerNit : receiverNit;
+    const nit = ownNit;
 
     // Navigate: root / nit / year / month / direction
     const nitFolderId = await findFolderByName(drive, nit, rootFolderId);
@@ -412,8 +411,7 @@ export async function uploadInvoiceFilesToDrive(
   pdfBuffer: Buffer | null,
   xmlBuffer: Buffer | null,
   docNumber: string,
-  issuerNit: string,
-  receiverNit: string,
+  ownNit: string,
   issueDate: string, // Formato DD/MM/YYYY o YYYY-MM-DD
   driveConfig: GoogleDriveConfig,
   userId: string,
@@ -425,8 +423,8 @@ export async function uploadInvoiceFilesToDrive(
 
   const { year, monthName } = parseInvoiceDate(issueDate);
   const directionLabel = direction === "sent" ? "Emitidas" : "Recibidas";
-  // NIT of the "own company": issuer for sent docs, receiver for received docs
-  const nit = (direction === "sent" ? issuerNit : receiverNit) || "SinNIT";
+  // NIT of the "own company": caller resolves the correct NIT and passes as ownNit
+  const nit = ownNit || "SinNIT";
 
   // Get direction folder (root/nit/year/month/direction) for folderUrl
   const pdfTypeFolderId = await getOrCreateTypeFolder(
