@@ -182,7 +182,8 @@ function extractPartyNit(party: any): string {
         : partyTaxScheme;
       const companyId = taxScheme?.CompanyID;
       if (companyId) {
-        return String(getText(companyId));
+        const id = String(getText(companyId)).trim();
+        if (id) return id;
       }
     }
 
@@ -192,7 +193,8 @@ function extractPartyNit(party: any): string {
       const entity = Array.isArray(legalEntity) ? legalEntity[0] : legalEntity;
       const companyId = entity?.CompanyID;
       if (companyId) {
-        return String(getText(companyId));
+        const id = String(getText(companyId)).trim();
+        if (id) return id;
       }
     }
 

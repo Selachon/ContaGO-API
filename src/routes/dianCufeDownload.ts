@@ -384,7 +384,7 @@ async function processCufeDownloadJob(
               pdfBuffer,
               xmlBuffer,
               invoiceData.docNumber!,
-              invoiceData.issuerNit || result.nit,
+              invoiceData.issuerNit || "",
               invoiceData.receiverNit || "",
               invoiceData.issueDate!,
               driveConfig,
@@ -404,7 +404,7 @@ async function processCufeDownloadJob(
             xmlBuffer,
             pdfBuffer,
             docnum: invoiceData.docNumber!,
-            issuerNit: invoiceData.issuerNit || result.nit,
+            issuerNit: invoiceData.issuerNit || "",
             receiverNit: invoiceData.receiverNit || "",
             issueDate: invoiceData.issueDate!,
           });
