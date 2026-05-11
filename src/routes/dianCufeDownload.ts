@@ -166,7 +166,20 @@ router.get("/job-download/:jobId", (req: Request, res: Response) => {
       if (job.outputPath && fs.existsSync(job.outputPath)) {
         try { fs.unlinkSync(job.outputPath); } catch {}
       }
-      jobTracker.delete(jobId);
+      // Keep job alive until drive upload finishes (or 30min max)
+      const isDriveUploading = job.driveUploadStatus === "uploading";
+      if (!isDriveUploading) {
+        jobTracker.delete(jobId);
+      } else {
+        const deadline = Date.now() + 30 * 60 * 1000;
+        const check = setInterval(() => {
+          const s = job.driveUploadStatus;
+          if (s === "done" || s === "error" || Date.now() > deadline) {
+            clearInterval(check);
+            jobTracker.delete(jobId);
+          }
+        }, 5_000);
+      }
     }, 10_000);
   });
 });
@@ -382,11 +395,14 @@ async function processCufeDownloadJob(
 
         const hasValidData = !!(invoiceData.issueDate && invoiceData.docNumber);
 
+        // Documento Soporte PDFs are not reliable — skip PDF, keep XML only
+        const effectivePdf = invoiceData.isDocumentoSoporte ? null : pdfBuffer;
+
         // Inline Drive upload: upload now and embed link in Excel column
         if (useInlineDriveLinks && driveConfig && hasValidData) {
           try {
             const uploadResult = await uploadInvoiceFilesToDrive(
-              pdfBuffer,
+              effectivePdf,
               xmlBuffer,
               invoiceData.docNumber!,
               getOwnNit(invoiceData, direction),
@@ -406,7 +422,7 @@ async function processCufeDownloadJob(
         if (runDeferredDriveUpload && hasValidData) {
           deferredUploads.push({
             xmlBuffer,
-            pdfBuffer,
+            pdfBuffer: effectivePdf,
             docnum: invoiceData.docNumber!,
             ownNit: getOwnNit(invoiceData, direction),
             issueDate: invoiceData.issueDate!,

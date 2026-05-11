@@ -59,7 +59,8 @@ export async function extractInvoiceDataFromXml(
       ignoreAttributes: false,
       attributeNamePrefix: "@_",
       removeNSPrefix: true,
-      parseAttributeValue: true,
+      parseAttributeValue: false,
+      parseTagValue: false,
       trimValues: true,
     });
 

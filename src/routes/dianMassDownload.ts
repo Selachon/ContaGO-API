@@ -304,13 +304,14 @@ async function processMassDownloadJob(
 
         let nit = result.nit || "";
         let docNumber = result.docnum || "";
+        let isDS = false;
 
         if (xmlBuffer) {
           try {
             const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, { id: result.trackId || result.cufe, docnum: docNumber });
             const issuerNit = invoiceData.issuerNit || "";
             const receiverNit = invoiceData.receiverNit || "";
-            const isDS = !!invoiceData.isDocumentoSoporte;
+            isDS = !!invoiceData.isDocumentoSoporte;
             // Counterpart NIT (for filenames): received→issuerNit, sent→receiverNit, DS sent→issuerNit (natural person)
             nit = (direction === "received" || isDS) ? issuerNit : receiverNit;
             // Own-company NIT (for ZIP filename): received→receiverNit, sent→issuerNit, DS sent→receiverNit
@@ -321,7 +322,8 @@ async function processMassDownloadJob(
           xmlFolder.file(`${safeFilename(nit, docNumber)}.xml`, xmlBuffer);
         }
 
-        if (pdfBuffer && pdfBuffer.length > 0) {
+        // Documento Soporte PDFs are not reliable — skip PDF, keep XML only
+        if (pdfBuffer && pdfBuffer.length > 0 && !isDS) {
           pdfFolder.file(`${safeFilename(nit, docNumber)}.pdf`, pdfBuffer);
           if (mergePdf) pdfBuffersForMerge.push(pdfBuffer);
         }
