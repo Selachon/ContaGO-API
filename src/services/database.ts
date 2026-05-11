@@ -131,7 +131,7 @@ export async function verifyPassword(user: User, password: string): Promise<bool
 
 // Maps decommissioned tool IDs to the new ones that replace them.
 // When a user has the old ID, the new ID is automatically included in their purchased tools.
-const TOOL_SUCCESSOR: Record<string, string> = {
+export const TOOL_SUCCESSOR: Record<string, string> = {
   "dian-downloader": "dian-mass-download",
   "dian-excel-exporter": "dian-cufe-downloader",
 };
@@ -437,6 +437,32 @@ export async function seedAdminUser(): Promise<void> {
       if (updates.is_admin) console.log(`Promoted ${adminEmail} to admin.`);
       if (updates.nits) console.log(`Updated NITs for ${adminEmail}: ${adminNits.join(", ")}`);
     }
+  }
+}
+
+export async function migrateToolSlugs(): Promise<void> {
+  try {
+    for (const [oldSlug, newSlug] of Object.entries(TOOL_SUCCESSOR)) {
+      await usersCollection().updateMany(
+        { purchasedTools: oldSlug },
+        [
+          {
+            $set: {
+              purchasedTools: {
+                $setUnion: [
+                  { $filter: { input: "$purchasedTools", cond: { $ne: ["$$this", oldSlug] } } },
+                  [newSlug],
+                ],
+              },
+              updated_at: new Date().toISOString(),
+            },
+          },
+        ]
+      );
+    }
+    console.log("[DB] Tool slug migration completed");
+  } catch (err) {
+    console.error("[DB] Tool slug migration failed:", err);
   }
 }
 

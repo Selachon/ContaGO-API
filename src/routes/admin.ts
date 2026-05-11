@@ -9,6 +9,7 @@ import {
   logAdminAction,
   getAuditLogs,
 } from "../services/adminService.js";
+import { TOOL_SUCCESSOR } from "../services/database.js";
 import { requireAuth } from "../middleware/auth.js";
 
 const router = Router();
@@ -113,7 +114,10 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
           updates.nits = [...new Set(nits.filter((n: unknown) => typeof n === "string" && n.trim()).map((n: string) => n.trim()))];
         } else if (field === "purchasedTools") {
           const tools = Array.isArray(req.body.purchasedTools) ? req.body.purchasedTools : [];
-          updates.purchasedTools = [...new Set(tools.filter((t: unknown) => typeof t === "string" && t.trim()).map((t: string) => t.trim()))];
+          const normalized = tools
+            .filter((t: unknown) => typeof t === "string" && (t as string).trim())
+            .map((t: string) => TOOL_SUCCESSOR[t.trim()] || t.trim());
+          updates.purchasedTools = [...new Set(normalized)];
         } else if (field === "isAdmin") {
           // Evitar que admin se quite a si mismo el rol
           if (id === actorId && req.body.isAdmin === false) {
