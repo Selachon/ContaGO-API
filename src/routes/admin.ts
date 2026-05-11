@@ -87,7 +87,7 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
       return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
     }
 
-    const allowedFields = ["name", "nits", "purchasedTools", "isAdmin"];
+    const allowedFields = ["name", "nits", "purchasedTools", "isAdmin", "phone", "paymentAmount", "paymentMethod", "licenseStartDate", "licenseEndDate", "companiesInPlan", "invoiceRef"];
     const updates: Record<string, unknown> = {};
     const before: Record<string, unknown> = {};
 
@@ -119,11 +119,26 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
             .map((t: string) => TOOL_SUCCESSOR[t.trim()] || t.trim());
           updates.purchasedTools = [...new Set(normalized)];
         } else if (field === "isAdmin") {
-          // Evitar que admin se quite a si mismo el rol
           if (id === actorId && req.body.isAdmin === false) {
             return res.status(400).json({ ok: false, message: "No puedes quitarte el rol de administrador a ti mismo" });
           }
           updates.is_admin = Boolean(req.body.isAdmin);
+        } else if (field === "phone") {
+          updates.phone = req.body.phone ? String(req.body.phone).trim() : undefined;
+        } else if (field === "paymentAmount") {
+          const v = parseFloat(req.body.paymentAmount);
+          updates.paymentAmount = isNaN(v) ? undefined : v;
+        } else if (field === "paymentMethod") {
+          updates.paymentMethod = req.body.paymentMethod ? String(req.body.paymentMethod).trim() : undefined;
+        } else if (field === "licenseStartDate") {
+          updates.licenseStartDate = req.body.licenseStartDate ? String(req.body.licenseStartDate).trim() : undefined;
+        } else if (field === "licenseEndDate") {
+          updates.licenseEndDate = req.body.licenseEndDate ? String(req.body.licenseEndDate).trim() : undefined;
+        } else if (field === "companiesInPlan") {
+          const v = parseInt(req.body.companiesInPlan, 10);
+          updates.companiesInPlan = isNaN(v) ? undefined : v;
+        } else if (field === "invoiceRef") {
+          updates.invoiceRef = req.body.invoiceRef ? String(req.body.invoiceRef).trim() : undefined;
         }
       }
     }

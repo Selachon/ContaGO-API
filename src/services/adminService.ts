@@ -19,6 +19,14 @@ interface UserRecord {
   suspended_at?: string;
   legacyId?: number;
   google_drive?: unknown;
+  // Licencia y contacto
+  phone?: string;
+  paymentAmount?: number;
+  paymentMethod?: string;
+  licenseStartDate?: string;
+  licenseEndDate?: string;
+  companiesInPlan?: number;
+  invoiceRef?: string;
 }
 
 interface AdminUser {
@@ -32,6 +40,14 @@ interface AdminUser {
   createdAt: string;
   updatedAt?: string;
   suspendedAt?: string;
+  // Licencia y contacto
+  phone?: string;
+  paymentAmount?: number;
+  paymentMethod?: string;
+  licenseStartDate?: string;
+  licenseEndDate?: string;
+  companiesInPlan?: number;
+  invoiceRef?: string;
 }
 
 interface AdminAuditLog {
@@ -81,6 +97,13 @@ function mapUserToAdmin(record: UserRecord): AdminUser {
     createdAt: record.created_at,
     updatedAt: record.updated_at,
     suspendedAt: record.suspended_at,
+    phone: record.phone,
+    paymentAmount: record.paymentAmount,
+    paymentMethod: record.paymentMethod,
+    licenseStartDate: record.licenseStartDate,
+    licenseEndDate: record.licenseEndDate,
+    companiesInPlan: record.companiesInPlan,
+    invoiceRef: record.invoiceRef,
   };
 }
 

@@ -188,7 +188,9 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
     return res.status(403).json(response);
   }
 
-  const { email, password, name, isAdmin, nits, purchasedTools } = req.body;
+  const { email, password, name, isAdmin, nits, purchasedTools,
+    phone, paymentAmount, paymentMethod, licenseStartDate, licenseEndDate, companiesInPlan, invoiceRef
+  } = req.body;
 
   if (
     !email || !password || !name ||
@@ -252,13 +254,23 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
     return res.status(400).json(response);
   }
 
+  const extras: Record<string, unknown> = {};
+  if (phone) extras.phone = String(phone).trim();
+  if (paymentAmount != null) { const v = parseFloat(paymentAmount); if (!isNaN(v)) extras.paymentAmount = v; }
+  if (paymentMethod) extras.paymentMethod = String(paymentMethod).trim();
+  if (licenseStartDate) extras.licenseStartDate = String(licenseStartDate).trim();
+  if (licenseEndDate) extras.licenseEndDate = String(licenseEndDate).trim();
+  if (companiesInPlan != null) { const v = parseInt(companiesInPlan, 10); if (!isNaN(v)) extras.companiesInPlan = v; }
+  if (invoiceRef) extras.invoiceRef = String(invoiceRef).trim();
+
   const user = await createUser(
     email.toLowerCase().trim(),
     name.trim(),
     password,
     !!isAdmin,
     cleanNits,
-    cleanTools
+    cleanTools,
+    extras
   );
 
   if (!user) {

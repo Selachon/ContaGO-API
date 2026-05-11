@@ -17,6 +17,13 @@ interface UserRecord {
   google_drive?: GoogleDriveConfig;
   google_drives?: GoogleDriveConfig[];
   selected_google_drive_id?: string | null;
+  phone?: string;
+  paymentAmount?: number;
+  paymentMethod?: string;
+  licenseStartDate?: string;
+  licenseEndDate?: string;
+  companiesInPlan?: number;
+  invoiceRef?: string;
 }
 
 
@@ -67,13 +74,24 @@ function mapUser(record: UserRecord | null): User | null {
 // User functions
 // ============================================
 
+export interface UserExtras {
+  phone?: string;
+  paymentAmount?: number;
+  paymentMethod?: string;
+  licenseStartDate?: string;
+  licenseEndDate?: string;
+  companiesInPlan?: number;
+  invoiceRef?: string;
+}
+
 export async function createUser(
   email: string,
   name: string,
   password: string,
   isAdmin = false,
   nits: string[] = [],
-  purchasedTools: string[] = []
+  purchasedTools: string[] = [],
+  extras: UserExtras = {}
 ): Promise<User | null> {
   try {
     const hash = await bcrypt.hash(password, 10);
@@ -86,6 +104,7 @@ export async function createUser(
       purchasedTools,
       nits,
       created_at: new Date().toISOString(),
+      ...extras,
     };
 
     await usersCollection().insertOne(record);
