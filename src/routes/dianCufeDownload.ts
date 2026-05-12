@@ -262,7 +262,7 @@ router.post(
       });
     }
 
-    const MAX_CUFES = 750;
+    const MAX_CUFES = 1100;
     if (downloadCufes.length > MAX_CUFES) {
       return res.status(400).json({
         status: "error",
@@ -570,14 +570,14 @@ const DATE_RE = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$|^\d{4}[\/\-]\d{2}[\/\-]\d{2
 const DATE_SCAN_COLS = ["A","C","D","E","F","G","H","I","J","K"];
 
 function buildLimitMessage(total: number, dates: string[]): string {
-  const partes = Math.ceil(total / 700);
+  const partes = Math.ceil(total / 1000);
   const rangos = Array.from({ length: partes }, (_, i) => {
-    const start = dates[i * 700] || "";
-    const end = dates[Math.min((i + 1) * 700 - 1, total - 1)] || "";
-    const count = Math.min(700, total - i * 700);
+    const start = dates[i * 1000] || "";
+    const end = dates[Math.min((i + 1) * 1000 - 1, total - 1)] || "";
+    const count = Math.min(1000, total - i * 1000);
     return `${start} a ${end} (${count} facturas)`;
   }).join(" — ");
-  return `El Excel excede el límite de 750. Prueba el rango ${rangos}`;
+  return `El Excel excede el límite de 1100. Prueba el rango ${rangos}`;
 }
 
 function classifyGrupo(grupoVal: string): "sent" | "received" | "nomina" | "applicationResponse" | "unknown" {
