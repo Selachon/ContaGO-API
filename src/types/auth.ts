@@ -6,6 +6,7 @@ export interface User {
   is_admin: boolean;
   nits: string[];
   status?: "active" | "suspended";
+  force_password_change?: boolean;
   created_at: string;
 }
 
@@ -33,5 +34,7 @@ export interface AuthResponse {
     isAdmin: boolean;
     purchasedTools: string[];
     nits: string[];
+    forcePasswordChange?: boolean;
   };
+  temporaryPassword?: string;
 }

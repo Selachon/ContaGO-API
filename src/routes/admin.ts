@@ -12,9 +12,13 @@ import {
   getAllUsersForExport,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
-import { TOOL_SUCCESSOR } from "../services/database.js";
+import { TOOL_SUCCESSOR, updateUserPassword } from "../services/database.js";
 
 const router = Router();
+
+function generateTemporaryPassword(): string {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
 
 // Todas las rutas admin requieren autenticacion y rol admin.
 router.use(requireAuth);
@@ -324,6 +328,44 @@ router.post("/users/:id/reactivate", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[Admin] Error reactivando usuario:", err);
     res.status(500).json({ ok: false, message: "Error interno al reactivar usuario" });
+  }
+});
+
+router.post("/users/:id/reset-password", async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const actorId = req.user!.userId;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+    }
+
+    const user = await getUserById(id);
+    if (!user) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    const temporaryPassword = generateTemporaryPassword();
+    const updated = await updateUserPassword(id, temporaryPassword, true);
+    if (!updated) {
+      return res.status(500).json({ ok: false, message: "No se pudo restablecer la contraseña" });
+    }
+
+    await logAdminAction({
+      actorId,
+      action: "reset_password",
+      targetUserId: id,
+      reason: "Restablecimiento manual por administrador",
+    });
+
+    return res.json({
+      ok: true,
+      message: "Contraseña restablecida correctamente",
+      temporaryPassword,
+    });
+  } catch (err) {
+    console.error("[Admin] Error restableciendo contraseña:", err);
+    return res.status(500).json({ ok: false, message: "Error interno al restablecer contraseña" });
   }
 });
 

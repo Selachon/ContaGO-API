@@ -12,6 +12,7 @@ interface UserRecord {
   purchasedTools: string[];
   nits: string[];
   status?: "active" | "suspended";
+  force_password_change?: boolean;
   created_at: string;
   legacyId?: number;
   google_drive?: GoogleDriveConfig;
@@ -66,6 +67,7 @@ function mapUser(record: UserRecord | null): User | null {
     is_admin: record.is_admin,
     nits: record.nits || [],
     status: record.status || "active",
+    force_password_change: !!record.force_password_change,
     created_at: record.created_at,
   };
 }
@@ -104,6 +106,7 @@ export async function createUser(
       purchasedTools,
       nits,
       created_at: new Date().toISOString(),
+      force_password_change: false,
       ...extras,
     };
 
@@ -112,6 +115,27 @@ export async function createUser(
   } catch (err) {
     console.error("Error creating user:", err);
     return null;
+  }
+}
+
+export async function updateUserPassword(userId: string, plainPassword: string, forcePasswordChange: boolean): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const hash = await bcrypt.hash(plainPassword, 10);
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      {
+        $set: {
+          password_hash: hash,
+          force_password_change: forcePasswordChange,
+          updated_at: new Date().toISOString(),
+        },
+      }
+    );
+    return result.modifiedCount > 0 || result.matchedCount > 0;
+  } catch (err) {
+    console.error("Error updating user password:", err);
+    return false;
   }
 }
 

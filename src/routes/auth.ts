@@ -6,6 +6,7 @@ import {
   getUserByEmail,
   getUserNits,
   getUserPurchases,
+  updateUserPassword,
   verifyPassword,
 } from "../services/database.js";
 import { logAdminAction } from "../services/adminService.js";
@@ -32,6 +33,10 @@ function getJwtSecret(): string {
 // Validación básica de email
 function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function generateTemporaryPassword(): string {
+  return String(Math.floor(100000 + Math.random() * 900000));
 }
 
 // ============================================
@@ -91,6 +96,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
       isAdmin: !!user.is_admin,
       purchasedTools,
       nits,
+      forcePasswordChange: !!user.force_password_change,
     },
   };
 
@@ -188,25 +194,17 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
     return res.status(403).json(response);
   }
 
-  const { email, password, name, isAdmin, nits, purchasedTools,
+  const { email, name, isAdmin, nits, purchasedTools,
     phone, paymentAmount, paymentMethod, licenseStartDate, licenseEndDate, companiesInPlan, invoiceRef
   } = req.body;
 
-  if (
-    !email || !password || !name ||
-    typeof email !== "string" || typeof password !== "string" || typeof name !== "string"
-  ) {
-    const response: AuthResponse = { ok: false, message: "Email, nombre y contraseña requeridos" };
+  if (!email || !name || typeof email !== "string" || typeof name !== "string") {
+    const response: AuthResponse = { ok: false, message: "Email y nombre requeridos" };
     return res.status(400).json(response);
   }
 
   if (!isValidEmail(email)) {
     const response: AuthResponse = { ok: false, message: "Email no válido" };
-    return res.status(400).json(response);
-  }
-
-  if (password.length < 8) {
-    const response: AuthResponse = { ok: false, message: "La contraseña debe tener al menos 8 caracteres" };
     return res.status(400).json(response);
   }
 
@@ -263,10 +261,12 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
   if (companiesInPlan != null) { const v = parseInt(companiesInPlan, 10); if (!isNaN(v)) extras.companiesInPlan = v; }
   if (invoiceRef) extras.invoiceRef = String(invoiceRef).trim();
 
+  const temporaryPassword = generateTemporaryPassword();
+
   const user = await createUser(
     email.toLowerCase().trim(),
     name.trim(),
-    password,
+    temporaryPassword,
     !!isAdmin,
     cleanNits,
     cleanTools,
@@ -275,6 +275,12 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
 
   if (!user) {
     const response: AuthResponse = { ok: false, message: "Error al crear usuario" };
+    return res.status(500).json(response);
+  }
+
+  const passwordPrepared = await updateUserPassword(user.id, temporaryPassword, true);
+  if (!passwordPrepared) {
+    const response: AuthResponse = { ok: false, message: "Error al preparar clave temporal" };
     return res.status(500).json(response);
   }
 
@@ -294,6 +300,7 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
 
   const response: AuthResponse = {
     ok: true,
+    temporaryPassword,
     user: {
       id: user.id,
       email: user.email,
@@ -301,6 +308,7 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
       isAdmin: !!user.is_admin,
       purchasedTools: cleanTools,
       nits: cleanNits,
+      forcePasswordChange: true,
     },
   };
 
@@ -351,11 +359,51 @@ router.get("/me", async (req: Request, res: Response) => {
         isAdmin: !!user.is_admin,
         purchasedTools,
         nits,
+        forcePasswordChange: !!user.force_password_change,
       },
     });
   } catch {
     return res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });
   }
+});
+
+router.post("/change-password", requireAuth, async (req: Request, res: Response) => {
+  const { currentPassword, newPassword } = req.body;
+
+  if (!newPassword || typeof newPassword !== "string") {
+    return res.status(400).json({ ok: false, message: "Nueva contraseña requerida" });
+  }
+
+  if (newPassword.length < 8) {
+    return res.status(400).json({ ok: false, message: "La nueva contraseña debe tener al menos 8 caracteres" });
+  }
+
+  const user = await getUserByIdStrict(req.user!.userId);
+  if (!user) {
+    return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+  }
+
+  if (!user.force_password_change) {
+    if (!currentPassword || typeof currentPassword !== "string") {
+      return res.status(400).json({ ok: false, message: "Contraseña actual requerida" });
+    }
+    const validCurrent = await verifyPassword(user, currentPassword);
+    if (!validCurrent) {
+      return res.status(401).json({ ok: false, message: "Contraseña actual incorrecta" });
+    }
+  }
+
+  const samePassword = await verifyPassword(user, newPassword);
+  if (samePassword) {
+    return res.status(400).json({ ok: false, message: "La nueva contraseña debe ser diferente" });
+  }
+
+  const updated = await updateUserPassword(user.id, newPassword, false);
+  if (!updated) {
+    return res.status(500).json({ ok: false, message: "No se pudo actualizar la contraseña" });
+  }
+
+  return res.json({ ok: true, message: "Contraseña actualizada" });
 });
 
 export default router;
