@@ -359,6 +359,9 @@ async function processCufeDownloadJob(
     }
   }
 
+  let companyName = "";
+  let companyNit = "";
+
   async function downloadAndFill(batch: string[], dir: string, phaseLabel: string): Promise<void> {
     const { results } = await downloadDocumentsByCufe(
       tokenUrl, batch, startDate, endDate, direction, dir,
@@ -392,6 +395,16 @@ async function processCufeDownloadJob(
           id: result.trackId || result.cufe,
           docnum: result.docnum || "",
         });
+
+        // Identificar empresa del primer XML
+        if (!companyName || companyName === "N/A") {
+          const possibleName = (direction === "sent" ? invoiceData.issuerName : invoiceData.receiverName) || "";
+          const possibleNit = (direction === "sent" ? invoiceData.issuerNit : invoiceData.receiverNit) || "";
+          if (possibleName && possibleName !== "N/A") {
+            companyName = possibleName;
+            companyNit = (possibleNit && possibleNit !== "N/A") ? possibleNit : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
+          }
+        }
 
         const hasValidData = !!(invoiceData.issueDate && invoiceData.docNumber);
 
@@ -474,10 +487,19 @@ async function processCufeDownloadJob(
     setProgress(jobId, { step: "Generando Excel...", current: allCufes.length, total: allCufes.length });
 
     const invoices = allCufes.map((cufe) => invoiceMap.get(cufe)!);
-    await generateExcelFile(invoices as InvoiceData[], outputPath, useInlineDriveLinks, direction === "sent");
+    await generateExcelFile(invoices as InvoiceData[], outputPath, useInlineDriveLinks, direction === "sent", companyName, companyNit);
 
-    const outputName = buildOutputName(invoices, direction, startDate, endDate);
-    job.outputName = outputName;
+    const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
+    const basePrefix = `Facturas ${dirLabel} DIAN`;
+    const startFmt = startDate ? formatDateES(startDate) : "";
+    const endFmt = endDate ? formatDateES(endDate) : "";
+    const range = startFmt && endFmt ? `${startFmt} - ${endFmt}` : startFmt || endFmt || new Date().toISOString().slice(0, 10);
+    
+    const filePrefix = companyName 
+      ? `${companyNit} - ${companyName} - ${basePrefix}` 
+      : (companyNit ? `${companyNit} - ${basePrefix}` : basePrefix);
+    
+    job.outputName = `${filePrefix} ${range}.xlsx`;
     job.outputMime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
     job.status = "completed";

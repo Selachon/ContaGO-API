@@ -10,6 +10,8 @@ export const progressTracker: Map<string, ProgressData> = new Map();
 interface ExtractionResult {
   documents: DocumentInfo[];
   cookies: Record<string, string>;
+  companyName?: string;
+  companyNit?: string;
 }
 
 type OnDocumentFound = (ctx: {
@@ -86,6 +88,33 @@ export async function extractDocumentIds(
     updateProgress({ step: "Accediendo con token..." });
     await navigateWithRetry(page, tokenUrl, 3);
     await delay(1000);
+
+    // Extraer razón social y NIT de la empresa desde el dashboard
+    const companyInfo = await page.evaluate(() => {
+      const selectors = [".user-profile", ".profile-info", ".user-name", ".navbar-user", ".company-name"];
+      let name = "";
+      let nit = "";
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          const text = el.textContent?.trim() || "";
+          if (text) {
+            const nitMatch = text.match(/NIT[:\s]+([\d-]+)/i);
+            if (nitMatch && !nit) nit = nitMatch[1].replace(/-/g, "");
+            if (text.length > 5 && !name) name = text.split(/NIT/i)[0].replace(/[-|]/g, "").trim();
+          }
+        }
+      }
+      if (!nit) {
+        const nitMatch = document.body.innerText.match(/NIT[:\s]+([\d-]+)/i);
+        if (nitMatch) nit = nitMatch[1].replace(/-/g, "");
+      }
+      return { name, nit };
+    });
+
+    const companyName = companyInfo.name;
+    const companyNitFromPage = companyInfo.nit;
+    console.log(`[Scraper] Empresa: "${companyName}" NIT: "${companyNitFromPage}"`);
 
     // Verificar si el token expiró (redirige a página de login)
     const currentUrl = page.url();
@@ -289,7 +318,7 @@ export async function extractDocumentIds(
 
     console.log(`Total documentos encontrados: ${allDocuments.length}`);
 
-    return { documents: allDocuments, cookies: cookieMap };
+    return { documents: allDocuments, cookies: cookieMap, companyName };
   } finally {
     if (browser) {
       await browser.close();
@@ -338,6 +367,33 @@ export async function extractDocumentIdsByCufe(
     updateProgress({ step: "Accediendo con token...", current: 0, total: 1 });
     await navigateWithRetry(page, tokenUrl, 3);
     await delay(1000);
+
+    // Extraer razón social y NIT de la empresa desde el dashboard
+    const companyInfo = await page.evaluate(() => {
+      const selectors = [".user-profile", ".profile-info", ".user-name", ".navbar-user", ".company-name"];
+      let name = "";
+      let nit = "";
+      for (const sel of selectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          const text = el.textContent?.trim() || "";
+          if (text) {
+            const nitMatch = text.match(/NIT[:\s]+([\d-]+)/i);
+            if (nitMatch && !nit) nit = nitMatch[1].replace(/-/g, "");
+            if (text.length > 5 && !name) name = text.split(/NIT/i)[0].replace(/[-|]/g, "").trim();
+          }
+        }
+      }
+      if (!nit) {
+        const nitMatch = document.body.innerText.match(/NIT[:\s]+([\d-]+)/i);
+        if (nitMatch) nit = nitMatch[1].replace(/-/g, "");
+      }
+      return { name, nit };
+    });
+
+    const companyName = companyInfo.name;
+    const companyNitFromPage = companyInfo.nit;
+    console.log(`[Scraper] Empresa (Cufe): "${companyName}" NIT: "${companyNitFromPage}"`);
 
     if (isLoginPage(page.url())) {
       throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
@@ -560,7 +616,7 @@ export async function extractDocumentIdsByCufe(
       total: 0,
     });
 
-    return { documents: finalDocuments, cookies: baseCookieMap };
+    return { documents: finalDocuments, cookies: baseCookieMap, companyName, companyNit: companyNitFromPage };
   } finally {
     if (browser) await browser.close();
   }

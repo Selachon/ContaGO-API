@@ -17,29 +17,6 @@ function normalizeNit(nit: string | null | undefined): string {
   return raw.replace(/[^0-9A-Za-z]/g, "").toUpperCase() || "N/A";
 }
 
-const HEADER_FILL: ExcelJS.Fill = {
-  type: "pattern",
-  pattern: "solid",
-  fgColor: { argb: "FF1F3864" },
-};
-
-const HEADER_FONT: Partial<ExcelJS.Font> = {
-  bold: true,
-  color: { argb: "FFFFFFFF" },
-  size: 11,
-};
-
-function styleHeader(cell: ExcelJS.Cell): void {
-  cell.fill = HEADER_FILL;
-  cell.font = HEADER_FONT;
-  cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
-}
-
-function applyHeaderRow(row: ExcelJS.Row): void {
-  row.eachCell({ includeEmpty: true }, (cell) => styleHeader(cell));
-  row.height = 30;
-}
-
 const NUM_FMT = "#,##0.00";
 const PCT_FMT = "0.00%";
 
@@ -70,9 +47,46 @@ function applyFormats(row: ExcelJS.Row, currencyCols: number[], percentCols: num
   for (const ci of percentCols) row.getCell(ci).numFmt = PCT_FMT;
 }
 
-// Freezes the first two rows (decorative spacer + header) so they stay visible on scroll.
+const BRAND_VIOLET = "FF7C2DD3"; // #7C2DD3
+
+// Freezes the first four rows (company info + spacer + header) so they stay visible on scroll.
 function freezeHeaderRows(ws: ExcelJS.Worksheet): void {
-  ws.views = [{ state: "frozen" as const, xSplit: 0, ySplit: 2, topLeftCell: "A3", activeCell: "A3" }];
+  ws.views = [{ state: "frozen" as const, xSplit: 0, ySplit: 4, topLeftCell: "A5", activeCell: "A5" }];
+}
+
+function applyCompanyHeader(ws: ExcelJS.Worksheet, name: string, nit: string): void {
+  const row1 = ws.getRow(1);
+  row1.height = 25;
+  const cell1 = row1.getCell(2);
+  cell1.value = name || "N/A";
+  cell1.font = { bold: true, size: 14, color: { argb: BRAND_VIOLET } };
+  cell1.alignment = { vertical: "middle" };
+
+  const row2 = ws.getRow(2);
+  row2.height = 20;
+  const cell2 = row2.getCell(2);
+  cell2.value = nit ? `NIT: ${nit}` : "NIT: N/A";
+  cell2.font = { bold: true, size: 11, color: { argb: "FF44546A" } };
+  cell2.alignment = { vertical: "middle" };
+
+  ws.getRow(3).height = 8; // Spacer
+}
+
+function applyHeaderRow(row: ExcelJS.Row): void {
+  row.height = 28;
+  row.eachCell((cell) => {
+    cell.fill = {
+      type: "pattern",
+      pattern: "solid",
+      fgColor: { argb: BRAND_VIOLET },
+    };
+    cell.font = { bold: true, color: { argb: "FFFFFFFF" }, size: 11 };
+    cell.alignment = { vertical: "middle", horizontal: "center", wrapText: true };
+    cell.border = {
+      bottom: { style: "thin", color: { argb: "FFFFFFFF" } },
+      right: { style: "thin", color: { argb: "FFFFFFFF" } },
+    };
+  });
 }
 
 // Auto-fits column widths based on actual cell content after data is written.
@@ -80,6 +94,9 @@ function autoFitColumns(ws: ExcelJS.Worksheet, minWidth = 8, maxWidth = 70): voi
   const colMaxLens: number[] = [];
 
   ws.eachRow({ includeEmpty: false }, (row) => {
+    // Skip company info rows for auto-fit calculation to prevent huge first column
+    if (row.number <= 2) return;
+
     row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
       let len: number;
       const v = cell.value;
@@ -108,22 +125,20 @@ function autoFitColumns(ws: ExcelJS.Worksheet, minWidth = 8, maxWidth = 70): voi
 
 // ── Sheet 1: Facturas DIAN ────────────────────────────────────────────────────
 //
-// A: No.               B: Tipo documento      C: Número factura
-// D: NIT Emisor        E: Razón Social Emisor
-// F: NIT Receptor      G: Razón Social Receptor
-// H: Fecha             I: Concepto            J: Forma de pago
-// K: Subtotal          L: Descuento           M: Recargo
-// N: IVA               O: INC                 P: Bolsas
-// Q: ICUI              R: IC                  S: ICL
-// T: IC Porcentual     U: IBUA                V: ADV
-// W: Total             [X: Enlace Drive]      Y/X: CUFE
+// 1: Razón Social
+// 2: NIT
+// 3: (Spacer)
+// 4: Headers
+// 5+: Data
 
 function buildSheet1(
   ws: ExcelJS.Worksheet,
   invoices: InvoiceData[],
-  includeDriveColumn: boolean
+  includeDriveColumn: boolean,
+  companyName: string = "",
+  companyNit: string = ""
 ): void {
-  ws.getRow(1).height = 5;
+  applyCompanyHeader(ws, companyName, companyNit);
 
   const baseHeaders = [
     "No.", "Tipo documento", "Número factura",
@@ -137,19 +152,19 @@ function buildSheet1(
   if (includeDriveColumn) baseHeaders.push("Enlace Drive");
   baseHeaders.push("CUFE");
 
-  const headerRow = ws.getRow(2);
+  const headerRow = ws.getRow(4);
   headerRow.values = ["", ...baseHeaders];
   applyHeaderRow(headerRow);
   freezeHeaderRows(ws);
 
   const { currencyCols, percentCols } = computeFormatCols(baseHeaders);
 
-  let rowNum = 3;
+  let rowNum = 5;
   for (const inv of invoices) {
     const td = Object.fromEntries((inv.taxes || []).map((t) => [t.taxName, t]));
 
     const rowData: (string | number | ExcelJS.CellHyperlinkValue)[] = [
-      rowNum - 2,
+      rowNum - 4,
       inv.documentType || "",
       (inv.docNumber || inv.trackId || "").trim(),
       inv.issuerNit || "",
@@ -191,20 +206,9 @@ function buildSheet1(
 }
 
 // ── Sheet 2: Detallado ────────────────────────────────────────────────────────
-//
-// A: Item              B: Número Factura      C: Tipo documento    D: Concepto
-// E: Cantidad          F: Base del impuesto   G: Descuento detalle H: Recargo detalle
-// I: IVA               J: % IVA               K: INC               L: % INC
-// M: Bolsas            N: % Bolsas            O: ICUI              P: % ICUI
-// Q: IC                (sin % IC — impuesto por grados de alcohol, sin % fijo)
-// R: IC Porcentual     S: % IC Porcentual
-// T: ICL               (sin % ICL — ídem)
-// U: IBUA              V: % IBUA
-// W: ADV               (sin % ADV)
-// X: Precio unitario (incluye impuestos)
 
-function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
-  ws.getRow(1).height = 5;
+function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName: string = "", companyNit: string = ""): void {
+  applyCompanyHeader(ws, companyName, companyNit);
 
   const headers = [
     "Item", "Número Factura", "Tipo documento", "Concepto",
@@ -218,14 +222,14 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
     "Precio unitario (incluye impuestos)",
   ];
 
-  const headerRow = ws.getRow(2);
+  const headerRow = ws.getRow(4);
   headerRow.values = ["", ...headers];
   applyHeaderRow(headerRow);
   freezeHeaderRows(ws);
 
   const { currencyCols, percentCols } = computeFormatCols(headers);
 
-  let rowNum = 3;
+  let rowNum = 5;
   for (const inv of invoices) {
     const invDocNumber = (inv.docNumber || inv.trackId || "").trim();
     for (const li of inv.lineItems || []) {
@@ -269,15 +273,15 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
 
 // ── Sheet 3: Datos de terceros ────────────────────────────────────────────────
 
-function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
-  ws.getRow(1).height = 5;
+function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName: string = "", companyNit: string = ""): void {
+  applyCompanyHeader(ws, companyName, companyNit);
 
   const headers = [
     "NIT", "Razón Social", "Nombre Comercial", "Resp. Tributaria",
     "País", "Departamento", "Ciudad", "Dirección", "Teléfono", "Correo",
   ];
 
-  const headerRow = ws.getRow(2);
+  const headerRow = ws.getRow(4);
   headerRow.values = ["", ...headers];
   applyHeaderRow(headerRow);
   freezeHeaderRows(ws);
@@ -322,7 +326,7 @@ function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[]): void {
     });
   }
 
-  let rowNum = 3;
+  let rowNum = 5;
   for (const p of byNit.values()) {
     ws.getRow(rowNum).values = [
       "",
@@ -340,7 +344,9 @@ export async function generateExcelFile(
   invoices: InvoiceData[],
   outputPath: string,
   includeDriveColumn: boolean,
-  isSentDocuments: boolean = false // kept for API compatibility, no longer affects columns
+  isSentDocuments: boolean = false, // kept for API compatibility, no longer affects columns
+  companyName: string = "",
+  companyNit: string = ""
 ): Promise<void> {
   const sorted = sortInvoicesByDate(invoices);
 
@@ -352,11 +358,11 @@ export async function generateExcelFile(
   const ws2 = workbook.addWorksheet("Detallado");
   const ws3 = workbook.addWorksheet("Datos de terceros");
 
-  buildSheet1(ws1, sorted, includeDriveColumn);
+  buildSheet1(ws1, sorted, includeDriveColumn, companyName, companyNit);
   autoFitColumns(ws1);
-  buildSheet2(ws2, sorted);
+  buildSheet2(ws2, sorted, companyName, companyNit);
   autoFitColumns(ws2);
-  buildSheet3(ws3, sorted);
+  buildSheet3(ws3, sorted, companyName, companyNit);
   autoFitColumns(ws3);
 
   await workbook.xlsx.writeFile(outputPath);
@@ -380,7 +386,9 @@ export function generateExcelFilename(
 export async function generateThirdPartiesExcelFile(
   invoices: Partial<InvoiceData>[],
   outputPath: string,
-  isSentDocuments: boolean = false // kept for API compatibility
+  isSentDocuments: boolean = false, // kept for API compatibility
+  companyName: string = "",
+  companyNit: string = ""
 ): Promise<void> {
   const sorted = sortInvoicesByDate(invoices as InvoiceData[]);
 
@@ -389,7 +397,7 @@ export async function generateThirdPartiesExcelFile(
   workbook.created = new Date();
 
   const ws3 = workbook.addWorksheet("Datos de terceros");
-  buildSheet3(ws3, sorted);
+  buildSheet3(ws3, sorted, companyName, companyNit);
   autoFitColumns(ws3);
 
   await workbook.xlsx.writeFile(outputPath);

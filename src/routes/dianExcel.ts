@@ -400,13 +400,14 @@ async function processExcelJob(
         total: p.total,
       })
     );
-    console.log(
-      `[Excel] Job ${jobId}: extractDocumentIds devolvio ${documents.length} documentos (${directionLabel})`
-    );
+
+    let actualCompanyName = "";
+    let actualCompanyNit = tokenNit || "";
+
     if (documents.length > 0) {
       const firstDoc = documents[0];
       console.log(
-        `[Excel] Job ${jobId}: primer documento id=${firstDoc.id} docnum=${firstDoc.docnum} tipo=${firstDoc.docType}`
+        `[Excel] Job ${jobId}: extraídos ${documents.length} documentos. Iniciando procesamiento...`
       );
     }
 
@@ -538,6 +539,18 @@ async function processExcelJob(
           docnum: doc.docnum,
           docType: doc.docType, // Tipo de documento de la tabla DIAN
         });
+
+        // Extraer info de la empresa propietaria del reporte del primer XML exitoso
+        if (!actualCompanyName || actualCompanyName === "N/A") {
+          const possibleName = (documentDirection === "sent" ? invoiceData.issuerName : invoiceData.receiverName) || "";
+          const possibleNit = (documentDirection === "sent" ? invoiceData.issuerNit : invoiceData.receiverNit) || "";
+          
+          if (possibleName && possibleName !== "N/A") {
+            actualCompanyName = possibleName;
+            actualCompanyNit = (possibleNit && possibleNit !== "N/A") ? possibleNit : actualCompanyNit;
+            console.log(`[Excel] Empresa identificada desde XML: ${actualCompanyName} (NIT: ${actualCompanyNit})`);
+          }
+        }
 
         let issuer = {
           nit: invoiceData.issuerNit || "N/A",
@@ -795,7 +808,7 @@ async function processExcelJob(
       throw new Error("No se generaron filas para el Excel. Revisa logs de extracción de documentos.");
     }
 
-    await generateExcelFile(invoicesForExcel, excelPath, useInlineDriveLinks, isSentDocs);
+    await generateExcelFile(invoicesForExcel, excelPath, useInlineDriveLinks, isSentDocs, actualCompanyName, actualCompanyNit);
 
     // Si no hay carga diferida, limpiar temporales de inmediato.
     if (!runDeferredDriveUpload) {
@@ -805,7 +818,9 @@ async function processExcelJob(
     // 5) Publicar estado final para polling/descarga.
     job.status = "completed";
     const basePrefix = isSentDocs ? "Facturas Emitidas DIAN" : "Facturas DIAN";
-    const filePrefix = tokenNit ? `${tokenNit} - ${basePrefix}` : basePrefix;
+    const filePrefix = actualCompanyName 
+      ? `${actualCompanyNit} - ${actualCompanyName} - ${basePrefix}` 
+      : (actualCompanyNit ? `${actualCompanyNit} - ${basePrefix}` : basePrefix);
     job.excelName = generateExcelFilename(startDate, endDate, filePrefix);
     job.completedAt = Date.now();
     job.invoicesProcessed = successCount;
