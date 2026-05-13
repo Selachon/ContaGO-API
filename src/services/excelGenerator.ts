@@ -28,8 +28,7 @@ const CURRENCY_HEADERS = new Set([
   "ICUI", "% ICUI", "IC", "IC Porcentual", "% IC Porcentual",
   "ICL", "IBUA", "% IBUA", "ADV",
   "Total",
-  "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle",
-  "Precio unitario (incluye impuestos)",
+  "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle",  "Precio unitario (incluye impuestos)",
 ]);
 
 // Computes format column indices from the actual headers array so indices can never drift.
@@ -147,7 +146,7 @@ function buildSheet1(
     "Fecha", "Concepto", "Forma de pago",
     "Subtotal", "Descuento", "Recargo",
     "IVA", "INC", "Bolsas", "ICUI", "IC", "ICL", "IC Porcentual", "IBUA", "ADV",
-    "Total",
+    "Total", "Observaciones",
   ];
   if (includeDriveColumn) baseHeaders.push("Enlace Drive");
   baseHeaders.push("CUFE");
@@ -187,6 +186,7 @@ function buildSheet1(
       td["IBUA"]?.amount ?? 0,
       td["ADV"]?.amount ?? 0,
       typeof inv.total === "number" ? inv.total : 0,
+      inv.notes || "",
     ];
 
     if (includeDriveColumn) {

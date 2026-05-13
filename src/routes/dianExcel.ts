@@ -698,6 +698,7 @@ async function processExcelJob(
           documentType: invoiceData.documentType || "Factura Electrónica",
           isDocumentoSoporte: invoiceData.isDocumentoSoporte || false,
           cufe: invoiceData.cufe || "N/A",
+          notes: invoiceData.notes || "",
           trackId: doc.id,
           docNumber: invoiceData.docNumber || doc.docnum || doc.id,
           driveUrl,

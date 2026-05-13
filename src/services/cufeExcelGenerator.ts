@@ -67,10 +67,11 @@ function buildSheet1Row(inv: Partial<InvoiceData>, id: number, rowNum: number, w
     numCell("S", rowNum, getTaxAmt(taxes, "IBUA")),
     numCell("T", rowNum, getTaxAmt(taxes, "ADV")),
     numCell("U", rowNum, inv.total ?? 0),
-    strCell("V", rowNum, inv.cufe ?? ""),
+    strCell("V", rowNum, inv.notes ?? ""),
+    strCell("W", rowNum, inv.cufe ?? ""),
   ];
-  if (withDriveLink) baseCells.push(strCell("W", rowNum, inv.driveUrl ?? ""));
-  const cols = withDriveLink ? 23 : 22;
+  if (withDriveLink) baseCells.push(strCell("X", rowNum, inv.driveUrl ?? ""));
+  const cols = withDriveLink ? 24 : 23;
   return `<row r="${rowNum}" spans="1:${cols}">${baseCells.join("")}</row>`;
 }
 
@@ -186,7 +187,7 @@ export async function generateCufeExcel(
   const zip = await JSZip.loadAsync(templateBuffer);
 
   // ── Sheet 1: Facturas DIAN ──────────────────────────────────────────────
-  const s1LastCol = includeDriveLinks ? "W" : "V";
+  const s1LastCol = includeDriveLinks ? "X" : "W";
   const s1Rows: string[] = [];
   invoices.forEach((inv, i) => {
     s1Rows.push(buildSheet1Row(inv, i + 1, i + 3, includeDriveLinks));

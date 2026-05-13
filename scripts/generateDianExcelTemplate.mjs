@@ -73,11 +73,14 @@ async function buildTemplate() {
     { header: "Valor Bolsas", key: "tax_Bolsas", width: 14 },
     { header: "Valor ICUI", key: "tax_ICUI", width: 14 },
     { header: "Valor IC", key: "tax_IC", width: 14 },
-    { header: "Descuento Global (-)", key: "globalDiscount", width: 18 },
-    { header: "Recargo Global (+)", key: "globalSurcharge", width: 16 },
+    { header: "Valor ICL", key: "tax_ICL", width: 14 },
+    { header: "Valor IC Porcentual", key: "tax_IC_Porcentual", width: 14 },
+    { header: "Valor IBUA", key: "tax_IBUA", width: 14 },
+    { header: "Valor ADV", key: "tax_ADV", width: 14 },
     { header: "Valor total", key: "total", width: 15 },
-    { header: "Enlace factura", key: "driveUrl", width: 45 },
+    { header: "Observaciones", key: "notes", width: 40 },
     { header: "CUFE", key: "cufe", width: 100 },
+    { header: "Enlace factura", key: "driveUrl", width: 45 },
   ];
   addBrandRow(mainSheet, "ContaGO - Exportador DIAN");
   setHeadersOnRowTwo(mainSheet);
@@ -100,11 +103,14 @@ async function buildTemplate() {
     tax_Bolsas: 0,
     tax_ICUI: 0,
     tax_IC: 0,
-    globalDiscount: 0,
-    globalSurcharge: 0,
+    tax_ICL: 0,
+    tax_IC_Porcentual: 0,
+    tax_IBUA: 0,
+    tax_ADV: 0,
     total: 1190000,
-    driveUrl: "https://drive.google.com/file/d/EJEMPLO/view",
+    notes: "Notas de prueba",
     cufe: "e4f91de5-EXAMPLE-CUFE",
+    driveUrl: "https://drive.google.com/file/d/EJEMPLO/view",
   });
 
   const detailSheet = workbook.addWorksheet("Detallado", {

@@ -107,6 +107,7 @@ export async function extractInvoiceDataFromXml(
     const { subtotal, iva, total, taxes, discount, surcharge } = extractTotals(invoice);
     const lineItems = extractLineItems(invoice);
     const concepts = extractConcepts(lineItems);
+    const notes = extractNotes(invoice);
     const cufe = extractCUFE(invoice);
     const paymentMethod = extractPaymentMethod(invoice);
 
@@ -146,6 +147,7 @@ export async function extractInvoiceDataFromXml(
       discount,
       surcharge,
       concepts,
+      notes,
       lineItems,
       documentType,
       isDocumentoSoporte,
@@ -736,6 +738,27 @@ function extractPaymentMethod(invoice: any): string {
     return "N/A";
   } catch {
     return "N/A";
+  }
+}
+
+/**
+ * Extrae notas/observaciones del documento (cbc:Note)
+ */
+function extractNotes(invoice: any): string {
+  try {
+    const notes = invoice.Note;
+    if (!notes) return "";
+
+    if (Array.isArray(notes)) {
+      return notes
+        .map((n) => getText(n))
+        .filter(Boolean)
+        .join(" | ");
+    }
+
+    return getText(notes);
+  } catch {
+    return "";
   }
 }
 

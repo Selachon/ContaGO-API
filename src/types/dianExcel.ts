@@ -72,6 +72,7 @@ export interface InvoiceData {
   isDocumentoSoporte?: boolean;
   cufe: string;
   driveUrl?: string;
+  notes?: string;
 
   // Impuestos dinámicos (IVA, INC, Bolsas, ICUI, etc.)
   taxes: TaxDetail[];
