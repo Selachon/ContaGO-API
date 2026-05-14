@@ -191,7 +191,7 @@ router.post(
       });
     }
 
-    const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 800);
+    const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
     if (cufes.length > MAX_CUFES) {
       return res.status(400).json({
         status: "error",

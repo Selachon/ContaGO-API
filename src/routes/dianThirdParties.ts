@@ -121,6 +121,8 @@ async function processJobWithExcel(
   
   const uniqueCufes = Object.values(cufesByNit);
   if (!uniqueCufes.length) throw new Error("No se encontraron CUFEs procesables en el Excel");
+  const maxCufes = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
+  if (uniqueCufes.length > maxCufes) throw new Error(`El Excel excede el límite de ${maxCufes} documentos (contiene ${uniqueCufes.length}). Divide el reporte en rangos más pequeños.`);
 
   setProgress(jobId, { step: "Validando sesión DIAN...", current: 0, total: 1 });
   // Usamos el primer CUFE para obtener cookies válidas
