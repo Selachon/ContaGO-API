@@ -262,11 +262,11 @@ router.post(
       });
     }
 
-    const MAX_CUFES = 1100;
+    const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 800);
     if (downloadCufes.length > MAX_CUFES) {
       return res.status(400).json({
         status: "error",
-        detalle: buildLimitMessage(downloadCufes.length, allDates),
+        detalle: buildLimitMessage(downloadCufes.length, allDates, MAX_CUFES),
       });
     }
 
@@ -361,6 +361,7 @@ async function processCufeDownloadJob(
 
   let companyName = "";
   let companyNit = "";
+  let companyWasFromDS = false;
 
   async function downloadAndFill(batch: string[], dir: string, phaseLabel: string): Promise<void> {
     const { results } = await downloadDocumentsByCufe(
@@ -397,12 +398,25 @@ async function processCufeDownloadJob(
         });
 
         // Identificar empresa del primer XML
-        if (!companyName || companyName === "N/A") {
-          const possibleName = (direction === "sent" ? invoiceData.issuerName : invoiceData.receiverName) || "";
-          const possibleNit = (direction === "sent" ? invoiceData.issuerNit : invoiceData.receiverNit) || "";
-          if (possibleName && possibleName !== "N/A") {
-            companyName = possibleName;
-            companyNit = (possibleNit && possibleNit !== "N/A") ? possibleNit : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
+        // Preferimos documentos que NO sean "Documento Soporte" para identificar la empresa
+        const isDS = !!invoiceData.isDocumentoSoporte;
+        const currentOwnName = (direction === "received") 
+          ? invoiceData.receiverName 
+          : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
+        const currentOwnNit = (direction === "received")
+          ? invoiceData.receiverNit
+          : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
+
+        const isNameEmpty = !companyName || companyName === "N/A";
+        const isCurrentlyDSIdentified = companyName && companyWasFromDS;
+
+        if (isNameEmpty || (isCurrentlyDSIdentified && !isDS)) {
+          if (currentOwnName && currentOwnName !== "N/A") {
+            companyName = currentOwnName;
+            companyNit = (currentOwnNit && currentOwnNit !== "N/A") 
+              ? currentOwnNit 
+              : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
+            companyWasFromDS = isDS;
           }
         }
 
@@ -591,15 +605,15 @@ async function resolveExcelBuffer(file: Express.Multer.File): Promise<Buffer> {
 const DATE_RE = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$|^\d{4}[\/\-]\d{2}[\/\-]\d{2}$/;
 const DATE_SCAN_COLS = ["A","C","D","E","F","G","H","I","J","K"];
 
-function buildLimitMessage(total: number, dates: string[]): string {
-  const partes = Math.ceil(total / 1000);
+function buildLimitMessage(total: number, dates: string[], limit: number): string {
+  const partes = Math.ceil(total / limit);
   const rangos = Array.from({ length: partes }, (_, i) => {
-    const start = dates[i * 1000] || "";
-    const end = dates[Math.min((i + 1) * 1000 - 1, total - 1)] || "";
-    const count = Math.min(1000, total - i * 1000);
+    const start = dates[i * limit] || "";
+    const end = dates[Math.min((i + 1) * limit - 1, total - 1)] || "";
+    const count = Math.min(limit, total - i * limit);
     return `${start} a ${end} (${count} facturas)`;
   }).join(" — ");
-  return `El Excel excede el límite de 1100. Prueba el rango ${rangos}`;
+  return `El Excel excede el límite de ${limit}. Prueba el rango ${rangos}`;
 }
 
 function classifyGrupo(grupoVal: string): "sent" | "received" | "nomina" | "applicationResponse" | "unknown" {

@@ -367,6 +367,9 @@ router.get("/me", async (req: Request, res: Response) => {
   }
 });
 
+// ============================================
+// POST /auth/change-password (usuario autenticado)
+// ============================================
 router.post("/change-password", requireAuth, async (req: Request, res: Response) => {
   const { currentPassword, newPassword } = req.body;
 
@@ -383,7 +386,9 @@ router.post("/change-password", requireAuth, async (req: Request, res: Response)
     return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
   }
 
-  if (!user.force_password_change) {
+  if (user.force_password_change) {
+    // Usuario recién autenticado con clave temporal: no pedirla nuevamente.
+  } else {
     if (!currentPassword || typeof currentPassword !== "string") {
       return res.status(400).json({ ok: false, message: "Contraseña actual requerida" });
     }

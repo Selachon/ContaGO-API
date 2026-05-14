@@ -403,6 +403,7 @@ async function processExcelJob(
 
     let actualCompanyName = "";
     let actualCompanyNit = tokenNit || "";
+    let actualCompanyWasFromDS = false;
 
     if (documents.length > 0) {
       const firstDoc = documents[0];
@@ -541,14 +542,24 @@ async function processExcelJob(
         });
 
         // Extraer info de la empresa propietaria del reporte del primer XML exitoso
-        if (!actualCompanyName || actualCompanyName === "N/A") {
-          const possibleName = (documentDirection === "sent" ? invoiceData.issuerName : invoiceData.receiverName) || "";
-          const possibleNit = (documentDirection === "sent" ? invoiceData.issuerNit : invoiceData.receiverNit) || "";
-          
-          if (possibleName && possibleName !== "N/A") {
-            actualCompanyName = possibleName;
-            actualCompanyNit = (possibleNit && possibleNit !== "N/A") ? possibleNit : actualCompanyNit;
-            console.log(`[Excel] Empresa identificada desde XML: ${actualCompanyName} (NIT: ${actualCompanyNit})`);
+        // Preferimos documentos que NO sean "Documento Soporte" para identificar la empresa
+        const isDS = !!invoiceData.isDocumentoSoporte;
+        const currentOwnName = (documentDirection === "received") 
+          ? invoiceData.receiverName 
+          : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
+        const currentOwnNit = (documentDirection === "received")
+          ? invoiceData.receiverNit
+          : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
+
+        const isActualNameEmpty = !actualCompanyName || actualCompanyName === "N/A";
+        const isCurrentlyDSIdentified = actualCompanyName && actualCompanyWasFromDS;
+
+        if (isActualNameEmpty || (isCurrentlyDSIdentified && !isDS)) {
+          if (currentOwnName && currentOwnName !== "N/A") {
+            actualCompanyName = currentOwnName;
+            actualCompanyNit = (currentOwnNit && currentOwnNit !== "N/A") ? currentOwnNit : actualCompanyNit;
+            actualCompanyWasFromDS = isDS;
+            console.log(`[Excel] Empresa identificada desde XML (${isDS ? "DS" : "Factura"}): ${actualCompanyName} (NIT: ${actualCompanyNit})`);
           }
         }
 

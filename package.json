@@ -41,7 +41,7 @@
     "capsolver-npm": "^2.1.11",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "exceljs": "^4.4.0",
+    "exceljs": "^4.1.1",
     "express": "^4.21.0",
     "fast-xml-parser": "^5.4.1",
     "googleapis": "^144.0.0",

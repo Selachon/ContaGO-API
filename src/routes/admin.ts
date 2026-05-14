@@ -331,6 +331,9 @@ router.post("/users/:id/reactivate", async (req: Request, res: Response) => {
   }
 });
 
+// ============================================
+// POST /admin/users/:id/reset-password - Restablecer contraseña
+// ============================================
 router.post("/users/:id/reset-password", async (req: Request, res: Response) => {
   try {
     const { id } = req.params;

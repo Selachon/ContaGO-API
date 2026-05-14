@@ -191,11 +191,11 @@ router.post(
       });
     }
 
-    const MAX_CUFES = 1100;
+    const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 800);
     if (cufes.length > MAX_CUFES) {
       return res.status(400).json({
         status: "error",
-        detalle: buildLimitMessage(cufes.length, excelDates),
+        detalle: buildLimitMessage(cufes.length, excelDates, MAX_CUFES),
       });
     }
 
@@ -397,15 +397,15 @@ async function resolveExcelBuffer(file: Express.Multer.File): Promise<Buffer> {
   return file.buffer;
 }
 
-function buildLimitMessage(total: number, dates: string[]): string {
-  const partes = Math.ceil(total / 1000);
+function buildLimitMessage(total: number, dates: string[], limit: number): string {
+  const partes = Math.ceil(total / limit);
   const rangos = Array.from({ length: partes }, (_, i) => {
-    const start = dates[i * 1000] || "";
-    const end = dates[Math.min((i + 1) * 1000 - 1, total - 1)] || "";
-    const count = Math.min(1000, total - i * 1000);
+    const start = dates[i * limit] || "";
+    const end = dates[Math.min((i + 1) * limit - 1, total - 1)] || "";
+    const count = Math.min(limit, total - i * limit);
     return `${start} a ${end} (${count} facturas)`;
   }).join(" — ");
-  return `El Excel excede el límite de 1100. Prueba el rango ${rangos}`;
+  return `El Excel excede el límite de ${limit}. Prueba el rango ${rangos}`;
 }
 
 function classifyGrupo(grupoVal: string): "sent" | "received" | "nomina" | "applicationResponse" | "unknown" {
