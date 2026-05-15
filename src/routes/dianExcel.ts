@@ -65,6 +65,14 @@ function setProgress(jobId: string, data: Partial<ExcelJobData["progress"]>): vo
   }
 }
 
+function isQuotaError(err: unknown): boolean {
+  const msg = ((err as Error)?.message || "").toLowerCase();
+  return msg.includes("storagequotaexceeded") ||
+    msg.includes("storage quota") ||
+    msg.includes("insufficient storage") ||
+    msg.includes("the user's drive storage quota");
+}
+
 function normalizeNitForMatch(nit: string | null | undefined): string {
   return String(nit || "")
     .replace(/[^0-9A-Za-z]/g, "")
@@ -244,6 +252,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     driveUploadTotal: job.driveUploadTotal,
     driveUploadFolderUrl: job.driveUploadFolderUrl,
     driveUploadError: job.driveUploadError,
+    driveWarning: job.driveWarning,
     timings: {
       startedAt: job.startedAt || job.createdAt,
       documentsFoundAt: job.documentsFoundAt || null,
@@ -475,6 +484,7 @@ async function processExcelJob(
     let errorCount = 0;
     let skippedCount = 0;
     let consecutiveErrors = 0;
+    let driveQuotaExceeded = false;
     const MAX_CONSECUTIVE_ERRORS = 10; // Si hay 10 errores seguidos, pausar y reintentar
     const downloadWorkers = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 4), 4));
     const zipPrefetch = new Map<number, Promise<Buffer>>();
@@ -596,7 +606,9 @@ async function processExcelJob(
                              receiver.nit && receiver.nit !== "N/A";
 
         if (useInlineDriveLinks && driveConfig && hasValidData) {
-          try {
+          if (driveQuotaExceeded) {
+            driveUrl = "ERROR: Sin espacio en Drive";
+          } else try {
             // Verificar si ya existe en Drive antes de subir
             const existing = await checkInvoiceExistsInDrive(
               driveConfig,
@@ -633,7 +645,15 @@ async function processExcelJob(
               }
             }
           } catch (driveErr) {
-            console.error(`[Excel] Error subiendo a Drive: ${doc.docnum}`, driveErr);
+            if (isQuotaError(driveErr)) {
+              if (!driveQuotaExceeded) {
+                driveQuotaExceeded = true;
+                console.warn(`[Excel] Job ${jobId}: sin espacio en Google Drive del cliente. Los documentos restantes no se subirán.`);
+                job.driveWarning = "Sin espacio en Google Drive: no se pudieron subir todos los documentos.";
+              }
+            } else {
+              console.error(`[Excel] Error subiendo a Drive: ${doc.docnum}`, driveErr);
+            }
             driveUrl = "ERROR: No se pudo subir a Drive";
           }
         }
@@ -943,8 +963,13 @@ async function runDriveUploadInBackground(
     console.log(`[Excel] Job ${jobId}: carga diferida a Drive completada (${uploads.length})`);
   } catch (err) {
     job.driveUploadStatus = "error";
-    job.driveUploadError = (err as Error).message || "Error en carga diferida a Drive";
-    console.error(`[Excel] Job ${jobId}: error en carga diferida a Drive`, err);
+    const quota = isQuotaError(err);
+    const done = job.driveUploadCurrent ?? 0;
+    const total = job.driveUploadTotal ?? uploads.length;
+    job.driveUploadError = quota
+      ? `Sin espacio en Google Drive: se subieron ${done} de ${total} documentos.`
+      : ((err as Error).message || "Error en carga diferida a Drive");
+    console.error(`[Excel] Job ${jobId}: error en carga diferida a Drive`, quota ? "quota exceeded" : err);
   } finally {
     try { if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }

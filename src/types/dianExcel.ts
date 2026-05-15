@@ -138,6 +138,7 @@ export interface ExcelJobData {
   driveUploadTotal?: number;
   driveUploadFolderUrl?: string;
   driveUploadError?: string;
+  driveWarning?: string;
 }
 
 export interface GoogleDriveConfig {
