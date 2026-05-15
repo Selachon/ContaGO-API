@@ -17,9 +17,11 @@ import {
 import { encryptToken } from "../utils/encryption.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
+import multer from "multer";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig } from "../types/dianExcel.js";
+import { parseListingRecordsFromExportZip, type ListingRecord } from "../services/dianScraper.js";
 
 interface DeferredDriveUploadItem {
   pdfPath: string | null;
@@ -41,6 +43,8 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
 const JOB_TTL_MS = 2 * 60 * 60 * 1000; // 2 horas para jobs grandes
 const USE_STAGING_PIPELINE = process.env.DIAN_EXCEL_USE_STAGING !== "0";
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 // Crea carpeta de trabajo al iniciar el proceso.
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -143,11 +147,19 @@ setInterval(() => {
 }, 60_000);
 
 // Crea un job asincrono de extraccion y generacion de Excel.
-router.post("/generate", validateDianUrl, async (req: Request, res: Response) => {
-  const body = req.body as ExcelGenerateRequest;
-  const { token_url, session_uid, document_direction, drive_connection_id, include_drive_links } = body;
+router.post("/generate", upload.single("excel"), validateDianUrl, async (req: Request, res: Response) => {
+  const token_url = req.body.token_url as string;
+  const session_uid = req.body.session_uid as string | undefined;
+  const document_direction = req.body.document_direction as string | undefined;
+  const drive_connection_id = req.body.drive_connection_id as string | undefined;
+  const include_drive_links = req.body.include_drive_links === "true";
+  const uploadedFile = req.file;
 
   const direction = document_direction === "sent" ? "sent" : "received";
+
+  if (!uploadedFile) {
+    return res.status(400).json({ status: "error", detalle: "Debes subir el listado exportado desde la DIAN (.xlsx o .zip)." });
+  }
 
   const jobId = session_uid || uuidv4();
   const userId = req.user!.userId;
@@ -193,6 +205,18 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   };
   jobTracker.set(jobId, job);
 
+  // Parsear listado del archivo subido antes de responder.
+  let listingRecords: ListingRecord[] = [];
+  try {
+    listingRecords = await parseListingRecordsFromExportZip(uploadedFile.buffer, direction);
+    if (listingRecords.length === 0) {
+      return res.status(400).json({ status: "error", detalle: "El listado subido no contiene documentos válidos para la dirección seleccionada." });
+    }
+  } catch (parseErr) {
+    const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+    return res.status(400).json({ status: "error", detalle: `Error al leer el listado: ${msg}` });
+  }
+
   // Respuesta no bloqueante; el trabajo corre en background.
   res.json({
     status: "accepted",
@@ -201,7 +225,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   });
 
   // No usar await para no retener la conexion HTTP.
-  processExcelJob(jobId, token_url, undefined, undefined, userId, direction, drive_connection_id, include_drive_links === true).catch((err) => {
+  processExcelJob(jobId, token_url, undefined, undefined, userId, direction, drive_connection_id, include_drive_links === true, listingRecords).catch((err) => {
     console.error(`[Excel] Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
@@ -357,7 +381,8 @@ async function processExcelJob(
   userId: string,
   documentDirection: "received" | "sent" = "received",
   driveConnectionId?: string,
-  includeDriveLinks: boolean = false
+  includeDriveLinks: boolean = false,
+  listingRecords: ListingRecord[] = []
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
@@ -382,23 +407,21 @@ async function processExcelJob(
   try {
     if (isJobCancelled(jobId)) return;
 
-    // 1) Prevalidación rápida para fallar temprano.
-    setProgress(jobId, { step: `Prevalidando documentos ${directionLabel}...`, current: 0, total: 1 });
-    await runDianExtractionPrecheck(tokenUrl, startDate, endDate, documentDirection, jobId);
-
-    // 2) Extraer ids y cookies de sesion desde DIAN.
+    // 1) Extraer ids y cookies de sesion desde DIAN (usando listado pre-cargado).
     setProgress(jobId, { step: `Extrayendo lista de documentos ${directionLabel}...`, current: 0, total: 1 });
     const { documents, cookies } = await extractDocumentIdsByCufe(
       tokenUrl,
-      startDate,
-      endDate,
+      undefined,
+      undefined,
       jobId,
       documentDirection,
       (p) => setProgress(jobId, {
         step: p.step,
         current: p.current,
         total: p.total,
-      })
+      }),
+      undefined,
+      listingRecords
     );
 
     let actualCompanyName = "";
