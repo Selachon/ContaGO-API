@@ -145,18 +145,9 @@ setInterval(() => {
 // Crea un job asincrono de extraccion y generacion de Excel.
 router.post("/generate", validateDianUrl, async (req: Request, res: Response) => {
   const body = req.body as ExcelGenerateRequest;
-  const { token_url, start_date, end_date, session_uid, document_direction, drive_connection_id, include_drive_links } = body;
-  
-  // Validar document_direction si se proporciona
-  const direction = document_direction === "sent" ? "sent" : "received";
+  const { token_url, session_uid, document_direction, drive_connection_id, include_drive_links } = body;
 
-  // Se valida formato para filtros consistentes en DIAN.
-  if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
-    return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
-  }
-  if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
-    return res.status(400).json({ status: "error", detalle: "end_date debe tener formato YYYY-MM-DD" });
-  }
+  const direction = document_direction === "sent" ? "sent" : "received";
 
   const jobId = session_uid || uuidv4();
   const userId = req.user!.userId;
@@ -210,7 +201,7 @@ router.post("/generate", validateDianUrl, async (req: Request, res: Response) =>
   });
 
   // No usar await para no retener la conexion HTTP.
-  processExcelJob(jobId, token_url, start_date, end_date, userId, direction, drive_connection_id, include_drive_links === true).catch((err) => {
+  processExcelJob(jobId, token_url, undefined, undefined, userId, direction, drive_connection_id, include_drive_links === true).catch((err) => {
     console.error(`[Excel] Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
     if (job) {
