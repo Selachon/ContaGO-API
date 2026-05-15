@@ -9,7 +9,7 @@ import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
-import { extractDocumentIdsByCufe, runDianExtractionPrecheck } from "../services/dianScraper.js";
+import { extractDocumentIdsByCufe, type ListingRecord } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateThirdPartiesExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData } from "../types/dianExcel.js";
@@ -125,8 +125,8 @@ async function processJobWithExcel(
   if (uniqueCufes.length > maxCufes) throw new Error(`El Excel excede el límite de ${maxCufes} documentos (contiene ${uniqueCufes.length}). Divide el reporte en rangos más pequeños.`);
 
   setProgress(jobId, { step: "Validando sesión DIAN...", current: 0, total: 1 });
-  // Usamos el primer CUFE para obtener cookies válidas
-  const { cookies } = await extractDocumentIdsByCufe(tokenUrl, undefined, undefined, jobId, "received", () => {});
+  const preloadedRecords: ListingRecord[] = uniqueCufes.map(cufe => ({ cufe, docnum: "" }));
+  const { cookies } = await extractDocumentIdsByCufe(tokenUrl, undefined, undefined, jobId, "received", () => {}, undefined, preloadedRecords);
 
   const documents = uniqueCufes.map(c => ({ id: c, docnum: "", docType: "" }));
   await downloadAndProcessDocuments(jobId, documents, cookies, tokenNit);
