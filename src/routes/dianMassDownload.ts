@@ -247,6 +247,29 @@ function safeFilename(nit: string, docNumber: string): string {
   return safeNit && safeDoc ? `${safeNit}-${safeDoc}` : safeNit || safeDoc || "sin-numero";
 }
 
+const MONTHS_ES = [
+  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+];
+
+function parseInvoiceDate(dateStr: string): { year: string; monthName: string } {
+  let year = "SinAño";
+  let monthName = "SinMes";
+
+  if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
+    const parts = dateStr.split("-");
+    year = parts[0];
+    const month = parseInt(parts[1], 10);
+    monthName = MONTHS_ES[month - 1] || "SinMes";
+  } else if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(dateStr)) {
+    const parts = dateStr.split("/");
+    year = parts[2];
+    const month = parseInt(parts[1], 10);
+    monthName = MONTHS_ES[month - 1] || "SinMes";
+  }
+  return { year, monthName };
+}
+
 async function processMassDownloadJob(
   jobId: string,
   tokenUrl: string,
@@ -291,8 +314,6 @@ async function processMassDownloadJob(
     setProgress(jobId, { step: "Empaquetando documentos...", current: downloaded, total: cufes.length });
 
     const bundle = new JSZip();
-    const pdfFolder = bundle.folder("PDF")!;
-    const xmlFolder = bundle.folder("XML")!;
     const pdfBuffersForMerge: Buffer[] = [];
     let ownerNit = "";
 
@@ -305,6 +326,7 @@ async function processMassDownloadJob(
         let nit = result.nit || "";
         let docNumber = result.docnum || "";
         let isDS = false;
+        let issueDate = "";
 
         if (xmlBuffer) {
           try {
@@ -317,15 +339,20 @@ async function processMassDownloadJob(
             // Own-company NIT (for ZIP filename): received→receiverNit, sent→issuerNit, DS sent→receiverNit
             if (!ownerNit) ownerNit = (direction === "sent" && !isDS) ? issuerNit : receiverNit;
             docNumber = invoiceData.docNumber || docNumber;
+            issueDate = invoiceData.issueDateISO || invoiceData.issueDate || "";
           } catch {}
 
-          xmlFolder.file(`${safeFilename(nit, docNumber)}.xml`, xmlBuffer);
-        }
+          const { year, monthName } = parseInvoiceDate(issueDate);
+          const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
+          const xmlPath = `${year}/${monthName}/${dirLabel}/XML/${safeFilename(nit, docNumber)}.xml`;
+          bundle.file(xmlPath, xmlBuffer);
 
-        // Documento Soporte PDFs are not reliable — skip PDF, keep XML only
-        if (pdfBuffer && pdfBuffer.length > 0 && !isDS) {
-          pdfFolder.file(`${safeFilename(nit, docNumber)}.pdf`, pdfBuffer);
-          if (mergePdf) pdfBuffersForMerge.push(pdfBuffer);
+          // Documento Soporte PDFs are not reliable — skip PDF, keep XML only
+          if (pdfBuffer && pdfBuffer.length > 0 && !isDS) {
+            const pdfPath = `${year}/${monthName}/${dirLabel}/PDF/${safeFilename(nit, docNumber)}.pdf`;
+            bundle.file(pdfPath, pdfBuffer);
+            if (mergePdf) pdfBuffersForMerge.push(pdfBuffer);
+          }
         }
       } catch (err) {
         console.warn(`[MASS DL] Error procesando ${result.cufe?.slice(0, 16)}:`, err);
