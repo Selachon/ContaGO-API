@@ -56,14 +56,14 @@ function freezeHeaderRows(ws: ExcelJS.Worksheet): void {
 function applyCompanyHeader(ws: ExcelJS.Worksheet, name: string, nit: string): void {
   const row1 = ws.getRow(1);
   row1.height = 25;
-  const cell1 = row1.getCell(2);
+  const cell1 = row1.getCell(1);
   cell1.value = name || "N/A";
   cell1.font = { bold: true, size: 14, color: { argb: BRAND_VIOLET } };
   cell1.alignment = { vertical: "middle" };
 
   const row2 = ws.getRow(2);
   row2.height = 20;
-  const cell2 = row2.getCell(2);
+  const cell2 = row2.getCell(1);
   cell2.value = nit ? `NIT: ${nit}` : "NIT: N/A";
   cell2.font = { bold: true, size: 11, color: { argb: "FF44546A" } };
   cell2.alignment = { vertical: "middle" };
@@ -152,7 +152,7 @@ function buildSheet1(
   baseHeaders.push("CUFE");
 
   const headerRow = ws.getRow(4);
-  headerRow.values = ["", ...baseHeaders];
+  headerRow.values = baseHeaders;
   applyHeaderRow(headerRow);
   freezeHeaderRows(ws);
 
@@ -199,7 +199,7 @@ function buildSheet1(
     rowData.push(inv.cufe || "");
 
     const row = ws.getRow(rowNum);
-    row.values = ["", ...rowData];
+    row.values = rowData;
     applyFormats(row, currencyCols, percentCols);
     rowNum++;
   }
@@ -223,7 +223,7 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
   ];
 
   const headerRow = ws.getRow(4);
-  headerRow.values = ["", ...headers];
+  headerRow.values = headers;
   applyHeaderRow(headerRow);
   freezeHeaderRows(ws);
 
@@ -264,7 +264,7 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
       ];
 
       const row = ws.getRow(rowNum);
-      row.values = ["", ...rowData];
+      row.values = rowData;
       applyFormats(row, currencyCols, percentCols);
       rowNum++;
     }
@@ -297,7 +297,7 @@ function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
   ];
 
   const headerRow = ws.getRow(4);
-  headerRow.values = ["", ...headers];
+  headerRow.values = headers;
   applyHeaderRow(headerRow);
   freezeHeaderRows(ws);
 
@@ -343,12 +343,23 @@ function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
 
   let rowNum = 5;
   for (const p of byNit.values()) {
-    ws.getRow(rowNum).values = [
-      "",
-      p.nit, calcularDV(p.nit), p.name, p.commercial, p.taxResp,
+    const nitDigits = (p.nit || "").replace(/\D/g, "");
+    const nitValue: string | number = nitDigits ? parseInt(nitDigits, 10) : (p.nit || "");
+    const dvStr = nitDigits ? calcularDV(p.nit) : "";
+    const dvValue: string | number = dvStr !== "" ? parseInt(dvStr, 10) : "";
+    const cleanPhone = (p.phone || "").replace(/\|/g, "").trim();
+    const firstEmail = (p.email || "").split(",")[0].trim();
+
+    const row = ws.getRow(rowNum);
+    row.values = [
+      nitValue, dvValue, p.name, p.commercial, p.taxResp,
       p.country, p.dept, p.city, p.addr,
-      p.phone, p.email,
+      cleanPhone, firstEmail,
     ];
+    if (nitDigits) {
+      row.getCell(1).numFmt = "0";
+      row.getCell(2).numFmt = "0";
+    }
     rowNum++;
   }
 }

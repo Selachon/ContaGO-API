@@ -157,21 +157,19 @@ async function downloadAndProcessDocuments(
       if (!xmlBuffer) continue;
       const inv = await extractInvoiceDataFromXml(xmlBuffer, { id: doc.id, docnum: doc.docnum, docType: doc.docType });
       
-      // Identificar empresa del primer XML
+      // Identificar empresa usando el NIT del token (companyNit = tokenNit)
       if (!companyName || companyName === "N/A") {
-        // En Terceros, uno de los dos (Emisor/Receptor) es siempre el usuario.
-        // Si bajamos una factura donde el Tercero es Emisor, el usuario es Receptor.
-        // Si bajamos una factura donde el Tercero es Receptor, el usuario es Emisor.
-        // El reporte DIAN nos dice quién es quién, pero lo más fácil es buscar el NIT que NO sea el del tercero procesado.
-        // O más simple: probar Receptor primero (típico de Recibidos) y luego Emisor.
-        if (inv.receiverName && inv.receiverName !== "N/A" && inv.receiverNit !== inv.issuerNit) {
-          companyName = inv.receiverName;
-          companyNit = inv.receiverNit || companyNit;
-        } else if (inv.issuerName && inv.issuerName !== "N/A") {
-          companyName = inv.issuerName;
-          companyNit = inv.issuerNit || companyNit;
+        const normToken = (companyNit || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+        if (normToken) {
+          const normIssuer = (inv.issuerNit || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+          const normReceiver = (inv.receiverNit || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+          if (normIssuer === normToken && inv.issuerName && inv.issuerName !== "N/A") {
+            companyName = inv.issuerName;
+          } else if (normReceiver === normToken && inv.receiverName && inv.receiverName !== "N/A") {
+            companyName = inv.receiverName;
+          }
+          if (companyName && companyName !== "N/A") console.log(`[ThirdParties] Empresa del token NIT: ${companyName} (NIT: ${companyNit})`);
         }
-        if (companyName && companyName !== "N/A") console.log(`[ThirdParties] Empresa identificada: ${companyName} (NIT: ${companyNit})`);
       }
 
       rows.push(inv);
