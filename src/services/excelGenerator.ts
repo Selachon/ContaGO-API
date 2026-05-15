@@ -271,13 +271,28 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
   }
 }
 
+// ── DV Calculation (DIAN algorithm) ──────────────────────────────────────────
+
+function calcularDV(nit: string): string {
+  const clean = nit.replace(/[\s,.\-]/g, "");
+  if (!clean || isNaN(Number(clean))) return "";
+  const vpri = [0, 3, 7, 13, 17, 19, 23, 29, 37, 41, 43, 47, 53, 59, 67, 71];
+  const z = clean.length;
+  let x = 0;
+  for (let i = 0; i < z; i++) {
+    x += parseInt(clean[i], 10) * vpri[z - i];
+  }
+  const y = x % 11;
+  return String(y > 1 ? 11 - y : y);
+}
+
 // ── Sheet 3: Datos de terceros ────────────────────────────────────────────────
 
 function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName: string = "", companyNit: string = ""): void {
   applyCompanyHeader(ws, companyName, companyNit);
 
   const headers = [
-    "NIT", "Razón Social", "Nombre Comercial", "Resp. Tributaria",
+    "NIT", "DV", "Razón Social", "Nombre Comercial", "Resp. Tributaria",
     "País", "Departamento", "Ciudad", "Dirección", "Teléfono", "Correo",
   ];
 
@@ -330,7 +345,7 @@ function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
   for (const p of byNit.values()) {
     ws.getRow(rowNum).values = [
       "",
-      p.nit, p.name, p.commercial, p.taxResp,
+      p.nit, calcularDV(p.nit), p.name, p.commercial, p.taxResp,
       p.country, p.dept, p.city, p.addr,
       p.phone, p.email,
     ];
