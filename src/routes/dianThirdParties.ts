@@ -255,7 +255,7 @@ router.post(
       });
     }
 
-    const MAX_UNIQUE_THIRD_PARTIES = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
+    const MAX_UNIQUE_THIRD_PARTIES = Number(process.env.DIAN_THIRD_PARTIES_MAX_DOCUMENTS || 2000);
     if (downloadCufes.length > MAX_UNIQUE_THIRD_PARTIES) {
       return res.status(400).json({
         status: "error",
