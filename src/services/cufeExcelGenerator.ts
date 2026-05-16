@@ -23,6 +23,12 @@ function xmlEsc(s: string): string {
     .replace(/'/g, "&apos;");
 }
 
+function uppercaseBusinessName(value: string | null | undefined): string {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "N/A") return raw || "";
+  return raw.toLocaleUpperCase("es-CO");
+}
+
 function strCell(col: string, row: number, value: string): string {
   const escaped = xmlEsc(value);
   return `<c r="${col}${row}" t="inlineStr"><is><t>${escaped}</t></is></c>`;
@@ -50,7 +56,7 @@ function buildSheet1Row(inv: Partial<InvoiceData>, id: number, rowNum: number, w
     strCell("B", rowNum, inv.documentType ?? ""),
     strCell("C", rowNum, inv.docNumber ?? ""),
     strCell("D", rowNum, inv.issuerNit ?? ""),
-    strCell("E", rowNum, inv.issuerName ?? ""),
+    strCell("E", rowNum, uppercaseBusinessName(inv.issuerName)),
     strCell("F", rowNum, inv.issueDate ?? ""),
     strCell("G", rowNum, inv.concepts ?? ""),
     strCell("H", rowNum, inv.paymentMethod ?? ""),
@@ -118,7 +124,7 @@ function buildSheet2Row(
 function buildSheet3Row(inv: Partial<InvoiceData>, rowNum: number): string {
   const cells = [
     strCell("A", rowNum, inv.issuerNit ?? ""),
-    strCell("B", rowNum, inv.issuerName ?? ""),
+    strCell("B", rowNum, uppercaseBusinessName(inv.issuerName)),
     strCell("C", rowNum, inv.issuerCommercialName ?? ""),
     strCell("D", rowNum, inv.issuerTaxResponsibility ?? ""),
     strCell("E", rowNum, inv.issuerCountry ?? ""),

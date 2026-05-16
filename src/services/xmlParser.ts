@@ -163,6 +163,73 @@ export async function extractInvoiceDataFromXml(
   }
 }
 
+/**
+ * Versión ultra-optimizada para la herramienta de Terceros.
+ * Omite el procesamiento de impuestos, líneas de detalle, totales y conceptos.
+ */
+export async function extractThirdPartyDataFromXml(
+  xmlBuffer: Buffer,
+  docInfo: DocInfo
+): Promise<Partial<InvoiceData>> {
+  try {
+    const xmlString = xmlBuffer.toString("utf-8");
+    const parser = new XMLParser({
+      ignoreAttributes: false,
+      removeNSPrefix: true,
+      parseAttributeValue: false,
+      parseTagValue: false,
+      trimValues: true,
+    });
+    const parsed = parser.parse(xmlString);
+    const invoice = parsed.Invoice || parsed.CreditNote || parsed.DebitNote;
+    if (!invoice) return buildSkipResult(docInfo, detectDocType(parsed));
+
+    const supplierParty = invoice.AccountingSupplierParty?.Party;
+    const customerParty = invoice.AccountingCustomerParty?.Party;
+    
+    const issuerNit = extractPartyNit(supplierParty);
+    const issuerName = extractPartyName(supplierParty);
+    const issuerDetails = extractPartyDetails(supplierParty);
+
+    const receiverNit = extractPartyNit(customerParty);
+    const receiverName = extractPartyName(customerParty);
+    const receiverDetails = extractPartyDetails(customerParty);
+
+    const { issueDateISO } = extractIssueDate(invoice);
+    const profileId = getText(invoice.ProfileID || "");
+    const isDocumentoSoporte = /soporte/i.test(profileId);
+
+    return {
+      issuerNit,
+      issuerName,
+      issuerEmail: issuerDetails.email,
+      issuerPhone: issuerDetails.phone,
+      issuerAddress: issuerDetails.address,
+      issuerCity: issuerDetails.city,
+      issuerDepartment: issuerDetails.department,
+      issuerCountry: issuerDetails.country,
+      issuerCommercialName: issuerDetails.commercialName,
+      issuerTaxResponsibility: issuerDetails.taxResponsibility,
+      receiverNit,
+      receiverName,
+      receiverEmail: receiverDetails.email,
+      receiverPhone: receiverDetails.phone,
+      receiverAddress: receiverDetails.address,
+      receiverCity: receiverDetails.city,
+      receiverDepartment: receiverDetails.department,
+      receiverCountry: receiverDetails.country,
+      receiverCommercialName: receiverDetails.commercialName,
+      receiverTaxResponsibility: receiverDetails.taxResponsibility,
+      issueDateISO,
+      isDocumentoSoporte,
+      trackId: docInfo.id,
+      docNumber: docInfo.docnum,
+    };
+  } catch (err) {
+    return buildSkipResult(docInfo, "Error en parseo optimizado");
+  }
+}
+
 function extractDocumentNumber(invoice: any, fallback?: string): string {
   try {
     const idRaw = getText(invoice?.ID || "").trim();
@@ -227,7 +294,7 @@ function extractPartyName(party: any): string {
       const entity = Array.isArray(legalEntity) ? legalEntity[0] : legalEntity;
       const regName = entity?.RegistrationName;
       if (regName) {
-        return cleanText(getText(regName));
+        return uppercaseBusinessName(cleanText(getText(regName)));
       }
     }
 
@@ -239,7 +306,7 @@ function extractPartyName(party: any): string {
         : partyTaxScheme;
       const regName = taxScheme?.RegistrationName;
       if (regName) {
-        return cleanText(getText(regName));
+        return uppercaseBusinessName(cleanText(getText(regName)));
       }
     }
 
@@ -248,7 +315,7 @@ function extractPartyName(party: any): string {
     if (partyName) {
       const name = Array.isArray(partyName) ? partyName[0]?.Name : partyName.Name;
       if (name) {
-        return cleanText(getText(name));
+        return uppercaseBusinessName(cleanText(getText(name)));
       }
     }
 
@@ -256,6 +323,11 @@ function extractPartyName(party: any): string {
   } catch {
     return "N/A";
   }
+}
+
+function uppercaseBusinessName(value: string): string {
+  if (!value || value === "N/A") return value;
+  return value.toLocaleUpperCase("es-CO");
 }
 
 function pickAddressNode(party: any): any {

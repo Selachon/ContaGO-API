@@ -17,6 +17,12 @@ function normalizeNit(nit: string | null | undefined): string {
   return raw.replace(/[^0-9A-Za-z]/g, "").toUpperCase() || "N/A";
 }
 
+function uppercaseBusinessName(value: string | null | undefined): string {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "N/A") return raw || "";
+  return raw.toLocaleUpperCase("es-CO");
+}
+
 const NUM_FMT = "#,##0.00";
 const PCT_FMT = "0.00%";
 
@@ -57,7 +63,7 @@ function applyCompanyHeader(ws: ExcelJS.Worksheet, name: string, nit: string): v
   const row1 = ws.getRow(1);
   row1.height = 25;
   const cell1 = row1.getCell(1);
-  cell1.value = name || "N/A";
+  cell1.value = uppercaseBusinessName(name) || "N/A";
   cell1.font = { bold: true, size: 14, color: { argb: BRAND_VIOLET } };
   cell1.alignment = { vertical: "middle" };
 
@@ -167,9 +173,9 @@ function buildSheet1(
       inv.documentType || "",
       (inv.docNumber || inv.trackId || "").trim(),
       inv.issuerNit || "",
-      inv.issuerName || "",
+      uppercaseBusinessName(inv.issuerName),
       inv.receiverNit || "",
-      inv.receiverName || "",
+      uppercaseBusinessName(inv.receiverName),
       inv.issueDate || "",
       inv.concepts || "",
       inv.paymentMethod || "N/A",
@@ -352,7 +358,7 @@ function buildSheet3(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
 
     const row = ws.getRow(rowNum);
     row.values = [
-      nitValue, dvValue, p.name, p.commercial, p.taxResp,
+      nitValue, dvValue, uppercaseBusinessName(p.name), p.commercial, p.taxResp,
       p.country, p.dept, p.city, p.addr,
       cleanPhone, firstEmail,
     ];

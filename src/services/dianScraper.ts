@@ -29,6 +29,7 @@ interface PrecheckResult {
 export interface ListingRecord {
   cufe: string;
   docnum: string;
+  direction?: DocumentDirection;
 }
 
 function normalizeCufe(value: string): string {
@@ -502,6 +503,7 @@ export async function extractDocumentIdsByCufe(
       let wp = workerPages[workerIdx];
       let wc = workerCookies[workerIdx] || baseCookieMap;
       let processedByWorker = 0;
+      let currentWorkerDir: DocumentDirection | null = direction; // track current worker tab
       const recycleEvery = Math.max(50, Number(process.env.DIAN_CUFE_RECYCLE_EVERY || 250));
 
       while (true) {
@@ -509,13 +511,28 @@ export async function extractDocumentIdsByCufe(
         if (i >= cufes.length) break;
         nextIndex++;
 
+        const record = listedRecords.find(r => normalizeCufe(r.cufe) === cufes[i]);
         const cufe = cufes[i];
+        const recordDir = record?.direction;
+
         try {
+          // Si el documento tiene una dirección específica y el worker está en la pestaña opuesta, cambiar de pestaña.
+          if (recordDir && recordDir !== currentWorkerDir) {
+            const targetUrl = recordDir === "sent" 
+              ? "https://catalogo-vpfe.dian.gov.co/Document/Sent" 
+              : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+            
+            await navigateWithRetry(wp, targetUrl, 2);
+            if (startDate && endDate) await applyDateFilter(wp, startDate, endDate, false);
+            await waitForTableLoad(wp);
+            currentWorkerDir = recordDir;
+          }
+
           const maxAttempts = 2;
           let found: DocumentInfo | null = null;
           for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-              found = await findDocumentByUniqueCodeOrDocnum(wp, cufe, "", seenIds, isSent);
+              found = await findDocumentByUniqueCodeOrDocnum(wp, cufe, "", seenIds, currentWorkerDir === "sent");
               break;
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
@@ -534,6 +551,7 @@ export async function extractDocumentIdsByCufe(
               wc = refreshed.cookies;
               workerPages[workerIdx] = wp;
               workerCookies[workerIdx] = wc;
+              currentWorkerDir = direction; // reset to initial
             }
           }
 

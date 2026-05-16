@@ -1,0 +1,1 @@
+import ExcelJS from 'exceljs'; async function test() { const wb = new ExcelJS.Workbook(); try { await wb.xlsx.load(Buffer.alloc(0)); } catch (err) { console.log('Error caught:', err.message); } } test();

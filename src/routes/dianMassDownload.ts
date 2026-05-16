@@ -415,7 +415,9 @@ async function resolveExcelBuffer(file: Express.Multer.File): Promise<Buffer> {
   if (file.originalname.toLowerCase().endsWith(".zip")) {
     const zip = await JSZip.loadAsync(file.buffer);
     for (const [filename, entry] of Object.entries(zip.files)) {
-      if (!entry.dir && /\.(xlsx|xls)$/i.test(filename)) {
+      const isExcel = /\.(xlsx|xls)$/i.test(filename);
+      const isMacJunk = filename.split("/").some(part => part.startsWith("._"));
+      if (!entry.dir && isExcel && !isMacJunk) {
         return entry.async("nodebuffer");
       }
     }

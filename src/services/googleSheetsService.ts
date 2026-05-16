@@ -67,6 +67,15 @@ export async function readRegistroCuentasCobroRows(): Promise<{
       fields: "sheets(properties(sheetId,title))",
     });
 
+    if (!metadata.data) {
+      throw new CausationError(
+        "No se pudieron obtener metadatos de la Google Sheet",
+        502,
+        "google_sheet_metadata_empty",
+        { spreadsheetId }
+      );
+    }
+
     const targetSheet = metadata.data.sheets?.find((sheet) => sheet.properties?.sheetId === gid);
     if (!targetSheet?.properties?.title) {
       throw new CausationError(
