@@ -117,11 +117,12 @@ export async function listUsers(params: ListUsersParams): Promise<{ users: Admin
 
   const query: Record<string, unknown> = {};
 
-  // Filtro de busqueda por email o nombre
+  // Filtro de busqueda por email o nombre o telefono
   if (search) {
     query.$or = [
       { email: { $regex: search, $options: "i" } },
       { name: { $regex: search, $options: "i" } },
+      { phone: { $regex: search, $options: "i" } },
     ];
   }
 

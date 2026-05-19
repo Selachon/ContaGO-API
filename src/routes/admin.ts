@@ -49,11 +49,11 @@ router.get("/users/export", async (req: Request, res: Response) => {
       { header: "NITs", key: "nits", width: 40 },
       { header: "Valor pago", key: "paymentAmount", width: 14 },
       { header: "Forma de pago", key: "paymentMethod", width: 22 },
-      { header: "Inicio licencia", key: "licenseStartDate", width: 16 },
-      { header: "Fin licencia", key: "licenseEndDate", width: 16 },
+      { header: "Inicio licencia", key: "licenseStartDate", width: 16, style: { numFmt: "yyyy-mm-dd" } },
+      { header: "Fin licencia", key: "licenseEndDate", width: 16, style: { numFmt: "yyyy-mm-dd" } },
       { header: "Empresas en plan", key: "companiesInPlan", width: 18 },
       { header: "Factura ref.", key: "invoiceRef", width: 20 },
-      { header: "Fecha creación", key: "createdAt", width: 20 },
+      { header: "Fecha creación", key: "createdAt", width: 20, style: { numFmt: "yyyy-mm-dd hh:mm" } },
     ];
 
     // Header style
@@ -63,6 +63,11 @@ router.get("/users/export", async (req: Request, res: Response) => {
       cell.alignment = { vertical: "middle", horizontal: "center" };
     });
     ws.getRow(1).height = 20;
+
+    const parseDate = (d: string | undefined) => {
+      if (!d || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+      return new Date(d + "T12:00:00");
+    };
 
     for (const u of users) {
       ws.addRow({
@@ -75,11 +80,11 @@ router.get("/users/export", async (req: Request, res: Response) => {
         nits: u.nits.join(", "),
         paymentAmount: u.paymentAmount ?? "",
         paymentMethod: u.paymentMethod ?? "",
-        licenseStartDate: u.licenseStartDate ?? "",
-        licenseEndDate: u.licenseEndDate ?? "",
+        licenseStartDate: parseDate(u.licenseStartDate),
+        licenseEndDate: parseDate(u.licenseEndDate),
         companiesInPlan: u.companiesInPlan ?? "",
         invoiceRef: u.invoiceRef ?? "",
-        createdAt: u.createdAt ? new Date(u.createdAt).toLocaleDateString("es-CO") : "",
+        createdAt: u.createdAt ? new Date(u.createdAt) : null,
       });
     }
 

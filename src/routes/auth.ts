@@ -256,8 +256,21 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
   if (phone) extras.phone = String(phone).trim();
   if (paymentAmount != null) { const v = parseFloat(paymentAmount); if (!isNaN(v)) extras.paymentAmount = v; }
   if (paymentMethod) extras.paymentMethod = String(paymentMethod).trim();
-  if (licenseStartDate) extras.licenseStartDate = String(licenseStartDate).trim();
-  if (licenseEndDate) extras.licenseEndDate = String(licenseEndDate).trim();
+  
+  // Agile license dates: default start to today, default end to +1 year
+  const today = new Date().toISOString().slice(0, 10);
+  const finalStartDate = licenseStartDate ? String(licenseStartDate).trim() : today;
+  extras.licenseStartDate = finalStartDate;
+
+  if (licenseEndDate) {
+    extras.licenseEndDate = String(licenseEndDate).trim();
+  } else {
+    // Default to annual
+    const d = new Date(finalStartDate);
+    d.setFullYear(d.getFullYear() + 1);
+    extras.licenseEndDate = d.toISOString().slice(0, 10);
+  }
+
   if (companiesInPlan != null) { const v = parseInt(companiesInPlan, 10); if (!isNaN(v)) extras.companiesInPlan = v; }
   if (invoiceRef) extras.invoiceRef = String(invoiceRef).trim();
 

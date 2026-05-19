@@ -453,19 +453,22 @@ function extractPartyDetails(party: any): {
  */
 function extractIssueDate(invoice: any): { issueDate: string; issueDateISO: string } {
   try {
-    const issueDate = invoice.IssueDate;
-    if (!issueDate) return { issueDate: "N/A", issueDateISO: "9999-12-31" };
+    const rawDate = getText(invoice.IssueDate);
+    if (!rawDate) return { issueDate: "N/A", issueDateISO: "9999-12-31" };
 
     // Formato ISO: YYYY-MM-DD
-    if (typeof issueDate === "string" && /^\d{4}-\d{2}-\d{2}/.test(issueDate)) {
-      const [year, month, day] = issueDate.split("-");
+    if (/^\d{4}-\d{2}-\d{2}/.test(rawDate)) {
+      const parts = rawDate.split("-");
+      const year = parts[0];
+      const month = parts[1];
+      const day = parts[2].substring(0, 2); // Evitar problemas con timezones o horas pegadas
       return {
         issueDate: `${day}/${month}/${year}`,
         issueDateISO: `${year}-${month}-${day}`
       };
     }
 
-    return { issueDate: String(issueDate), issueDateISO: "9999-12-31" };
+    return { issueDate: rawDate, issueDateISO: "9999-12-31" };
   } catch {
     return { issueDate: "N/A", issueDateISO: "9999-12-31" };
   }
