@@ -11,6 +11,7 @@ import dianExcelRoutes from "./routes/dianExcel.js";
 import dianThirdPartiesRoutes from "./routes/dianThirdParties.js";
 import googleAuthRoutes from "./routes/googleAuth.js";
 import adminRoutes from "./routes/admin.js";
+import portalStatusRoutes from "./routes/portalStatus.js";
 import siigoRoutes from "./routes/siigo.js";
 import causationRoutes from "./routes/causation.js";
 import dianCufeRoutes from "./routes/dianCufeDownload.js";
@@ -59,6 +60,7 @@ app.use(express.json({ limit: "1mb" }));
 // ============================================
 app.use("/auth", authRoutes);
 app.use("/auth/google", googleAuthRoutes);
+app.use("/portal-status", portalStatusRoutes);
 app.use("/admin", adminRoutes);
 app.use("/dian", dianRoutes);
 app.use("/dian-excel", dianExcelRoutes);

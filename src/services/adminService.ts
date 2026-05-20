@@ -71,6 +71,39 @@ interface ListUsersParams {
   tool?: string;
 }
 
+export type PortalStatusMode = "maintenance" | "incident" | "degraded" | "improvement";
+
+export interface PortalToolStatus {
+  toolId: string;
+  enabled: boolean;
+  mode: PortalStatusMode;
+  title?: string;
+  message?: string;
+}
+
+export interface PortalStatusConfig {
+  global: {
+    enabled: boolean;
+    mode: PortalStatusMode;
+    title: string;
+    message: string;
+    disableLogin: boolean;
+    linkLabel?: string;
+    linkUrl?: string;
+  };
+  tools: PortalToolStatus[];
+  updatedAt?: string;
+  updatedBy?: string;
+}
+
+interface PortalStatusRecord {
+  _id: string;
+  global: PortalStatusConfig["global"];
+  tools: PortalToolStatus[];
+  updatedAt: string;
+  updatedBy?: string;
+}
+
 // ============================================
 // Helpers
 // ============================================
@@ -83,6 +116,28 @@ function usersCollection(): Collection<UserRecord> {
 function auditCollection(): Collection<AdminAuditLog> {
   if (!db) throw new Error("MongoDB no conectado");
   return db.collection<AdminAuditLog>("admin_audit_logs");
+}
+
+function portalStatusCollection(): Collection<PortalStatusRecord> {
+  if (!db) throw new Error("MongoDB no conectado");
+  return db.collection<PortalStatusRecord>("portal_status");
+}
+
+function defaultPortalStatus(): PortalStatusConfig {
+  return {
+    global: {
+      enabled: false,
+      mode: "maintenance",
+      title: "Mantenimiento programado",
+      message: "",
+      disableLogin: false,
+      linkLabel: "",
+      linkUrl: "",
+    },
+    tools: [],
+    updatedAt: undefined,
+    updatedBy: "",
+  };
 }
 
 function mapUserToAdmin(record: UserRecord): AdminUser {
@@ -295,4 +350,60 @@ export async function getAuditLogs(params: {
   ]);
 
   return { logs, total };
+}
+
+export async function getPortalStatusConfig(): Promise<PortalStatusConfig> {
+  const record = await portalStatusCollection().findOne({ _id: "portal-status" });
+  if (!record) return defaultPortalStatus();
+
+  return {
+    global: {
+      ...defaultPortalStatus().global,
+      ...(record.global || {}),
+    },
+    tools: Array.isArray(record.tools) ? record.tools : [],
+    updatedAt: record.updatedAt || undefined,
+    updatedBy: record.updatedBy || "",
+  };
+}
+
+export async function updatePortalStatusConfig(
+  config: PortalStatusConfig,
+  actorId: string
+): Promise<PortalStatusConfig> {
+  const nextConfig: PortalStatusConfig = {
+    global: {
+      enabled: !!config.global?.enabled,
+      mode: config.global?.mode || "maintenance",
+      title: (config.global?.title || "").trim(),
+      message: (config.global?.message || "").trim(),
+      disableLogin: !!config.global?.disableLogin,
+      linkLabel: (config.global?.linkLabel || "").trim(),
+      linkUrl: (config.global?.linkUrl || "").trim(),
+    },
+    tools: (config.tools || []).map((tool) => ({
+      toolId: String(tool.toolId || "").trim(),
+      enabled: !!tool.enabled,
+      mode: tool.mode || "maintenance",
+      title: (tool.title || "").trim(),
+      message: (tool.message || "").trim(),
+    })).filter((tool) => tool.toolId),
+    updatedAt: new Date().toISOString(),
+    updatedBy: actorId,
+  };
+
+  await portalStatusCollection().updateOne(
+    { _id: "portal-status" },
+    {
+      $set: {
+        global: nextConfig.global,
+        tools: nextConfig.tools,
+        updatedAt: nextConfig.updatedAt,
+        updatedBy: nextConfig.updatedBy,
+      },
+    },
+    { upsert: true }
+  );
+
+  return nextConfig;
 }

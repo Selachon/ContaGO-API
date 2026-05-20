@@ -10,6 +10,9 @@ import {
   logAdminAction,
   getAuditLogs,
   getAllUsersForExport,
+  getPortalStatusConfig,
+  updatePortalStatusConfig,
+  type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
 import { TOOL_SUCCESSOR, updateUserPassword } from "../services/database.js";
@@ -402,6 +405,48 @@ router.get("/audit", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[Admin] Error obteniendo logs de auditoria:", err);
     res.status(500).json({ ok: false, message: "Error interno al obtener logs" });
+  }
+});
+
+// ============================================
+// GET /admin/portal-status - Configuracion de mantenimiento del portal
+// ============================================
+router.get("/portal-status", async (_req: Request, res: Response) => {
+  try {
+    const status = await getPortalStatusConfig();
+    res.json({ ok: true, status });
+  } catch (err) {
+    console.error("[Admin] Error obteniendo portal status:", err);
+    res.status(500).json({ ok: false, message: "Error obteniendo configuracion del portal" });
+  }
+});
+
+// ============================================
+// PUT /admin/portal-status - Actualizar configuracion del portal
+// ============================================
+router.put("/portal-status", async (req: Request, res: Response) => {
+  try {
+    const actorId = req.user!.userId;
+    const current = await getPortalStatusConfig();
+    const payload = req.body?.status as PortalStatusConfig | undefined;
+
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ ok: false, message: "Payload de configuracion invalido" });
+    }
+
+    const updated = await updatePortalStatusConfig(payload, actorId);
+
+    await logAdminAction({
+      actorId,
+      action: "update_portal_status",
+      before: current as unknown as Record<string, unknown>,
+      after: updated as unknown as Record<string, unknown>,
+    });
+
+    res.json({ ok: true, status: updated, message: "Configuracion del portal actualizada" });
+  } catch (err) {
+    console.error("[Admin] Error actualizando portal status:", err);
+    res.status(500).json({ ok: false, message: "Error actualizando configuracion del portal" });
   }
 });
 
