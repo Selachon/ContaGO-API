@@ -65,6 +65,7 @@ const CURRENCY_HEADERS = new Set([
   "ICL", "IBUA", "% IBUA", "ADV",
   "Total",
   "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle", "Precio unitario (incluye impuestos)",
+  "Bases de IVAS al 19%", "IVAS del 19%", "Bases IVAS 5%", "IVAS 5%", "Bases sin IVA", "IVA 0%",
 ]);
 
 const DATE_HEADERS = new Set(["Fecha"]);
@@ -325,6 +326,88 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
   }
 }
 
+// ── Sheet IVA: Reporte Auxiliar IVA ──────────────────────────────────────────
+
+function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName: string = "", companyNit: string = ""): void {
+  applyCompanyHeader(ws, companyName, companyNit);
+
+  // Disclaimer Row
+  const disclaimerRow = ws.getRow(4);
+  disclaimerRow.height = 30;
+  const disclaimerCell = disclaimerRow.getCell(1);
+  disclaimerCell.value = "AVISO LEGAL: Esta herramienta proporciona un reporte auxiliar basado en los datos extraídos. ContaGO NO liquida impuestos. Es responsabilidad exclusiva del usuario revisar y validar esta información antes de cualquier presentación ante autoridades tributarias.";
+  disclaimerCell.font = { italic: true, size: 10, color: { argb: "FFFF0000" } };
+  disclaimerCell.alignment = { vertical: "middle", wrapText: true };
+  ws.mergeCells(`A4:L4`);
+
+  const headers = [
+    "No.", "Tipo documento", "Número factura", "NIT Emisor", "Razón Social Emisor", "Fecha",
+    "Bases de IVAS al 19%", "IVAS del 19%",
+    "Bases IVAS 5%", "IVAS 5%",
+    "Bases sin IVA", "IVA 0%",
+  ];
+
+  const headerRow = ws.getRow(5);
+  headerRow.values = headers;
+  applyHeaderRow(headerRow);
+  
+  // Custom freeze for this sheet since we added a row
+  ws.views = [{ state: "frozen" as const, xSplit: 0, ySplit: 5, topLeftCell: "A6", activeCell: "A6" }];
+
+  const { currencyCols, percentCols, dateCols } = computeFormatCols(headers);
+
+  let rowNum = 6;
+  for (const inv of invoices) {
+    let base19 = 0;
+    let iva19 = 0;
+    let base5 = 0;
+    let iva5 = 0;
+    let baseSinIVA = 0;
+
+    for (const li of inv.lineItems || []) {
+      const ivaTax = (li.taxes || []).find(t => t.taxName === "IVA");
+      const base = li.totalUnitPrice || 0;
+      
+      if (!ivaTax) {
+        baseSinIVA += base;
+      } else {
+        const pct = ivaTax.percent;
+        if (pct === 19) {
+          base19 += base;
+          iva19 += ivaTax.amount || 0;
+        } else if (pct === 5) {
+          base5 += base;
+          iva5 += ivaTax.amount || 0;
+        } else {
+          // Tanto el IVA 0% como cualquier otro porcentaje diferente a 19 o 5 
+          // se suman a la base sin IVA, ya que no generan IVA a reportar en esas columnas.
+          baseSinIVA += base;
+        }
+      }
+    }
+
+    const rowData: (any)[] = [
+      rowNum - 5,
+      inv.documentType || "",
+      (inv.docNumber || inv.trackId || "").trim(),
+      inv.issuerNit || "",
+      uppercaseBusinessName(inv.issuerName),
+      parseExcelDate(inv.issueDate, inv.issueDateISO),
+      base19,
+      iva19,
+      base5,
+      iva5,
+      baseSinIVA,
+      0, // IVA 0% siempre en ceros según requerimiento
+    ];
+
+    const row = ws.getRow(rowNum);
+    row.values = rowData;
+    applyFormats(row, currencyCols, percentCols, dateCols);
+    rowNum++;
+  }
+}
+
 // ── DV Calculation ───────────────────────────────────────────────────────────
 
 function calcularDV(nit: string): string {
@@ -436,14 +519,17 @@ export async function generateExcelFile(
 
   const ws1 = workbook.addWorksheet("Facturas DIAN");
   const ws2 = workbook.addWorksheet("Detallado");
-  const ws3 = workbook.addWorksheet("Datos de terceros");
+  const ws3 = workbook.addWorksheet("Reporte Auxiliar IVA");
+  const ws4 = workbook.addWorksheet("Datos de terceros");
 
   buildSheet1(ws1, sorted, includeDriveColumn, companyName, companyNit);
   autoFitColumns(ws1);
   buildSheet2(ws2, sorted, companyName, companyNit);
   autoFitColumns(ws2);
-  buildSheet3(ws3, sorted, companyName, companyNit);
+  buildSheetIVA(ws3, sorted, companyName, companyNit);
   autoFitColumns(ws3);
+  buildSheet3(ws4, sorted, companyName, companyNit);
+  autoFitColumns(ws4);
 
   await workbook.xlsx.writeFile(outputPath);
 }

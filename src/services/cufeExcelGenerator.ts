@@ -137,6 +137,50 @@ function buildSheet3Row(inv: Partial<InvoiceData>, rowNum: number): string {
   return `<row r="${rowNum}" spans="1:10">${cells}</row>`;
 }
 
+function buildSheetIVARow(inv: Partial<InvoiceData>, id: number, rowNum: number): string {
+  let base19 = 0;
+  let iva19 = 0;
+  let base5 = 0;
+  let iva5 = 0;
+  let baseSinIVA = 0;
+
+  for (const li of inv.lineItems || []) {
+    const ivaTax = (li.taxes || []).find(t => t.taxName === "IVA");
+    const base = li.totalUnitPrice || 0;
+    
+    if (!ivaTax) {
+      baseSinIVA += base;
+    } else {
+      const pct = ivaTax.percent;
+      if (pct === 19) {
+        base19 += base;
+        iva19 += ivaTax.amount || 0;
+      } else if (pct === 5) {
+        base5 += base;
+        iva5 += ivaTax.amount || 0;
+      } else {
+        baseSinIVA += base;
+      }
+    }
+  }
+
+  const cells = [
+    numCell("A", rowNum, id),
+    strCell("B", rowNum, inv.documentType || ""),
+    strCell("C", rowNum, (inv.docNumber || inv.trackId || "").trim()),
+    strCell("D", rowNum, inv.issuerNit || ""),
+    strCell("E", rowNum, uppercaseBusinessName(inv.issuerName)),
+    strCell("F", rowNum, inv.issueDate ?? ""),
+    numCell("G", rowNum, base19),
+    numCell("H", rowNum, iva19),
+    numCell("I", rowNum, base5),
+    numCell("J", rowNum, iva5),
+    numCell("K", rowNum, baseSinIVA),
+    numCell("L", rowNum, 0),
+  ].join("");
+  return `<row r="${rowNum}" spans="1:12">${cells}</row>`;
+}
+
 // ─── sheet patcher ──────────────────────────────────────────────────────────
 
 /**
@@ -147,16 +191,18 @@ function buildSheet3Row(inv: Partial<InvoiceData>, rowNum: number): string {
 function patchSheetData(
   sheetXml: string,
   dataRows: string[],
-  lastCol: string
+  lastCol: string,
+  headerRowsCount: number = 2
 ): string {
-  // Extraer filas 1 y 2 del sheetData original
-  const row1Match = sheetXml.match(/<row r="1"[^>]*>[\s\S]*?<\/row>/);
-  const row2Match = sheetXml.match(/<row r="2"[^>]*>[\s\S]*?<\/row>/);
-  const row1 = row1Match ? row1Match[0] : "";
-  const row2 = row2Match ? row2Match[0] : "";
+  // Extraer las primeras N filas del sheetData original
+  let headerRows = "";
+  for (let i = 1; i <= headerRowsCount; i++) {
+    const rowMatch = sheetXml.match(new RegExp(`<row r="${i}"[^>]*>[\\s\\S]*?<\\/row>`));
+    if (rowMatch) headerRows += rowMatch[0];
+  }
 
-  const totalRows = 2 + dataRows.length;
-  const newSheetData = `<sheetData>${row1}${row2}${dataRows.join("")}</sheetData>`;
+  const totalRows = headerRowsCount + dataRows.length;
+  const newSheetData = `<sheetData>${headerRows}${dataRows.join("")}</sheetData>`;
 
   let result = sheetXml.replace(/<sheetData>[\s\S]*?<\/sheetData>/, newSheetData);
 
@@ -225,26 +271,41 @@ export async function generateCufeExcel(
   const t2Xml = await zip.file("xl/tables/table2.xml")!.async("string");
   zip.file("xl/tables/table2.xml", patchTableRef(t2Xml, "AA", s2LastRow));
 
-  // ── Sheet 3: Datos de terceros ─────────────────────────────────────────
-  const seenNits = new Set<string>();
+  // ── Sheet 3: Reporte Auxiliar IVA ──────────────────────────────────────
   const s3Rows: string[] = [];
-  let s3Row = 3;
+  invoices.forEach((inv, i) => {
+    s3Rows.push(buildSheetIVARow(inv, i + 1, i + 6));
+  });
+
+  const s3Xml = await zip.file("xl/worksheets/sheet3.xml")!.async("string");
+  const s3LastRow = 5 + s3Rows.length;
+  zip.file(
+    "xl/worksheets/sheet3.xml",
+    patchSheetData(s3Xml, s3Rows, "L", 5)
+  );
+  const t3Xml = await zip.file("xl/tables/table3.xml")!.async("string");
+  zip.file("xl/tables/table3.xml", patchTableRef(t3Xml, "L", s3LastRow));
+
+  // ── Sheet 4: Datos de terceros ─────────────────────────────────────────
+  const seenNits = new Set<string>();
+  const s4Rows: string[] = [];
+  let s4Row = 3;
   for (const inv of invoices) {
     const nit = inv.issuerNit ?? "";
     if (!nit || seenNits.has(nit)) continue;
     seenNits.add(nit);
-    s3Rows.push(buildSheet3Row(inv, s3Row));
-    s3Row++;
+    s4Rows.push(buildSheet3Row(inv, s4Row));
+    s4Row++;
   }
 
-  const s3Xml = await zip.file("xl/worksheets/sheet3.xml")!.async("string");
-  const s3LastRow = 2 + s3Rows.length;
+  const s4Xml = await zip.file("xl/worksheets/sheet4.xml")!.async("string");
+  const s4LastRow = 2 + s4Rows.length;
   zip.file(
-    "xl/worksheets/sheet3.xml",
-    patchSheetData(s3Xml, s3Rows, "J")
+    "xl/worksheets/sheet4.xml",
+    patchSheetData(s4Xml, s4Rows, "J")
   );
-  const t3Xml = await zip.file("xl/tables/table3.xml")!.async("string");
-  zip.file("xl/tables/table3.xml", patchTableRef(t3Xml, "J", s3LastRow));
+  const t4Xml = await zip.file("xl/tables/table4.xml")!.async("string");
+  zip.file("xl/tables/table4.xml", patchTableRef(t4Xml, "J", s4LastRow));
 
   // ── Generar buffer final ───────────────────────────────────────────────
   const outputBuffer = await zip.generateAsync({

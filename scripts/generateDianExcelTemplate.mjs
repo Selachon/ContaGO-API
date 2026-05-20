@@ -167,6 +167,62 @@ async function buildTemplate() {
     unitPriceWithTax: 1190000,
   });
 
+  const ivaSheet = workbook.addWorksheet("Reporte Auxiliar IVA", {
+    views: [{ state: "frozen", ySplit: 2, xSplit: 0 }],
+    properties: {
+      defaultColWidth: 15,
+      defaultRowHeight: 15,
+      tabColor: { argb: "FF92D050" },
+    },
+  });
+
+  ivaSheet.columns = [
+    { header: "No.", key: "id", width: 8 },
+    { header: "Tipo documento", key: "documentType", width: 22 },
+    { header: "Número factura", key: "docNumber", width: 20 },
+    { header: "NIT Emisor", key: "partyNit", width: 14 },
+    { header: "Razón Social Emisor", key: "partyName", width: 40 },
+    { header: "Fecha", key: "issueDate", width: 16 },
+    { header: "Bases de IVAS al 19%", key: "base19", width: 20 },
+    { header: "IVAS del 19%", key: "iva19", width: 20 },
+    { header: "Bases IVAS 5%", key: "base5", width: 20 },
+    { header: "IVAS 5%", key: "iva5", width: 20 },
+    { header: "Bases sin IVA", key: "baseSinIVA", width: 20 },
+    { header: "IVA 0%", key: "base0", width: 20 },
+  ];
+  addBrandRow(ivaSheet, "ContaGO - Reporte Auxiliar IVA");
+  
+  // Disclaimer on Row 4
+  const disclaimerRow = ivaSheet.getRow(4);
+  disclaimerRow.height = 30;
+  const disclaimerCell = disclaimerRow.getCell(1);
+  disclaimerCell.value = "AVISO LEGAL: Esta herramienta proporciona un reporte auxiliar basado en los datos extraídos. ContaGO NO liquida impuestos. Es responsabilidad exclusiva del usuario revisar y validar esta información antes de cualquier presentación ante autoridades tributarias.";
+  disclaimerCell.font = { italic: true, size: 10, color: { argb: "FFFF0000" } };
+  disclaimerCell.alignment = { vertical: "middle", wrapText: true };
+  ivaSheet.mergeCells(4, 1, 4, 12);
+
+  // Headers on Row 5
+  const headerRow5 = ivaSheet.getRow(5);
+  ivaSheet.columns.forEach((column, index) => {
+    headerRow5.getCell(index + 1).value = column.header || "";
+  });
+  styleHeaderRow(headerRow5);
+
+  ivaSheet.addRow({
+    id: 1,
+    documentType: "Factura Electrónica de Venta",
+    docNumber: "FV-1001",
+    partyNit: "900123456",
+    partyName: "Empresa Ejemplo SAS",
+    issueDate: "2026-04-27",
+    base19: 1000000,
+    iva19: 190000,
+    base5: 0,
+    iva5: 0,
+    baseSinIVA: 0,
+    base0: 0,
+  });
+
   const thirdSheet = workbook.addWorksheet("Datos de terceros", {
     views: [{ state: "frozen", ySplit: 2, xSplit: 0 }],
     properties: {
