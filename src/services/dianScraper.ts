@@ -48,6 +48,107 @@ interface ExtractOptions {
 const BROWSER_LAUNCH_TIMEOUT_MS = Number(process.env.PUPPETEER_LAUNCH_TIMEOUT_MS || 120000);
 const BROWSER_LAUNCH_RETRIES = Number(process.env.PUPPETEER_LAUNCH_RETRIES || 3);
 
+// ── Control de concurrencia y limpieza de navegadores ─────────────────────────
+// Cada Chromium genera decenas de procesos. Sin un tope, varios scrapes a la vez
+// agotan los recursos del contenedor y el siguiente lanzamiento falla con
+// "spawn EAGAIN". Además, los procesos que no se cierran bien se acumulan como
+// huérfanos hasta provocar el mismo error de forma intermitente.
+const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 2));
+const BROWSER_CLOSE_TIMEOUT_MS = Number(process.env.PUPPETEER_CLOSE_TIMEOUT_MS || 15000);
+
+type BrowserWithSlot = Browser & { __releaseSlot?: () => void };
+
+let activeBrowsers = 0;
+const browserWaitQueue: Array<() => void> = [];
+
+/** Reserva un cupo de navegador; resuelve con la función que lo libera. */
+function acquireBrowserSlot(): Promise<() => void> {
+  return new Promise((resolve) => {
+    const grant = () => {
+      activeBrowsers++;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        activeBrowsers--;
+        const next = browserWaitQueue.shift();
+        if (next) next();
+      });
+    };
+    if (activeBrowsers < MAX_CONCURRENT_BROWSERS) {
+      grant();
+    } else {
+      browserWaitQueue.push(grant);
+    }
+  });
+}
+
+/** Devuelve todos los PIDs descendientes de `rootPid` leyendo /proc. */
+function collectDescendantPids(rootPid: number): number[] {
+  const procs: Array<{ pid: number; ppid: number }> = [];
+  try {
+    for (const entry of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        // Formato: "pid (comm) state ppid ...". comm puede traer espacios o
+        // paréntesis, así que se corta tras el último ')'.
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+        procs.push({ pid, ppid: Number(fields[1]) });
+      } catch {
+        // El proceso desapareció mientras se leía: se ignora.
+      }
+    }
+  } catch {
+    return [];
+  }
+
+  const descendants: number[] = [];
+  const stack = [rootPid];
+  while (stack.length > 0) {
+    const parent = stack.pop() as number;
+    for (const proc of procs) {
+      if (proc.ppid === parent && !descendants.includes(proc.pid)) {
+        descendants.push(proc.pid);
+        stack.push(proc.pid);
+      }
+    }
+  }
+  return descendants;
+}
+
+/** Mata con SIGKILL un proceso y todos sus hijos (el árbol de Chromium). */
+function killProcessTree(rootPid: number): void {
+  const pids = [...collectDescendantPids(rootPid), rootPid];
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ESRCH: el proceso ya había terminado.
+    }
+  }
+}
+
+/**
+ * Cierra el navegador y garantiza que no queden procesos Chromium huérfanos.
+ * Libera además el cupo de concurrencia. Los huérfanos acumulados son la causa
+ * de los "spawn EAGAIN" intermitentes, así que la limpieza es incondicional.
+ */
+async function closeBrowserSafely(browser: Browser): Promise<void> {
+  const pid = browser.process()?.pid;
+  const closePromise = browser
+    .close()
+    .catch((err) => console.warn(`Error cerrando navegador: ${(err as Error)?.message || String(err)}`));
+  // Si close() se cuelga, no se espera indefinidamente: se fuerza la limpieza.
+  await Promise.race([closePromise, delay(BROWSER_CLOSE_TIMEOUT_MS)]);
+  if (typeof pid === "number") {
+    killProcessTree(pid);
+  }
+  const release = (browser as BrowserWithSlot).__releaseSlot;
+  if (release) release();
+}
+
 /**
  * Extrae ids de documentos DIAN y cookies de sesion para descargas posteriores.
  */
@@ -322,7 +423,7 @@ export async function extractDocumentIds(
     return { documents: allDocuments, cookies: cookieMap, companyName };
   } finally {
     if (browser) {
-      await browser.close();
+      await closeBrowserSafely(browser);
     }
   }
 }
@@ -644,7 +745,7 @@ export async function extractDocumentIdsByCufe(
 
     return { documents: finalDocuments, cookies: baseCookieMap, companyName, companyNit: companyNitFromPage };
   } finally {
-    if (browser) await browser.close();
+    if (browser) await closeBrowserSafely(browser);
   }
 }
 
@@ -714,7 +815,7 @@ export async function runDianExtractionPrecheck(
       return { ok: true, listedCount: 0 };
     }
   } finally {
-    if (browser) await browser.close();
+    if (browser) await closeBrowserSafely(browser);
   }
 }
 
@@ -750,9 +851,16 @@ async function launchBrowserWithRetry(
     process.env.LD_LIBRARY_PATH = parts.join(":");
   }
 
+  // Espera turno si ya hay el máximo de navegadores activos. Esto evita el pico
+  // de recursos que provoca "spawn EAGAIN" al lanzar un Chromium nuevo.
+  if (activeBrowsers >= MAX_CONCURRENT_BROWSERS) {
+    updateProgress({ step: "En cola, esperando un navegador disponible..." });
+  }
+  const releaseSlot = await acquireBrowserSlot();
+
   for (let attempt = 1; attempt <= BROWSER_LAUNCH_RETRIES; attempt++) {
     try {
-      return await puppeteer.launch({
+      const browser = await puppeteer.launch({
         headless: true,
         timeout: BROWSER_LAUNCH_TIMEOUT_MS,
         protocolTimeout: BROWSER_LAUNCH_TIMEOUT_MS,
@@ -768,6 +876,9 @@ async function launchBrowserWithRetry(
         ],
         executablePath: executablePath || undefined,
       });
+      // El cupo se libera al cerrar el navegador (closeBrowserSafely).
+      (browser as BrowserWithSlot).__releaseSlot = releaseSlot;
+      return browser;
     } catch (err) {
       lastError = err as Error;
       const isLastAttempt = attempt >= BROWSER_LAUNCH_RETRIES;
@@ -783,10 +894,15 @@ async function launchBrowserWithRetry(
         step: `Reintentando inicio de navegador (${attempt}/${BROWSER_LAUNCH_RETRIES})...`,
       });
 
-      await delay(1500 * attempt);
+      // EAGAIN/ENOMEM = el SO no pudo crear el proceso por falta de recursos:
+      // se espera más tiempo para dar margen a que se liberen.
+      const isResourceError = /EAGAIN|ENOMEM/i.test(message);
+      await delay((isResourceError ? 8000 : 1500) * attempt);
     }
   }
 
+  // Falló de forma definitiva: se libera el cupo para no bloquear la cola.
+  releaseSlot();
   throw new Error(
     `No fue posible iniciar Chromium tras ${BROWSER_LAUNCH_RETRIES} intentos. Último error: ${lastError?.message || "desconocido"}`
   );
@@ -2174,7 +2290,7 @@ export async function downloadDocumentsByCufe(
 
     return { results, downloaded, failed };
   } finally {
-    if (browser) await browser.close();
+    if (browser) await closeBrowserSafely(browser);
   }
 }
 
