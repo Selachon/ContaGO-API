@@ -1,8 +1,31 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+
 interface SiigoConfig {
   baseUrl: string;
   partnerId: string;
   username: string;
   accessKey: string;
+}
+
+// Contexto de empresa por petición — lo fija el middleware requireSiigoCompany.
+export interface SiigoContext {
+  companyId: string;
+  baseUrl: string;
+  partnerId: string;
+  username: string;
+  accessKey: string;
+}
+
+const siigoAls = new AsyncLocalStorage<SiigoContext>();
+
+/** Ejecuta `fn` con las credenciales de una empresa Siigo en contexto. */
+export function runWithSiigoCompany<T>(ctx: SiigoContext, fn: () => T): T {
+  return siigoAls.run(ctx, fn);
+}
+
+/** Id de la empresa Siigo activa en este contexto (null si se usa el .env). */
+export function getCurrentSiigoCompanyId(): string | null {
+  return siigoAls.getStore()?.companyId ?? null;
 }
 
 interface SiigoTokenCache {
@@ -52,8 +75,9 @@ export class SiigoError extends Error {
   }
 }
 
-let tokenCache: SiigoTokenCache | null = null;
-let authInFlight: Promise<string> | null = null;
+// Token Siigo cacheado por empresa (clave = cacheKey de getSiigoConfig).
+const tokenCache = new Map<string, SiigoTokenCache>();
+const authInFlight = new Map<string, Promise<string>>();
 
 function safeTrim(value: string | undefined): string {
   return typeof value === "string" ? value.trim() : "";
@@ -63,13 +87,23 @@ function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "");
 }
 
-function getSiigoConfig(): SiigoConfig {
+function getSiigoConfig(): SiigoConfig & { cacheKey: string } {
+  const ctx = siigoAls.getStore();
+  if (ctx) {
+    return {
+      baseUrl: normalizeBaseUrl(safeTrim(ctx.baseUrl || "https://api.siigo.com")),
+      partnerId: safeTrim(ctx.partnerId || "SentiidoAI"),
+      username: safeTrim(ctx.username),
+      accessKey: safeTrim(ctx.accessKey),
+      cacheKey: `company:${ctx.companyId}`,
+    };
+  }
+  // Fallback al .env (empresa única original / arranque sin contexto).
   const baseUrl = normalizeBaseUrl(safeTrim(process.env.SIIGO_API_BASE_URL || "https://api.siigo.com"));
   const partnerId = safeTrim(process.env.SIIGO_PARTNER_ID || "SentiidoAI");
   const username = safeTrim(process.env.SIIGO_USERNAME);
   const accessKey = safeTrim(process.env.SIIGO_ACCESS_KEY);
-
-  return { baseUrl, partnerId, username, accessKey };
+  return { baseUrl, partnerId, username, accessKey, cacheKey: "env" };
 }
 
 function getMissingConfig(config: SiigoConfig): string[] {
@@ -102,10 +136,11 @@ function resolveTokenTtlMs(expiresInRaw: unknown): number {
   return parsed;
 }
 
-function isTokenValid(): boolean {
-  if (!tokenCache) return false;
+function isTokenValid(cacheKey: string): boolean {
+  const cached = tokenCache.get(cacheKey);
+  if (!cached) return false;
   const skewMs = 30_000;
-  return Date.now() < tokenCache.expiresAt - skewMs;
+  return Date.now() < cached.expiresAt - skewMs;
 }
 
 function buildUrl(baseUrl: string, path: string, query?: Record<string, unknown>): URL {
@@ -147,7 +182,7 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
   }
 }
 
-async function doAuth(config: SiigoConfig): Promise<string> {
+async function doAuth(config: SiigoConfig, cacheKey: string): Promise<string> {
   const authUrl = buildUrl(config.baseUrl, "/auth");
 
   const response = await fetch(authUrl, {
@@ -179,12 +214,12 @@ async function doAuth(config: SiigoConfig): Promise<string> {
 
   const ttlMs = resolveTokenTtlMs(payload.expires_in);
 
-  tokenCache = {
+  tokenCache.set(cacheKey, {
     token,
     expiresAt: Date.now() + ttlMs,
-  };
+  });
 
-  console.log(`[Siigo] Token renovado (${maskToken(token)})`);
+  console.log(`[Siigo] Token renovado (${maskToken(token)}) [${cacheKey}]`);
   return token;
 }
 
@@ -200,24 +235,28 @@ async function ensureToken(forceRefresh = false): Promise<string> {
     );
   }
 
-  if (!forceRefresh && isTokenValid() && tokenCache) {
-    return tokenCache.token;
+  const key = config.cacheKey;
+
+  if (!forceRefresh && isTokenValid(key)) {
+    return tokenCache.get(key)!.token;
   }
 
   if (forceRefresh) {
-    tokenCache = null;
+    tokenCache.delete(key);
   }
 
-  if (!authInFlight) {
-    authInFlight = doAuth(config).finally(() => {
-      authInFlight = null;
+  let inFlight = authInFlight.get(key);
+  if (!inFlight) {
+    inFlight = doAuth(config, key).finally(() => {
+      authInFlight.delete(key);
     });
+    authInFlight.set(key, inFlight);
   }
 
-  return authInFlight;
+  return inFlight;
 }
 
-async function request(path: string, options: SiigoRequestOptions = {}): Promise<unknown> {
+export async function request(path: string, options: SiigoRequestOptions = {}): Promise<unknown> {
   const {
     method = "GET",
     query,
@@ -268,7 +307,7 @@ async function request(path: string, options: SiigoRequestOptions = {}): Promise
 
   if (response.status === 401 && authRequired && retryOn401) {
     console.warn("[Siigo] 401 recibido. Reintentando con re-autenticación...");
-    tokenCache = null;
+    tokenCache.delete(config.cacheKey);
     await ensureToken(true);
     return request(path, { ...options, retryOn401: false });
   }
@@ -328,24 +367,25 @@ export function getSiigoIntegrationHealth(): {
     source: "siigo",
     configured: missing.length === 0,
     missing,
-    tokenCached: isTokenValid(),
+    tokenCached: isTokenValid(config.cacheKey),
     baseUrl: config.baseUrl,
     partnerId: config.partnerId,
   };
 }
 
 export function resetSiigoTokenCache(): void {
-  tokenCache = null;
-  authInFlight = null;
+  tokenCache.clear();
+  authInFlight.clear();
 }
 
 export async function authenticateWithSiigo(): Promise<{ ok: true; source: "siigo"; authenticated: true; expiresAt: string }> {
   await ensureToken(false);
+  const cached = tokenCache.get(getSiigoConfig().cacheKey);
   return {
     ok: true,
     source: "siigo",
     authenticated: true,
-    expiresAt: new Date(tokenCache!.expiresAt).toISOString(),
+    expiresAt: new Date(cached?.expiresAt ?? Date.now()).toISOString(),
   };
 }
 
@@ -385,6 +425,12 @@ export async function getPaymentReceiptById(id: string): Promise<unknown> {
   return request(`/v1/payment-receipts/${encodeURIComponent(id)}`);
 }
 
+export async function getPaymentReceiptPdf(id: string): Promise<SiigoBinaryResponse | SiigoJsonResponse> {
+  return request(`/v1/payment-receipts/${encodeURIComponent(id)}/pdf`, { responseType: "binary" }) as Promise<
+    SiigoBinaryResponse | SiigoJsonResponse
+  >;
+}
+
 export async function listCustomers(query: Record<string, unknown>): Promise<unknown> {
   return request("/v1/customers", { query });
 }
@@ -408,4 +454,82 @@ export async function listPurchaseDocumentTypes(query: Record<string, unknown> =
       ...query,
     },
   });
+}
+
+export async function listCreditNoteDocumentTypes(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/document-types", {
+    query: {
+      type: "NC",
+      ...query,
+    },
+  });
+}
+
+export async function listPurchaseSupportDocumentTypes(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/document-types", {
+    query: {
+      type: "DS",
+      ...query,
+    },
+  });
+}
+
+export async function listPurchaseSupportDocuments(query: Record<string, unknown>): Promise<unknown> {
+  return request("/v1/purchase-support-documents", { query });
+}
+
+export async function getPurchaseSupportDocumentById(id: string): Promise<unknown> {
+  return request(`/v1/purchase-support-documents/${encodeURIComponent(id)}`);
+}
+
+export async function getPurchaseSupportDocumentPdf(id: string): Promise<SiigoBinaryResponse | SiigoJsonResponse> {
+  return request(`/v1/purchase-support-documents/${encodeURIComponent(id)}/pdf`, { responseType: "binary" }) as Promise<
+    SiigoBinaryResponse | SiigoJsonResponse
+  >;
+}
+
+export async function getPurchasePdf(id: string): Promise<SiigoBinaryResponse | SiigoJsonResponse> {
+  return request(`/v1/purchases/${encodeURIComponent(id)}/pdf`, { responseType: "binary" }) as Promise<
+    SiigoBinaryResponse | SiigoJsonResponse
+  >;
+}
+
+// Write Operations
+export async function createPurchase(body: unknown): Promise<unknown> {
+  return request("/v1/purchases", { method: "POST", body });
+}
+
+export async function createPurchaseSupportDocument(body: unknown): Promise<unknown> {
+  return request("/v1/purchase-support-documents", { method: "POST", body });
+}
+
+export async function createCreditNote(body: unknown): Promise<unknown> {
+  return request("/v1/credit-notes", { method: "POST", body });
+}
+
+// Master Data
+export async function listCostCenters(): Promise<unknown> {
+  return request("/v1/cost-centers");
+}
+
+export async function listPaymentTypes(documentId?: number, documentType: string = "FC"): Promise<unknown> {
+  const query: Record<string, unknown> = { document_type: documentType };
+  if (documentId) query.document_id = documentId;
+  return request("/v1/payment-types", { query });
+}
+
+export async function listTaxes(): Promise<unknown> {
+  return request("/v1/taxes");
+}
+
+export async function listProducts(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/products", { query });
+}
+
+export async function listAccounts(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/accounts", { query });
+}
+
+export async function createCustomer(body: unknown): Promise<unknown> {
+  return request("/v1/customers", { method: "POST", body });
 }

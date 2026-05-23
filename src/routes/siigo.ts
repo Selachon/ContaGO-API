@@ -1,4 +1,5 @@
 import { Router, Request, Response, type NextFunction, type RequestHandler } from "express";
+import multer from "multer";
 import { requireIntegrationAuth } from "../middleware/requireIntegrationAuth.js";
 import {
   authenticateWithSiigo,
@@ -7,17 +8,53 @@ import {
   getInvoicePdf,
   getInvoiceXml,
   getPaymentReceiptById,
+  getPaymentReceiptPdf,
   getProductById,
   getPurchaseById,
+  getPurchasePdf,
+  getPurchaseSupportDocumentById,
+  getPurchaseSupportDocumentPdf,
   getSiigoIntegrationHealth,
   listCustomers,
   listDocumentTypes,
   listInvoices,
   listPaymentReceipts,
   listPurchaseDocumentTypes,
+  listPurchaseSupportDocuments,
   listPurchases,
+  listCostCenters,
+  listPaymentTypes,
+  listTaxes,
+  listProducts,
+  listAccounts,
+  listCreditNoteDocumentTypes,
+  listPurchaseSupportDocumentTypes,
+  runWithSiigoCompany,
   SiigoError,
 } from "../services/siigoService.js";
+import {
+  listCompanies,
+  createCompany,
+  deleteCompany,
+  getCompanyContext,
+} from "../services/siigoCompaniesService.js";
+import { getUserSiigoCompanies, setUserSiigoCompanies } from "../services/database.js";
+import { processBulkPdfExcel } from "../services/bulkPdfDownloadService.js";
+import { processXmlForAccounting, processXmlBatch, submitToSiigo } from "../services/siigoAccountingService.js";
+import {
+  savePaymentMap,
+  rebuildProfilesFromBalance,
+  rebuildProfilesFromSiigoReport,
+  savePlanCuentas,
+  getSupplierProfile,
+  getSuggestionsStatus,
+  getAccountsCatalog,
+} from "../services/siigoSuggestionsService.js";
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+});
 
 type BinaryKind = "pdf" | "xml";
 
@@ -268,10 +305,102 @@ function applyTextFilter(
   });
 }
 
+// Si la petición trae el header X-Siigo-Company, ejecuta el resto con las
+// credenciales de esa empresa en contexto. Sin header → usa el .env (fallback).
+async function withSiigoCompany(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const companyId = req.header("X-Siigo-Company");
+  if (!companyId) return next();
+  try {
+    const ctx = await getCompanyContext(companyId);
+    if (!ctx) {
+      res.status(400).json({
+        ok: false,
+        source: "siigo",
+        code: "siigo_company_not_found",
+        message: "Empresa Siigo no encontrada",
+      });
+      return;
+    }
+    runWithSiigoCompany(ctx, () => next());
+  } catch (error) {
+    next(error);
+  }
+}
+
+// true si el solicitante puede administrar empresas (admin JWT o API key interna)
+function canManageCompanies(req: Request, res: Response): boolean {
+  if (req.integrationAuthMode === "jwt" && !req.user?.isAdmin) {
+    res.status(403).json({ ok: false, code: "forbidden", message: "Solo administradores" });
+    return false;
+  }
+  return true;
+}
+
 export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegrationAuth): Router {
   const router = Router();
 
   router.use((req: Request, res: Response, next: NextFunction) => authMiddleware(req, res, next));
+  router.use(withSiigoCompany);
+
+  // ─── Empresas Siigo (multi-empresa) ──────────────────────────────────
+  router.get("/companies", async (req: Request, res: Response) => {
+    try {
+      let companies = await listCompanies();
+      // Usuario no-admin: solo las empresas de su plan
+      if (req.integrationAuthMode === "jwt" && !req.user?.isAdmin && req.user?.userId) {
+        const allowed = new Set(await getUserSiigoCompanies(req.user.userId));
+        companies = companies.filter((c) => allowed.has(c.id));
+      }
+      return res.json({ ok: true, data: companies });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.post("/companies", async (req: Request, res: Response) => {
+    try {
+      if (!canManageCompanies(req, res)) return;
+      const { name, username, accessKey } = req.body || {};
+      const company = await createCompany(name, username, accessKey);
+      return res.json({ ok: true, data: company });
+    } catch (error) {
+      return res.status(400).json({
+        ok: false,
+        message: error instanceof Error ? error.message : "Error creando la empresa",
+      });
+    }
+  });
+
+  router.delete("/companies/:id", async (req: Request, res: Response) => {
+    try {
+      if (!canManageCompanies(req, res)) return;
+      const deleted = await deleteCompany(req.params.id);
+      return res.json({ ok: true, data: { deleted } });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Empresas asignadas a un usuario (panel admin)
+  router.get("/companies/user/:userId", async (req: Request, res: Response) => {
+    try {
+      if (!canManageCompanies(req, res)) return;
+      return res.json({ ok: true, data: await getUserSiigoCompanies(req.params.userId) });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.put("/companies/user/:userId", async (req: Request, res: Response) => {
+    try {
+      if (!canManageCompanies(req, res)) return;
+      const ids = Array.isArray(req.body?.companyIds) ? req.body.companyIds : [];
+      const ok = await setUserSiigoCompanies(req.params.userId, ids);
+      return res.json({ ok, data: { userId: req.params.userId, companyIds: ids } });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
 
   router.get("/health", (_req: Request, res: Response) => {
     const health = getSiigoIntegrationHealth();
@@ -437,6 +566,62 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   }
   });
 
+  router.get("/purchases/:id/pdf", async (req: Request, res: Response) => {
+    try {
+      const id = validateId(req.params.id);
+      if (!id) {
+        return res.status(400).json({ ok: false, source: "siigo", code: "invalid_id", message: "ID de compra inválido" });
+      }
+
+      const data = await getPurchasePdf(id);
+      return handleBinaryOrJsonResponse(res, id, "pdf", data);
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/purchase-support-documents", async (req: Request, res: Response) => {
+    try {
+      const query = getAllowedQuery(req, ["page", "page_size"]);
+      const data = await listPurchaseSupportDocuments(query);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/purchase-support-documents/:id", async (req: Request, res: Response) => {
+    try {
+      const id = validateId(req.params.id);
+      if (!id) {
+        return res
+          .status(400)
+          .json({ ok: false, source: "siigo", code: "invalid_id", message: "ID de documento soporte inválido" });
+      }
+
+      const data = await getPurchaseSupportDocumentById(id);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/purchase-support-documents/:id/pdf", async (req: Request, res: Response) => {
+    try {
+      const id = validateId(req.params.id);
+      if (!id) {
+        return res
+          .status(400)
+          .json({ ok: false, source: "siigo", code: "invalid_id", message: "ID de documento soporte inválido" });
+      }
+
+      const data = await getPurchaseSupportDocumentPdf(id);
+      return handleBinaryOrJsonResponse(res, id, "pdf", data);
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
   router.get("/payment-receipts", async (req: Request, res: Response) => {
     try {
       const query = getAllowedQuery(req, ["created_start", "created_end", "updated_start", "updated_end", "page", "page_size"]);
@@ -508,6 +693,22 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
       const data = await getPaymentReceiptById(id);
       return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/payment-receipts/:id/pdf", async (req: Request, res: Response) => {
+    try {
+      const id = validateId(req.params.id);
+      if (!id) {
+        return res
+          .status(400)
+          .json({ ok: false, source: "siigo", code: "invalid_id", message: "ID de recibo de pago inválido" });
+      }
+
+      const data = await getPaymentReceiptPdf(id);
+      return handleBinaryOrJsonResponse(res, id, "pdf", data);
     } catch (error) {
       return handleSiigoError(res, error);
     }
@@ -624,6 +825,220 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       });
     } catch (error) {
       return handleSiigoError(res, error);
+    }
+  });
+
+  // Master Data Routes
+  router.get("/cost-centers", async (_req: Request, res: Response) => {
+    try {
+      const data = await listCostCenters();
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/payment-types", async (req: Request, res: Response) => {
+    try {
+      const docId = req.query.document_id ? Number(req.query.document_id) : undefined;
+      const docType = req.query.document_type ? String(req.query.document_type) : "FC";
+      const data = await listPaymentTypes(docId, docType);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/taxes", async (_req: Request, res: Response) => {
+    try {
+      const data = await listTaxes();
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/products", async (req: Request, res: Response) => {
+    try {
+      const query = getAllowedQuery(req, ["code", "name", "page", "page_size"]);
+      const data = await listProducts(query);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/accounts", async (req: Request, res: Response) => {
+    try {
+      const query = getAllowedQuery(req, ["code", "name", "page", "page_size"]);
+      const data = await listAccounts(query);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/credit-note-document-types", async (_req: Request, res: Response) => {
+    try {
+      const data = await listCreditNoteDocumentTypes();
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/purchase-support-document-types", async (_req: Request, res: Response) => {
+    try {
+      const data = await listPurchaseSupportDocumentTypes();
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Accounting Wizard Routes
+  router.post("/accounting/process-xml", upload.single("xml"), async (req: Request, res: Response) => {
+    try {
+      if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir un archivo XML" });
+      const draft = await processXmlForAccounting(req.file.buffer);
+      return res.json({ ok: true, data: draft });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el XML" });
+    }
+  });
+
+  router.post("/accounting/process-batch", upload.array("files", 200), async (req: Request, res: Response) => {
+    try {
+      const files = (req.files as Express.Multer.File[]) || [];
+      if (!files.length) return res.status(400).json({ ok: false, message: "Debe subir XML o un ZIP" });
+      const items = await processXmlBatch(files.map((f) => ({ name: f.originalname, buffer: f.buffer })));
+      return res.json({ ok: true, data: items });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el lote" });
+    }
+  });
+
+  router.post("/accounting/submit", async (req: Request, res: Response) => {
+    try {
+      const { type, payload } = req.body;
+      if (!type || !payload) return res.status(400).json({ ok: false, message: "type and payload are required" });
+
+      console.log(`[SiigoAccounting] Submission request received. Type: ${type}, Supplier: ${payload.supplier?.identification}, Total: ${payload.payments?.[0]?.value}`);
+      const result = await submitToSiigo(type, payload);
+      console.log(`[SiigoAccounting] Submission SUCCESS for ${payload.supplier?.identification}`);
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
+      console.error(
+        `[SiigoAccounting] Submission FAILED:`,
+        error instanceof Error ? error.message : error,
+        "| Siigo details:",
+        detalle
+      );
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.post("/bulk-pdf-download", upload.single("excel"), async (req: Request, res: Response) => {
+    try {
+      // Security check: Only admins can use this masive tool via JWT
+      if (req.integrationAuthMode === "jwt" && !req.user?.isAdmin) {
+        return res.status(403).json({
+          ok: false,
+          code: "forbidden",
+          message: "Esta herramienta masiva solo está disponible para administradores",
+        });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ ok: false, code: "missing_file", message: "Debe subir un archivo Excel" });
+      }
+
+      console.log(`[Siigo] Starting bulk process for user ${req.user?.email || "internal"}`);
+      const result = await processBulkPdfExcel(req.file.buffer);
+
+      console.log(`[Siigo] Bulk process completed. Sending Excel (${result.excelBuffer.length} bytes)`);
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="reporte-siigo-${Date.now()}.xlsx"`);
+      return res.send(result.excelBuffer);
+    } catch (error) {      console.error("[Siigo] Error en cruce masivo:", error);
+      return res.status(500).json({
+        ok: false,
+        code: "bulk_cross_failed",
+        message: error instanceof Error ? error.message : "Error procesando cruce masivo",
+      });
+    }
+  });
+
+  // Motor de sugerencias por proveedor (balance de prueba + traductor de pagos)
+  router.post("/suggestions/upload-payment-map", upload.single("file"), async (req: Request, res: Response) => {
+    try {
+      if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir el Excel de formas de pago" });
+      const result = await savePaymentMap(req.file.buffer);
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el Excel" });
+    }
+  });
+
+  router.post("/suggestions/upload-balance", upload.single("file"), async (req: Request, res: Response) => {
+    try {
+      if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir el balance de prueba" });
+      const result = await rebuildProfilesFromBalance(req.file.buffer);
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el balance" });
+    }
+  });
+
+  router.get("/suggestions/status", async (_req: Request, res: Response) => {
+    try {
+      return res.json({ ok: true, data: await getSuggestionsStatus() });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.post("/suggestions/fetch-balance", async (req: Request, res: Response) => {
+    try {
+      const now = new Date();
+      const year = Number(req.body?.year) || now.getFullYear();
+      const monthStart = Number(req.body?.month_start) || 1;
+      const monthEnd = Number(req.body?.month_end) || 13;
+      const result = await rebuildProfilesFromSiigoReport(year, monthStart, monthEnd);
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      return res.status(400).json({
+        ok: false,
+        message: error instanceof Error ? error.message : "Error trayendo el balance desde Siigo",
+      });
+    }
+  });
+
+  router.post("/suggestions/upload-plan-cuentas", upload.single("file"), async (req: Request, res: Response) => {
+    try {
+      if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir el plan de cuentas" });
+      const result = await savePlanCuentas(req.file.buffer);
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el plan de cuentas" });
+    }
+  });
+
+  router.get("/suggestions/accounts", async (_req: Request, res: Response) => {
+    try {
+      return res.json({ ok: true, data: await getAccountsCatalog() });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.get("/suggestions/:nit", async (req: Request, res: Response) => {
+    try {
+      const profile = await getSupplierProfile(req.params.nit);
+      return res.json({ ok: true, data: profile });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
     }
   });
 

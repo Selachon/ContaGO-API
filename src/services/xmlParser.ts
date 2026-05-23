@@ -64,11 +64,39 @@ export async function extractInvoiceDataFromXml(
       trimValues: true,
     });
 
-    const parsed = parser.parse(xmlString);
+    let parsed = parser.parse(xmlString);
+
+    // UNWRAP AttachedDocument if necessary
+    if (parsed.AttachedDocument) {
+      console.log("[XMLParser] unwrapping AttachedDocument...");
+      const attachment = parsed.AttachedDocument.Attachment;
+      const externalRef = attachment?.ExternalReference;
+      const description = externalRef?.Description; // Sometimes the XML is here as text
+
+      if (description) {
+        try {
+          parsed = parser.parse(description);
+        } catch (e) {
+          console.warn("[XMLParser] Could not parse AttachedDocument description as XML");
+        }
+      } else if (attachment?.EmbeddedDocumentBinaryObject) {
+        // XML might be base64 inside EmbeddedDocumentBinaryObject
+        const base64 = attachment.EmbeddedDocumentBinaryObject["#text"] || attachment.EmbeddedDocumentBinaryObject;
+        if (typeof base64 === "string" && base64.length > 100) {
+          try {
+            const decoded = Buffer.from(base64, "base64").toString("utf-8");
+            parsed = parser.parse(decoded);
+          } catch (e) {
+            console.warn("[XMLParser] Could not parse EmbeddedDocumentBinaryObject as XML");
+          }
+        }
+      }
+    }
 
     // El documento puede ser Invoice (factura), CreditNote o DebitNote
     const invoice = parsed.Invoice || parsed.CreditNote || parsed.DebitNote;
     if (!invoice) {
+      console.warn("[XMLParser] Document is not Invoice, CreditNote or DebitNote after unwrapping. Keys:", Object.keys(parsed));
       return buildSkipResult(docInfo, detectDocType(parsed));
     }
 

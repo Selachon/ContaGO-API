@@ -11,6 +11,7 @@
     "typecheck": "tsc --noEmit",
     "test:causation": "tsx --test src/services/causationService.test.ts src/routes/causation.test.ts",
     "test:siigo": "tsx --test src/routes/siigo.test.ts",
+    "test:causacion-interfaces": "tsx --test scripts/test-causacion-interfaces.ts",
     "test:dian": "tsx scripts/test-dian.ts",
     "migrate:sqlite-mongo": "tsx scripts/migrateSqliteToMongo.ts",
     "template:dian-excel": "node scripts/generateDianExcelTemplate.mjs",

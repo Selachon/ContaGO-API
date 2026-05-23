@@ -341,6 +341,94 @@ describe("Siigo integration routes", () => {
     assert.equal(response.body.data.applied_filters.query, "soporte");
   });
 
+  it("GET /purchases/:id/pdf returns PDF from base64 JSON", async () => {
+    global.fetch = async (url) => {
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+      return jsonResponse(200, { base64: Buffer.from("fake-pdf-content").toString("base64") });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get("/integrations/siigo/purchases/some-guid/pdf");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.header["content-type"], "application/pdf");
+    assert.equal(response.body.toString(), "fake-pdf-content");
+  });
+
+  it("GET /purchase-support-documents forwards pagination and returns list", async () => {
+    const fetchCalls: string[] = [];
+    global.fetch = async (url) => {
+      fetchCalls.push(String(url));
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+      return jsonResponse(200, { results: [{ id: "ds-1" }], pagination: { page: 1 } });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get("/integrations/siigo/purchase-support-documents?page=2&page_size=10");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.ok(fetchCalls[1].includes("/v1/purchase-support-documents"));
+    assert.ok(fetchCalls[1].includes("page=2"));
+    assert.ok(fetchCalls[1].includes("page_size=10"));
+    assert.equal(response.body.data.results[0].id, "ds-1");
+  });
+
+  it("GET /purchase-support-documents/:id returns document detail", async () => {
+    global.fetch = async (url) => {
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+      return jsonResponse(200, { id: "ds-guid", number: 123 });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get("/integrations/siigo/purchase-support-documents/ds-guid");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.data.id, "ds-guid");
+  });
+
+  it("GET /purchase-support-documents/:id/pdf returns binary PDF if Siigo responds with binary", async () => {
+    global.fetch = async (url) => {
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+      return new Response(Buffer.from("binary-pdf"), {
+        status: 200,
+        headers: { "content-type": "application/pdf" },
+      });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get("/integrations/siigo/purchase-support-documents/ds-guid/pdf");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.header["content-type"], "application/pdf");
+    assert.equal(response.body.toString(), "binary-pdf");
+  });
+
+  it("GET /payment-receipts/:id/pdf returns PDF from base64 JSON", async () => {
+    global.fetch = async (url) => {
+      if (String(url).endsWith("/auth")) {
+        return jsonResponse(200, { access_token: "siigo-token", expires_in: 3600 });
+      }
+      return jsonResponse(200, { base64: Buffer.from("pr-pdf-content").toString("base64") });
+    };
+
+    const app = buildApp();
+    const response = await request(app).get("/integrations/siigo/payment-receipts/pr-guid/pdf");
+
+    assert.equal(response.status, 200);
+    assert.equal(response.header["content-type"], "application/pdf");
+    assert.equal(response.body.toString(), "pr-pdf-content");
+  });
+
   it("retries once after 401 and then succeeds", async () => {
     let call = 0;
     global.fetch = async (url) => {

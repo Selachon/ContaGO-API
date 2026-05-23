@@ -25,6 +25,7 @@ interface UserRecord {
   licenseEndDate?: string;
   companiesInPlan?: number;
   invoiceRef?: string;
+  siigoCompanies?: string[];
 }
 
 
@@ -36,6 +37,13 @@ function usersCollection(): Collection<UserRecord> {
     throw new Error("MongoDB no está conectado");
   }
   return db.collection<UserRecord>("users");
+}
+
+export function getDb(): Db {
+  if (!db) {
+    throw new Error("MongoDB no está conectado");
+  }
+  return db;
 }
 
 export async function connectMongo(): Promise<void> {
@@ -84,6 +92,7 @@ export interface UserExtras {
   licenseEndDate?: string;
   companiesInPlan?: number;
   invoiceRef?: string;
+  siigoCompanies?: string[];
 }
 
 export async function createUser(
@@ -231,6 +240,31 @@ export async function getUserNits(userId: string): Promise<string[]> {
     return record?.nits || [];
   } catch {
     return [];
+  }
+}
+
+// ============================================
+// Empresas Siigo asignadas a un usuario
+// ============================================
+
+export async function getUserSiigoCompanies(userId: string): Promise<string[]> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne({ _id: oid }, { projection: { siigoCompanies: 1 } });
+    return record?.siigoCompanies || [];
+  } catch {
+    return [];
+  }
+}
+
+export async function setUserSiigoCompanies(userId: string, companyIds: string[]): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const clean = Array.from(new Set(companyIds.filter((c) => typeof c === "string" && c.trim())));
+    const result = await usersCollection().updateOne({ _id: oid }, { $set: { siigoCompanies: clean } });
+    return result.matchedCount > 0;
+  } catch {
+    return false;
   }
 }
 

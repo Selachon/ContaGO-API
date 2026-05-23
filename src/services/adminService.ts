@@ -104,6 +104,58 @@ interface PortalStatusRecord {
   updatedBy?: string;
 }
 
+export type AdminKanbanPriority = "low" | "medium" | "high" | "urgent";
+
+export interface AdminKanbanStatus {
+  id: string;
+  name: string;
+  color: string;
+  order: number;
+}
+
+export interface AdminKanbanChecklistItem {
+  id: string;
+  label: string;
+  done: boolean;
+}
+
+export interface AdminKanbanTask {
+  id: string;
+  title: string;
+  description: string;
+  statusId: string;
+  assigneeIds: string[];
+  priority: AdminKanbanPriority;
+  category: string;
+  dueDate: string;
+  tags: string[];
+  checklist: AdminKanbanChecklistItem[];
+  links: string[];
+  order: number;
+  createdAt: string;
+  createdBy: string;
+  updatedAt: string;
+  updatedBy: string;
+  completedAt?: string;
+}
+
+export interface AdminKanbanBoard {
+  statuses: AdminKanbanStatus[];
+  tasks: AdminKanbanTask[];
+  updatedAt?: string;
+  updatedBy?: string;
+}
+
+interface AdminKanbanRecord extends AdminKanbanBoard {
+  _id: string;
+}
+
+export interface KanbanAdminUser {
+  id: string;
+  email: string;
+  name: string;
+}
+
 // ============================================
 // Helpers
 // ============================================
@@ -123,6 +175,16 @@ function portalStatusCollection(): Collection<PortalStatusRecord> {
   return db.collection<PortalStatusRecord>("portal_status");
 }
 
+function adminKanbanCollection(): Collection<AdminKanbanRecord> {
+  if (!db) throw new Error("MongoDB no conectado");
+  return db.collection<AdminKanbanRecord>("admin_kanban");
+}
+
+function personalKanbanCollection(): Collection<AdminKanbanRecord> {
+  if (!db) throw new Error("MongoDB no conectado");
+  return db.collection<AdminKanbanRecord>("personal_kanban");
+}
+
 function defaultPortalStatus(): PortalStatusConfig {
   return {
     global: {
@@ -137,6 +199,126 @@ function defaultPortalStatus(): PortalStatusConfig {
     tools: [],
     updatedAt: undefined,
     updatedBy: "",
+  };
+}
+
+
+function defaultAdminKanbanBoard(): AdminKanbanBoard {
+  return {
+    statuses: [
+      { id: "backlog", name: "Pendiente", color: "#7C2DD3", order: 0 },
+      { id: "in-progress", name: "En progreso", color: "#2563EB", order: 1 },
+      { id: "review", name: "En revision", color: "#C9A961", order: 2 },
+      { id: "done", name: "Hecho", color: "#16A34A", order: 3 },
+    ],
+    tasks: [],
+    updatedAt: undefined,
+    updatedBy: "",
+  };
+}
+
+function safeString(value: unknown, fallback = "", max = 500): string {
+  if (typeof value !== "string") return fallback;
+  return value.trim().slice(0, max);
+}
+
+function safeStringArray(value: unknown, maxItems = 20, maxLength = 80): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(
+    value
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim().slice(0, maxLength))
+      .filter(Boolean)
+  )].slice(0, maxItems);
+}
+
+function normalizeColor(value: unknown, fallback: string): string {
+  const color = safeString(value, fallback, 16);
+  return /^#[0-9a-f]{6}$/i.test(color) ? color.toUpperCase() : fallback;
+}
+
+function ensureId(value: unknown): string {
+  const id = safeString(value, "", 80).replace(/[^a-zA-Z0-9_-]/g, "");
+  return id || new ObjectId().toString();
+}
+
+function normalizePriority(value: unknown): AdminKanbanPriority {
+  return value === "low" || value === "medium" || value === "high" || value === "urgent"
+    ? value
+    : "medium";
+}
+
+function normalizeAdminKanbanBoard(input: Partial<AdminKanbanBoard>, actorId: string): AdminKanbanBoard {
+  const now = new Date().toISOString();
+  const fallback = defaultAdminKanbanBoard();
+  const rawStatuses = Array.isArray(input.statuses) && input.statuses.length > 0
+    ? input.statuses
+    : fallback.statuses;
+
+  const statusMap = new Map<string, AdminKanbanStatus>();
+  rawStatuses.slice(0, 12).forEach((status, index) => {
+    const fallbackStatus = fallback.statuses[index % fallback.statuses.length];
+    const id = ensureId(status?.id);
+    if (statusMap.has(id)) return;
+    statusMap.set(id, {
+      id,
+      name: safeString(status?.name, fallbackStatus.name, 42) || fallbackStatus.name,
+      color: normalizeColor(status?.color, fallbackStatus.color),
+      order: Number.isFinite(Number(status?.order)) ? Number(status?.order) : index,
+    });
+  });
+
+  const statuses = [...statusMap.values()].sort((a, b) => a.order - b.order).map((status, index) => ({
+    ...status,
+    order: index,
+  }));
+  const validStatusIds = new Set(statuses.map((status) => status.id));
+  const firstStatusId = statuses[0]?.id || "backlog";
+
+  const taskMap = new Map<string, AdminKanbanTask>();
+  const rawTasks = Array.isArray(input.tasks) ? input.tasks : [];
+  rawTasks.slice(0, 500).forEach((task, index) => {
+    const id = ensureId(task?.id);
+    if (taskMap.has(id)) return;
+    const statusId = validStatusIds.has(safeString(task?.statusId)) ? safeString(task?.statusId) : firstStatusId;
+    const checklist = Array.isArray(task?.checklist)
+      ? task.checklist.slice(0, 40).map((item, itemIndex) => ({
+        id: ensureId(item?.id || id + "-check-" + itemIndex),
+        label: safeString(item?.label, "", 160),
+        done: !!item?.done,
+      })).filter((item) => item.label)
+      : [];
+
+    taskMap.set(id, {
+      id,
+      title: safeString(task?.title, "Tarea sin titulo", 140) || "Tarea sin titulo",
+      description: safeString(task?.description, "", 2000),
+      statusId,
+      assigneeIds: safeStringArray(task?.assigneeIds, 12, 80),
+      priority: normalizePriority(task?.priority),
+      category: safeString(task?.category, "Web", 60) || "Web",
+      dueDate: /^\d{4}-\d{2}-\d{2}$/.test(safeString(task?.dueDate)) ? safeString(task?.dueDate) : "",
+      tags: safeStringArray(task?.tags, 12, 32),
+      checklist,
+      links: safeStringArray(task?.links, 10, 220),
+      order: Number.isFinite(Number(task?.order)) ? Number(task?.order) : index,
+      createdAt: safeString(task?.createdAt) || now,
+      createdBy: safeString(task?.createdBy, actorId, 80),
+      updatedAt: now,
+      updatedBy: actorId,
+      ...(statusId === "done" ? { completedAt: safeString(task?.completedAt) || now } : {}),
+    });
+  });
+
+  const tasks = [...taskMap.values()]
+    .sort((a, b) => a.statusId.localeCompare(b.statusId) || a.order - b.order)
+    .map((task, index) => ({ ...task, order: index }));
+
+  return {
+    statuses,
+    tasks,
+    updatedAt: now,
+    updatedBy: actorId,
   };
 }
 
@@ -406,4 +588,128 @@ export async function updatePortalStatusConfig(
   );
 
   return nextConfig;
+}
+
+export async function listAdminUsersForKanban(): Promise<KanbanAdminUser[]> {
+  const records = await usersCollection()
+    .find(
+      {
+        is_admin: true,
+        $or: [{ status: "active" }, { status: { $exists: false } }],
+      },
+      { projection: { password_hash: 0, google_drive: 0, google_drives: 0 } }
+    )
+    .sort({ name: 1 })
+    .toArray();
+
+  return records.map((record) => ({
+    id: record._id.toString(),
+    email: record.email,
+    name: record.name,
+  }));
+}
+
+export async function getAdminKanbanBoard(): Promise<AdminKanbanBoard> {
+  const record = await adminKanbanCollection().findOne({ _id: "admin-kanban" });
+  if (!record) return defaultAdminKanbanBoard();
+
+  return {
+    statuses: Array.isArray(record.statuses) ? record.statuses : defaultAdminKanbanBoard().statuses,
+    tasks: Array.isArray(record.tasks) ? record.tasks : [],
+    updatedAt: record.updatedAt,
+    updatedBy: record.updatedBy,
+  };
+}
+
+export async function updateAdminKanbanBoard(
+  board: Partial<AdminKanbanBoard>,
+  actorId: string
+): Promise<AdminKanbanBoard> {
+  const nextBoard = normalizeAdminKanbanBoard(board, actorId);
+
+  await adminKanbanCollection().updateOne(
+    { _id: "admin-kanban" },
+    {
+      $set: {
+        statuses: nextBoard.statuses,
+        tasks: nextBoard.tasks,
+        updatedAt: nextBoard.updatedAt,
+        updatedBy: nextBoard.updatedBy,
+      },
+    },
+    { upsert: true }
+  );
+
+  return nextBoard;
+}
+
+export async function getAccountingKanbanBoard(): Promise<AdminKanbanBoard> {
+  const record = await adminKanbanCollection().findOne({ _id: "accounting-kanban" });
+  if (!record) return defaultAdminKanbanBoard();
+
+  return {
+    statuses: Array.isArray(record.statuses) ? record.statuses : defaultAdminKanbanBoard().statuses,
+    tasks: Array.isArray(record.tasks) ? record.tasks : [],
+    updatedAt: record.updatedAt,
+    updatedBy: record.updatedBy,
+  };
+}
+
+export async function updateAccountingKanbanBoard(
+  board: Partial<AdminKanbanBoard>,
+  actorId: string
+): Promise<AdminKanbanBoard> {
+  const nextBoard = normalizeAdminKanbanBoard(board, actorId);
+
+  await adminKanbanCollection().updateOne(
+    { _id: "accounting-kanban" },
+    {
+      $set: {
+        statuses: nextBoard.statuses,
+        tasks: nextBoard.tasks,
+        updatedAt: nextBoard.updatedAt,
+        updatedBy: nextBoard.updatedBy,
+      },
+    },
+    { upsert: true }
+  );
+
+  return nextBoard;
+}
+
+export async function getPersonalKanbanBoard(userId: string): Promise<AdminKanbanBoard> {
+  const record = await personalKanbanCollection().findOne({ _id: userId });
+  if (!record) return defaultAdminKanbanBoard();
+
+  return {
+    statuses: Array.isArray(record.statuses) ? record.statuses : defaultAdminKanbanBoard().statuses,
+    tasks: Array.isArray(record.tasks) ? record.tasks : [],
+    updatedAt: record.updatedAt,
+    updatedBy: record.updatedBy,
+  };
+}
+
+export async function updatePersonalKanbanBoard(
+  userId: string,
+  board: Partial<AdminKanbanBoard>
+): Promise<AdminKanbanBoard> {
+  const nextBoard = normalizeAdminKanbanBoard(board, userId);
+
+  await personalKanbanCollection().updateOne(
+    { _id: userId },
+    {
+      $set: {
+        statuses: nextBoard.statuses,
+        tasks: nextBoard.tasks,
+        updatedAt: nextBoard.updatedAt,
+        updatedBy: userId,
+      },
+    },
+    { upsert: true }
+  );
+
+  return {
+    ...nextBoard,
+    updatedBy: userId,
+  };
 }

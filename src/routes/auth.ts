@@ -9,7 +9,12 @@ import {
   updateUserPassword,
   verifyPassword,
 } from "../services/database.js";
-import { logAdminAction } from "../services/adminService.js";
+import {
+  getPersonalKanbanBoard,
+  logAdminAction,
+  updatePersonalKanbanBoard,
+  type AdminKanbanBoard,
+} from "../services/adminService.js";
 import {
   AUTH_COOKIE_NAME,
   getAuthCookieClearOptions,
@@ -377,6 +382,46 @@ router.get("/me", async (req: Request, res: Response) => {
     });
   } catch {
     return res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });
+  }
+});
+
+// ============================================
+// GET /auth/kanban (tablero personal del usuario)
+// ============================================
+router.get("/kanban", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = await getUserByIdStrict(req.user!.userId);
+    if (!user) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    const board = await getPersonalKanbanBoard(user.id);
+    return res.json({
+      ok: true,
+      board,
+      admins: [{ id: user.id, email: user.email, name: user.name }],
+    });
+  } catch (err) {
+    console.error("[Auth] Error obteniendo kanban personal:", err);
+    return res.status(500).json({ ok: false, message: "Error obteniendo Kanban personal" });
+  }
+});
+
+// ============================================
+// PUT /auth/kanban (guardar tablero personal del usuario)
+// ============================================
+router.put("/kanban", requireAuth, async (req: Request, res: Response) => {
+  try {
+    const payload = req.body?.board as Partial<AdminKanbanBoard> | undefined;
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ ok: false, message: "Payload de tablero invalido" });
+    }
+
+    const board = await updatePersonalKanbanBoard(req.user!.userId, payload);
+    return res.json({ ok: true, board, message: "Kanban personal actualizado" });
+  } catch (err) {
+    console.error("[Auth] Error actualizando kanban personal:", err);
+    return res.status(500).json({ ok: false, message: "Error guardando Kanban personal" });
   }
 });
 

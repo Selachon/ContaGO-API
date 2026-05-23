@@ -17,6 +17,7 @@ import causationRoutes from "./routes/causation.js";
 import dianCufeRoutes from "./routes/dianCufeDownload.js";
 import dianMassDownloadRoutes from "./routes/dianMassDownload.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
+import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
 
 // ============================================
 // Validar variables de entorno obligatorias
@@ -104,6 +105,7 @@ ensurePuppeteer()
   .then(connectMongo)
   .then(seedAdminUser)
   .then(migrateToolSlugs)
+  .then(seedSiigoCompanyFromEnv)
   .then(() => {
     app.listen(PORT, () => {
       console.log(`ContaGO API running on port ${PORT}`);

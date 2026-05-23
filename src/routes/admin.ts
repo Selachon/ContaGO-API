@@ -12,6 +12,12 @@ import {
   getAllUsersForExport,
   getPortalStatusConfig,
   updatePortalStatusConfig,
+  getAccountingKanbanBoard,
+  getAdminKanbanBoard,
+  listAdminUsersForKanban,
+  updateAccountingKanbanBoard,
+  updateAdminKanbanBoard,
+  type AdminKanbanBoard,
   type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -450,4 +456,104 @@ router.put("/portal-status", async (req: Request, res: Response) => {
   }
 });
 
+function summarizeKanban(board: AdminKanbanBoard): Record<string, unknown> {
+  return {
+    statuses: board.statuses?.length || 0,
+    tasks: board.tasks?.length || 0,
+    done: (board.tasks || []).filter((task) => task.statusId === "done").length,
+  };
+}
+
+// ============================================
+// GET /admin/kanban - Tablero administrativo
+// ============================================
+router.get("/kanban", async (_req: Request, res: Response) => {
+  try {
+    const [board, admins] = await Promise.all([
+      getAdminKanbanBoard(),
+      listAdminUsersForKanban(),
+    ]);
+
+    res.json({ ok: true, board, admins });
+  } catch (err) {
+    console.error("[Admin] Error obteniendo kanban:", err);
+    res.status(500).json({ ok: false, message: "Error obteniendo tablero Kanban" });
+  }
+});
+
+// ============================================
+// PUT /admin/kanban - Guardar tablero administrativo
+// ============================================
+router.put("/kanban", async (req: Request, res: Response) => {
+  try {
+    const actorId = req.user!.userId;
+    const payload = req.body?.board as Partial<AdminKanbanBoard> | undefined;
+
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ ok: false, message: "Payload de tablero invalido" });
+    }
+
+    const current = await getAdminKanbanBoard();
+    const board = await updateAdminKanbanBoard(payload, actorId);
+
+    await logAdminAction({
+      actorId,
+      action: "update_admin_kanban",
+      before: summarizeKanban(current),
+      after: summarizeKanban(board),
+    });
+
+    res.json({ ok: true, board, message: "Tablero Kanban actualizado" });
+  } catch (err) {
+    console.error("[Admin] Error actualizando kanban:", err);
+    res.status(500).json({ ok: false, message: "Error guardando tablero Kanban" });
+  }
+});
+
+
+// ============================================
+// GET /admin/accounting-kanban - Tablero contable
+// ============================================
+router.get("/accounting-kanban", async (_req: Request, res: Response) => {
+  try {
+    const [board, admins] = await Promise.all([
+      getAccountingKanbanBoard(),
+      listAdminUsersForKanban(),
+    ]);
+
+    res.json({ ok: true, board, admins });
+  } catch (err) {
+    console.error("[Admin] Error obteniendo kanban contable:", err);
+    res.status(500).json({ ok: false, message: "Error obteniendo tablero Kanban contable" });
+  }
+});
+
+// ============================================
+// PUT /admin/accounting-kanban - Guardar tablero contable
+// ============================================
+router.put("/accounting-kanban", async (req: Request, res: Response) => {
+  try {
+    const actorId = req.user!.userId;
+    const payload = req.body?.board as Partial<AdminKanbanBoard> | undefined;
+
+    if (!payload || typeof payload !== "object") {
+      return res.status(400).json({ ok: false, message: "Payload de tablero invalido" });
+    }
+
+    const current = await getAccountingKanbanBoard();
+    const board = await updateAccountingKanbanBoard(payload, actorId);
+
+    await logAdminAction({
+      actorId,
+      action: "update_accounting_kanban",
+      before: summarizeKanban(current),
+      after: summarizeKanban(board),
+    });
+
+    res.json({ ok: true, board, message: "Tablero Kanban contable actualizado" });
+  } catch (err) {
+    console.error("[Admin] Error actualizando kanban contable:", err);
+    res.status(500).json({ ok: false, message: "Error guardando tablero Kanban contable" });
+  }
+});
 export default router;
