@@ -23,6 +23,15 @@ export function runWithSiigoCompany<T>(ctx: SiigoContext, fn: () => T): T {
   return siigoAls.run(ctx, fn);
 }
 
+/**
+ * Establece el contexto Siigo en ALS y mantiene su persistencia durante el resto
+ * del request (sobrevive a multer y otros middlewares async).
+ * Usar en middlewares Express en vez de runWithSiigoCompany.
+ */
+export function enterSiigoCompany(ctx: SiigoContext): void {
+  siigoAls.enterWith(ctx);
+}
+
 /** Id de la empresa Siigo activa en este contexto (null si se usa el .env). */
 export function getCurrentSiigoCompanyId(): string | null {
   return siigoAls.getStore()?.companyId ?? null;
@@ -505,6 +514,16 @@ export async function createPurchaseSupportDocument(body: unknown): Promise<unkn
 
 export async function createCreditNote(body: unknown): Promise<unknown> {
   return request("/v1/credit-notes", { method: "POST", body });
+}
+
+export async function listJournalDocumentTypes(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/document-types", {
+    query: { type: "AC", ...query },
+  });
+}
+
+export async function createJournalVoucher(body: unknown): Promise<unknown> {
+  return request("/v1/journals", { method: "POST", body });
 }
 
 // Master Data

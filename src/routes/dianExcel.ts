@@ -11,6 +11,7 @@ import {
   uploadInvoiceFilesToDrive,
   checkInvoiceExistsInDrive,
   getOrCreateRootFolder,
+  parseInvoiceDate,
   type ExistingInvoiceFiles,
   type UploadResult,
 } from "../services/googleDrive.js";
@@ -136,6 +137,9 @@ setInterval(() => {
       // Mejor esfuerzo de limpieza.
       if (job.excelPath && fs.existsSync(job.excelPath)) {
         try { fs.unlinkSync(job.excelPath); } catch {}
+      }
+      if (job.filesZipPath && fs.existsSync(job.filesZipPath)) {
+        try { fs.unlinkSync(job.filesZipPath); } catch {}
       }
       if (job.tempDir && fs.existsSync(job.tempDir)) {
         try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch {}
@@ -268,6 +272,8 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     driveUploadFolderUrl: job.driveUploadFolderUrl,
     driveUploadError: job.driveUploadError,
     driveWarning: job.driveWarning,
+    filesZipAvailable: !!job.filesZipPath,
+    filesZipName: job.filesZipName,
     timings: {
       startedAt: job.startedAt || job.createdAt,
       documentsFoundAt: job.documentsFoundAt || null,
@@ -324,11 +330,56 @@ router.get("/download/:jobId", (req: Request, res: Response) => {
       if (job.excelPath && fs.existsSync(job.excelPath)) {
         try { fs.unlinkSync(job.excelPath); } catch {}
       }
-      if (job.driveUploadStatus === "processing" || job.driveUploadStatus === "pending") {
-        job.excelPath = undefined;
-      } else {
+      job.excelPath = undefined;
+      // Mantener el job vivo si hay un ZIP de archivos pendiente o Drive procesando.
+      // El TTL se encarga de la limpieza definitiva.
+      const hasPendingZip = !!job.filesZipPath;
+      const driveBusy = job.driveUploadStatus === "processing" || job.driveUploadStatus === "pending";
+      if (!hasPendingZip && !driveBusy) {
         if (job.tempDir && fs.existsSync(job.tempDir)) {
           try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch {}
+        }
+        jobTracker.delete(jobId);
+      }
+    }, 10_000);
+  });
+});
+
+// Descarga del ZIP con XML+PDF estructurado por NIT/Año/Mes/Dirección.
+router.get("/download-files/:jobId", (req: Request, res: Response) => {
+  const { jobId } = req.params;
+  if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    return res.status(400).json({ status: "error", detalle: "jobId invalido" });
+  }
+  const job = jobTracker.get(jobId);
+  if (!job) return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado para este job" });
+  }
+  if (job.status !== "completed") {
+    return res.status(400).json({ status: "error", detalle: `Job no completado. Estado: ${job.status}` });
+  }
+  if (!job.filesZipPath || !fs.existsSync(job.filesZipPath)) {
+    return res.status(404).json({ status: "error", detalle: "ZIP de archivos no disponible" });
+  }
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="${encodeURIComponent(job.filesZipName || "facturas-archivos.zip")}"`
+  );
+  const stream = fs.createReadStream(job.filesZipPath);
+  stream.pipe(res);
+  stream.on("end", () => {
+    setTimeout(() => {
+      if (job.filesZipPath && fs.existsSync(job.filesZipPath)) {
+        try { fs.unlinkSync(job.filesZipPath); } catch { /* ignore */ }
+      }
+      job.filesZipPath = undefined;
+      // Si ya no hay Excel ni Drive pendiente, limpiar todo
+      const driveBusy = job.driveUploadStatus === "processing" || job.driveUploadStatus === "pending";
+      if (!job.excelPath && !driveBusy) {
+        if (job.tempDir && fs.existsSync(job.tempDir)) {
+          try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
         }
         jobTracker.delete(jobId);
       }
@@ -672,6 +723,38 @@ async function processExcelJob(
           }
         }
 
+        // Siempre persistir XML/PDF en estructura tipo Drive para construir el ZIP final
+        // de descarga ofrecido al usuario al terminar el job.
+        if (xmlBuffer || (pdfBuffer && pdfBuffer.length > 0)) {
+          try {
+            const ownNitForFiles = getOwnNit(
+              invoiceData.issuerNit || doc.nit,
+              receiver.nit,
+              !!invoiceData.isDocumentoSoporte,
+              documentDirection === "sent" ? "sent" : "received"
+            ).replace(/[^a-zA-Z0-9._-]/g, "_") || "SinNIT";
+            const dateForFolders = invoiceData.issueDate && invoiceData.issueDate !== "N/A"
+              ? invoiceData.issueDate
+              : new Date().toISOString().slice(0, 10);
+            const { year, monthName } = parseInvoiceDate(dateForFolders);
+            const directionLabel = documentDirection === "sent" ? "Emitidas" : "Recibidas";
+            const safeDocNum = (doc.docnum || doc.id).replace(/[^a-zA-Z0-9._-]/g, "_");
+            const baseDir = path.join(tempDir, "files", ownNitForFiles, year, monthName, directionLabel);
+            if (xmlBuffer) {
+              const xmlDir = path.join(baseDir, "XML");
+              fs.mkdirSync(xmlDir, { recursive: true });
+              fs.writeFileSync(path.join(xmlDir, `${safeDocNum}.xml`), xmlBuffer);
+            }
+            if (pdfBuffer && pdfBuffer.length > 0) {
+              const pdfDir = path.join(baseDir, "PDF");
+              fs.mkdirSync(pdfDir, { recursive: true });
+              fs.writeFileSync(path.join(pdfDir, `${safeDocNum}.pdf`), pdfBuffer);
+            }
+          } catch (e) {
+            console.warn(`[Excel] No se pudo persistir XML/PDF para ZIP (${doc.docnum}):`, e);
+          }
+        }
+
         if (runDeferredDriveUpload && driveConfig && hasValidData && xmlBuffer) {
           const pendingDir = path.join(tempDir, "drive-pending");
           fs.mkdirSync(pendingDir, { recursive: true });
@@ -848,6 +931,30 @@ async function processExcelJob(
 
     await generateExcelFile(invoicesForExcel, excelPath, useInlineDriveLinks, isSentDocs, actualCompanyName, actualCompanyNit);
 
+    // Construir ZIP con todos los XML+PDF en estructura NIT/Año/Mes/Dirección/(PDF|XML).
+    // El ZIP queda disponible para descargar mientras el job esté vivo (TTL).
+    try {
+      const filesRootDir = path.join(tempDir, "files");
+      if (fs.existsSync(filesRootDir)) {
+        const zip = new JSZip();
+        const walk = (dir: string, prefix: string) => {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const fullPath = path.join(dir, entry.name);
+            const inZipPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+            if (entry.isDirectory()) walk(fullPath, inZipPath);
+            else zip.file(inZipPath, fs.readFileSync(fullPath));
+          }
+        };
+        walk(filesRootDir, "");
+        const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE", compressionOptions: { level: 6 } });
+        const filesZipPath = path.join(DOWNLOADS_DIR, `${jobId}-files.zip`);
+        fs.writeFileSync(filesZipPath, zipBuf);
+        job.filesZipPath = filesZipPath;
+      }
+    } catch (e) {
+      console.warn(`[Excel] No se pudo construir ZIP de archivos para ${jobId}:`, e);
+    }
+
     // Si no hay carga diferida, limpiar temporales de inmediato.
     if (!runDeferredDriveUpload) {
       try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
@@ -860,6 +967,10 @@ async function processExcelJob(
       ? `${actualCompanyNit} - ${actualCompanyName} - ${basePrefix}` 
       : (actualCompanyNit ? `${actualCompanyNit} - ${basePrefix}` : basePrefix);
     job.excelName = generateExcelFilename(startDate, endDate, filePrefix);
+    if (job.filesZipPath) {
+      const baseZipName = job.excelName.replace(/\.xlsx?$/i, "");
+      job.filesZipName = `${baseZipName} - Archivos.zip`;
+    }
     job.completedAt = Date.now();
     job.invoicesProcessed = successCount;
     job.invoicesFailed = errorCount;
@@ -890,7 +1001,7 @@ async function processExcelJob(
 
 // Helpers
 
-async function downloadZipFile(
+export async function downloadZipFile(
   trackId: string,
   cookies: Record<string, string>
 ): Promise<Buffer> {

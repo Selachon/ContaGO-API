@@ -372,7 +372,7 @@ export async function checkInvoiceExistsInDrive(
 }
 
 // Parsear fecha de factura a año y mes
-function parseInvoiceDate(dateStr: string): { year: string; month: number; monthName: string } {
+export function parseInvoiceDate(dateStr: string): { year: string; month: number; monthName: string } {
   let year: string;
   let month: number;
 

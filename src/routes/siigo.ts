@@ -20,6 +20,8 @@ import {
   listInvoices,
   listPaymentReceipts,
   listPurchaseDocumentTypes,
+  listJournalDocumentTypes,
+  createJournalVoucher,
   listPurchaseSupportDocuments,
   listPurchases,
   listCostCenters,
@@ -30,6 +32,7 @@ import {
   listCreditNoteDocumentTypes,
   listPurchaseSupportDocumentTypes,
   runWithSiigoCompany,
+  enterSiigoCompany,
   SiigoError,
 } from "../services/siigoService.js";
 import {
@@ -39,7 +42,6 @@ import {
   getCompanyContext,
 } from "../services/siigoCompaniesService.js";
 import { getUserSiigoCompanies, setUserSiigoCompanies } from "../services/database.js";
-import { processBulkPdfExcel } from "../services/bulkPdfDownloadService.js";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo } from "../services/siigoAccountingService.js";
 import {
   savePaymentMap,
@@ -321,7 +323,9 @@ async function withSiigoCompany(req: Request, res: Response, next: NextFunction)
       });
       return;
     }
-    runWithSiigoCompany(ctx, () => next());
+    // enterWith en vez de run() para que ALS sobreviva a multer y demás middlewares async
+    enterSiigoCompany(ctx);
+    next();
   } catch (error) {
     next(error);
   }
@@ -781,6 +785,20 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     }
   });
 
+  router.get("/journal-document-types", async (req: Request, res: Response) => {
+    try {
+      // Por defecto trae TODOS los tipos para que el usuario elija el comprobante
+      // contable libremente (Ajustes, Saldos iniciales, etc.). Si llega ?type=AC se respeta.
+      const type = String(req.query.type || "").trim();
+      const data = type
+        ? await listJournalDocumentTypes({ type })
+        : await listDocumentTypes({});
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
   router.get("/purchase-document-types/search", async (req: Request, res: Response) => {
     try {
       const filters = getAllowedQuery(req, ["query", "code", "name", "description"]);
@@ -908,14 +926,21 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   });
 
   router.post("/accounting/process-batch", upload.array("files", 200), async (req: Request, res: Response) => {
-    try {
-      const files = (req.files as Express.Multer.File[]) || [];
-      if (!files.length) return res.status(400).json({ ok: false, message: "Debe subir XML o un ZIP" });
-      const items = await processXmlBatch(files.map((f) => ({ name: f.originalname, buffer: f.buffer })));
-      return res.json({ ok: true, data: items });
-    } catch (error) {
-      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el lote" });
-    }
+    // El ALS context puede haberse perdido durante multer. Lo re-aplicamos dentro
+    // del handler para garantizar aislamiento por empresa en processXmlBatch.
+    const companyId = req.header("X-Siigo-Company");
+    const ctx = companyId ? await getCompanyContext(companyId) : null;
+    const work = async () => {
+      try {
+        const files = (req.files as Express.Multer.File[]) || [];
+        if (!files.length) return res.status(400).json({ ok: false, message: "Debe subir XML o un ZIP" });
+        const items = await processXmlBatch(files.map((f) => ({ name: f.originalname, buffer: f.buffer })));
+        return res.json({ ok: true, data: items });
+      } catch (error) {
+        return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el lote" });
+      }
+    };
+    return ctx ? runWithSiigoCompany(ctx, () => work()) : work();
   });
 
   router.post("/accounting/submit", async (req: Request, res: Response) => {
@@ -939,34 +964,22 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     }
   });
 
-  router.post("/bulk-pdf-download", upload.single("excel"), async (req: Request, res: Response) => {
+  router.post("/accounting/credit-note-journal", async (req: Request, res: Response) => {
     try {
-      // Security check: Only admins can use this masive tool via JWT
-      if (req.integrationAuthMode === "jwt" && !req.user?.isAdmin) {
-        return res.status(403).json({
-          ok: false,
-          code: "forbidden",
-          message: "Esta herramienta masiva solo está disponible para administradores",
-        });
+      const payload = req.body;
+      if (!payload || !payload.document?.id) {
+        return res.status(400).json({ ok: false, message: "Falta document.id (tipo de comprobante contable)" });
       }
-
-      if (!req.file) {
-        return res.status(400).json({ ok: false, code: "missing_file", message: "Debe subir un archivo Excel" });
+      if (!Array.isArray(payload.items) || payload.items.length === 0) {
+        return res.status(400).json({ ok: false, message: "El comprobante no tiene partidas" });
       }
-
-      console.log(`[Siigo] Starting bulk process for user ${req.user?.email || "internal"}`);
-      const result = await processBulkPdfExcel(req.file.buffer);
-
-      console.log(`[Siigo] Bulk process completed. Sending Excel (${result.excelBuffer.length} bytes)`);
-      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-      res.setHeader("Content-Disposition", `attachment; filename="reporte-siigo-${Date.now()}.xlsx"`);
-      return res.send(result.excelBuffer);
-    } catch (error) {      console.error("[Siigo] Error en cruce masivo:", error);
-      return res.status(500).json({
-        ok: false,
-        code: "bulk_cross_failed",
-        message: error instanceof Error ? error.message : "Error procesando cruce masivo",
-      });
+      console.log(`[SiigoJournal] NC → journal: ${payload.items.length} partidas | doc ${payload.document.id}`);
+      const result = await createJournalVoucher(payload);
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
+      console.error("[SiigoJournal] FAILED:", error instanceof Error ? error.message : error, "| details:", detalle);
+      return handleSiigoError(res, error);
     }
   });
 

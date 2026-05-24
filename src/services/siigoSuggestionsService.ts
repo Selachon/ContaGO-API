@@ -39,6 +39,7 @@ export interface SupplierProfile {
   reteica: RetentionHint | null;
   paymentName: string | null;
   paymentCode: string | null; // ID numérico de Siigo (ej: 113)
+  cxpCode: string | null; // Cuenta por pagar dominante en el balance (21xx)
   updatedAt: string;
 }
 
@@ -256,7 +257,7 @@ function buildFromBalance(
       retefuente: rf ? { accountName: rf.name, rate: parseRate(rf.name) } : null,
       reteiva: ri ? { accountName: ri.name, rate: parseRate(ri.name) } : null,
       reteica: rc ? { accountName: rc.name, rate: parseRate(rc.name) } : null,
-      paymentName: pg?.paymentName ?? null, paymentCode: pg?.paymentCode ?? null, updatedAt: now,
+      paymentName: pg?.paymentName ?? null, paymentCode: pg?.paymentCode ?? null, cxpCode: pg?.code ?? null, updatedAt: now,
     });
   }
   return { profiles: out, accountsCatalog: [...catalog.entries()].map(([code, name]) => ({ code, name })).sort((a, b) => a.code.localeCompare(b.code)) };
