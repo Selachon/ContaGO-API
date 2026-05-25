@@ -18,6 +18,7 @@ interface UserRecord {
   google_drive?: GoogleDriveConfig;
   google_drives?: GoogleDriveConfig[];
   selected_google_drive_id?: string | null;
+  sentiido_drive?: GoogleDriveConfig;
   phone?: string;
   paymentAmount?: number;
   paymentMethod?: string;
@@ -423,6 +424,45 @@ export async function updateUserDriveFolder(
 
 export async function removeUserGoogleDrive(userId: string): Promise<boolean> {
   return removeUserGoogleDriveById(userId);
+}
+
+export async function getUserSentiidoDrive(userId: string): Promise<GoogleDriveConfig | null> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne(
+      { _id: oid },
+      { projection: { sentiido_drive: 1 } }
+    );
+    return record?.sentiido_drive || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateUserSentiidoDrive(userId: string, driveConfig: GoogleDriveConfig): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      { $set: { sentiido_drive: driveConfig } }
+    );
+    return result.modifiedCount > 0 || result.matchedCount > 0;
+  } catch {
+    return false;
+  }
+}
+
+export async function removeUserSentiidoDrive(userId: string): Promise<boolean> {
+  try {
+    const oid = new ObjectId(userId);
+    const result = await usersCollection().updateOne(
+      { _id: oid },
+      { $unset: { sentiido_drive: "" } }
+    );
+    return result.modifiedCount > 0 || result.matchedCount > 0;
+  } catch {
+    return false;
+  }
 }
 
 export async function setSelectedUserGoogleDrive(userId: string, connectionId: string): Promise<boolean> {

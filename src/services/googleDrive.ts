@@ -6,6 +6,7 @@ import type { GoogleDriveConfig } from "../types/dianExcel.js";
 
 const SCOPES = [
   "https://www.googleapis.com/auth/drive.file",
+  "https://www.googleapis.com/auth/drive.readonly",
   "https://www.googleapis.com/auth/userinfo.email",
 ];
 const ROOT_FOLDER_NAME = "Facturas DIAN - Herramienta ContaGO";
