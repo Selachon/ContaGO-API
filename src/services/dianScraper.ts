@@ -53,7 +53,7 @@ const BROWSER_LAUNCH_RETRIES = Number(process.env.PUPPETEER_LAUNCH_RETRIES || 3)
 // agotan los recursos del contenedor y el siguiente lanzamiento falla con
 // "spawn EAGAIN". Además, los procesos que no se cierran bien se acumulan como
 // huérfanos hasta provocar el mismo error de forma intermitente.
-const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 2));
+const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 5));
 const BROWSER_CLOSE_TIMEOUT_MS = Number(process.env.PUPPETEER_CLOSE_TIMEOUT_MS || 15000);
 
 type BrowserWithSlot = Browser & { __releaseSlot?: () => void };
@@ -137,16 +137,20 @@ function killProcessTree(rootPid: number): void {
  */
 async function closeBrowserSafely(browser: Browser): Promise<void> {
   const pid = browser.process()?.pid;
-  const closePromise = browser
-    .close()
-    .catch((err) => console.warn(`Error cerrando navegador: ${(err as Error)?.message || String(err)}`));
-  // Si close() se cuelga, no se espera indefinidamente: se fuerza la limpieza.
-  await Promise.race([closePromise, delay(BROWSER_CLOSE_TIMEOUT_MS)]);
-  if (typeof pid === "number") {
-    killProcessTree(pid);
-  }
   const release = (browser as BrowserWithSlot).__releaseSlot;
-  if (release) release();
+
+  try {
+    const closePromise = browser
+      .close()
+      .catch((err) => console.warn(`Error cerrando navegador: ${(err as Error)?.message || String(err)}`));
+    // Si close() se cuelga, no se espera indefinidamente: se fuerza la limpieza.
+    await Promise.race([closePromise, delay(BROWSER_CLOSE_TIMEOUT_MS)]);
+  } finally {
+    if (typeof pid === "number") {
+      killProcessTree(pid);
+    }
+    if (release) release();
+  }
 }
 
 /**
