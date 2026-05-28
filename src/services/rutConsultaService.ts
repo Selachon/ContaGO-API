@@ -126,6 +126,10 @@ const BROWSER_ARGS = [
   "--disable-background-networking",
   "--no-first-run",
   "--window-size=1280,900",
+  "--disable-breakpad",
+  "--no-zygote",
+  "--disable-features=WebRtcHideLocalIpsWithMdns,CrashReporter",
+  "--mute-audio",
 ];
 
 function resolveChromePath(): string | undefined {

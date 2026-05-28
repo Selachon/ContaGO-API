@@ -847,8 +847,10 @@ async function launchBrowserWithRetry(
 
   if (chromiumLibPath) {
     const currentLd = process.env.LD_LIBRARY_PATH || "";
-    const parts = [chromiumLibPath, currentLd].filter(Boolean);
-    process.env.LD_LIBRARY_PATH = parts.join(":");
+    if (!currentLd.includes(chromiumLibPath)) {
+      const parts = [chromiumLibPath, currentLd].filter(Boolean);
+      process.env.LD_LIBRARY_PATH = parts.join(":");
+    }
   }
 
   // Espera turno si ya hay el máximo de navegadores activos. Esto evita el pico
@@ -873,6 +875,11 @@ async function launchBrowserWithRetry(
           "--disable-background-networking",
           "--disable-sync",
           "--no-first-run",
+          "--disable-breakpad",
+          "--no-zygote",
+          "--disable-software-rasterizer",
+          "--disable-features=WebRtcHideLocalIpsWithMdns,CrashReporter",
+          "--mute-audio",
         ],
         executablePath: executablePath || undefined,
       });
