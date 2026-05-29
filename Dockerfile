@@ -43,6 +43,7 @@ RUN apt-get update && apt-get install -y \
     libxfixes3 \
     libxrandr2 \
     xdg-utils \
+    tini \
     python3 \
     make \
     g++ \
@@ -76,6 +77,10 @@ RUN mkdir -p /app/downloads /app/.cache/puppeteer \
 EXPOSE 8000
 
 USER node
+
+# tini como PID 1: reenvía señales (SIGTERM en redeploys) y recolecta los
+# procesos Chromium zombie que, de otro modo, agotan los PIDs del contenedor.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 
 # Start server
 CMD ["node", "dist/index.js"]

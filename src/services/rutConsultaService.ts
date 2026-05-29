@@ -127,7 +127,6 @@ const BROWSER_ARGS = [
   "--no-first-run",
   "--window-size=1280,900",
   "--disable-breakpad",
-  "--no-zygote",
   "--disable-features=WebRtcHideLocalIpsWithMdns,CrashReporter",
   "--mute-audio",
 ];
@@ -175,6 +174,14 @@ async function getBrowser(): Promise<Browser> {
   });
   browserInitTime = Date.now();
   return rutBrowser;
+}
+
+/** Cierra el navegador singleton de RUT (apagado ordenado). */
+export async function closeRutBrowser(): Promise<void> {
+  if (rutBrowser) {
+    try { await rutBrowser.close(); } catch { /* ignore */ }
+    rutBrowser = null;
+  }
 }
 
 // ── DOM extraction script (plain JS string — avoids esbuild __name helper leak) ─

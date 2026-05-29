@@ -53,13 +53,17 @@ const BROWSER_LAUNCH_RETRIES = Number(process.env.PUPPETEER_LAUNCH_RETRIES || 3)
 // agotan los recursos del contenedor y el siguiente lanzamiento falla con
 // "spawn EAGAIN". Además, los procesos que no se cierran bien se acumulan como
 // huérfanos hasta provocar el mismo error de forma intermitente.
-const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 5));
+const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 2));
 const BROWSER_CLOSE_TIMEOUT_MS = Number(process.env.PUPPETEER_CLOSE_TIMEOUT_MS || 15000);
 
-type BrowserWithSlot = Browser & { __releaseSlot?: () => void };
+type BrowserWithSlot = Browser & { __releaseSlot?: () => void; __userDataDir?: string };
 
 let activeBrowsers = 0;
 const browserWaitQueue: Array<() => void> = [];
+
+// Registro de navegadores abiertos para cerrarlos todos en un apagado ordenado
+// (SIGTERM en cada redeploy de Railway) y no dejar procesos huérfanos.
+const openBrowsers = new Set<Browser>();
 
 /** Reserva un cupo de navegador; resuelve con la función que lo libera. */
 function acquireBrowserSlot(): Promise<() => void> {
@@ -131,6 +135,31 @@ function killProcessTree(rootPid: number): void {
 }
 
 /**
+ * Devuelve los PIDs cuyo cmdline referencia `userDataDir`. Detecta procesos
+ * Chromium aunque se hayan reparentado a PID 1 (huérfanos), caso en el que el
+ * recorrido por ppid de killProcessTree ya no los encuentra.
+ */
+function collectPidsByUserDataDir(userDataDir: string): number[] {
+  const pids: number[] = [];
+  if (!userDataDir) return pids;
+  try {
+    for (const entry of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      try {
+        const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+        if (cmdline.includes(userDataDir)) pids.push(pid);
+      } catch {
+        // El proceso desapareció mientras se leía: se ignora.
+      }
+    }
+  } catch {
+    // /proc no disponible.
+  }
+  return pids;
+}
+
+/**
  * Cierra el navegador y garantiza que no queden procesos Chromium huérfanos.
  * Libera además el cupo de concurrencia. Los huérfanos acumulados son la causa
  * de los "spawn EAGAIN" intermitentes, así que la limpieza es incondicional.
@@ -149,8 +178,97 @@ async function closeBrowserSafely(browser: Browser): Promise<void> {
     if (typeof pid === "number") {
       killProcessTree(pid);
     }
+    // Backstop: mata cualquier proceso Chromium que comparta el user-data-dir
+    // de este navegador, aunque se haya reparentado a PID 1 (huérfano).
+    const userDataDir = (browser as BrowserWithSlot).__userDataDir;
+    if (userDataDir) {
+      for (const orphan of collectPidsByUserDataDir(userDataDir)) {
+        try { process.kill(orphan, "SIGKILL"); } catch { /* ya terminó */ }
+      }
+    }
+    openBrowsers.delete(browser);
     if (release) release();
   }
+}
+
+/** Cierra todos los navegadores abiertos. Se usa en el apagado ordenado. */
+export async function closeAllBrowsers(): Promise<void> {
+  const all = [...openBrowsers];
+  await Promise.all(all.map((b) => closeBrowserSafely(b).catch(() => undefined)));
+}
+
+// ── Barrido periódico de huérfanos (última red de seguridad) ──────────────────
+// Marcador del perfil temporal que Puppeteer crea para cada navegador
+// (`puppeteer_dev_<browser>_profile-`). Como nunca pasamos `userDataDir`, todos
+// nuestros Chromium lo llevan; sirve para distinguirlos de cualquier Chromium
+// ajeno del host.
+const PUPPETEER_PROFILE_MARKER = "puppeteer_dev_";
+
+/**
+ * Mata los procesos Chromium **huérfanos** (reparentados a PID 1 porque el node
+ * que los lanzó murió) que llevan el perfil temporal de Puppeteer.
+ *
+ * El criterio es seguro por construcción:
+ *  - `ppid === 1` excluye navegadores vivos de este proceso (ppid = nuestro node)
+ *    y de cualquier otro node vivo (p. ej. scripts de test): solo caen los que
+ *    perdieron a su dueño.
+ *  - el marcador de perfil excluye cualquier Chromium ajeno del sistema.
+ * Devuelve cuántos árboles de proceso se eliminaron.
+ */
+export function sweepOrphanBrowsers(): number {
+  let killed = 0;
+  let entries: string[];
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    let ppid: number;
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      ppid = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+    } catch {
+      continue; // el proceso desapareció mientras se leía
+    }
+    if (ppid !== 1) continue;
+    let cmdline: string;
+    try {
+      cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    } catch {
+      continue;
+    }
+    if (!cmdline.includes(PUPPETEER_PROFILE_MARKER)) continue;
+    if (!/chrom|chrome|headless_shell/i.test(cmdline)) continue;
+    killProcessTree(pid);
+    killed++;
+  }
+  if (killed > 0) {
+    console.warn(`Barrido de huérfanos: ${killed} Chromium reparentado(s) a PID 1 eliminado(s).`);
+  }
+  return killed;
+}
+
+let sweepTimer: NodeJS.Timeout | null = null;
+/**
+ * Arranca el barrido periódico. Idempotente. Intervalo por defecto 5 min;
+ * `BROWSER_SWEEP_INTERVAL_MS=0` (o negativo) lo desactiva.
+ */
+export function startOrphanBrowserSweep(): void {
+  if (sweepTimer) return;
+  const intervalMs = Number(process.env.BROWSER_SWEEP_INTERVAL_MS ?? 300000);
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) return;
+  sweepTimer = setInterval(() => {
+    try {
+      sweepOrphanBrowsers();
+    } catch (err) {
+      console.warn(`Error en barrido de huérfanos: ${(err as Error)?.message || String(err)}`);
+    }
+  }, intervalMs);
+  // No mantener vivo el proceso solo por este timer.
+  sweepTimer.unref();
 }
 
 /**
@@ -880,7 +998,6 @@ async function launchBrowserWithRetry(
           "--disable-sync",
           "--no-first-run",
           "--disable-breakpad",
-          "--no-zygote",
           "--disable-software-rasterizer",
           "--disable-features=WebRtcHideLocalIpsWithMdns,CrashReporter",
           "--mute-audio",
@@ -889,6 +1006,13 @@ async function launchBrowserWithRetry(
       });
       // El cupo se libera al cerrar el navegador (closeBrowserSafely).
       (browser as BrowserWithSlot).__releaseSlot = releaseSlot;
+      // Guarda el user-data-dir temporal para la limpieza de huérfanos.
+      const spawnArgs = browser.process()?.spawnargs ?? [];
+      const uddArg = spawnArgs.find((a) => a.startsWith("--user-data-dir="));
+      if (uddArg) {
+        (browser as BrowserWithSlot).__userDataDir = uddArg.slice("--user-data-dir=".length);
+      }
+      openBrowsers.add(browser);
       return browser;
     } catch (err) {
       lastError = err as Error;

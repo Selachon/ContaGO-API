@@ -19,6 +19,8 @@ import dianCufeRoutes from "./routes/dianCufeDownload.js";
 import dianMassDownloadRoutes from "./routes/dianMassDownload.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
 import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
+import { closeAllBrowsers, startOrphanBrowserSweep } from "./services/dianScraper.js";
+import { closeRutBrowser } from "./services/rutConsultaService.js";
 
 // ============================================
 // Validar variables de entorno obligatorias
@@ -101,6 +103,40 @@ async function ensurePuppeteer(): Promise<void> {
 }
 
 // ============================================
+// Apagado ordenado: cierra Chromium para no dejar procesos huérfanos.
+// Railway envía SIGTERM en cada redeploy; sin esto, Node (PID 1) lo ignora,
+// recibe SIGKILL y los Chromium en vuelo quedan huérfanos hasta agotar los PIDs.
+// ============================================
+let shuttingDown = false;
+function registerGracefulShutdown(server: ReturnType<typeof app.listen>): void {
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`Recibido ${signal}: cerrando navegadores y servidor...`);
+    server.close();
+    try {
+      await Promise.race([
+        Promise.all([closeAllBrowsers(), closeRutBrowser()]),
+        new Promise((resolve) => setTimeout(resolve, 20000)),
+      ]);
+    } catch (err) {
+      console.warn("Error durante el apagado:", err);
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+}
+
+// Redes de seguridad: registran fallos en vez de morir y dejar Chromium huérfano.
+process.on("unhandledRejection", (reason) => {
+  console.error("unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("uncaughtException:", err);
+});
+
+// ============================================
 // Startup
 // ============================================
 ensurePuppeteer()
@@ -109,10 +145,12 @@ ensurePuppeteer()
   .then(migrateToolSlugs)
   .then(seedSiigoCompanyFromEnv)
   .then(() => {
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`ContaGO API running on port ${PORT}`);
       console.log(`CORS origin: ${corsOrigin}`);
     });
+    registerGracefulShutdown(server);
+    startOrphanBrowserSweep();
   })
   .catch((err) => {
     console.error("Error inicializando la API:", err);
