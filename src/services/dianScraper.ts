@@ -53,7 +53,7 @@ const BROWSER_LAUNCH_RETRIES = Number(process.env.PUPPETEER_LAUNCH_RETRIES || 3)
 // agotan los recursos del contenedor y el siguiente lanzamiento falla con
 // "spawn EAGAIN". Además, los procesos que no se cierran bien se acumulan como
 // huérfanos hasta provocar el mismo error de forma intermitente.
-const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 2));
+const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 5));
 const BROWSER_CLOSE_TIMEOUT_MS = Number(process.env.PUPPETEER_CLOSE_TIMEOUT_MS || 15000);
 
 type BrowserWithSlot = Browser & { __releaseSlot?: () => void; __userDataDir?: string };
@@ -1006,6 +1006,28 @@ async function launchBrowserWithRetry(
       });
       // El cupo se libera al cerrar el navegador (closeBrowserSafely).
       (browser as BrowserWithSlot).__releaseSlot = releaseSlot;
+
+      // Watchdog opcional: si un job deja el navegador colgado, se fuerza el
+      // cierre para no retener el cupo. Desactivado por defecto (0); poner
+      // BROWSER_MAX_HOLD_MS por encima de la duración del job más largo.
+      const maxHoldMs = Number(process.env.BROWSER_MAX_HOLD_MS || 0);
+      const holdTimer = maxHoldMs > 0
+        ? setTimeout(() => {
+            console.warn(`Navegador retenido > ${maxHoldMs} ms; se fuerza el cierre para liberar el cupo.`);
+            void closeBrowserSafely(browser).catch(() => undefined);
+          }, maxHoldMs)
+        : null;
+      holdTimer?.unref();
+
+      // Auto-libera el cupo en cuanto el navegador se desconecta (crash, "Target
+      // closed" o cierre), aunque el job nunca llegue a closeBrowserSafely. Esto
+      // evita que un navegador muerto retenga su cupo. releaseSlot es idempotente.
+      browser.once("disconnected", () => {
+        if (holdTimer) clearTimeout(holdTimer);
+        openBrowsers.delete(browser);
+        releaseSlot();
+      });
+
       // Guarda el user-data-dir temporal para la limpieza de huérfanos.
       const spawnArgs = browser.process()?.spawnargs ?? [];
       const uddArg = spawnArgs.find((a) => a.startsWith("--user-data-dir="));
