@@ -11,6 +11,7 @@ import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
+import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
 import type { ProgressData, DocumentDirection } from "../types/dian.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +33,7 @@ interface JobData {
   error?: string;
   createdAt: number;
   tempDir?: string;
+  demoLimit?: DemoLimitInfo;
 }
 
 const jobTracker = new Map<string, JobData>();
@@ -86,7 +88,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
   if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
     return res.status(403).json({ status: "error", detalle: "No autorizado" });
   }
-  res.json({ status: job.status, progress: job.progress, error: job.error, outputName: job.outputName });
+  res.json({ status: job.status, progress: job.progress, error: job.error, outputName: job.outputName, demoLimit: job.demoLimit });
 });
 
 router.get("/job-download/:jobId", (req: Request, res: Response) => {
@@ -157,6 +159,8 @@ router.post(
       merge_pdf?: string;
     };
 
+    if (rejectIfWrongDemoNit(req, res, token_url)) return;
+
     if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
       return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
     }
@@ -184,6 +188,15 @@ router.post(
       return res.status(400).json({ status: "error", detalle: `Error leyendo archivo: ${msg}` });
     }
 
+    const originalCufeCount = cufes.length;
+    let demoLimitInfo: DemoLimitInfo | undefined;
+    const demoLimitValue = getDemoLimit(req);
+    if (demoLimitValue) {
+      demoLimitInfo = buildDemoLimitInfo(originalCufeCount, demoLimitValue);
+      cufes = cufes.slice(0, demoLimitValue);
+      excelDates = excelDates.slice(0, demoLimitValue);
+    }
+
     if (cufes.length === 0) {
       return res.status(400).json({
         status: "error",
@@ -205,6 +218,7 @@ router.post(
       progress: { step: "Iniciando...", current: 0, total: cufes.length },
       userId: req.user!.userId,
       createdAt: Date.now(),
+      demoLimit: demoLimitInfo,
     };
     jobTracker.set(jobId, job);
 
@@ -212,7 +226,9 @@ router.post(
       status: "accepted",
       jobId,
       totalCufes: cufes.length,
-      message: `${cufes.length} CUFEs encontrados. Usa /dian-mass-download/job-status/${jobId} para consultar el progreso.`,
+      totalFound: originalCufeCount,
+      demoLimit: demoLimitInfo,
+      message: demoLimitInfo?.message || `${cufes.length} CUFEs encontrados. Usa /dian-mass-download/job-status/${jobId} para consultar el progreso.`,
     });
 
     processMassDownloadJob(jobId, token_url, cufes, start_date, end_date, direction, merge_pdf === "true").catch((err) => {

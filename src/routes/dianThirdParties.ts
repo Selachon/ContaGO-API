@@ -11,6 +11,7 @@ import { generateThirdPartiesExcelFile } from "../services/excelGenerator.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
+import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
 import type { ProgressData, DocumentDirection } from "../types/dian.js";
 import type { InvoiceData } from "../types/dianExcel.js";
 
@@ -58,6 +59,7 @@ interface JobData {
   driveUploadStatus?: "uploading" | "done" | "error";
   driveUploadCurrent?: number;
   driveUploadTotal?: number;
+  demoLimit?: DemoLimitInfo;
 }
 
 const jobTracker = new Map<string, JobData>();
@@ -121,6 +123,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     driveUploadStatus: job.driveUploadStatus,
     driveUploadCurrent: job.driveUploadCurrent,
     driveUploadTotal: job.driveUploadTotal,
+    demoLimit: job.demoLimit,
   });
 });
 
@@ -203,6 +206,8 @@ router.post(
       end_date?: string;
     };
 
+    if (rejectIfWrongDemoNit(req, res, token_url)) return;
+
     if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
       return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
     }
@@ -240,6 +245,19 @@ router.post(
       return res.status(400).json({ status: "error", detalle: `Error leyendo archivo: ${msg}` });
     }
 
+    const originalInvoiceCount = allCufes.length;
+    let demoLimitInfo: DemoLimitInfo | undefined;
+    const demoLimitValue = getDemoLimit(req);
+    if (demoLimitValue) {
+      demoLimitInfo = buildDemoLimitInfo(originalInvoiceCount, demoLimitValue);
+      const limitedAllCufes = allCufes.slice(0, demoLimitValue);
+      const allowedCufes = new Set(limitedAllCufes);
+      downloadCufes = downloadCufes.filter((cufe) => allowedCufes.has(cufe));
+      allCufes = limitedAllCufes;
+      allDates = allDates.slice(0, demoLimitValue);
+      skippedEntries = skippedEntries.filter((entry) => allowedCufes.has(entry.cufe));
+    }
+
     if (allCufes.length === 0) {
       return res.status(400).json({
         status: "error",
@@ -269,6 +287,7 @@ router.post(
       progress: { step: "Iniciando...", current: 0, total: downloadCufes.length },
       userId: req.user!.userId,
       createdAt: Date.now(),
+      demoLimit: demoLimitInfo,
     };
     jobTracker.set(jobId, job);
 
@@ -276,7 +295,9 @@ router.post(
       status: "accepted",
       jobId,
       totalCufes: downloadCufes.length,
-      message: `${downloadCufes.length} terceros únicos encontrados. Usa /dian-third-parties/job-status/${jobId} para consultar el progreso.`,
+      totalFound: originalInvoiceCount,
+      demoLimit: demoLimitInfo,
+      message: demoLimitInfo?.message || `${downloadCufes.length} terceros únicos encontrados. Usa /dian-third-parties/job-status/${jobId} para consultar el progreso.`,
     });
 
     processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, skippedEntries, start_date, end_date, direction, req.user!.userId).catch((err) => {

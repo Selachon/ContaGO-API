@@ -20,6 +20,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import multer from "multer";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
+import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
 import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig } from "../types/dianExcel.js";
 import { parseListingRecordsFromExportZip, type ListingRecord } from "../services/dianScraper.js";
@@ -168,6 +169,8 @@ router.post("/generate", upload.single("excel"), validateDianUrl, async (req: Re
   const jobId = session_uid || uuidv4();
   const userId = req.user!.userId;
 
+  if (rejectIfWrongDemoNit(req, res, token_url)) return;
+
   // Control de acceso por NIT usando rk del token_url.
   if (!req.user?.isAdmin) {
     const allowedNits = await getUserNits(userId);
@@ -221,11 +224,24 @@ router.post("/generate", upload.single("excel"), validateDianUrl, async (req: Re
     return res.status(400).json({ status: "error", detalle: `Error al leer el listado: ${msg}` });
   }
 
+  const originalListingCount = listingRecords.length;
+  let demoLimitInfo: DemoLimitInfo | undefined;
+  const demoLimitValue = getDemoLimit(req);
+  if (demoLimitValue) {
+    demoLimitInfo = buildDemoLimitInfo(originalListingCount, demoLimitValue);
+    listingRecords = listingRecords.slice(0, demoLimitValue);
+  }
+  job.demoLimit = demoLimitInfo;
+  job.progress.total = listingRecords.length;
+
   // Respuesta no bloqueante; el trabajo corre en background.
   res.json({
     status: "accepted",
     jobId,
-    message: "Generacion de Excel iniciada. Usa /dian-excel/job-status/:jobId para consultar el progreso.",
+    totalFound: originalListingCount,
+    totalDocuments: listingRecords.length,
+    demoLimit: demoLimitInfo,
+    message: demoLimitInfo?.message || "Generacion de Excel iniciada. Usa /dian-excel/job-status/:jobId para consultar el progreso.",
   });
 
   // No usar await para no retener la conexion HTTP.
@@ -274,6 +290,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     driveWarning: job.driveWarning,
     filesZipAvailable: !!job.filesZipPath,
     filesZipName: job.filesZipName,
+    demoLimit: job.demoLimit,
     timings: {
       startedAt: job.startedAt || job.createdAt,
       documentsFoundAt: job.documentsFoundAt || null,
