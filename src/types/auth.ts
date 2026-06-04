@@ -1,13 +1,27 @@
+export type UserRole = "USER" | "ADMIN" | "DEMO";
+
+export interface DemoAccess {
+  nit: string;
+  normalizedNit: string;
+  toolId: string;
+  inviteId: string;
+  startedAt: string;
+  expiresAt: string;
+  trialLimit: number;
+}
+
 export interface User {
   id: string;
   email: string;
   name: string;
   password_hash: string;
   is_admin: boolean;
+  role: UserRole;
   nits: string[];
   status?: "active" | "suspended";
   force_password_change?: boolean;
   created_at: string;
+  demo?: DemoAccess;
 }
 
 export interface UserPurchase {
@@ -21,6 +35,7 @@ export interface JWTPayload {
   userId: string;
   email: string;
   isAdmin: boolean;
+  role?: UserRole;
 }
 
 export interface AuthResponse {
@@ -32,9 +47,14 @@ export interface AuthResponse {
     email: string;
     name: string;
     isAdmin: boolean;
+    role?: UserRole;
     purchasedTools: string[];
     nits: string[];
     forcePasswordChange?: boolean;
+    demo?: DemoAccess & {
+      isExpired: boolean;
+      remainingMs: number;
+    };
   };
   temporaryPassword?: string;
 }

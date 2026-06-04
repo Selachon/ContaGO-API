@@ -142,6 +142,12 @@ export interface ExcelJobData {
   driveUploadFolderUrl?: string;
   driveUploadError?: string;
   driveWarning?: string;
+  demoLimit?: {
+    found: number;
+    limit: number;
+    applied: boolean;
+    message: string;
+  };
   // ZIP con todos los XML+PDF descargados, en estructura NIT/Año/Mes/Dirección/(PDF|XML).
   filesZipPath?: string;
   filesZipName?: string;

@@ -12,6 +12,7 @@ interface ExtractionResult {
   cookies: Record<string, string>;
   companyName?: string;
   companyNit?: string;
+  listedCount?: number;
 }
 
 type OnDocumentFound = (ctx: {
@@ -563,7 +564,8 @@ export async function extractDocumentIdsByCufe(
   documentDirection: DocumentDirection = "received",
   onProgress?: (data: Partial<ProgressData>) => void,
   onDocumentFound?: OnDocumentFound,
-  preloadedRecords?: ListingRecord[]
+  preloadedRecords?: ListingRecord[],
+  maxDocuments?: number
 ): Promise<ExtractionResult> {
   const direction = documentDirection || "received";
   const isSent = direction === "sent";
@@ -633,14 +635,21 @@ export async function extractDocumentIdsByCufe(
       listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
     }
 
-    const cufes = Array.from(new Set(listedRecords.map((r) => normalizeCufe(r.cufe || "")).filter(Boolean)));
+    let cufes = Array.from(new Set(listedRecords.map((r) => normalizeCufe(r.cufe || "")).filter(Boolean)));
 
     if (cufes.length === 0) {
       throw new Error("No se encontraron CUFEs válidos en el listado.");
     }
 
+    const listedCount = cufes.length;
+    if (maxDocuments && maxDocuments > 0 && cufes.length > maxDocuments) {
+      cufes = cufes.slice(0, maxDocuments);
+    }
+
     updateProgress({
-      step: `Listado listo: ${cufes.length} CUFEs para procesar`,
+      step: maxDocuments && listedCount > cufes.length
+        ? "Listado listo: " + listedCount + " CUFEs encontrados, procesando " + cufes.length + " por límite de prueba"
+        : "Listado listo: " + cufes.length + " CUFEs para procesar",
       current: 0,
       total: cufes.length,
     });
@@ -865,7 +874,7 @@ export async function extractDocumentIdsByCufe(
       total: 0,
     });
 
-    return { documents: finalDocuments, cookies: baseCookieMap, companyName, companyNit: companyNitFromPage };
+    return { documents: finalDocuments, cookies: baseCookieMap, companyName, companyNit: companyNitFromPage, listedCount };
   } finally {
     if (browser) await closeBrowserSafely(browser);
   }

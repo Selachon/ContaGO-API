@@ -1,11 +1,14 @@
 import { Router, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import {
+  consumeDemoInvite,
   createUser,
   getUserByIdStrict,
+  getDemoInviteByToken,
   getUserByEmail,
   getUserNits,
   getUserPurchases,
+  isDemoTrialExpired,
   updateUserPassword,
   verifyPassword,
 } from "../services/database.js";
@@ -23,7 +26,7 @@ import {
   requireAuth,
 } from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rateLimit.js";
-import type { AuthResponse, JWTPayload } from "../types/auth.js";
+import type { AuthResponse, JWTPayload, User } from "../types/auth.js";
 
 const router = Router();
 
@@ -42,6 +45,29 @@ function isValidEmail(email: string): boolean {
 
 function generateTemporaryPassword(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function buildAuthUser(user: User, purchasedTools: string[], nits: string[]): NonNullable<AuthResponse["user"]> {
+  const role = user.role || (user.is_admin ? "ADMIN" : "USER");
+  const demo = user.demo
+    ? {
+      ...user.demo,
+      isExpired: isDemoTrialExpired(user.demo),
+      remainingMs: Math.max(0, new Date(user.demo.expiresAt).getTime() - Date.now()),
+    }
+    : undefined;
+
+  return {
+    id: user.id,
+    email: user.email,
+    name: user.name,
+    isAdmin: !!user.is_admin,
+    role,
+    purchasedTools,
+    nits,
+    forcePasswordChange: !!user.force_password_change,
+    demo,
+  };
 }
 
 // ============================================
@@ -83,6 +109,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
     userId: user.id,
     email: user.email,
     isAdmin: !!user.is_admin,
+    role: user.role || (user.is_admin ? "ADMIN" : "USER"),
   };
 
   const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
@@ -94,15 +121,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
   const response: AuthResponse = {
     ok: true,
     token,
-    user: {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      isAdmin: !!user.is_admin,
-      purchasedTools,
-      nits,
-      forcePasswordChange: !!user.force_password_change,
-    },
+    user: buildAuthUser(user, purchasedTools, nits),
   };
 
   res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
@@ -163,6 +182,7 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
     userId: user.id,
     email: user.email,
     isAdmin: !!user.is_admin,
+    role: user.role || (user.is_admin ? "ADMIN" : "USER"),
   };
 
   const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
@@ -170,18 +190,106 @@ router.post("/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res:
   const response: AuthResponse = {
     ok: true,
     token,
-    user: {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      isAdmin: !!user.is_admin,
-      purchasedTools: [],
-      nits: [],
-    },
+    user: buildAuthUser(user, [], []),
   };
 
   res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
 
+  return res.status(201).json(response);
+});
+
+// ============================================
+// GET /auth/demo-invites/:token (public demo invitation lookup)
+// ============================================
+router.get("/demo-invites/:token", rateLimit(20, 15 * 60 * 1000), async (req: Request, res: Response) => {
+  const token = String(req.params.token || "").trim();
+  if (!token) {
+    return res.status(400).json({ ok: false, message: "Enlace demo inválido" });
+  }
+
+  const lookup = await getDemoInviteByToken(token);
+  if (!lookup.ok || !lookup.invite) {
+    const message = lookup.reason === "used"
+      ? "Este enlace demo ya fue utilizado."
+      : lookup.reason === "expired"
+        ? "Este enlace demo expiró. Solicita uno nuevo al equipo ContaGO."
+        : "Este enlace demo no existe o es inválido.";
+    return res.status(lookup.reason === "expired" || lookup.reason === "used" ? 410 : 404).json({ ok: false, message, reason: lookup.reason });
+  }
+
+  return res.json({
+    ok: true,
+    invite: {
+      toolId: lookup.invite.toolId,
+      expiresAt: lookup.invite.expiresAt,
+    },
+  });
+});
+
+// ============================================
+// POST /auth/demo/register (public one-use demo registration)
+// ============================================
+router.post("/demo/register", rateLimit(5, 15 * 60 * 1000), async (req: Request, res: Response) => {
+  const { token, nit, email, password, name } = req.body;
+
+  if (!token || !nit || !email || !password || !name ||
+    typeof token !== "string" || typeof nit !== "string" || typeof email !== "string" || typeof password !== "string" || typeof name !== "string"
+  ) {
+    const response: AuthResponse = { ok: false, message: "Enlace demo, NIT, email, nombre y contraseña requeridos" };
+    return res.status(400).json(response);
+  }
+
+  if (!isValidEmail(email)) {
+    const response: AuthResponse = { ok: false, message: "Email no válido" };
+    return res.status(400).json(response);
+  }
+
+  if (password.length < 8) {
+    const response: AuthResponse = { ok: false, message: "La contraseña debe tener al menos 8 caracteres" };
+    return res.status(400).json(response);
+  }
+
+  if (name.trim().length < 2) {
+    const response: AuthResponse = { ok: false, message: "El nombre es demasiado corto" };
+    return res.status(400).json(response);
+  }
+
+  const result = await consumeDemoInvite(token.trim(), nit.trim(), email.toLowerCase().trim(), name.trim(), password);
+  if (!result.ok) {
+    const messageByReason: Record<string, string> = {
+      invalid: "El enlace demo no existe o es inválido.",
+      used: "Este enlace demo ya fue utilizado. Solicita acceso al equipo ContaGO si necesitas una licencia completa.",
+      expired: "Este enlace demo expiró. Solicita uno nuevo al equipo ContaGO.",
+      invalid_nit: "Ingresa un NIT válido para activar la DEMO.",
+      nit_used: "Este NIT ya tuvo o tiene una DEMO reservada. Para continuar, escríbenos y revisamos la licencia completa.",
+      email_exists: "El email ya está registrado. Inicia sesión o usa otro correo para esta prueba.",
+      create_failed: "No se pudo crear el usuario demo. Intenta nuevamente.",
+    };
+    const statusByReason: Record<string, number> = { invalid: 404, used: 410, expired: 410, invalid_nit: 400, nit_used: 409, email_exists: 400, create_failed: 500 };
+    const response: AuthResponse = { ok: false, message: messageByReason[result.reason] || "No se pudo activar la demo" };
+    return res.status(statusByReason[result.reason] || 400).json(response);
+  }
+
+  const user = result.user;
+  const payload: JWTPayload = {
+    userId: user.id,
+    email: user.email,
+    isAdmin: false,
+    role: "DEMO",
+  };
+  const authToken = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
+  const [purchasedTools, nits] = await Promise.all([
+    getUserPurchases(user.id),
+    getUserNits(user.id),
+  ]);
+
+  const response: AuthResponse = {
+    ok: true,
+    token: authToken,
+    user: buildAuthUser(user, purchasedTools, nits),
+  };
+
+  res.cookie(AUTH_COOKIE_NAME, authToken, getAuthCookieOptions());
   return res.status(201).json(response);
 });
 
@@ -320,12 +428,7 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
     ok: true,
     temporaryPassword,
     user: {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      isAdmin: !!user.is_admin,
-      purchasedTools: cleanTools,
-      nits: cleanNits,
+      ...buildAuthUser(user, cleanTools, cleanNits),
       forcePasswordChange: true,
     },
   };
@@ -370,15 +473,7 @@ router.get("/me", async (req: Request, res: Response) => {
 
     return res.json({
       ok: true,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-        isAdmin: !!user.is_admin,
-        purchasedTools,
-        nits,
-        forcePasswordChange: !!user.force_password_change,
-      },
+      user: buildAuthUser(user, purchasedTools, nits),
     });
   } catch {
     return res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });

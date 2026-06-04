@@ -9,6 +9,7 @@ import { PDFDocument } from "pdf-lib";
 import { extractDocumentIdsByCufe, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
+import { buildDemoLimitInfo, getDemoLimit, type DemoLimitInfo } from "../utils/demoLimit.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
@@ -60,6 +61,7 @@ interface JobData {
   createdAt: number;
   completedAt?: number;
   tempDir?: string; // Se usa para limpieza temprana al cancelar.
+  demoLimit?: DemoLimitInfo;
 }
 
 const jobTracker = new Map<string, JobData>();
@@ -202,6 +204,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     progress: job.progress,
     error: job.error,
     zipName: job.zipName,
+    demoLimit: job.demoLimit,
   });
 });
 
@@ -366,6 +369,8 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
     }
   }
 
+  const demoTrialLimit = getDemoLimit(req);
+
   // Registrar job antes de responder para que polling/SSE lo encuentren.
   const job: JobData = {
     status: "pending",
@@ -392,7 +397,8 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
     consolidate_pdf,
     include_pdf_folder,
     include_xml_folder,
-    direction
+    direction,
+    demoTrialLimit
   ).catch((err) => {
     console.error(`Error en job ${jobId}:`, err);
     const job = jobTracker.get(jobId);
@@ -413,7 +419,8 @@ async function processDownloadJob(
   consolidate_pdf: boolean | undefined,
   include_pdf_folder: boolean | undefined,
   include_xml_folder: boolean | undefined,
-  documentDirection: "received" | "sent" = "received"
+  documentDirection: "received" | "sent" = "received",
+  demoTrialLimit: number | null = null
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
@@ -456,7 +463,7 @@ async function processDownloadJob(
     const baseUrlNormal = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
     const baseUrlEquivalente = "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId=";
 
-    const { documents } = await extractDocumentIdsByCufe(
+    const { documents, listedCount } = await extractDocumentIdsByCufe(
       token_url,
       start_date,
       end_date,
@@ -512,11 +519,17 @@ async function processDownloadJob(
         if (activeDownloads.size >= downloadWorkers) {
           await Promise.race(activeDownloads);
         }
-      }
+      },
+      undefined,
+      demoTrialLimit || undefined
     );
 
     if (activeDownloads.size > 0) {
       await Promise.all(activeDownloads);
+    }
+
+    if (demoTrialLimit) {
+      job.demoLimit = buildDemoLimitInfo(listedCount || documents.length, demoTrialLimit);
     }
 
     // Checkpoint tras la operacion mas costosa del scraper.

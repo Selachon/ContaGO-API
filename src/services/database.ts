@@ -1,7 +1,58 @@
 import bcrypt from "bcrypt";
+import { createHash, randomBytes } from "crypto";
 import { MongoClient, type Db, type Collection, ObjectId } from "mongodb";
-import type { User } from "../types/auth.js";
+import type { DemoAccess, User, UserRole } from "../types/auth.js";
 import type { GoogleDriveConfig } from "../types/dianExcel.js";
+
+export const DEMO_TRIAL_HOURS = Number(process.env.DEMO_TRIAL_HOURS || 72);
+export const DEMO_TRIAL_LIMIT = Number(process.env.DEMO_TRIAL_LIMIT || 30);
+export const DEMO_INVITE_TTL_DAYS = Number(process.env.DEMO_INVITE_TTL_DAYS || 14);
+
+interface DemoInviteRecord {
+  _id: ObjectId;
+  tokenHash: string;
+  nit?: string;
+  normalizedNit?: string;
+  toolId: string;
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string;
+  usedAt?: string;
+  usedByUserId?: string;
+  status?: "active" | "used" | "expired";
+}
+
+interface DemoNitTrialRecord {
+  _id: string;
+  nit: string;
+  normalizedNit: string;
+  toolId: string;
+  inviteId: string;
+  createdBy: string;
+  createdAt: string;
+  status: "reserved" | "consumed";
+  userId?: string;
+  consumedAt?: string;
+}
+
+export interface DemoInviteListItem {
+  id: string;
+  nit?: string;
+  normalizedNit?: string;
+  toolId: string;
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string;
+  usedAt?: string;
+  usedByUserId?: string;
+  status: "active" | "used" | "expired";
+}
+
+export interface DemoInviteLookup {
+  ok: boolean;
+  reason?: "invalid" | "used" | "expired";
+  invite?: DemoInviteListItem;
+}
 
 interface UserRecord {
   _id: ObjectId;
@@ -9,6 +60,8 @@ interface UserRecord {
   name: string;
   password_hash: string;
   is_admin: boolean;
+  role?: UserRole;
+  demo?: DemoAccess;
   purchasedTools: string[];
   nits: string[];
   status?: "active" | "suspended";
@@ -40,6 +93,39 @@ function usersCollection(): Collection<UserRecord> {
   return db.collection<UserRecord>("users");
 }
 
+function demoInvitesCollection(): Collection<DemoInviteRecord> {
+  if (!db) {
+    throw new Error("MongoDB no está conectado");
+  }
+  return db.collection<DemoInviteRecord>("demo_invites");
+}
+
+function demoNitTrialsCollection(): Collection<DemoNitTrialRecord> {
+  if (!db) {
+    throw new Error("MongoDB no está conectado");
+  }
+  return db.collection<DemoNitTrialRecord>("demo_nit_trials");
+}
+
+async function ensureIndex(
+  collection: { collectionName: string; createIndex: (keys: Record<string, 1 | -1>, options?: Parameters<Collection["createIndex"]>[1]) => Promise<string> },
+  keys: Record<string, 1 | -1>,
+  options: Parameters<Collection["createIndex"]>[1] = {}
+): Promise<void> {
+  try {
+    await collection.createIndex(keys, options);
+  } catch (err) {
+    const code = (err as { code?: number }).code;
+    if (code === 14031) {
+      console.warn(
+        "[Mongo] Índice omitido por espacio insuficiente en Railway: " + collection.collectionName + " " + JSON.stringify(keys)
+      );
+      return;
+    }
+    throw err;
+  }
+}
+
 export function getDb(): Db {
   if (!db) {
     throw new Error("MongoDB no está conectado");
@@ -62,8 +148,13 @@ export async function connectMongo(): Promise<void> {
 
   // Índices
   const users = usersCollection();
-  await users.createIndex({ email: 1 }, { unique: true });
-  await users.createIndex({ legacyId: 1 });
+  await ensureIndex(users, { email: 1 }, { unique: true });
+  await ensureIndex(users, { legacyId: 1 });
+  await ensureIndex(users, { role: 1 });
+  const demoInvites = demoInvitesCollection();
+  await ensureIndex(demoInvites, { tokenHash: 1 }, { unique: true });
+  await ensureIndex(demoInvites, { normalizedNit: 1 });
+  await ensureIndex(demoInvites, { createdAt: -1 });
 }
 
 function mapUser(record: UserRecord | null): User | null {
@@ -74,11 +165,212 @@ function mapUser(record: UserRecord | null): User | null {
     name: record.name,
     password_hash: record.password_hash,
     is_admin: record.is_admin,
+    role: record.role || (record.is_admin ? "ADMIN" : "USER"),
     nits: record.nits || [],
     status: record.status || "active",
     force_password_change: !!record.force_password_change,
     created_at: record.created_at,
+    demo: record.demo,
   };
+}
+
+// ============================================
+// Demo trial functions
+// ============================================
+
+export function normalizeNitForDemo(nit: string): string {
+  return String(nit || "").replace(/[^0-9A-Za-z]/g, "").toUpperCase().trim();
+}
+
+function hashDemoInviteToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function addHours(date: Date, hours: number): Date {
+  return new Date(date.getTime() + hours * 60 * 60 * 1000);
+}
+
+function addDays(date: Date, days: number): Date {
+  return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
+}
+
+function mapDemoInvite(record: DemoInviteRecord): DemoInviteListItem {
+  const expired = !record.usedAt && new Date(record.expiresAt).getTime() <= Date.now();
+  return {
+    id: record._id.toString(),
+    nit: record.nit,
+    normalizedNit: record.normalizedNit,
+    toolId: record.toolId,
+    createdBy: record.createdBy,
+    createdAt: record.createdAt,
+    expiresAt: record.expiresAt,
+    usedAt: record.usedAt,
+    usedByUserId: record.usedByUserId,
+    status: record.usedAt ? "used" : expired ? "expired" : "active",
+  };
+}
+
+export function isDemoTrialExpired(demo?: DemoAccess | null): boolean {
+  if (!demo?.expiresAt) return false;
+  return new Date(demo.expiresAt).getTime() <= Date.now();
+}
+
+export async function createDemoInvite(toolId: string, createdBy: string): Promise<{ token: string; invite: DemoInviteListItem } | null> {
+  const cleanToolId = String(toolId || "").trim();
+  if (!cleanToolId) return null;
+
+  const inviteId = new ObjectId();
+  const token = randomBytes(32).toString("hex");
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresAt = addDays(now, DEMO_INVITE_TTL_DAYS).toISOString();
+
+  const inviteRecord: DemoInviteRecord = {
+    _id: inviteId,
+    tokenHash: hashDemoInviteToken(token),
+    toolId: cleanToolId,
+    createdBy,
+    createdAt: nowIso,
+    expiresAt,
+    status: "active",
+  };
+
+  await demoInvitesCollection().insertOne(inviteRecord);
+  return { token, invite: mapDemoInvite(inviteRecord) };
+}
+
+export async function listDemoInvites(limit = 25): Promise<DemoInviteListItem[]> {
+  const records = await demoInvitesCollection()
+    .find({})
+    .sort({ createdAt: -1 })
+    .limit(Math.min(Math.max(limit, 1), 100))
+    .toArray();
+  return records.map(mapDemoInvite);
+}
+
+export async function getDemoInviteByToken(token: string): Promise<DemoInviteLookup> {
+  const tokenHash = hashDemoInviteToken(String(token || ""));
+  const record = await demoInvitesCollection().findOne({ tokenHash });
+  if (!record) return { ok: false, reason: "invalid" };
+
+  const invite = mapDemoInvite(record);
+  if (invite.status === "used") return { ok: false, reason: "used", invite };
+  if (invite.status === "expired") return { ok: false, reason: "expired", invite };
+  return { ok: true, invite };
+}
+
+export async function consumeDemoInvite(
+  token: string,
+  nit: string,
+  email: string,
+  name: string,
+  password: string
+): Promise<{ ok: true; user: User } | { ok: false; reason: "invalid" | "used" | "expired" | "invalid_nit" | "nit_used" | "email_exists" | "create_failed" }> {
+  const lookup = await getDemoInviteByToken(token);
+  if (!lookup.ok || !lookup.invite) {
+    return { ok: false, reason: lookup.reason || "invalid" };
+  }
+
+  const cleanNit = String(nit || "").trim();
+  const normalizedNit = normalizeNitForDemo(cleanNit);
+  if (!cleanNit || normalizedNit.length < 5) return { ok: false, reason: "invalid_nit" };
+
+  const existing = await getUserByEmail(email);
+  if (existing) return { ok: false, reason: "email_exists" };
+
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const trialRecord: DemoNitTrialRecord = {
+    _id: normalizedNit,
+    nit: cleanNit,
+    normalizedNit,
+    toolId: lookup.invite.toolId,
+    inviteId: lookup.invite.id,
+    createdBy: lookup.invite.createdBy,
+    createdAt: nowIso,
+    status: "reserved",
+  };
+
+  try {
+    await demoNitTrialsCollection().insertOne(trialRecord);
+  } catch (err) {
+    if ((err as { code?: number }).code === 11000) return { ok: false, reason: "nit_used" };
+    throw err;
+  }
+
+  const claimed = await demoInvitesCollection().findOneAndUpdate(
+    { _id: new ObjectId(lookup.invite.id), usedAt: { $exists: false } },
+    { $set: { usedAt: nowIso, status: "used", nit: cleanNit, normalizedNit } },
+    { returnDocument: "after" }
+  );
+
+  if (!claimed) {
+    await demoNitTrialsCollection().deleteOne({ _id: normalizedNit, inviteId: lookup.invite.id, status: "reserved" });
+    return { ok: false, reason: "used" };
+  }
+
+  const trialExpiresAt = addHours(now, DEMO_TRIAL_HOURS).toISOString();
+  const demo: DemoAccess = {
+    nit: cleanNit,
+    normalizedNit,
+    toolId: lookup.invite.toolId,
+    inviteId: lookup.invite.id,
+    startedAt: nowIso,
+    expiresAt: trialExpiresAt,
+    trialLimit: DEMO_TRIAL_LIMIT,
+  };
+
+  const user = await createUser(
+    email,
+    name,
+    password,
+    false,
+    [cleanNit],
+    [lookup.invite.toolId],
+    {
+      role: "DEMO",
+      demo,
+      licenseStartDate: nowIso.slice(0, 10),
+      licenseEndDate: trialExpiresAt.slice(0, 10),
+      companiesInPlan: 1,
+    }
+  );
+
+  if (!user) {
+    await Promise.all([
+      demoInvitesCollection().updateOne(
+        { _id: new ObjectId(lookup.invite.id) },
+        { $unset: { usedAt: "", status: "", nit: "", normalizedNit: "" } }
+      ),
+      demoNitTrialsCollection().deleteOne({ _id: normalizedNit, inviteId: lookup.invite.id, status: "reserved" }),
+    ]);
+    return { ok: false, reason: "create_failed" };
+  }
+
+  await Promise.all([
+    demoInvitesCollection().updateOne(
+      { _id: new ObjectId(lookup.invite.id) },
+      { $set: { usedByUserId: user.id, status: "used", nit: cleanNit, normalizedNit } }
+    ),
+    demoNitTrialsCollection().updateOne(
+      { _id: normalizedNit, inviteId: lookup.invite.id },
+      { $set: { status: "consumed", userId: user.id, consumedAt: nowIso } }
+    ),
+  ]);
+
+  return { ok: true, user };
+}
+
+export async function getUserDemoAccess(userId: string): Promise<DemoAccess | null> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne({ _id: oid }, { projection: { role: 1, demo: 1, is_admin: 1 } });
+    const role = record?.role || (record?.is_admin ? "ADMIN" : "USER");
+    if (role !== "DEMO" || !record?.demo) return null;
+    return record.demo;
+  } catch {
+    return null;
+  }
 }
 
 // ============================================
@@ -86,6 +378,8 @@ function mapUser(record: UserRecord | null): User | null {
 // ============================================
 
 export interface UserExtras {
+  role?: UserRole;
+  demo?: DemoAccess;
   phone?: string;
   paymentAmount?: number;
   paymentMethod?: string;
@@ -118,6 +412,7 @@ export async function createUser(
       created_at: new Date().toISOString(),
       force_password_change: false,
       ...extras,
+      role: isAdmin ? "ADMIN" : (extras.role || "USER"),
     };
 
     await usersCollection().insertOne(record);

@@ -1,4 +1,5 @@
 import { ObjectId, type Collection } from "mongodb";
+import type { DemoAccess, UserRole } from "../types/auth.js";
 import { db } from "./database.js";
 
 // ============================================
@@ -11,6 +12,8 @@ interface UserRecord {
   name: string;
   password_hash: string;
   is_admin: boolean;
+  role?: UserRole;
+  demo?: DemoAccess;
   purchasedTools: string[];
   nits: string[];
   status: "active" | "suspended";
@@ -34,6 +37,8 @@ interface AdminUser {
   email: string;
   name: string;
   isAdmin: boolean;
+  role: UserRole;
+  demo?: DemoAccess;
   purchasedTools: string[];
   nits: string[];
   status: "active" | "suspended";
@@ -328,6 +333,8 @@ function mapUserToAdmin(record: UserRecord): AdminUser {
     email: record.email,
     name: record.name,
     isAdmin: record.is_admin,
+    role: record.role || (record.is_admin ? "ADMIN" : "USER"),
+    demo: record.demo,
     purchasedTools: record.purchasedTools || [],
     nits: record.nits || [],
     status: record.status || "active",

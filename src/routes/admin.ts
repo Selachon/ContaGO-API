@@ -21,12 +21,28 @@ import {
   type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
-import { TOOL_SUCCESSOR, updateUserPassword } from "../services/database.js";
+import { createDemoInvite, listDemoInvites, TOOL_SUCCESSOR, updateUserPassword } from "../services/database.js";
 
 const router = Router();
 
+const DEMO_ALLOWED_TOOLS = new Set([
+  "dian-cufe-downloader",
+  "dian-mass-download",
+  "dian-third-parties-excel",
+]);
+
 function generateTemporaryPassword(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function resolveFrontendBaseUrl(req: Request, rawBaseUrl: unknown): string {
+  const requested = typeof rawBaseUrl === "string" ? rawBaseUrl.trim() : "";
+  if (/^https?:\/\//i.test(requested)) return requested.replace(/\/+$/, "");
+
+  const envUrl = process.env.FRONTEND_URL || process.env.CORS_ORIGIN?.split(",")[0]?.trim();
+  if (envUrl && /^https?:\/\//i.test(envUrl)) return envUrl.replace(/\/+$/, "");
+
+  return (req.protocol + "://" + req.get("host")).replace(/\/+$/, "");
 }
 
 // Todas las rutas admin requieren autenticacion y rol admin.
@@ -53,6 +69,7 @@ router.get("/users/export", async (req: Request, res: Response) => {
       { header: "Email", key: "email", width: 32 },
       { header: "Estado", key: "status", width: 12 },
       { header: "Admin", key: "isAdmin", width: 8 },
+      { header: "Rol", key: "role", width: 12 },
       { header: "Teléfono", key: "phone", width: 16 },
       { header: "Herramientas", key: "purchasedTools", width: 40 },
       { header: "NITs", key: "nits", width: 40 },
@@ -84,6 +101,7 @@ router.get("/users/export", async (req: Request, res: Response) => {
         email: u.email,
         status: u.status === "active" ? "Activo" : "Suspendido",
         isAdmin: u.isAdmin ? "Sí" : "No",
+        role: u.role || (u.isAdmin ? "ADMIN" : "USER"),
         phone: u.phone ?? "",
         purchasedTools: u.purchasedTools.join(", "),
         nits: u.nits.join(", "),
@@ -109,6 +127,65 @@ router.get("/users/export", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[Admin] Error exportando usuarios:", err);
     res.status(500).json({ ok: false, message: "Error al exportar usuarios" });
+  }
+});
+
+// ============================================
+// GET /admin/demo-invites - Listar invitaciones DEMO recientes
+// ============================================
+router.get("/demo-invites", async (_req: Request, res: Response) => {
+  try {
+    const invites = await listDemoInvites(40);
+    res.json({ ok: true, invites });
+  } catch (err) {
+    console.error("[Admin] Error listando invitaciones demo:", err);
+    res.status(500).json({ ok: false, message: "Error al listar invitaciones DEMO" });
+  }
+});
+
+// ============================================
+// POST /admin/demo-invites - Crear enlace DEMO de un uso
+// ============================================
+router.post("/demo-invites", async (req: Request, res: Response) => {
+  try {
+    const actorId = req.user!.userId;
+    const toolId = typeof req.body?.toolId === "string" ? req.body.toolId.trim() : "";
+
+    if (!DEMO_ALLOWED_TOOLS.has(toolId)) {
+      return res.status(400).json({ ok: false, message: "Selecciona una herramienta válida para la DEMO" });
+    }
+
+    const created = await createDemoInvite(toolId, actorId);
+    if (!created) {
+      return res.status(409).json({
+        ok: false,
+        message: "No se pudo crear el enlace DEMO. Intenta nuevamente.",
+      });
+    }
+
+    const baseUrl = resolveFrontendBaseUrl(req, req.body?.frontendBaseUrl);
+    const inviteUrl = baseUrl + "/demo/" + created.token;
+
+    await logAdminAction({
+      actorId,
+      action: "create_demo_invite",
+      after: {
+        inviteId: created.invite.id,
+        toolId,
+        expiresAt: created.invite.expiresAt,
+      },
+    });
+
+    res.status(201).json({
+      ok: true,
+      inviteUrl,
+      token: created.token,
+      invite: created.invite,
+      message: "Enlace DEMO creado. Es de un solo uso; el cliente escribirá su NIT al activarlo.",
+    });
+  } catch (err) {
+    console.error("[Admin] Error creando invitación demo:", err);
+    res.status(500).json({ ok: false, message: "Error al crear invitación DEMO" });
   }
 });
 
