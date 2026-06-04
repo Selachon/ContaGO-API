@@ -16,6 +16,7 @@ import {
   getPurchaseSupportDocumentPdf,
   getSiigoIntegrationHealth,
   listCustomers,
+  createCustomer,
   listDocumentTypes,
   listInvoices,
   listPaymentReceipts,
@@ -42,7 +43,7 @@ import {
   getCompanyContext,
 } from "../services/siigoCompaniesService.js";
 import { getUserSiigoCompanies, setUserSiigoCompanies } from "../services/database.js";
-import { processXmlForAccounting, processXmlBatch, submitToSiigo } from "../services/siigoAccountingService.js";
+import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import {
   savePaymentMap,
   rebuildProfilesFromBalance,
@@ -53,9 +54,12 @@ import {
   getAccountsCatalog,
 } from "../services/siigoSuggestionsService.js";
 
+// Límite de subida POR ARCHIVO. Un ZIP con un mes de facturas + PDF puede pesar
+// bastante, así que es generoso y configurable con SIIGO_UPLOAD_LIMIT_MB.
+const UPLOAD_LIMIT_MB = Math.max(1, Number(process.env.SIIGO_UPLOAD_LIMIT_MB || 100));
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 },
 });
 
 type BinaryKind = "pdf" | "xml";
@@ -738,6 +742,30 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   }
   });
 
+  router.post("/customers", async (req: Request, res: Response) => {
+    try {
+      const body = req.body;
+      if (!body || !body.identification) {
+        return res.status(400).json({ ok: false, source: "siigo", code: "invalid_body", message: "Falta la identificación del tercero" });
+      }
+      const data = await createCustomer(body);
+      invalidateCustomersIndex();
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Índice de terceros (id, NIT, nombre) para autocompletar en el cliente.
+  router.get("/accounting/customers-index", async (_req: Request, res: Response) => {
+    try {
+      const data = await getCustomersIndex();
+      return res.json({ ok: true, data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
   router.get("/customers/:id", async (req: Request, res: Response) => {
   try {
     const id = validateId(req.params.id);
@@ -960,6 +988,20 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         "| Siigo details:",
         detalle
       );
+      if (error instanceof SiigoError) {
+        const nit = supplierNotFoundNit(error.details);
+        if (nit !== null) {
+          return res.status(409).json({
+            ok: false,
+            source: "siigo",
+            code: "SUPPLIER_NOT_FOUND",
+            nit,
+            message: nit
+              ? `El proveedor con NIT ${nit} no existe en Siigo. Puedes crearlo con los datos de la factura antes de causar.`
+              : "El proveedor de esta factura no existe en Siigo. Puedes crearlo con los datos de la factura antes de causar.",
+          });
+        }
+      }
       return handleSiigoError(res, error);
     }
   });
@@ -1053,6 +1095,23 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     } catch (error) {
       return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
     }
+  });
+
+  // Convierte errores de multer (p. ej. archivo demasiado grande) en JSON claro,
+  // en vez de un 500 HTML que el frontend muestra como "Error de red".
+  router.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+    const e = err as { name?: string; code?: string } | null;
+    if (e && e.name === "MulterError") {
+      const tooLarge = e.code === "LIMIT_FILE_SIZE";
+      return res.status(tooLarge ? 413 : 400).json({
+        ok: false,
+        code: tooLarge ? "file_too_large" : "upload_error",
+        message: tooLarge
+          ? `Archivo demasiado grande. Límite actual: ${UPLOAD_LIMIT_MB} MB por archivo. Si tu ZIP pesa más, súbelo en partes o sube los XML directamente.`
+          : "No se pudieron subir los archivos.",
+      });
+    }
+    return next(err);
   });
 
   return router;

@@ -39,6 +39,9 @@ export interface InvoiceData {
   issuerCity?: string;
   issuerDepartment?: string;
   issuerCountry?: string;
+  issuerCityCode?: string;
+  issuerStateCode?: string;
+  issuerCountryCode?: string;
   issuerCommercialName?: string;
   issuerTaxpayerType?: string;
   issuerFiscalRegime?: string;

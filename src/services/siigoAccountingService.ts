@@ -5,6 +5,8 @@ import {
   createPurchaseSupportDocument,
   createCreditNote,
   listPurchases,
+  listCustomers,
+  getCurrentSiigoCompanyId,
 } from "./siigoService.js";
 import { getSupplierProfile, type SupplierProfile } from "./siigoSuggestionsService.js";
 
@@ -14,6 +16,24 @@ export interface XmlCausacionItem {
   base: number; // Base del impuesto / valor unitario
   ivaPercent: number; // 0 si la línea no tiene IVA
   incPercent: number; // 0 si la línea no tiene Impoconsumo
+}
+
+/** Borrador de tercero (proveedor) prellenado desde el XML para crearlo en Siigo. */
+export interface SupplierDraft {
+  type: "Supplier";
+  person_type: "Person" | "Company";
+  id_type: string; // "31" NIT, "13" cédula
+  identification: string;
+  name: string[];
+  commercial_name?: string;
+  vat_responsible: boolean;
+  fiscal_responsibilities: Array<{ code: string }>;
+  address: {
+    address: string;
+    city: { country_code: string; state_code: string; city_code: string };
+  };
+  phones: Array<{ number: string }>;
+  contacts: Array<{ first_name: string; last_name?: string; email?: string }>;
 }
 
 /** Datos del XML mapeados a los campos del formulario de causación. */
@@ -29,6 +49,7 @@ export interface XmlCausacionData {
   cufe: string;
   items: XmlCausacionItem[];
   totals: { subtotal: number; iva: number; total: number };
+  supplierDraft: SupplierDraft;
 }
 
 /**
@@ -44,6 +65,44 @@ function splitDocNumber(raw: string): { prefix: string; number: string } {
   const letters = clean.replace(/[^A-Za-z]/g, "");
   const digits = clean.replace(/\D/g, "");
   return { prefix: letters ? letters.toUpperCase() : "FC", number: digits };
+}
+
+/**
+ * Construye un borrador de tercero (proveedor) a partir de los datos del emisor
+ * del XML, listo para que el usuario lo revise/edite y se cree vía POST /v1/customers.
+ */
+function buildSupplierDraft(xml: any): SupplierDraft {
+  const clean = (v: unknown) => {
+    const s = String(v ?? "").trim();
+    return s && s.toUpperCase() !== "N/A" ? s : "";
+  };
+  const nit = clean(xml.issuerNit).split("-")[0].replace(/\D/g, "");
+  // AdditionalAccountID (issuerTaxpayerType): "1" persona jurídica, "2" persona natural.
+  const isCompany = clean(xml.issuerTaxpayerType) !== "2";
+  const name = clean(xml.issuerName);
+  const email = clean(xml.issuerEmail);
+  const phone = clean(xml.issuerPhone).replace(/\D/g, "");
+  const cityCode = clean(xml.issuerCityCode).replace(/\D/g, "");
+  const stateCode = clean(xml.issuerStateCode).replace(/\D/g, "") || (cityCode.length >= 2 ? cityCode.slice(0, 2) : "");
+  let countryCode = clean(xml.issuerCountryCode) || "CO";
+  if (countryCode.toUpperCase() === "CO") countryCode = "Co"; // Siigo guarda Colombia como "Co"
+
+  return {
+    type: "Supplier",
+    person_type: isCompany ? "Company" : "Person",
+    id_type: isCompany ? "31" : "13",
+    identification: nit,
+    name: [name],
+    commercial_name: clean(xml.issuerCommercialName) || undefined,
+    vat_responsible: false,
+    fiscal_responsibilities: [{ code: "R-99-PN" }],
+    address: {
+      address: clean(xml.issuerAddress) || "N/A",
+      city: { country_code: countryCode, state_code: stateCode, city_code: cityCode },
+    },
+    phones: phone ? [{ number: phone }] : [],
+    contacts: [{ first_name: name || "Contacto", ...(email ? { email } : {}) }],
+  };
 }
 
 /**
@@ -110,6 +169,7 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
       iva: Number(xmlData.iva) || 0,
       total: Number(xmlData.total) || 0,
     },
+    supplierDraft: buildSupplierDraft(xmlData),
   };
 }
 
@@ -243,9 +303,78 @@ export async function processXmlBatch(
   return results;
 }
 
+// ─── Índice de terceros para autocompletar (nombre / NIT) ─────────────
+export interface CustomerIndexEntry {
+  id: string;
+  identification: string;
+  name: string;
+  branch_office: number;
+}
+
+const customerIndexCache = new Map<string, { at: number; data: CustomerIndexEntry[] }>();
+const CUSTOMER_INDEX_TTL_MS = 10 * 60 * 1000;
+
+/** Borra la caché del índice (p. ej. tras crear un tercero nuevo). */
+export function invalidateCustomersIndex(): void {
+  customerIndexCache.clear();
+}
+
+/**
+ * Trae todos los terceros de la empresa (paginado) en forma reducida para
+ * autocompletar en el cliente. Cacheado por empresa con TTL para no golpear la API.
+ */
+export async function getCustomersIndex(): Promise<CustomerIndexEntry[]> {
+  const key = getCurrentSiigoCompanyId() || "env";
+  const cached = customerIndexCache.get(key);
+  if (cached && Date.now() - cached.at < CUSTOMER_INDEX_TTL_MS) return cached.data;
+
+  const out: CustomerIndexEntry[] = [];
+  for (let page = 1; page <= 200; page++) {
+    const resp = (await listCustomers({ page, page_size: 100 })) as any;
+    const results: any[] = Array.isArray(resp?.results) ? resp.results : [];
+    if (!results.length) break;
+    for (const c of results) {
+      out.push({
+        id: String(c?.id ?? ""),
+        identification: String(c?.identification ?? ""),
+        name: Array.isArray(c?.name) ? c.name.filter(Boolean).join(" ") : String(c?.name ?? c?.commercial_name ?? ""),
+        branch_office: Number(c?.branch_office) || 0,
+      });
+    }
+    const total = Number(resp?.pagination?.total_results) || 0;
+    if (results.length < 100 || (total && out.length >= total)) break;
+  }
+  customerIndexCache.set(key, { at: Date.now(), data: out });
+  return out;
+}
+
 export async function submitToSiigo(type: "FC" | "DS" | "NC", payload: unknown) {
   if (type === "FC") return createPurchase(payload);
   if (type === "DS") return createPurchaseSupportDocument(payload);
   if (type === "NC") return createCreditNote(payload);
   throw new Error("Tipo de documento no soportado");
+}
+
+/**
+ * Si los detalles de un error de Siigo corresponden a "el proveedor no existe"
+ * (code invalid_reference sobre supplier.identification), devuelve el NIT
+ * mencionado (o "" si no se pudo extraer). Si no es ese error, devuelve null.
+ */
+export function supplierNotFoundNit(details: unknown): string | null {
+  const rec = details as Record<string, unknown> | null;
+  const errs = (rec?.errors ?? rec?.Errors) as unknown;
+  if (!Array.isArray(errs)) return null;
+  for (const e of errs as Array<Record<string, unknown>>) {
+    const code = String(e?.code ?? e?.Code ?? "").toLowerCase();
+    const message = String(e?.message ?? e?.Message ?? "");
+    const params = (Array.isArray(e?.params ?? e?.Params) ? (e?.params ?? e?.Params) : []) as unknown[];
+    const aboutSupplier =
+      params.some((p) => String(p).toLowerCase().includes("supplier")) ||
+      /supplier|proveedor/i.test(message);
+    if (code === "invalid_reference" && aboutSupplier) {
+      const m = message.match(/(\d{4,})/);
+      return m ? m[1] : "";
+    }
+  }
+  return null;
 }

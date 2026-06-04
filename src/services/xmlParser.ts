@@ -148,6 +148,9 @@ export async function extractInvoiceDataFromXml(
       issuerCity: issuerDetails.city,
       issuerDepartment: issuerDetails.department,
       issuerCountry: issuerDetails.country,
+      issuerCityCode: issuerDetails.cityCode,
+      issuerStateCode: issuerDetails.stateCode,
+      issuerCountryCode: issuerDetails.countryCode,
       issuerCommercialName: issuerDetails.commercialName,
       issuerTaxpayerType: issuerDetails.taxpayerType,
       issuerFiscalRegime: issuerDetails.fiscalRegime,
@@ -388,6 +391,9 @@ function extractPartyDetails(party: any): {
   city: string;
   department: string;
   country: string;
+  cityCode: string;
+  stateCode: string;
+  countryCode: string;
   commercialName: string;
   taxpayerType: string;
   fiscalRegime: string;
@@ -402,6 +408,9 @@ function extractPartyDetails(party: any): {
       city: "N/A",
       department: "N/A",
       country: "N/A",
+      cityCode: "",
+      stateCode: "",
+      countryCode: "",
       commercialName: "N/A",
       taxpayerType: "N/A",
       fiscalRegime: "N/A",
@@ -426,6 +435,12 @@ function extractPartyDetails(party: any): {
     const department = cleanText(getText(addressNode?.CountrySubentity || "N/A"));
     const countryNode = addressNode?.Country;
     const country = cleanText(getText(countryNode?.Name || countryNode?.IdentificationCode || "N/A"));
+
+    // Códigos DANE para crear terceros en Siigo (city_code 5 díg., state_code 2 díg.).
+    const cityCode = cleanText(getText(addressNode?.ID || "")).replace(/\D/g, "");
+    const stateCode = (cleanText(getText(addressNode?.CountrySubentityCode || "")).replace(/\D/g, ""))
+      || (cityCode.length >= 2 ? cityCode.slice(0, 2) : "");
+    const countryCode = (cleanText(getText(countryNode?.IdentificationCode || "")) || "").toUpperCase();
 
     const partyNameNode = party.PartyName;
     const commercialNameRaw = Array.isArray(partyNameNode)
@@ -453,6 +468,9 @@ function extractPartyDetails(party: any): {
       city,
       department,
       country,
+      cityCode,
+      stateCode,
+      countryCode,
       commercialName: cleanText(getText(commercialNameRaw || "N/A")),
       taxpayerType: cleanText(getText(taxpayerTypeRaw || "N/A")),
       fiscalRegime: cleanText(getText(fiscalRegimeRaw || "N/A")),
@@ -467,6 +485,9 @@ function extractPartyDetails(party: any): {
       city: "N/A",
       department: "N/A",
       country: "N/A",
+      cityCode: "",
+      stateCode: "",
+      countryCode: "",
       commercialName: "N/A",
       taxpayerType: "N/A",
       fiscalRegime: "N/A",
