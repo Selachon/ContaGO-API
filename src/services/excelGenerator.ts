@@ -328,8 +328,41 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
 
 // ── Sheet IVA: Reporte Auxiliar IVA ──────────────────────────────────────────
 
+// Impuestos que no son IVA ni retenciones — se excluyen de las columnas extra
+const IVA_EXCLUDED_TAXES = new Set(["IVA", "ReteIVA", "ReteRenta", "ReteICA"]);
+
+function colLetter(n: number): string {
+  let s = "";
+  while (n > 0) {
+    n--;
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26);
+  }
+  return s;
+}
+
+const EXTRA_TAX_PRIORITY = ["INC", "IC", "IC Porcentual", "Bolsas", "ICUI", "ICL", "IBUA", "ADV"];
+
+function collectExtraTaxNames(invoices: InvoiceData[]): string[] {
+  const seen = new Set<string>();
+  for (const inv of invoices) {
+    for (const li of inv.lineItems || []) {
+      for (const tax of li.taxes || []) {
+        if (!IVA_EXCLUDED_TAXES.has(tax.taxName)) seen.add(tax.taxName);
+      }
+    }
+  }
+  const priority = EXTRA_TAX_PRIORITY.filter(n => seen.has(n));
+  const rest = [...seen].filter(n => !EXTRA_TAX_PRIORITY.includes(n));
+  return [...priority, ...rest];
+}
+
 function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName: string = "", companyNit: string = ""): void {
   applyCompanyHeader(ws, companyName, companyNit);
+
+  const extraTaxNames = collectExtraTaxNames(invoices);
+  const totalCols = 12 + extraTaxNames.length;
+  const lastCol = colLetter(totalCols);
 
   // Disclaimer Row
   const disclaimerRow = ws.getRow(4);
@@ -338,23 +371,28 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
   disclaimerCell.value = "AVISO LEGAL: Esta herramienta proporciona un reporte auxiliar basado en los datos extraídos. ContaGO NO liquida impuestos. Es responsabilidad exclusiva del usuario revisar y validar esta información antes de cualquier presentación ante autoridades tributarias.";
   disclaimerCell.font = { italic: true, size: 10, color: { argb: "FFFF0000" } };
   disclaimerCell.alignment = { vertical: "middle", wrapText: true };
-  ws.mergeCells(`A4:L4`);
+  ws.mergeCells(`A4:${lastCol}4`);
 
   const headers = [
     "No.", "Tipo documento", "Número factura", "NIT Emisor", "Razón Social Emisor", "Fecha",
     "Bases de IVAS al 19%", "IVAS del 19%",
     "Bases IVAS 5%", "IVAS 5%",
     "Bases sin IVA", "IVA 0%",
+    ...extraTaxNames,
   ];
 
   const headerRow = ws.getRow(5);
   headerRow.values = headers;
   applyHeaderRow(headerRow);
-  
+
   // Custom freeze for this sheet since we added a row
   ws.views = [{ state: "frozen" as const, xSplit: 0, ySplit: 5, topLeftCell: "A6", activeCell: "A6" }];
 
   const { currencyCols, percentCols, dateCols } = computeFormatCols(headers);
+  // Extra tax columns are always currency regardless of whether the name is in CURRENCY_HEADERS
+  for (let i = 13; i <= totalCols; i++) {
+    if (!currencyCols.includes(i)) currencyCols.push(i);
+  }
 
   let rowNum = 6;
   for (const inv of invoices) {
@@ -363,11 +401,12 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
     let base5 = 0;
     let iva5 = 0;
     let baseSinIVA = 0;
+    const extraTaxTotals = new Map<string, number>(extraTaxNames.map(n => [n, 0]));
 
     for (const li of inv.lineItems || []) {
       const ivaTax = (li.taxes || []).find(t => t.taxName === "IVA");
       const base = li.totalUnitPrice || 0;
-      
+
       if (!ivaTax) {
         baseSinIVA += base;
       } else {
@@ -379,9 +418,15 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
           base5 += base;
           iva5 += ivaTax.amount || 0;
         } else {
-          // Tanto el IVA 0% como cualquier otro porcentaje diferente a 19 o 5 
+          // Tanto el IVA 0% como cualquier otro porcentaje diferente a 19 o 5
           // se suman a la base sin IVA, ya que no generan IVA a reportar en esas columnas.
           baseSinIVA += base;
+        }
+      }
+
+      for (const tax of li.taxes || []) {
+        if (extraTaxTotals.has(tax.taxName)) {
+          extraTaxTotals.set(tax.taxName, (extraTaxTotals.get(tax.taxName) || 0) + (tax.amount || 0));
         }
       }
     }
@@ -399,6 +444,7 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
       iva5,
       baseSinIVA,
       0, // IVA 0% siempre en ceros según requerimiento
+      ...extraTaxNames.map(n => extraTaxTotals.get(n) || 0),
     ];
 
     const row = ws.getRow(rowNum);

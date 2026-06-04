@@ -137,17 +137,46 @@ function buildSheet3Row(inv: Partial<InvoiceData>, rowNum: number): string {
   return `<row r="${rowNum}" spans="1:10">${cells}</row>`;
 }
 
-function buildSheetIVARow(inv: Partial<InvoiceData>, id: number, rowNum: number): string {
+const CUFE_IVA_EXCLUDED = new Set(["IVA", "ReteIVA", "ReteRenta", "ReteICA"]);
+
+function cufeColLetter(n: number): string {
+  let s = "";
+  while (n > 0) {
+    n--;
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26);
+  }
+  return s;
+}
+
+const CUFE_EXTRA_TAX_PRIORITY = ["INC", "IC", "IC Porcentual", "Bolsas", "ICUI", "ICL", "IBUA", "ADV"];
+
+function collectCufeExtraTaxNames(invoices: Partial<InvoiceData>[]): string[] {
+  const seen = new Set<string>();
+  for (const inv of invoices) {
+    for (const li of inv.lineItems || []) {
+      for (const tax of li.taxes || []) {
+        if (!CUFE_IVA_EXCLUDED.has(tax.taxName)) seen.add(tax.taxName);
+      }
+    }
+  }
+  const priority = CUFE_EXTRA_TAX_PRIORITY.filter(n => seen.has(n));
+  const rest = [...seen].filter(n => !CUFE_EXTRA_TAX_PRIORITY.includes(n));
+  return [...priority, ...rest];
+}
+
+function buildSheetIVARow(inv: Partial<InvoiceData>, id: number, rowNum: number, extraTaxNames: string[]): string {
   let base19 = 0;
   let iva19 = 0;
   let base5 = 0;
   let iva5 = 0;
   let baseSinIVA = 0;
+  const extraTaxTotals = new Map<string, number>(extraTaxNames.map(n => [n, 0]));
 
   for (const li of inv.lineItems || []) {
     const ivaTax = (li.taxes || []).find(t => t.taxName === "IVA");
     const base = li.totalUnitPrice || 0;
-    
+
     if (!ivaTax) {
       baseSinIVA += base;
     } else {
@@ -162,8 +191,19 @@ function buildSheetIVARow(inv: Partial<InvoiceData>, id: number, rowNum: number)
         baseSinIVA += base;
       }
     }
+
+    for (const tax of li.taxes || []) {
+      if (extraTaxTotals.has(tax.taxName)) {
+        extraTaxTotals.set(tax.taxName, (extraTaxTotals.get(tax.taxName) || 0) + (tax.amount || 0));
+      }
+    }
   }
 
+  const extraCells = extraTaxNames.map((name, i) =>
+    numCell(cufeColLetter(13 + i), rowNum, extraTaxTotals.get(name) || 0)
+  ).join("");
+
+  const totalCols = 12 + extraTaxNames.length;
   const cells = [
     numCell("A", rowNum, id),
     strCell("B", rowNum, inv.documentType || ""),
@@ -177,8 +217,9 @@ function buildSheetIVARow(inv: Partial<InvoiceData>, id: number, rowNum: number)
     numCell("J", rowNum, iva5),
     numCell("K", rowNum, baseSinIVA),
     numCell("L", rowNum, 0),
+    extraCells,
   ].join("");
-  return `<row r="${rowNum}" spans="1:12">${cells}</row>`;
+  return `<row r="${rowNum}" spans="1:${totalCols}">${cells}</row>`;
 }
 
 // ─── sheet patcher ──────────────────────────────────────────────────────────
@@ -272,19 +313,21 @@ export async function generateCufeExcel(
   zip.file("xl/tables/table2.xml", patchTableRef(t2Xml, "AA", s2LastRow));
 
   // ── Sheet 3: Reporte Auxiliar IVA ──────────────────────────────────────
+  const s3ExtraTaxNames = collectCufeExtraTaxNames(invoices);
+  const s3LastCol = cufeColLetter(12 + s3ExtraTaxNames.length);
   const s3Rows: string[] = [];
   invoices.forEach((inv, i) => {
-    s3Rows.push(buildSheetIVARow(inv, i + 1, i + 6));
+    s3Rows.push(buildSheetIVARow(inv, i + 1, i + 6, s3ExtraTaxNames));
   });
 
   const s3Xml = await zip.file("xl/worksheets/sheet3.xml")!.async("string");
   const s3LastRow = 5 + s3Rows.length;
   zip.file(
     "xl/worksheets/sheet3.xml",
-    patchSheetData(s3Xml, s3Rows, "L", 5)
+    patchSheetData(s3Xml, s3Rows, s3LastCol, 5)
   );
   const t3Xml = await zip.file("xl/tables/table3.xml")!.async("string");
-  zip.file("xl/tables/table3.xml", patchTableRef(t3Xml, "L", s3LastRow));
+  zip.file("xl/tables/table3.xml", patchTableRef(t3Xml, s3LastCol, s3LastRow));
 
   // ── Sheet 4: Datos de terceros ─────────────────────────────────────────
   const seenNits = new Set<string>();
