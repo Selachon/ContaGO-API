@@ -12,15 +12,69 @@ export interface SiigoCompanyPublic {
   id: string;
   name: string;
   username: string;
+  ownerUserId?: string;
+  sharedWith?: string[];
 }
 
 function toPublic(doc: any): SiigoCompanyPublic {
-  return { id: doc._id.toString(), name: doc.name, username: doc.username };
+  return {
+    id: doc._id.toString(),
+    name: doc.name,
+    username: doc.username,
+    ownerUserId: doc.ownerUserId ? String(doc.ownerUserId) : undefined,
+    sharedWith: Array.isArray(doc.sharedWith) ? doc.sharedWith.map(String) : [],
+  };
 }
 
+/** _id de un usuario admin para asignar como dueño por defecto (seed, fallback). */
+async function resolveMainAdminId(): Promise<string | null> {
+  const db = getDb();
+  const email = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+  let admin = email ? await db.collection<any>("users").findOne({ email }) : null;
+  if (!admin) admin = await db.collection<any>("users").findOne({ is_admin: true }, { sort: { created_at: 1 } });
+  return admin ? admin._id.toString() : null;
+}
+
+/** Todas las empresas (uso interno / API key). Para usuarios usar listCompaniesForUser. */
 export async function listCompanies(): Promise<SiigoCompanyPublic[]> {
   const docs = await getDb().collection<any>(COMPANIES).find({}).sort({ name: 1 }).toArray();
   return docs.map(toPublic);
+}
+
+/** Empresas visibles para un usuario: las que posee o las que le comparten. */
+export async function listCompaniesForUser(userId: string): Promise<SiigoCompanyPublic[]> {
+  const docs = await getDb()
+    .collection<any>(COMPANIES)
+    .find({ $or: [{ ownerUserId: userId }, { sharedWith: userId }] })
+    .sort({ name: 1 })
+    .toArray();
+  return docs.map(toPublic);
+}
+
+/** True si el usuario es dueño de la empresa o la tiene compartida. */
+export async function userCanAccessCompany(companyId: string, userId: string): Promise<boolean> {
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(companyId);
+  } catch {
+    return false;
+  }
+  const doc = await getDb()
+    .collection<any>(COMPANIES)
+    .findOne({ _id: oid, $or: [{ ownerUserId: userId }, { sharedWith: userId }] }, { projection: { _id: 1 } });
+  return !!doc;
+}
+
+/** True si el usuario es el dueño de la empresa. */
+export async function userOwnsCompany(companyId: string, userId: string): Promise<boolean> {
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(companyId);
+  } catch {
+    return false;
+  }
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid, ownerUserId: userId }, { projection: { _id: 1 } });
+  return !!doc;
 }
 
 /** Credenciales completas (descifradas) de una empresa, listas para el contexto Siigo. */
@@ -42,11 +96,15 @@ export async function getCompanyContext(id: string): Promise<SiigoContext | null
   };
 }
 
-/** Crea una empresa, validando las credenciales contra Siigo antes de guardar. */
+/**
+ * Crea una empresa, validando las credenciales contra Siigo antes de guardar.
+ * `ownerUserId` queda como dueño; si no se pasa, cae al admin principal.
+ */
 export async function createCompany(
   name: string,
   username: string,
-  accessKey: string
+  accessKey: string,
+  ownerUserId?: string
 ): Promise<SiigoCompanyPublic> {
   const cleanName = String(name || "").trim();
   const cleanUser = String(username || "").trim();
@@ -75,13 +133,16 @@ export async function createCompany(
     );
   }
 
+  const owner = ownerUserId || (await resolveMainAdminId()) || "";
   const res = await db.collection<any>(COMPANIES).insertOne({
     name: cleanName,
     username: cleanUser,
     accessKeyEnc: encryptSecret(cleanKey),
+    ownerUserId: owner,
+    sharedWith: [],
     createdAt: new Date().toISOString(),
   });
-  return { id: res.insertedId.toString(), name: cleanName, username: cleanUser };
+  return { id: res.insertedId.toString(), name: cleanName, username: cleanUser, ownerUserId: owner, sharedWith: [] };
 }
 
 export async function deleteCompany(id: string): Promise<boolean> {
@@ -95,6 +156,48 @@ export async function deleteCompany(id: string): Promise<boolean> {
   return res.deletedCount > 0;
 }
 
+/** Comparte una empresa con otro usuario (lo agrega a sharedWith). */
+export async function shareCompany(companyId: string, targetUserId: string): Promise<boolean> {
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(companyId);
+  } catch {
+    return false;
+  }
+  const clean = String(targetUserId || "").trim();
+  if (!clean) return false;
+  const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $addToSet: { sharedWith: clean } });
+  return res.matchedCount > 0;
+}
+
+/** Deja de compartir una empresa con un usuario. */
+export async function unshareCompany(companyId: string, targetUserId: string): Promise<boolean> {
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(companyId);
+  } catch {
+    return false;
+  }
+  const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $pull: { sharedWith: String(targetUserId) } } as any);
+  return res.matchedCount > 0;
+}
+
+/** Transfiere la propiedad de una empresa a otro usuario. */
+export async function transferOwner(companyId: string, newOwnerUserId: string): Promise<boolean> {
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(companyId);
+  } catch {
+    return false;
+  }
+  const clean = String(newOwnerUserId || "").trim();
+  if (!clean) return false;
+  const res = await getDb()
+    .collection<any>(COMPANIES)
+    .updateOne({ _id: oid }, { $set: { ownerUserId: clean }, $pull: { sharedWith: clean } } as any);
+  return res.matchedCount > 0;
+}
+
 /** Siembra la empresa del .env como primera empresa si todavía no existe. */
 export async function seedSiigoCompanyFromEnv(): Promise<void> {
   const username = String(process.env.SIIGO_USERNAME || "").trim();
@@ -102,11 +205,29 @@ export async function seedSiigoCompanyFromEnv(): Promise<void> {
   if (!username || !accessKey) return;
   const db = getDb();
   const existing = await db.collection<any>(COMPANIES).findOne({ username });
-  if (existing) return;
+  if (existing) {
+    // Empresa sembrada antes de tener dueño: la dejamos consistente con el modelo.
+    if (!existing.ownerUserId) {
+      const owner = await resolveMainAdminId();
+      if (owner) {
+        await db.collection<any>(COMPANIES).updateOne(
+          { _id: existing._id },
+          { $set: { ownerUserId: owner }, ...(Array.isArray(existing.sharedWith) ? {} : { $setOnInsert: {} }) }
+        );
+        if (!Array.isArray(existing.sharedWith)) {
+          await db.collection<any>(COMPANIES).updateOne({ _id: existing._id }, { $set: { sharedWith: [] } });
+        }
+      }
+    }
+    return;
+  }
+  const owner = (await resolveMainAdminId()) || "";
   await db.collection<any>(COMPANIES).insertOne({
     name: process.env.SIIGO_SEED_COMPANY_NAME || "Fundación Sentiido",
     username,
     accessKeyEnc: encryptSecret(accessKey),
+    ownerUserId: owner,
+    sharedWith: [],
     createdAt: new Date().toISOString(),
     seeded: true,
   });

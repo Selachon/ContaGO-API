@@ -122,6 +122,12 @@ async function ensureIndex(
       );
       return;
     }
+    if (code === 11000) {
+      console.warn(
+        "[Mongo] Índice ÚNICO no creado por duplicados existentes: " + collection.collectionName + " " + JSON.stringify(keys)
+      );
+      return;
+    }
     throw err;
   }
 }
@@ -155,6 +161,15 @@ export async function connectMongo(): Promise<void> {
   await ensureIndex(demoInvites, { tokenHash: 1 }, { unique: true });
   await ensureIndex(demoInvites, { normalizedNit: 1 });
   await ensureIndex(demoInvites, { createdAt: -1 });
+
+  // Índices del dominio Siigo (aislamiento por usuario/empresa). Tolerantes a
+  // falta de espacio (Railway) y a duplicados preexistentes.
+  const siigoCompanies = db.collection("siigoCompanies");
+  await ensureIndex(siigoCompanies, { ownerUserId: 1 });
+  await ensureIndex(siigoCompanies, { sharedWith: 1 });
+  await ensureIndex(siigoCompanies, { username: 1 }, { unique: true });
+  const siigoProfiles = db.collection("siigoSupplierProfiles");
+  await ensureIndex(siigoProfiles, { companyId: 1 });
 }
 
 function mapUser(record: UserRecord | null): User | null {

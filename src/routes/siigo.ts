@@ -38,11 +38,20 @@ import {
 } from "../services/siigoService.js";
 import {
   listCompanies,
+  listCompaniesForUser,
+  userCanAccessCompany,
+  userOwnsCompany,
   createCompany,
   deleteCompany,
   getCompanyContext,
+  shareCompany,
+  unshareCompany,
+  transferOwner,
 } from "../services/siigoCompaniesService.js";
 import { getUserSiigoCompanies, setUserSiigoCompanies } from "../services/database.js";
+import { requireToolAccess } from "../middleware/requireToolAccess.js";
+
+const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import {
   savePaymentMap,
@@ -317,6 +326,22 @@ async function withSiigoCompany(req: Request, res: Response, next: NextFunction)
   const companyId = req.header("X-Siigo-Company");
   if (!companyId) return next();
   try {
+    // Autorización por empresa: un usuario JWT solo puede operar empresas que
+    // posee o que le comparten. El modo API key interno (integración) no se filtra.
+    if (req.integrationAuthMode === "jwt") {
+      const userId = req.user?.userId;
+      const allowed = userId ? await userCanAccessCompany(companyId, userId) : false;
+      if (!allowed) {
+        res.status(403).json({
+          ok: false,
+          source: "siigo",
+          code: "siigo_company_forbidden",
+          message: "No tienes acceso a esta empresa.",
+        });
+        return;
+      }
+    }
+
     const ctx = await getCompanyContext(companyId);
     if (!ctx) {
       res.status(400).json({
@@ -335,6 +360,15 @@ async function withSiigoCompany(req: Request, res: Response, next: NextFunction)
   }
 }
 
+// Re-aplica el contexto de empresa DENTRO del handler. Necesario tras multer,
+// que puede romper el AsyncLocalStorage fijado por withSiigoCompany y hacer que
+// los datos se guarden bajo la empresa equivocada (namespace "env").
+async function runInCompanyCtx<T>(req: Request, fn: () => Promise<T> | T): Promise<T> {
+  const companyId = req.header("X-Siigo-Company");
+  const ctx = companyId ? await getCompanyContext(companyId) : null;
+  return ctx ? runWithSiigoCompany(ctx, () => fn()) : fn();
+}
+
 // true si el solicitante puede administrar empresas (admin JWT o API key interna)
 function canManageCompanies(req: Request, res: Response): boolean {
   if (req.integrationAuthMode === "jwt" && !req.user?.isAdmin) {
@@ -348,17 +382,27 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   const router = Router();
 
   router.use((req: Request, res: Response, next: NextFunction) => authMiddleware(req, res, next));
+
+  // Gate de acceso a la herramienta: los usuarios JWT deben tener
+  // "siigo-xml-accounting" (los admin pasan). El modo API key interno (integración
+  // server-to-server, sin usuario) queda exento.
+  const toolGate = requireToolAccess(SIIGO_TOOL_ID);
+  router.use((req: Request, res: Response, next: NextFunction) => {
+    if (req.integrationAuthMode === "internal_api_key") return next();
+    return toolGate(req, res, next);
+  });
+
   router.use(withSiigoCompany);
 
   // ─── Empresas Siigo (multi-empresa) ──────────────────────────────────
   router.get("/companies", async (req: Request, res: Response) => {
     try {
-      let companies = await listCompanies();
-      // Usuario no-admin: solo las empresas de su plan
-      if (req.integrationAuthMode === "jwt" && !req.user?.isAdmin && req.user?.userId) {
-        const allowed = new Set(await getUserSiigoCompanies(req.user.userId));
-        companies = companies.filter((c) => allowed.has(c.id));
-      }
+      // JWT: solo las empresas que el usuario posee o le comparten.
+      // API key interno: todas (integración server-to-server).
+      const companies =
+        req.integrationAuthMode === "jwt" && req.user?.userId
+          ? await listCompaniesForUser(req.user.userId)
+          : await listCompanies();
       return res.json({ ok: true, data: companies });
     } catch (error) {
       return handleSiigoError(res, error);
@@ -367,9 +411,10 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
   router.post("/companies", async (req: Request, res: Response) => {
     try {
-      if (!canManageCompanies(req, res)) return;
       const { name, username, accessKey } = req.body || {};
-      const company = await createCompany(name, username, accessKey);
+      // El creador queda como dueño. Sin usuario (API key) → admin principal (default en el servicio).
+      const ownerUserId = req.integrationAuthMode === "jwt" ? req.user?.userId : undefined;
+      const company = await createCompany(name, username, accessKey, ownerUserId);
       return res.json({ ok: true, data: company });
     } catch (error) {
       return res.status(400).json({
@@ -381,9 +426,65 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
   router.delete("/companies/:id", async (req: Request, res: Response) => {
     try {
-      if (!canManageCompanies(req, res)) return;
+      // Solo el dueño puede borrar (en modo JWT). API key interno puede borrar.
+      if (req.integrationAuthMode === "jwt") {
+        const userId = req.user?.userId;
+        const owns = userId ? await userOwnsCompany(req.params.id, userId) : false;
+        if (!owns) {
+          return res.status(403).json({ ok: false, code: "forbidden", message: "Solo el dueño puede eliminar esta empresa." });
+        }
+      }
       const deleted = await deleteCompany(req.params.id);
       return res.json({ ok: true, data: { deleted } });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // ── Compartir / transferir (solo el dueño admin) ─────────────────────
+  async function requireOwnerAdmin(req: Request, res: Response, companyId: string): Promise<boolean> {
+    if (req.integrationAuthMode !== "jwt") return true; // API key interno
+    if (!req.user?.isAdmin) {
+      res.status(403).json({ ok: false, code: "forbidden", message: "Solo administradores pueden compartir empresas." });
+      return false;
+    }
+    const owns = await userOwnsCompany(companyId, req.user.userId);
+    if (!owns) {
+      res.status(403).json({ ok: false, code: "forbidden", message: "Solo el dueño puede compartir esta empresa." });
+      return false;
+    }
+    return true;
+  }
+
+  router.post("/companies/:id/share", async (req: Request, res: Response) => {
+    try {
+      if (!(await requireOwnerAdmin(req, res, req.params.id))) return;
+      const targetUserId = String(req.body?.userId || "").trim();
+      if (!targetUserId) return res.status(400).json({ ok: false, message: "Falta userId a compartir" });
+      const ok = await shareCompany(req.params.id, targetUserId);
+      return res.json({ ok, data: { companyId: req.params.id, userId: targetUserId } });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.delete("/companies/:id/share/:userId", async (req: Request, res: Response) => {
+    try {
+      if (!(await requireOwnerAdmin(req, res, req.params.id))) return;
+      const ok = await unshareCompany(req.params.id, req.params.userId);
+      return res.json({ ok, data: { companyId: req.params.id, userId: req.params.userId } });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.post("/companies/:id/transfer", async (req: Request, res: Response) => {
+    try {
+      if (!(await requireOwnerAdmin(req, res, req.params.id))) return;
+      const newOwnerUserId = String(req.body?.userId || "").trim();
+      if (!newOwnerUserId) return res.status(400).json({ ok: false, message: "Falta userId del nuevo dueño" });
+      const ok = await transferOwner(req.params.id, newOwnerUserId);
+      return res.json({ ok, data: { companyId: req.params.id, ownerUserId: newOwnerUserId } });
     } catch (error) {
       return handleSiigoError(res, error);
     }
@@ -1029,7 +1130,8 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   router.post("/suggestions/upload-payment-map", upload.single("file"), async (req: Request, res: Response) => {
     try {
       if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir el Excel de formas de pago" });
-      const result = await savePaymentMap(req.file.buffer);
+      const buf = req.file.buffer;
+      const result = await runInCompanyCtx(req, () => savePaymentMap(buf));
       return res.json({ ok: true, data: result });
     } catch (error) {
       return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el Excel" });
@@ -1039,7 +1141,8 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   router.post("/suggestions/upload-balance", upload.single("file"), async (req: Request, res: Response) => {
     try {
       if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir el balance de prueba" });
-      const result = await rebuildProfilesFromBalance(req.file.buffer);
+      const buf = req.file.buffer;
+      const result = await runInCompanyCtx(req, () => rebuildProfilesFromBalance(buf));
       return res.json({ ok: true, data: result });
     } catch (error) {
       return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el balance" });
@@ -1060,7 +1163,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const year = Number(req.body?.year) || now.getFullYear();
       const monthStart = Number(req.body?.month_start) || 1;
       const monthEnd = Number(req.body?.month_end) || 13;
-      const result = await rebuildProfilesFromSiigoReport(year, monthStart, monthEnd);
+      const result = await runInCompanyCtx(req, () => rebuildProfilesFromSiigoReport(year, monthStart, monthEnd));
       return res.json({ ok: true, data: result });
     } catch (error) {
       return res.status(400).json({
@@ -1073,7 +1176,8 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   router.post("/suggestions/upload-plan-cuentas", upload.single("file"), async (req: Request, res: Response) => {
     try {
       if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir el plan de cuentas" });
-      const result = await savePlanCuentas(req.file.buffer);
+      const buf = req.file.buffer;
+      const result = await runInCompanyCtx(req, () => savePlanCuentas(buf));
       return res.json({ ok: true, data: result });
     } catch (error) {
       return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el plan de cuentas" });

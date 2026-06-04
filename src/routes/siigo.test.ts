@@ -18,7 +18,7 @@ const authStub: RequestHandler = (req, _res, next) => {
   req.user = {
     userId: "test-user-id",
     email: "test@example.com",
-    isAdmin: false,
+    isAdmin: true,
   };
   next();
 };
@@ -84,7 +84,7 @@ describe("Siigo integration routes", () => {
       req.user = {
         userId: "jwt-user",
         email: "jwt@example.com",
-        isAdmin: false,
+        isAdmin: true,
       };
       next();
     };
