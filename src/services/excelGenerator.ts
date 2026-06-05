@@ -361,7 +361,8 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
   applyCompanyHeader(ws, companyName, companyNit);
 
   const extraTaxNames = collectExtraTaxNames(invoices);
-  const totalCols = 12 + extraTaxNames.length;
+  const BASE_COLS = 14; // columnas fijas antes de los impuestos extra
+  const totalCols = BASE_COLS + extraTaxNames.length;
   const lastCol = colLetter(totalCols);
 
   // Disclaimer Row
@@ -374,7 +375,10 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
   ws.mergeCells(`A4:${lastCol}4`);
 
   const headers = [
-    "No.", "Tipo documento", "Número factura", "NIT Emisor", "Razón Social Emisor", "Fecha",
+    "No.", "Tipo documento", "Número factura",
+    "NIT Emisor", "Razón Social Emisor",
+    "NIT Receptor", "Razón Social Receptor",
+    "Fecha",
     "Bases de IVAS al 19%", "IVAS del 19%",
     "Bases IVAS 5%", "IVAS 5%",
     "Bases sin IVA", "IVA 0%",
@@ -390,7 +394,7 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
 
   const { currencyCols, percentCols, dateCols } = computeFormatCols(headers);
   // Extra tax columns are always currency regardless of whether the name is in CURRENCY_HEADERS
-  for (let i = 13; i <= totalCols; i++) {
+  for (let i = BASE_COLS + 1; i <= totalCols; i++) {
     if (!currencyCols.includes(i)) currencyCols.push(i);
   }
 
@@ -437,6 +441,8 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
       (inv.docNumber || inv.trackId || "").trim(),
       inv.issuerNit || "",
       uppercaseBusinessName(inv.issuerName),
+      inv.receiverNit || "",
+      uppercaseBusinessName(inv.receiverName),
       parseExcelDate(inv.issueDate, inv.issueDateISO),
       base19,
       iva19,
