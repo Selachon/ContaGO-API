@@ -125,7 +125,7 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
     "Aviso de Recepción",
   ]);
   if (NON_INVOICE_LABELS.has(docTypeStr)) {
-    throw new Error(`No es una factura procesable: el XML es de tipo "${docTypeStr}" (no es una factura ni una nota crédito de compra).`);
+    throw new NonInvoiceXmlError(docTypeStr);
   }
   if (!xmlData.issuerNit && lineItems.length === 0) {
     throw new Error(
@@ -178,11 +178,23 @@ export interface BatchItem {
   fileName: string;
   ok: boolean;
   message?: string;
+  /** XML auxiliar conocido (Application Response, nómina, etc.): se ignora sin tratarlo como error. */
+  ignored?: boolean;
   xml?: XmlCausacionData;
   profile?: SupplierProfile | null;
   alreadyCausada?: boolean;
   pdfBase64?: string;
   pdfName?: string;
+}
+
+/** Error para XMLs que no son facturas (acuses, nómina, etc.). No es un fallo real. */
+export class NonInvoiceXmlError extends Error {
+  docType: string;
+  constructor(docType: string) {
+    super(`Documento auxiliar de tipo "${docType}" (no es una factura).`);
+    this.name = "NonInvoiceXmlError";
+    this.docType = docType;
+  }
 }
 
 const onlyDigits = (s: unknown) => String(s ?? "").replace(/\D/g, "");
@@ -278,11 +290,17 @@ export async function processXmlBatch(
         ...(pdf ? { pdfBase64: pdf.buffer.toString("base64"), pdfName: pdf.name } : {}),
       });
     } catch (e) {
-      results.push({
-        fileName: xf.name,
-        ok: false,
-        message: e instanceof Error ? e.message : "Error procesando el XML",
-      });
+      // Los XMLs auxiliares (Application Response, nómina, etc.) son ruido esperado
+      // dentro de los ZIP de la DIAN: se marcan como "ignored", no como error.
+      if (e instanceof NonInvoiceXmlError) {
+        results.push({ fileName: xf.name, ok: false, ignored: true, message: e.message });
+      } else {
+        results.push({
+          fileName: xf.name,
+          ok: false,
+          message: e instanceof Error ? e.message : "Error procesando el XML",
+        });
+      }
     }
   }
 

@@ -12,8 +12,15 @@ export interface SiigoCompanyPublic {
   id: string;
   name: string;
   username: string;
+  /** NIT de la empresa (sin dígito de verificación), para validar tokens DIAN. */
+  nit?: string;
   ownerUserId?: string;
   sharedWith?: string[];
+}
+
+/** Normaliza un NIT para comparación: descarta el dígito de verificación y deja solo dígitos. */
+export function normalizeNit(value: unknown): string {
+  return String(value ?? "").split("-")[0].replace(/\D/g, "");
 }
 
 function toPublic(doc: any): SiigoCompanyPublic {
@@ -21,6 +28,7 @@ function toPublic(doc: any): SiigoCompanyPublic {
     id: doc._id.toString(),
     name: doc.name,
     username: doc.username,
+    nit: doc.nit || "",
     ownerUserId: doc.ownerUserId ? String(doc.ownerUserId) : undefined,
     sharedWith: Array.isArray(doc.sharedWith) ? doc.sharedWith.map(String) : [],
   };
@@ -93,7 +101,27 @@ export async function getCompanyContext(id: string): Promise<SiigoContext | null
     partnerId: partnerId(),
     username: doc.username,
     accessKey: decryptSecret(doc.accessKeyEnc),
+    nit: doc.nit || "",
   };
+}
+
+/**
+ * Define/actualiza el NIT de una empresa. Se usa como fuente de verdad para
+ * validar que un token DIAN pertenezca a esta empresa. Guarda el NIT normalizado
+ * (solo dígitos, sin DV).
+ */
+export async function setCompanyNit(companyId: string, nit: string): Promise<string> {
+  let oid: ObjectId;
+  try {
+    oid = new ObjectId(companyId);
+  } catch {
+    throw new Error("Empresa inválida.");
+  }
+  const clean = normalizeNit(nit);
+  if (!clean) throw new Error("El NIT debe contener dígitos.");
+  const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: { nit: clean } });
+  if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
+  return clean;
 }
 
 /**
@@ -104,11 +132,13 @@ export async function createCompany(
   name: string,
   username: string,
   accessKey: string,
-  ownerUserId?: string
+  ownerUserId?: string,
+  nit?: string
 ): Promise<SiigoCompanyPublic> {
   const cleanName = String(name || "").trim();
   const cleanUser = String(username || "").trim();
   const cleanKey = String(accessKey || "").trim();
+  const cleanNit = normalizeNit(nit);
   if (!cleanName || !cleanUser || !cleanKey) {
     throw new Error("Nombre, usuario y access key son obligatorios.");
   }
@@ -138,11 +168,12 @@ export async function createCompany(
     name: cleanName,
     username: cleanUser,
     accessKeyEnc: encryptSecret(cleanKey),
+    nit: cleanNit,
     ownerUserId: owner,
     sharedWith: [],
     createdAt: new Date().toISOString(),
   });
-  return { id: res.insertedId.toString(), name: cleanName, username: cleanUser, ownerUserId: owner, sharedWith: [] };
+  return { id: res.insertedId.toString(), name: cleanName, username: cleanUser, nit: cleanNit, ownerUserId: owner, sharedWith: [] };
 }
 
 export async function deleteCompany(id: string): Promise<boolean> {

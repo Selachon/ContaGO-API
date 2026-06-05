@@ -1499,7 +1499,8 @@ async function extractListingRecordsFromDownloadTab(
   page: Page,
   direction: DocumentDirection,
   startDate?: string,
-  endDate?: string
+  endDate?: string,
+  receiverNit: string = ""
 ): Promise<ListingRecord[]> {
   try {
     const baseUrl = "https://catalogo-vpfe.dian.gov.co";
@@ -1516,7 +1517,9 @@ async function extractListingRecordsFromDownloadTab(
       },
     }).then((r) => r.text());
 
-    const reusableLinks = findReusableExportLinks(exportPageBefore, direction, startDate, endDate);
+    // Si se filtra por NIT receptor, no reutilizamos listados previos (no podemos
+    // garantizar que correspondan al mismo filtro); forzamos regenerar.
+    const reusableLinks = receiverNit ? [] : findReusableExportLinks(exportPageBefore, direction, startDate, endDate);
     if (reusableLinks.length > 0) {
       console.log(`[DIAN Export] Se encontraron ${reusableLinks.length} listados reutilizables para el rango.`);
       for (let i = 0; i < reusableLinks.length; i++) {
@@ -1558,7 +1561,7 @@ async function extractListingRecordsFromDownloadTab(
     body.set("__RequestVerificationToken", formData.token);
     body.set("Type", formData.type || "0");
     body.set("AmountAdmin", formData.amountAdmin || "100000");
-    body.set("ReceiverCode", "");
+    body.set("ReceiverCode", receiverNit || "");
     body.set("GroupCode", direction === "sent" ? "1" : "2");
     if (startDate) body.set("StartDate", toDianExportDate(startDate));
     if (endDate) body.set("EndDate", toDianExportDate(endDate, true));
@@ -1717,6 +1720,61 @@ export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direct
     });
   }
   return finalRows;
+}
+
+export interface CufeListingResult {
+  /** Registros del listado: { cufe, docnum } ya deduplicados. */
+  records: ListingRecord[];
+  /** CUFEs únicos, normalizados y no vacíos, listos para la descarga masiva. */
+  cufes: string[];
+}
+
+/**
+ * Paso 1 de la ingesta automática: obtiene SOLO el listado de CUFEs del portal
+ * DIAN (`/Document/Export`) para un rango de fechas + dirección, sin descargar
+ * los documentos. Es la lista que luego alimenta a `downloadDocumentsByCufe`,
+ * garantizando que no se omita ningún CUFE (los Application Response / Nómina se
+ * excluyen al filtrar estrictamente por la columna "Grupo" del listado).
+ *
+ * Lanza su propio navegador y lo cierra en `finally`; no reutiliza sesiones de
+ * otros flujos. Honra el slot pool y el barrido anti-huérfanos del scraper.
+ */
+export async function getCufeListing(
+  tokenUrl: string,
+  startDate: string | undefined,
+  endDate: string | undefined,
+  direction: DocumentDirection,
+  receiverNit: string = "",
+  onProgress?: (data: Partial<ProgressData>) => void
+): Promise<CufeListingResult> {
+  const update = (data: Partial<ProgressData>) => onProgress?.(data);
+  let browser: Browser | null = null;
+  try {
+    update({ step: "Iniciando navegador...", current: 0, total: 0 });
+    browser = await launchBrowserWithRetry(resolveExecutablePath(), update);
+
+    const page = await browser.newPage();
+    await hardenPageRuntime(page);
+    await page.setViewport({ width: 1280, height: 800 });
+    page.setDefaultTimeout(120000);
+    page.setDefaultNavigationTimeout(120000);
+
+    update({ step: "Accediendo con token...", current: 0, total: 0 });
+    await navigateWithRetry(page, tokenUrl, 3);
+    await delay(1000);
+    if (isLoginPage(page.url())) {
+      throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+    }
+
+    update({ step: "Descargando listado de CUFEs...", current: 0, total: 0 });
+    const records = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate, receiverNit);
+    const cufes = Array.from(new Set(records.map((r) => normalizeCufe(r.cufe || "")).filter(Boolean)));
+
+    update({ step: `Listado listo: ${cufes.length} CUFEs`, current: 0, total: cufes.length });
+    return { records, cufes };
+  } finally {
+    if (browser) await closeBrowserSafely(browser);
+  }
 }
 
 function parseSharedStrings(xml: string): string[] {

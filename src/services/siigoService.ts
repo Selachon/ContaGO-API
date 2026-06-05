@@ -14,6 +14,8 @@ export interface SiigoContext {
   partnerId: string;
   username: string;
   accessKey: string;
+  /** NIT de la empresa asociada. Fuente de verdad para validar el token DIAN. */
+  nit?: string;
 }
 
 const siigoAls = new AsyncLocalStorage<SiigoContext>();

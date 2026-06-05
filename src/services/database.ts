@@ -170,6 +170,8 @@ export async function connectMongo(): Promise<void> {
   await ensureIndex(siigoCompanies, { username: 1 }, { unique: true });
   const siigoProfiles = db.collection("siigoSupplierProfiles");
   await ensureIndex(siigoProfiles, { companyId: 1 });
+  const siigoIngestedCufes = db.collection("siigoIngestedCufes");
+  await ensureIndex(siigoIngestedCufes, { companyId: 1, cufe: 1 }, { unique: true });
 }
 
 function mapUser(record: UserRecord | null): User | null {

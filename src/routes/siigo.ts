@@ -44,6 +44,8 @@ import {
   createCompany,
   deleteCompany,
   getCompanyContext,
+  setCompanyNit,
+  normalizeNit,
   shareCompany,
   unshareCompany,
   transferOwner,
@@ -53,6 +55,9 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
+import { ingestFromDian, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
+import { v4 as uuidv4 } from "uuid";
+import type { ProgressData } from "../types/dian.js";
 import {
   savePaymentMap,
   rebuildProfilesFromBalance,
@@ -70,6 +75,27 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 },
 });
+
+// ─── Ingesta automática desde DIAN (token + fechas + grupo) ──────────────
+// Job en memoria: el flujo (listar CUFEs → descargar → parsear) puede tardar
+// minutos, así que se ejecuta en segundo plano y el frontend hace polling.
+interface DianIngestJob {
+  status: "processing" | "completed" | "error" | "cancelled";
+  progress: ProgressData;
+  userId: string;
+  result?: IngestResult;
+  error?: string;
+  createdAt: number;
+}
+const dianIngestJobs = new Map<string, DianIngestJob>();
+const DIAN_INGEST_TTL_MS = 3 * 60 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of dianIngestJobs) {
+    if (now - job.createdAt > DIAN_INGEST_TTL_MS) dianIngestJobs.delete(id);
+  }
+}, 60_000);
 
 type BinaryKind = "pdf" | "xml";
 
@@ -411,15 +437,40 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
   router.post("/companies", async (req: Request, res: Response) => {
     try {
-      const { name, username, accessKey } = req.body || {};
+      const { name, username, accessKey, nit } = req.body || {};
       // El creador queda como dueño. Sin usuario (API key) → admin principal (default en el servicio).
       const ownerUserId = req.integrationAuthMode === "jwt" ? req.user?.userId : undefined;
-      const company = await createCompany(name, username, accessKey, ownerUserId);
+      const company = await createCompany(name, username, accessKey, ownerUserId, nit);
       return res.json({ ok: true, data: company });
     } catch (error) {
       return res.status(400).json({
         ok: false,
         message: error instanceof Error ? error.message : "Error creando la empresa",
+      });
+    }
+  });
+
+  // Definir/actualizar el NIT de una empresa (fuente de verdad para validar
+  // tokens DIAN). Solo el dueño puede hacerlo en modo JWT.
+  router.patch("/companies/:id", async (req: Request, res: Response) => {
+    try {
+      if (req.integrationAuthMode === "jwt") {
+        const userId = req.user?.userId;
+        const owns = userId ? await userOwnsCompany(req.params.id, userId) : false;
+        if (!owns) {
+          return res.status(403).json({ ok: false, code: "forbidden", message: "Solo el dueño puede editar esta empresa." });
+        }
+      }
+      const { nit } = req.body || {};
+      if (nit === undefined) {
+        return res.status(400).json({ ok: false, message: "Nada que actualizar." });
+      }
+      const saved = await setCompanyNit(req.params.id, String(nit));
+      return res.json({ ok: true, data: { id: req.params.id, nit: saved } });
+    } catch (error) {
+      return res.status(400).json({
+        ok: false,
+        message: error instanceof Error ? error.message : "Error actualizando la empresa",
       });
     }
   });
@@ -1070,6 +1121,154 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       }
     };
     return ctx ? runWithSiigoCompany(ctx, () => work()) : work();
+  });
+
+  // ─── Ingesta automática desde DIAN ───────────────────────────────────
+  // Recibe token + rango de fechas + grupo, obtiene el listado de CUFEs del
+  // portal, descarga cada documento (con reintentos por CUFE) y los parsea.
+  // Devuelve un jobId; el resultado final tiene el mismo shape que process-batch.
+  router.post("/accounting/from-dian", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) {
+      return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
+    }
+    const ctx = await getCompanyContext(companyId);
+    if (!ctx) {
+      return res.status(400).json({ ok: false, message: "Empresa Siigo no encontrada." });
+    }
+
+    const { tokenUrl, fechaInicio, fechaFin, forceRedownload } = (req.body || {}) as {
+      tokenUrl?: string;
+      fechaInicio?: string;
+      fechaFin?: string;
+      forceRedownload?: boolean;
+    };
+
+    if (!tokenUrl || !/catalogo-vpfe\.dian\.gov\.co\/User\/AuthToken/i.test(tokenUrl)) {
+      return res.status(400).json({ ok: false, message: "Token DIAN inválido. Pega la URL completa de ingreso (/User/AuthToken?...)." });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fechaInicio || "") || !/^\d{4}-\d{2}-\d{2}$/.test(fechaFin || "")) {
+      return res.status(400).json({ ok: false, message: "Fechas inválidas. Usa el formato YYYY-MM-DD." });
+    }
+    if (fechaInicio! > fechaFin!) {
+      return res.status(400).json({ ok: false, message: "La fecha inicial no puede ser mayor que la final." });
+    }
+
+    // Esta herramienta SOLO contabiliza facturas RECIBIDAS por la empresa asociada.
+    const grupoNorm: IngestGrupo = "Recibidos";
+
+    // ── Validación de propiedad: el token DIAN debe pertenecer a la MISMA
+    //    empresa asociada en Siigo. El NIT del token viene en el parámetro `rk`.
+    //    Evita que se contabilicen en esta empresa facturas de otra. ──────────
+    const companyNit = normalizeNit(ctx.nit);
+    if (!companyNit) {
+      return res.status(400).json({
+        ok: false,
+        code: "company_nit_missing",
+        message: "La empresa asociada no tiene NIT configurado. Defínelo en la configuración de la empresa antes de usar la ingesta automática desde DIAN.",
+      });
+    }
+    let tokenNit = "";
+    try {
+      tokenNit = normalizeNit(new URL(tokenUrl).searchParams.get("rk") || "");
+    } catch {
+      /* URL inválida ya cubierta arriba */
+    }
+    if (!tokenNit) {
+      return res.status(400).json({
+        ok: false,
+        code: "token_nit_missing",
+        message: "No se pudo determinar el NIT del token (parámetro rk). Verifica que la URL de ingreso esté completa.",
+      });
+    }
+    if (tokenNit !== companyNit) {
+      return res.status(403).json({
+        ok: false,
+        code: "token_company_mismatch",
+        message: `El token pertenece a la empresa NIT ${tokenNit}, pero la empresa asociada es NIT ${companyNit}. No se permite contabilizar facturas de otra empresa.`,
+      });
+    }
+
+    const maxDocuments = Math.max(1, Number(process.env.DIAN_MAX_DOCUMENTS || 850));
+
+    const jobId = uuidv4();
+    dianIngestJobs.set(jobId, {
+      status: "processing",
+      progress: { step: "En cola...", current: 0, total: 0 },
+      userId: req.user?.userId || "",
+      createdAt: Date.now(),
+    });
+
+    // Procesamiento en segundo plano (dentro del contexto de empresa).
+    runWithSiigoCompany(ctx, () =>
+      ingestFromDian({
+        companyId,
+        tokenUrl,
+        fechaInicio: fechaInicio!,
+        fechaFin: fechaFin!,
+        grupo: grupoNorm,
+        maxDocuments,
+        retryRounds: 3,
+        forceRedownload: forceRedownload === true,
+        onProgress: (p) => {
+          const job = dianIngestJobs.get(jobId);
+          if (job && job.status === "processing") job.progress = p;
+        },
+        isCancelled: () => dianIngestJobs.get(jobId)?.status === "cancelled",
+      })
+    )
+      .then((result) => {
+        const job = dianIngestJobs.get(jobId);
+        if (!job || job.status === "cancelled") return;
+        job.status = "completed";
+        job.result = result;
+        job.progress = {
+          step: "Completado",
+          current: result.stats.downloaded,
+          total: result.stats.listed,
+        };
+      })
+      .catch((err) => {
+        const job = dianIngestJobs.get(jobId);
+        if (!job || job.status === "cancelled") return;
+        job.status = "error";
+        job.error = err instanceof Error ? err.message : "Error en la ingesta desde DIAN";
+      });
+
+    return res.json({ ok: true, jobId });
+  });
+
+  router.get("/accounting/from-dian/status/:jobId", (req: Request, res: Response) => {
+    const job = dianIngestJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ ok: false, message: "Job no encontrado" });
+    return res.json({
+      ok: true,
+      status: job.status,
+      progress: job.progress,
+      error: job.error,
+      stats: job.result?.stats,
+    });
+  });
+
+  router.get("/accounting/from-dian/result/:jobId", (req: Request, res: Response) => {
+    const job = dianIngestJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ ok: false, message: "Job no encontrado" });
+    if (job.status !== "completed" || !job.result) {
+      return res.status(409).json({ ok: false, message: "El job aún no ha terminado", status: job.status });
+    }
+    return res.json({
+      ok: true,
+      data: job.result.items,
+      stats: job.result.stats,
+      failures: job.result.failures,
+    });
+  });
+
+  router.post("/accounting/from-dian/cancel/:jobId", (req: Request, res: Response) => {
+    const job = dianIngestJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ ok: false, message: "Job no encontrado" });
+    if (job.status === "processing") job.status = "cancelled";
+    return res.json({ ok: true });
   });
 
   router.post("/accounting/submit", async (req: Request, res: Response) => {
