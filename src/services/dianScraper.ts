@@ -4,6 +4,13 @@ import path from "path";
 import JSZip from "jszip";
 import type { DocumentInfo, ProgressData, DocumentDirection } from "../types/dian.js";
 
+// User-Agent de un Chrome real. La DIAN bloquea ("Solicitud bloqueada por
+// controles de seguridad") los navegadores que se anuncian como HeadlessChrome
+// o exponen navigator.webdriver, así que tanto el navegador como los fetch a la
+// DIAN deben presentarse como un Chrome normal.
+const REAL_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
 // Estado de progreso compartido entre scraper y rutas de consulta.
 export const progressTracker: Map<string, ProgressData> = new Map();
 
@@ -951,6 +958,23 @@ export async function runDianExtractionPrecheck(
 }
 
 async function hardenPageRuntime(page: Page): Promise<void> {
+  // Presentarse como un Chrome real: User-Agent normal + ocultar la bandera
+  // navigator.webdriver. Sin esto la DIAN responde "Solicitud bloqueada por
+  // controles de seguridad" y el listado/descarga vuelven vacíos.
+  try {
+    await page.setUserAgent(REAL_USER_AGENT);
+    await page.setExtraHTTPHeaders({ "Accept-Language": "es-CO,es;q=0.9" });
+  } catch {
+    // noop
+  }
+  await page.evaluateOnNewDocument(() => {
+    try {
+      Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+    } catch {
+      // noop
+    }
+  });
+
   // En algunos entornos de transpile, page.evaluate puede serializar helpers
   // como __name. Definirlo en runtime evita el fallo "__name is not defined".
   await page.evaluateOnNewDocument(() => {
@@ -1000,6 +1024,7 @@ async function launchBrowserWithRetry(
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
+          "--disable-blink-features=AutomationControlled",
           "--disable-dev-shm-usage",
           "--disable-gpu",
           "--disable-extensions",
@@ -1512,7 +1537,7 @@ async function extractListingRecordsFromDownloadTab(
     const exportPageBefore = await fetch(`${baseUrl}/Document/Export`, {
       method: "GET",
       headers: {
-        Cookie: cookieHeader,
+        "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader,
         Referer: `${baseUrl}/Document/Export`,
       },
     }).then((r) => r.text());
@@ -1528,7 +1553,7 @@ async function extractListingRecordsFromDownloadTab(
           console.log(`[DIAN Export] Reutilizando listado #${i + 1}: ${reusableLink}`);
           const downloaded = await fetch(`${baseUrl}${reusableLink}`, {
             method: "GET",
-            headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
+            headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
           }).then((r) => r.arrayBuffer());
 
           const zipBuffer = Buffer.from(new Uint8Array(downloaded));
@@ -1570,7 +1595,7 @@ async function extractListingRecordsFromDownloadTab(
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
-        Cookie: cookieHeader,
+        "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader,
         Referer: `${baseUrl}/Document/Export`,
       },
       body: body.toString(),
@@ -1586,7 +1611,7 @@ async function extractListingRecordsFromDownloadTab(
       const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
         method: "GET",
         headers: {
-          Cookie: cookieHeader,
+          "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader,
           Referer: `${baseUrl}/Document/Export`,
         },
       }).then((r) => r.text());
@@ -1607,7 +1632,7 @@ async function extractListingRecordsFromDownloadTab(
 
     const downloaded = await fetch(`${baseUrl}${selectedLink}`, {
       method: "GET",
-      headers: { Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
+      headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
     }).then((r) => r.arrayBuffer());
     const zipBuffer = Buffer.from(new Uint8Array(downloaded));
 
@@ -2528,7 +2553,7 @@ async function fetchZipToFile(url: string, destPath: string, cookieHeader: strin
     const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
       const resp = await fetch(url, {
-        headers: { Cookie: cookieHeader },
+        headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader },
         signal: controller.signal,
       });
       clearTimeout(timer);
