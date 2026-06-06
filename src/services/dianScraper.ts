@@ -2084,44 +2084,24 @@ async function findDocumentByUniqueCodeOrDocnum(
       }
 
       if (searchedByUniqueCode) {
-        const wantCufe = normalizeCufe(cufe || "");
-        // La tabla puede tardar en reflejar NUESTRA búsqueda y seguir mostrando el
-        // resultado de un CUFE consultado antes. Aceptar la primera fila sin validar
-        // produce "resultados cruzados": el documento de otro CUFE se asigna a este,
-        // su id colisiona y se descarta como duplicado, dejando la factura sin datos.
-        // Por eso reintentamos la lectura hasta que aparezca el documento del CUFE
-        // buscado (match exacto por CUFE/número).
-        for (let attempt = 0; attempt < 6; attempt++) {
-          await delay(attempt === 0 ? 80 : 300);
-          await waitForTableLoad(page);
+        await delay(80);
+        await waitForTableLoad(page);
 
-          // Set temporal para no descartar un resultado válido por deduplicación
-          // previa de otro CUFE.
-          const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, new Set<string>(), isSentDocuments);
-          if (foundByUniqueCode.length === 0) break; // sin filas → pasar al fallback de abajo
-
+        // Set temporal para no descartar un resultado válido por deduplicación
+        // previa de otro CUFE.
+        const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, new Set<string>(), isSentDocuments);
+        if (foundByUniqueCode.length > 0) {
+          // Preferir el documento que coincide exactamente con el CUFE buscado.
+          // Si no hay match exacto, tomar el primero: los resultados cruzados por
+          // race condition los detecta acceptedDocIds y los recupera la segunda
+          // pasada serializada en extractDocumentIdsByCufe.
           const exact = foundByUniqueCode.find((d) =>
             (docnum && d.docnum === docnum) ||
-            (wantCufe && normalizeCufe(d.cufe || "") === wantCufe)
+            (cufe && normalizeCufe(d.cufe || "") === normalizeCufe(cufe))
           );
-          if (exact) {
-            if (!seenIds.has(exact.id)) seenIds.add(exact.id);
-            return exact;
-          }
-
-          // Si alguna fila trae un CUFE legible y ninguno coincide con el buscado,
-          // la tabla está mostrando un resultado viejo/cruzado: esperar y reintentar.
-          const someReadableCufe = foundByUniqueCode.some((d) => normalizeCufe(d.cufe || "").length >= 32);
-          if (someReadableCufe) continue;
-
-          // Sin CUFE legible y una sola fila: el portal filtró a un único documento
-          // y no hay forma de validar por CUFE; se acepta esa fila.
-          if (foundByUniqueCode.length === 1) {
-            const sel = foundByUniqueCode[0];
-            if (!seenIds.has(sel.id)) seenIds.add(sel.id);
-            return sel;
-          }
-          // Varias filas sin CUFE legible: ambiguo → reintentar.
+          const selected = exact || foundByUniqueCode[0];
+          if (!seenIds.has(selected.id)) seenIds.add(selected.id);
+          return selected;
         }
 
         const visibleRows = await page.evaluate(() =>
