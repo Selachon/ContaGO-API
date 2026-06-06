@@ -4,7 +4,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
-import { extractDocumentIdsByCufe, runDianExtractionPrecheck } from "../services/dianScraper.js";
+import { extractDocumentIdsByCufe, runDianExtractionPrecheck, REAL_USER_AGENT } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import {
@@ -1035,7 +1035,7 @@ export async function downloadZipFile(
 
     try {
       const response = await fetch(url, {
-        headers: { Cookie: cookieHeader },
+        headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader },
         signal: controller.signal,
       });
 

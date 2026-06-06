@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
-import { downloadDocumentsByCufe } from "../services/dianScraper.js";
+import { extractDocumentIdsByCufe, fetchZipToFile, REAL_USER_AGENT, type ListingRecord } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile } from "../services/excelGenerator.js";
 import {
@@ -241,6 +241,7 @@ router.post(
     let allDates: string[];
     let skippedEntries: Array<{cufe: string; reason: string}>;
     let direction: DocumentDirection;
+    let listingRecords: ListingRecord[] = [];
     try {
       const excelBuffer = await resolveExcelBuffer(file);
       const result = await extractCufesFromExcel(excelBuffer);
@@ -255,6 +256,7 @@ router.post(
       allDates = result.dates;
       skippedEntries = result.skippedEntries;
       direction = result.detectedDirection;
+      listingRecords = result.listingRecords;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return res.status(400).json({ status: "error", detalle: `Error leyendo archivo: ${msg}` });
@@ -307,7 +309,7 @@ router.post(
       message: demoLimitInfo?.message || `${allCufes.length} CUFEs encontrados. Usa /dian-cufe/job-status/${jobId} para consultar el progreso.`,
     });
 
-    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, skippedEntries, start_date, end_date, direction, req.user!.userId, drive_connection_id, parseBoolParam(include_drive_links, false), parseBoolParam(upload_to_drive, true)).catch((err) => {
+    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, skippedEntries, start_date, end_date, direction, req.user!.userId, drive_connection_id, parseBoolParam(include_drive_links, false), parseBoolParam(upload_to_drive, true), listingRecords).catch((err) => {
       console.error(`[CUFE DL] Job ${jobId} error:`, err);
       const j = jobTracker.get(jobId);
       if (j) {
@@ -331,7 +333,8 @@ async function processCufeDownloadJob(
   userId: string,
   driveConnectionId: string | undefined,
   includeDriveLinks: boolean,
-  uploadToDrive: boolean
+  uploadToDrive: boolean,
+  listingRecords: ListingRecord[] = []
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
@@ -384,28 +387,135 @@ async function processCufeDownloadJob(
   let companyNit = "";
   let companyWasFromDS = false;
 
-  async function downloadAndFill(batch: string[], dir: string, phaseLabel: string): Promise<void> {
-    const { results } = await downloadDocumentsByCufe(
-      tokenUrl, batch, startDate, endDate, direction, dir,
-      (progress) => setProgress(jobId, {
-        step: `${phaseLabel}: ${progress.step || "..."}`,
-        current: progress.current ?? 0,
-        total: progress.total ?? allCufes.length,
+  function hasData(cufe: string): boolean {
+    const inv = invoiceMap.get(cufe);
+    return !!(inv?.issuerNit || inv?.docNumber);
+  }
+
+  try {
+    if (isJobCancelled(jobId)) return;
+
+    // Semáforo de descargas. Por defecto 2: DIAN permite algo de concurrencia y el
+    // segundo cupo absorbe la varianza (descargas lentas) sin estancar la búsqueda
+    // (~2.1s/doc con 2 vs ~3.0s/doc con 1). Genera unos pocos 403 transitorios que
+    // recupera el reintento con sesión fresca al final. Subir a 3-4 acelera poco y
+    // multiplica los 403.
+    const MAX_DL = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 2), 4));
+    let dlSlots = MAX_DL;
+    const dlQueue: Array<() => void> = [];
+    const acquireDl = (): Promise<void> =>
+      dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((res) => dlQueue.push(res));
+    const releaseDl = () => {
+      const next = dlQueue.shift();
+      if (next) next(); else dlSlots++;
+    };
+
+    // Download results keyed by cufe
+    const dlResults = new Map<string, { destPath: string | null; trackId: string; docnum: string; nit: string; error?: string }>();
+    let dlDone = 0;
+    // Descargas disparadas en segundo plano; se esperan todas al final.
+    const downloadPromises: Promise<void>[] = [];
+
+    // Descarga el ZIP de un documento y registra el resultado en dlResults.
+    // Reutilizado por el flujo principal y por el reintento de fallidos.
+    const downloadDoc = async (
+      doc: { id: string; docnum: string; nit?: string; cufe?: string; docType?: string },
+      cookies: Record<string, string>,
+    ): Promise<void> => {
+      const isEquivalente = doc.docType?.toLowerCase().includes("equivalente") ?? false;
+      const baseUrl = isEquivalente
+        ? "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId="
+        : "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
+      const safeNit = (doc.nit || "SinNIT").replace(/[^a-zA-Z0-9_\-]/g, "_");
+      const safeDoc = (doc.docnum || doc.id.slice(0, 12)).replace(/[^a-zA-Z0-9_\-]/g, "_");
+      const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
+      const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+      const key = doc.cufe || doc.id;
+      try {
+        await fetchZipToFile(`${baseUrl}${doc.id}`, destPath, cookieHeader);
+        dlResults.set(key, { destPath, trackId: doc.id, docnum: doc.docnum, nit: doc.nit || "" });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[CUFE DL] Error descarga ${key.slice(0, 16)}: ${msg}`);
+        dlResults.set(key, { destPath: null, trackId: doc.id, docnum: doc.docnum, nit: doc.nit || "", error: msg });
+      }
+    };
+
+    setProgress(jobId, { step: "Buscando y descargando documentos...", current: 0, total: downloadCufes.length });
+
+    // Búsqueda serial (1 worker → sin race) + descargas en paralelo con contrapresión.
+    // El callback espera SOLO a que haya cupo de descarga libre, dispara la descarga
+    // en segundo plano y devuelve el control para que la búsqueda del siguiente CUFE
+    // se solape con la descarga en curso. Así el tiempo de búsqueda (~0.7s) se esconde
+    // bajo el de descarga (~1.9s, el cuello de botella real de DIAN).
+    const { documents } = await extractDocumentIdsByCufe(
+      tokenUrl,
+      startDate,
+      endDate,
+      jobId,
+      direction,
+      (p) => setProgress(jobId, {
+        step: `Descargando ${dlDone}/${downloadCufes.length}...`,
+        current: dlDone,
+        total: downloadCufes.length,
       }),
-      () => isJobCancelled(jobId)
+      async ({ doc, cookies }) => {
+        // Contrapresión: bloquea la búsqueda solo si ya hay MAX_DL descargas en vuelo.
+        // Mantiene la cola corta → las cookies siguen frescas (sin 403 por sesión vieja).
+        await acquireDl();
+        const dl = (async () => {
+          try {
+            await downloadDoc(doc, cookies);
+          } finally {
+            releaseDl();
+            dlDone++;
+            setProgress(jobId, { step: `Descargando ${dlDone}/${downloadCufes.length}...`, current: dlDone, total: allCufes.length });
+          }
+        })();
+        downloadPromises.push(dl);
+        // No esperamos la descarga: la búsqueda continúa con el siguiente CUFE.
+      },
+      listingRecords,
     );
+
+    // Esperar a que terminen las descargas en vuelo.
+    await Promise.all(downloadPromises);
+    console.log(`[CUFE DL] ${documents.length}/${downloadCufes.length} CUFEs resueltos, ${dlDone} descargados`);
 
     if (isJobCancelled(jobId)) return;
 
-    const successful = results.filter((r) => r.success && r.destPath);
+    // Reintento de descargas fallidas (típicamente 403 transitorios de DIAN: límite
+    // de concurrencia o ventana de permiso). Se re-resuelven con sesión fresca y se
+    // descargan en serie (lote pequeño). Esto recupera los documentos sin reabrir el
+    // problema de robo por race (sigue siendo 1 worker).
+    const failedKeys = [...dlResults.entries()].filter(([, r]) => !r.destPath).map(([k]) => k);
+    if (failedKeys.length > 0) {
+      console.log(`[CUFE DL] Reintentando ${failedKeys.length} descargas fallidas...`);
+      setProgress(jobId, { step: `Reintentando ${failedKeys.length} descargas...`, current: dlDone, total: allCufes.length });
+      const failedSet = new Set(failedKeys.map((k) => k.toLowerCase()));
+      const retryRecords = listingRecords.filter((r) => failedSet.has((r.cufe || "").toLowerCase()));
+      try {
+        await extractDocumentIdsByCufe(
+          tokenUrl, startDate, endDate, jobId, direction,
+          () => {},
+          async ({ doc, cookies }) => { await downloadDoc(doc, cookies); },
+          retryRecords,
+        );
+      } catch (err) {
+        console.warn(`[CUFE DL] Error en reintento de descargas:`, err instanceof Error ? err.message : err);
+      }
+      const stillFailed = [...dlResults.entries()].filter(([, r]) => !r.destPath).length;
+      console.log(`[CUFE DL] Tras reintento: ${stillFailed} descargas aún fallidas`);
+    }
+
+    if (isJobCancelled(jobId)) return;
+
+    // Process XML for each successful download
+    const successful = [...dlResults.entries()].filter(([, r]) => r.destPath);
     for (let i = 0; i < successful.length; i++) {
       if (isJobCancelled(jobId)) return;
-      const result = successful[i];
-      setProgress(jobId, {
-        step: `${phaseLabel}: procesando XML ${i + 1}/${successful.length}...`,
-        current: i + 1,
-        total: successful.length,
-      });
+      const [cufe, result] = successful[i];
+      setProgress(jobId, { step: `Procesando XML ${i + 1}/${successful.length}...`, current: i + 1, total: successful.length });
       try {
         const zipBuffer = fs.readFileSync(result.destPath!);
         const { xmlBuffer, pdfBuffer } = await extractFilesFromZip(zipBuffer);
@@ -414,17 +524,15 @@ async function processCufeDownloadJob(
           continue;
         }
         const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
-          id: result.trackId || result.cufe,
+          id: result.trackId,
           docnum: result.docnum || "",
         });
 
-        // Identificar empresa del primer XML
-        // Preferimos documentos que NO sean "Documento Soporte" para identificar la empresa
         const isDS = !!invoiceData.isDocumentoSoporte;
-        const currentOwnName = (direction === "received") 
-          ? invoiceData.receiverName 
+        const currentOwnName = direction === "received"
+          ? invoiceData.receiverName
           : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
-        const currentOwnNit = (direction === "received")
+        const currentOwnNit = direction === "received"
           ? invoiceData.receiverNit
           : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
 
@@ -434,19 +542,16 @@ async function processCufeDownloadJob(
         if (isNameEmpty || (isCurrentlyDSIdentified && !isDS)) {
           if (currentOwnName && currentOwnName !== "N/A") {
             companyName = currentOwnName;
-            companyNit = (currentOwnNit && currentOwnNit !== "N/A") 
-              ? currentOwnNit 
+            companyNit = (currentOwnNit && currentOwnNit !== "N/A")
+              ? currentOwnNit
               : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
             companyWasFromDS = isDS;
           }
         }
 
         const hasValidData = !!(invoiceData.issueDate && invoiceData.docNumber);
-
-        // Documento Soporte PDFs are not reliable — skip PDF, keep XML only
         const effectivePdf = invoiceData.isDocumentoSoporte ? null : pdfBuffer;
 
-        // Inline Drive upload: upload now and embed link in Excel column
         if (useInlineDriveLinks && driveConfig && hasValidData) {
           try {
             const uploadResult = await uploadInvoiceFilesToDrive(
@@ -462,11 +567,10 @@ async function processCufeDownloadJob(
             );
             invoiceData.driveUrl = uploadResult.pdfUrl || uploadResult.folderUrl;
           } catch (driveErr) {
-            console.warn(`[CUFE DL] Drive upload error ${result.cufe.slice(0, 16)}:`, driveErr);
+            console.warn(`[CUFE DL] Drive upload error ${cufe.slice(0, 16)}:`, driveErr);
           }
         }
 
-        // Deferred Drive upload: collect for background upload after Excel is ready
         if (runDeferredDriveUpload && hasValidData) {
           deferredUploads.push({
             xmlBuffer,
@@ -477,47 +581,15 @@ async function processCufeDownloadJob(
           });
         }
 
-        invoiceMap.set(result.cufe, invoiceData);
+        invoiceMap.set(cufe, invoiceData);
       } catch (err) {
-        console.warn(`[CUFE DL] Error XML ${result.cufe.slice(0, 16)}:`, err);
-      }
-    }
-  }
-
-  function hasData(cufe: string): boolean {
-    const inv = invoiceMap.get(cufe);
-    return !!(inv?.issuerNit || inv?.docNumber);
-  }
-
-  try {
-    if (isJobCancelled(jobId)) return;
-
-    // Phase 1: Download + parse processable CUFEs (skipped ones already pre-filled)
-    await downloadAndFill(downloadCufes, tempDir, "Descarga");
-
-    if (isJobCancelled(jobId)) return;
-
-    // Phase 2: Retry only downloadable CUFEs that still have no parsed data
-    const pendingCufes = downloadCufes.filter((c) => !hasData(c));
-    if (pendingCufes.length > 0) {
-      console.log(`[CUFE DL] Reintentando ${pendingCufes.length} documentos sin datos...`);
-      const tempDir2 = path.join(DOWNLOADS_DIR, `${sessionId}_retry`);
-      fs.mkdirSync(tempDir2, { recursive: true });
-      try {
-        setProgress(jobId, {
-          step: `Reintentando ${pendingCufes.length} documentos sin datos...`,
-          current: downloadCufes.length - pendingCufes.length,
-          total: allCufes.length,
-        });
-        await downloadAndFill(pendingCufes, tempDir2, "Reintento");
-      } finally {
-        try { fs.rmSync(tempDir2, { recursive: true, force: true }); } catch {}
+        console.warn(`[CUFE DL] Error XML ${cufe.slice(0, 16)}:`, err);
       }
     }
 
     if (isJobCancelled(jobId)) return;
 
-    // Phase 3: Generate Excel with ALL CUFEs in original order (includes skipped rows with notes)
+    // Generate Excel with ALL CUFEs in original order (includes skipped rows with notes)
     const filledCount = downloadCufes.filter(hasData).length;
     setProgress(jobId, { step: "Generando Excel...", current: allCufes.length, total: allCufes.length });
 
@@ -656,6 +728,7 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{
   detectedDirection: DocumentDirection | null;
   mixedDirections: boolean;
   skippedEntries: Array<{cufe: string; reason: string}>;
+  listingRecords: ListingRecord[];
 }> {
   const zip = await JSZip.loadAsync(buffer);
   const allFiles = Object.keys(zip.files);
@@ -746,14 +819,18 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{
   const allCufes: string[] = [];     // all in original order
   const dates: string[] = [];
   const skippedEntries: Array<{cufe: string; reason: string}> = [];
+  const listingRecords: ListingRecord[] = [];
 
   for (const rowNum of sortedRows) {
     const cufe = rows.get(rowNum)?.get("B") || "";
     if (!cufe) continue;
+    const docnum = rows.get(rowNum)?.get("C") || "";
     const date = dateCol ? (rows.get(rowNum)?.get(dateCol) || "") : "";
     const cls = rowClassMap.get(rowNum) ?? "unknown";
     allCufes.push(cufe);
     dates.push(date);
+    const dir: DocumentDirection | undefined = cls === "sent" ? "sent" : cls === "received" ? "received" : undefined;
+    listingRecords.push({ cufe, docnum, direction: dir });
     if (cls === "nomina") {
       skippedEntries.push({ cufe, reason: "Nómina Individual: CUFE no procesable por esta herramienta" });
     } else if (cls === "applicationResponse") {
@@ -764,7 +841,7 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{
   }
 
   console.log(`[Excel CUFE] total=${allCufes.length} processable=${cufes.length} skipped=${skippedEntries.length} direction="${detectedDirection}" mixed=${mixedDirections}`);
-  return { cufes, allCufes, dates, detectedDirection, mixedDirections, skippedEntries };
+  return { cufes, allCufes, dates, detectedDirection, mixedDirections, skippedEntries, listingRecords };
 }
 
 export default router;

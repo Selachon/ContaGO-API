@@ -8,7 +8,7 @@ import type { DocumentInfo, ProgressData, DocumentDirection } from "../types/dia
 // controles de seguridad") los navegadores que se anuncian como HeadlessChrome
 // o exponen navigator.webdriver, así que tanto el navegador como los fetch a la
 // DIAN deben presentarse como un Chrome normal.
-const REAL_USER_AGENT =
+export const REAL_USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 // Estado de progreso compartido entre scraper y rutas de consulta.
@@ -665,8 +665,13 @@ export async function extractDocumentIdsByCufe(
       ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
       : "https://catalogo-vpfe.dian.gov.co/Document/Received";
 
-    const requestedWorkers = Number(process.env.DIAN_CUFE_WORKERS || 4);
-    const workerCount = Math.max(1, Math.min(Number.isFinite(requestedWorkers) ? requestedWorkers : 2, 4));
+    // Por defecto 1 worker: las búsquedas comparten una sola sesión DIAN, y con
+    // varios workers concurrentes el portal cruza resultados (race condition) que
+    // antes robaba documentos entre CUFEs. Con 1 worker la búsqueda es serial y
+    // siempre correcta; la velocidad la aporta el pipeline de descargas en paralelo
+    // (la descarga es el cuello de botella real, ~1.9s/doc en DIAN).
+    const requestedWorkers = Number(process.env.DIAN_CUFE_WORKERS || 1);
+    const workerCount = Math.max(1, Math.min(Number.isFinite(requestedWorkers) ? requestedWorkers : 1, 4));
     updateProgress({ step: `Navegando a documentos ${directionLabel}...`, current: 0, total: cufes.length });
 
     // Página base (se mantiene para compatibilidad y fallback de cookies).
@@ -771,7 +776,11 @@ export async function extractDocumentIdsByCufe(
           let found: DocumentInfo | null = null;
           for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-              found = await findDocumentByUniqueCodeOrDocnum(wp, cufe, "", seenIds, currentWorkerDir === "sent");
+              // Con un solo worker no hay race (búsquedas serializadas en una sola
+              // sesión), así que la primera fila es siempre el resultado correcto y se
+              // permite el fallback. Con varios workers se exige match exacto para
+              // evitar robar el documento de otro CUFE por race condition.
+              found = await findDocumentByUniqueCodeOrDocnum(wp, cufe, record?.docnum || "", seenIds, currentWorkerDir === "sent", false, workerCount === 1);
               break;
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
@@ -888,7 +897,9 @@ export async function extractDocumentIdsByCufe(
               await waitForTableLoad(retry.page);
               retryDir = wantDir;
             }
-            const found = await findDocumentByUniqueCodeOrDocnum(retry.page, cufe, "", seenIds, retryDir === "sent");
+            // Segunda pasada serializada: sin race, el fallback de primera fila es
+            // seguro. Se pasa el docnum del listado para reforzar la coincidencia.
+            const found = await findDocumentByUniqueCodeOrDocnum(retry.page, cufe, record?.docnum || "", seenIds, retryDir === "sent", false, true);
             if (found?.id) {
               found.cufe = cufe;
               const nc = normalizeCufe(found.cufe || cufe);
@@ -2018,7 +2029,13 @@ async function findDocumentByUniqueCodeOrDocnum(
   docnum: string,
   seenIds: Set<string>,
   isSentDocuments: boolean,
-  searchTriggeredByCaller: boolean = false
+  searchTriggeredByCaller: boolean = false,
+  // Cuando es false, solo se acepta un documento que coincida EXACTAMENTE con el
+  // CUFE o el docnum buscado. Se usa en los workers paralelos: ahí la tabla del
+  // portal puede mostrar el resultado de otro worker (race condition de sesión
+  // compartida) y tomar la primera fila robaría el documento de otro CUFE.
+  // La segunda pasada serializada (sin race) sí usa el fallback con seguridad.
+  allowFirstRowFallback: boolean = true
 ): Promise<DocumentInfo | null> {
   const candidates = [cufe].filter(Boolean);
   for (const term of candidates) {
@@ -2091,22 +2108,28 @@ async function findDocumentByUniqueCodeOrDocnum(
         // previa de otro CUFE.
         const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, new Set<string>(), isSentDocuments);
         if (foundByUniqueCode.length > 0) {
-          // Preferir el documento que coincide exactamente con el CUFE buscado.
-          // Si no hay match exacto, tomar el primero: los resultados cruzados por
-          // race condition los detecta acceptedDocIds y los recupera la segunda
-          // pasada serializada en extractDocumentIdsByCufe.
+          // Preferir el documento que coincide exactamente con el CUFE o docnum buscado.
           const exact = foundByUniqueCode.find((d) =>
             (docnum && d.docnum === docnum) ||
             (cufe && normalizeCufe(d.cufe || "") === normalizeCufe(cufe))
           );
-          const selected = exact || foundByUniqueCode[0];
-          if (!seenIds.has(selected.id)) seenIds.add(selected.id);
-          return selected;
+          // En modo estricto (workers paralelos): si no hay match exacto, NO tomar la
+          // primera fila — podría ser el resultado de otro CUFE por race condition, lo
+          // que robaría su documento. Se devuelve null y la segunda pasada serializada
+          // (sin race) lo recupera correctamente.
+          const selected = exact || (allowFirstRowFallback ? foundByUniqueCode[0] : null);
+          if (selected) {
+            if (!seenIds.has(selected.id)) seenIds.add(selected.id);
+            return selected;
+          }
+          if (!allowFirstRowFallback) return null;
         }
 
-        const visibleRows = await page.evaluate(() =>
-          document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)").length
-        );
+        const visibleRows = allowFirstRowFallback
+          ? await page.evaluate(() =>
+              document.querySelectorAll("#tableDocuments tbody tr:not(.dataTables_empty)").length
+            )
+          : 0;
         if (visibleRows > 0) {
           // Fallback ultra directo: tomar la primera fila visible exactamente
           // como en uso manual (si hay una fila, descargar esa).
@@ -2605,7 +2628,7 @@ export async function downloadDocumentsByCufe(
   }
 }
 
-async function fetchZipToFile(url: string, destPath: string, cookieHeader: string): Promise<void> {
+export async function fetchZipToFile(url: string, destPath: string, cookieHeader: string): Promise<void> {
   const MAX_RETRIES = 3;
   const TIMEOUT_MS = 180_000;
   let lastError: Error | null = null;
