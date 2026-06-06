@@ -857,6 +857,64 @@ export async function extractDocumentIdsByCufe(
     await Promise.all(workerPages.map((_, idx) => runWorker(idx)));
     await Promise.all(workerPages.map(async (wp) => { try { await wp.close(); } catch {} }));
 
+    // ── Segunda pasada SERIALIZADA para los CUFEs que quedaron sin resolver ──
+    // El cruce de resultados de búsqueda solo ocurre con consultas concurrentes
+    // (los workers comparten sesión en el portal). Reintentar los rezagados uno
+    // por uno, sin concurrencia, recupera el documento correcto de cada CUFE sin
+    // sacrificar la velocidad del grueso (que sí va en paralelo).
+    const pendingCufes = cufes.filter((c) => !acceptedCufes.has(normalizeCufe(c)));
+    if (pendingCufes.length > 0) {
+      console.log(`[DIAN CUFE] Segunda pasada serializada: ${pendingCufes.length} CUFE(s) sin resolver`);
+      updateProgress({
+        step: `Recuperando ${pendingCufes.length} documento(s) rezagado(s)...`,
+        current: cufes.length,
+        total: cufes.length,
+      });
+      let retry: { page: Page; cookies: Record<string, string> } | null = null;
+      try {
+        retry = await initWorkerPage();
+        let retryDir: DocumentDirection = direction;
+        let recovered = 0;
+        for (const cufe of pendingCufes) {
+          const record = listedRecords.find((r) => normalizeCufe(r.cufe) === normalizeCufe(cufe));
+          const wantDir: DocumentDirection = record?.direction || direction;
+          try {
+            if (wantDir !== retryDir) {
+              const targetUrl = wantDir === "sent"
+                ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+                : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+              await navigateWithRetry(retry.page, targetUrl, 2);
+              if (startDate && endDate) await applyDateFilter(retry.page, startDate, endDate, false);
+              await waitForTableLoad(retry.page);
+              retryDir = wantDir;
+            }
+            const found = await findDocumentByUniqueCodeOrDocnum(retry.page, cufe, "", seenIds, retryDir === "sent");
+            if (found?.id) {
+              found.cufe = cufe;
+              const nc = normalizeCufe(found.cufe || cufe);
+              if (!acceptedDocIds.has(found.id) && !(nc && acceptedCufes.has(nc))) {
+                acceptedDocIds.add(found.id);
+                if (nc) acceptedCufes.add(nc);
+                documents.push(found);
+                recovered++;
+                if (onDocumentFound) {
+                  await onDocumentFound({ doc: found, index: documents.length, total: cufes.length, cookies: retry.cookies });
+                }
+              }
+            }
+          } catch (err) {
+            console.warn(`[DIAN CUFE] Reintento serializado falló para CUFE ${cufe.slice(0, 16)}...`, err instanceof Error ? err.message : err);
+          }
+          await delay(150);
+        }
+        console.log(`[DIAN CUFE] Segunda pasada: recuperados ${recovered}/${pendingCufes.length}`);
+      } catch (err) {
+        console.warn("[DIAN CUFE] No se pudo ejecutar la segunda pasada:", err instanceof Error ? err.message : err);
+      } finally {
+        if (retry) { try { await retry.page.close(); } catch {} }
+      }
+    }
+
     const finalDocuments = documents;
 
     console.log(
@@ -2026,20 +2084,44 @@ async function findDocumentByUniqueCodeOrDocnum(
       }
 
       if (searchedByUniqueCode) {
-        await delay(80);
-        await waitForTableLoad(page);
+        const wantCufe = normalizeCufe(cufe || "");
+        // La tabla puede tardar en reflejar NUESTRA búsqueda y seguir mostrando el
+        // resultado de un CUFE consultado antes. Aceptar la primera fila sin validar
+        // produce "resultados cruzados": el documento de otro CUFE se asigna a este,
+        // su id colisiona y se descarta como duplicado, dejando la factura sin datos.
+        // Por eso reintentamos la lectura hasta que aparezca el documento del CUFE
+        // buscado (match exacto por CUFE/número).
+        for (let attempt = 0; attempt < 6; attempt++) {
+          await delay(attempt === 0 ? 80 : 300);
+          await waitForTableLoad(page);
 
-        // Usar un set temporal en búsqueda puntual para no descartar un resultado
-        // válido por deduplicación previa de otro CUFE.
-        const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, new Set<string>(), isSentDocuments);
-        if (foundByUniqueCode.length > 0) {
+          // Set temporal para no descartar un resultado válido por deduplicación
+          // previa de otro CUFE.
+          const foundByUniqueCode = await extractDocsFromCurrentPageHtml(page, new Set<string>(), isSentDocuments);
+          if (foundByUniqueCode.length === 0) break; // sin filas → pasar al fallback de abajo
+
           const exact = foundByUniqueCode.find((d) =>
             (docnum && d.docnum === docnum) ||
-            (cufe && normalizeCufe(d.cufe || "") === normalizeCufe(cufe))
+            (wantCufe && normalizeCufe(d.cufe || "") === wantCufe)
           );
-          const selected = exact || foundByUniqueCode[0];
-          if (!seenIds.has(selected.id)) seenIds.add(selected.id);
-          return selected;
+          if (exact) {
+            if (!seenIds.has(exact.id)) seenIds.add(exact.id);
+            return exact;
+          }
+
+          // Si alguna fila trae un CUFE legible y ninguno coincide con el buscado,
+          // la tabla está mostrando un resultado viejo/cruzado: esperar y reintentar.
+          const someReadableCufe = foundByUniqueCode.some((d) => normalizeCufe(d.cufe || "").length >= 32);
+          if (someReadableCufe) continue;
+
+          // Sin CUFE legible y una sola fila: el portal filtró a un único documento
+          // y no hay forma de validar por CUFE; se acepta esa fila.
+          if (foundByUniqueCode.length === 1) {
+            const sel = foundByUniqueCode[0];
+            if (!seenIds.has(sel.id)) seenIds.add(sel.id);
+            return sel;
+          }
+          // Varias filas sin CUFE legible: ambiguo → reintentar.
         }
 
         const visibleRows = await page.evaluate(() =>
