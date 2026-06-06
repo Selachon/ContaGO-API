@@ -665,8 +665,8 @@ export async function extractDocumentIdsByCufe(
       ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
       : "https://catalogo-vpfe.dian.gov.co/Document/Received";
 
-    const requestedWorkers = Number(process.env.DIAN_CUFE_WORKERS || 4);
-    const workerCount = Math.max(1, Math.min(Number.isFinite(requestedWorkers) ? requestedWorkers : 2, 4));
+    const requestedWorkers = Number(process.env.DIAN_CUFE_WORKERS || 5);
+    const workerCount = Math.max(1, Math.min(Number.isFinite(requestedWorkers) ? requestedWorkers : 2, 6));
     updateProgress({ step: `Navegando a documentos ${directionLabel}...`, current: 0, total: cufes.length });
 
     // Página base (se mantiene para compatibilidad y fallback de cookies).
@@ -1263,7 +1263,7 @@ async function waitForTableLoad(page: Page): Promise<void> {
   try {
     // DataTables usa este overlay durante recargas (v1: #..._processing, v2: .dt-processing).
     try {
-      await page.waitForSelector("#tableDocuments_processing, .dt-processing", { visible: true, timeout: 5000 });
+      await page.waitForSelector("#tableDocuments_processing, .dt-processing", { visible: true, timeout: 1000 });
       await page.waitForSelector("#tableDocuments_processing, .dt-processing", { hidden: true, timeout: 20000 });
     } catch {
       // Fallback cuando el overlay no se renderiza.
