@@ -172,6 +172,12 @@ export async function connectMongo(): Promise<void> {
   await ensureIndex(siigoProfiles, { companyId: 1 });
   const siigoIngestedCufes = db.collection("siigoIngestedCufes");
   await ensureIndex(siigoIngestedCufes, { companyId: 1, cufe: 1 }, { unique: true });
+  const siigoEgresoMovs = db.collection("siigoEgresoMovs");
+  await ensureIndex(siigoEgresoMovs, { companyId: 1, createdAt: -1 });
+  await ensureIndex(siigoEgresoMovs, { companyId: 1, bankAccountId: 1, createdAt: -1 });
+  await ensureIndex(siigoEgresoMovs, { companyId: 1, status: 1, fingerprint: 1 });
+  const siigoBankAccounts = db.collection("siigoBankAccounts");
+  await ensureIndex(siigoBankAccounts, { companyId: 1, createdAt: 1 });
 }
 
 function mapUser(record: UserRecord | null): User | null {

@@ -5,3 +5,8 @@ downloads/
 .env
 .DS_Store
 data.db
+
+# Datos sensibles y utilidades de desarrollo (no subir)
+uploads/
+read-pdf.cjs
+upload-server.mjs

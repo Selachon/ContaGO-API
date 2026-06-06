@@ -20,6 +20,8 @@ import {
   listDocumentTypes,
   listInvoices,
   listPaymentReceipts,
+  listPaymentReceiptDocumentTypes,
+  getAccountsPayable,
   listPurchaseDocumentTypes,
   listJournalDocumentTypes,
   createJournalVoucher,
@@ -56,6 +58,31 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import { ingestFromDian, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
+import {
+  parseBankExcel,
+  validateEgresoPayload,
+  submitEgreso,
+  suggestSuppliersByValue,
+  findMatchingVouchers,
+  EgresosError,
+  type EgresoPayload,
+} from "../services/siigoEgresosService.js";
+import { parseBankPdf, StatementError } from "../services/bankStatementParser.js";
+import {
+  listMovements,
+  addMovements,
+  updateMovement,
+  deleteMovement,
+  clearMovements,
+  findDuplicateDone,
+  fingerprint as egresoFingerprint,
+} from "../services/siigoEgresosStoreService.js";
+import {
+  listBankAccounts,
+  createBankAccount,
+  updateBankAccount,
+  deleteBankAccount,
+} from "../services/siigoBankAccountsService.js";
 import { v4 as uuidv4 } from "uuid";
 import type { ProgressData } from "../types/dian.js";
 import {
@@ -870,6 +897,275 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const data = await getPaymentReceiptPdf(id);
       return handleBinaryOrJsonResponse(res, id, "pdf", data);
     } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // ─── Egresos / Recibos de pago desde extracto bancario ───────────────
+  // Tipos de comprobante RP (para elegir document.id al crear el egreso).
+  router.get("/payment-receipt-document-types", async (req: Request, res: Response) => {
+    try {
+      const query = getAllowedQuery(req, ["id", "code", "name"]);
+      const data = await listPaymentReceiptDocumentTypes(query);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Cuentas por pagar: vencimientos abiertos para cruzar facturas en el egreso.
+  router.get("/accounts-payable", async (req: Request, res: Response) => {
+    try {
+      const query = getAllowedQuery(req, [
+        "due_date_start",
+        "due_date_end",
+        "provider_identification",
+        "provider_branch_office",
+      ]);
+      const data = await getAccountsPayable(query);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Sube el Excel del extracto bancario y devuelve sus hojas como tablas
+  // (columnas + filas) para mapear columnas en la UI. No llama a Siigo.
+  router.post("/egresos/parse-bank", upload.single("file"), async (req: Request, res: Response) => {
+    try {
+      if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir un archivo." });
+      const name = (req.file.originalname || "").toLowerCase();
+      const isPdf = req.file.mimetype === "application/pdf" || name.endsWith(".pdf");
+      if (isPdf) {
+        const password = typeof req.body?.password === "string" ? req.body.password : undefined;
+        const data = await parseBankPdf(req.file.buffer, password);
+        return res.json({ ok: true, kind: "pdf", data });
+      }
+      const data = await parseBankExcel(req.file.buffer);
+      return res.json({ ok: true, kind: "excel", data });
+    } catch (error) {
+      if (error instanceof StatementError || error instanceof EgresosError) {
+        return res.status(error.status).json({ ok: false, code: error.code, message: error.message });
+      }
+      return res.status(400).json({
+        ok: false,
+        message: error instanceof Error ? error.message : "Error procesando el archivo.",
+      });
+    }
+  });
+
+  // Concilia un ingreso del extracto contra los Recibos de Caja (RC) ya creados en Siigo.
+  router.get("/egresos/reconcile-income", async (req: Request, res: Response) => {
+    try {
+      const value = Number(req.query.value);
+      const tolerance = req.query.tolerance ? Number(req.query.tolerance) : 1;
+      if (!Number.isFinite(value) || value <= 0) {
+        return res.status(400).json({ ok: false, message: "Parámetro 'value' inválido." });
+      }
+      const createdStart = typeof req.query.created_start === "string" ? req.query.created_start : undefined;
+      const createdEnd = typeof req.query.created_end === "string" ? req.query.created_end : undefined;
+      const data = await findMatchingVouchers(value, tolerance, createdStart, createdEnd);
+      return res.json({ ok: true, data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Sugiere terceros cuyo saldo por pagar coincide con un valor (del movimiento).
+  router.get("/egresos/suggest-by-value", async (req: Request, res: Response) => {
+    try {
+      const value = Number(req.query.value);
+      const tolerance = req.query.tolerance ? Number(req.query.tolerance) : 1;
+      if (!Number.isFinite(value) || value <= 0) {
+        return res.status(400).json({ ok: false, message: "Parámetro 'value' inválido." });
+      }
+      const data = await suggestSuppliersByValue(value, tolerance);
+      return res.json({ ok: true, data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // ── Cuentas bancarias por empresa (pestañas) ──
+  router.get("/egresos/bank-accounts", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    try {
+      return res.json({ ok: true, data: await listBankAccounts(companyId) });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.post("/egresos/bank-accounts", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    try {
+      return res.json({ ok: true, data: await createBankAccount(companyId, req.body || {}) });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.patch("/egresos/bank-accounts/:id", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    try {
+      const updated = await updateBankAccount(companyId, req.params.id, req.body || {});
+      if (!updated) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
+      return res.json({ ok: true, data: updated });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.delete("/egresos/bank-accounts/:id", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    try {
+      return res.json({ ok: true, deleted: await deleteBankAccount(companyId, req.params.id) });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  // ── Persistencia de los pagos a causar (para retomar la tarea) ──
+  router.get("/egresos/movements", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    try {
+      const bankAccountId = typeof req.query.bankAccountId === "string" ? req.query.bankAccountId : undefined;
+      return res.json({ ok: true, data: await listMovements(companyId, bankAccountId) });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.post("/egresos/movements", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    const movs = Array.isArray(req.body?.movements) ? req.body.movements : [];
+    if (movs.length === 0) return res.status(400).json({ ok: false, message: "Sin movimientos a guardar." });
+    try {
+      return res.json({ ok: true, data: await addMovements(companyId, movs) });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.patch("/egresos/movements/:id", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    try {
+      const updated = await updateMovement(companyId, req.params.id, req.body || {});
+      if (!updated) return res.status(404).json({ ok: false, message: "Movimiento no encontrado." });
+      return res.json({ ok: true, data: updated });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.delete("/egresos/movements/:id", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    try {
+      return res.json({ ok: true, deleted: await deleteMovement(companyId, req.params.id) });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  router.delete("/egresos/movements", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    try {
+      const includeDone = req.query.includeDone === "true";
+      const bankAccountId = typeof req.query.bankAccountId === "string" ? req.query.bankAccountId : undefined;
+      return res.json({ ok: true, deleted: await clearMovements(companyId, bankAccountId, includeDone) });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
+    }
+  });
+
+  // Crea un Recibo de pago / Egreso (RP) en Siigo. POST a producción.
+  // Acepta `movementId` (para marcarlo causado) y `force` (saltar el aviso de duplicado).
+  router.post("/egresos/submit", async (req: Request, res: Response) => {
+    const payload = req.body?.payload as EgresoPayload | undefined;
+    const movementId = req.body?.movementId as string | undefined;
+    const force = req.body?.force === true;
+    const errors = validateEgresoPayload(payload);
+    if (errors.length > 0) {
+      return res.status(400).json({ ok: false, code: "invalid_payload", message: errors.join(" "), errors });
+    }
+    const companyId = req.header("X-Siigo-Company");
+
+    // Valor del egreso: el del pago, o (en el Avanzado/Detailed) la suma de débitos.
+    const egresoAmount =
+      payload!.payment?.value ??
+      (payload!.items || []).reduce((s, it) => s + (it.account?.movement === "Debit" ? Number(it.value) || 0 : 0), 0);
+
+    // Huella anti-duplicado: empresa + fecha + NIT + valor.
+    const fp = companyId
+      ? egresoFingerprint(companyId, payload!.date, payload!.supplier.identification, egresoAmount)
+      : null;
+    if (companyId && fp && !force) {
+      try {
+        const dup = await findDuplicateDone(companyId, fp, movementId);
+        if (dup) {
+          return res.status(409).json({
+            ok: false,
+            code: "DUPLICATE_EGRESO",
+            message: `Ya existe un egreso causado para este pago (${dup.receipt?.name || "RP"}: ${dup.date}, NIT ${dup.nit}, ${dup.value}). ¿Crear de todos modos?`,
+            duplicate: dup,
+          });
+        }
+      } catch (e) {
+        console.warn("[SiigoEgreso] No se pudo verificar duplicado:", e instanceof Error ? e.message : e);
+      }
+    }
+
+    try {
+      console.log(
+        `[SiigoEgreso] Crear RP | proveedor ${payload!.supplier.identification} | tipo ${payload!.type} | valor ${egresoAmount} | doc ${payload!.document.id}`
+      );
+      const result = await runInCompanyCtx(req, () => submitEgreso(payload!));
+      console.log(`[SiigoEgreso] RP creado para ${payload!.supplier.identification}`);
+      // Marca el movimiento como causado + guarda la huella.
+      if (companyId && movementId) {
+        const r = result as Record<string, unknown> | undefined;
+        const receipt = { id: r?.id as string | undefined, name: (r?.name as string | undefined) || "RP" };
+        try {
+          await updateMovement(companyId, movementId, {
+            status: "done",
+            receipt,
+            fingerprint: fp,
+            nit: payload!.supplier.identification,
+            value: egresoAmount,
+            date: payload!.date,
+          });
+        } catch (e) {
+          console.warn("[SiigoEgreso] No se pudo marcar el movimiento:", e instanceof Error ? e.message : e);
+        }
+      }
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
+      console.error("[SiigoEgreso] FALLÓ:", error instanceof Error ? error.message : error, "| details:", detalle);
+      console.error("[SiigoEgreso] payload enviado:", JSON.stringify(payload));
+      if (error instanceof SiigoError) {
+        const nit = supplierNotFoundNit(error.details);
+        if (nit !== null) {
+          return res.status(409).json({
+            ok: false,
+            source: "siigo",
+            code: "SUPPLIER_NOT_FOUND",
+            nit,
+            message: nit
+              ? `El proveedor con NIT ${nit} no existe en Siigo.`
+              : "El proveedor de este pago no existe en Siigo.",
+          });
+        }
+      }
       return handleSiigoError(res, error);
     }
   });

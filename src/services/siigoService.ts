@@ -432,6 +432,30 @@ export async function listPaymentReceipts(query: Record<string, unknown>): Promi
   return request("/v1/payment-receipts", { query });
 }
 
+/** Tipos de comprobante de Recibo de pago/egreso (RP). */
+export async function listPaymentReceiptDocumentTypes(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/document-types", { query: { type: "RP", ...query } });
+}
+
+/**
+ * Reporte de cuentas por pagar. Filtra por proveedor y/o rango de vencimiento.
+ * Devuelve los vencimientos abiertos (due.prefix/consecutive/quote/date/balance)
+ * que sirven para cruzar las facturas en un recibo de pago tipo DebtPayment.
+ */
+export async function getAccountsPayable(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/accounts-payable", { query });
+}
+
+/** Crea un Recibo de pago / Egreso (RP). POST a producción: confirmar antes. */
+export async function createPaymentReceipt(body: unknown): Promise<unknown> {
+  return request("/v1/payment-receipts", { method: "POST", body });
+}
+
+/** Lista Recibos de Caja (RC / vouchers). Para conciliar ingresos del banco. */
+export async function listVouchers(query: Record<string, unknown>): Promise<unknown> {
+  return request("/v1/vouchers", { query });
+}
+
 export async function getPaymentReceiptById(id: string): Promise<unknown> {
   return request(`/v1/payment-receipts/${encodeURIComponent(id)}`);
 }
