@@ -13,7 +13,7 @@
  * mapeo de columnas en la UI), no asume un formato concreto.
  */
 import ExcelJS from "exceljs";
-import { createPaymentReceipt, getAccountsPayable, listVouchers } from "./siigoService.js";
+import { createPaymentReceipt, getAccountsPayable, listVouchers, listPaymentReceipts, listJournals } from "./siigoService.js";
 
 export interface BankSheet {
   name: string;
@@ -417,4 +417,143 @@ export async function findMatchingVouchers(
     if (rows.length < 100) break;
   }
   return matches.slice(0, 25);
+}
+
+// ─── Anti-duplicado contra Siigo: ¿ya existe un egreso (RP o CC) por ese valor? ──
+
+export interface SiigoEgresoMatch {
+  kind: "RP" | "CC";
+  id: string;
+  name: string;
+  date: string;
+  value: number;
+  thirdParty: string;
+}
+
+const within = (a: string, b: string, days: number): boolean => {
+  if (!a || !b) return true; // si falta alguna fecha, no descartar por fecha
+  const da = Date.parse(a), db = Date.parse(b);
+  if (Number.isNaN(da) || Number.isNaN(db)) return true;
+  return Math.abs(da - db) <= days * 86400000;
+};
+
+/**
+ * Busca en Siigo si ya existe un egreso por `value` (±tolerance), tanto como
+ * Recibo de pago/egreso (RP) como Comprobante Contable (CC). Sirve para avisar
+ * antes de causar y evitar duplicados de pagos hechos por fuera de la herramienta.
+ */
+export async function findExistingEgresoInSiigo(
+  value: number,
+  date: string,
+  tolerance = 1,
+  createdStart?: string,
+  createdEnd?: string,
+  dateWindowDays = 8
+): Promise<SiigoEgresoMatch[]> {
+  if (!Number.isFinite(value) || value <= 0) return [];
+  const out: SiigoEgresoMatch[] = [];
+  const q = (page: number): Record<string, unknown> => {
+    const query: Record<string, unknown> = { page, page_size: 100 };
+    if (createdStart) query.created_start = createdStart;
+    if (createdEnd) query.created_end = createdEnd;
+    return query;
+  };
+
+  // 1) Recibos de pago/egreso (RP) — match por payment.value
+  try {
+    for (let page = 1; page <= 5; page++) {
+      const raw = (await listPaymentReceipts(q(page))) as any;
+      const rows: any[] = Array.isArray(raw?.results) ? raw.results : Array.isArray(raw) ? raw : [];
+      if (rows.length === 0) break;
+      for (const r of rows) {
+        const val = voucherValue(r);
+        if (Math.abs(val - value) <= tolerance && within(r?.date, date, dateWindowDays)) {
+          out.push({ kind: "RP", id: String(r?.id ?? ""), name: String(r?.name ?? ""), date: String(r?.date ?? ""), value: val, thirdParty: String(r?.supplier?.identification ?? "") });
+        }
+      }
+      if (rows.length < 100) break;
+    }
+  } catch { /* la API puede limitar; seguimos con CC */ }
+
+  // 2) Comprobantes contables (CC) — match si alguna partida tiene ese valor
+  try {
+    for (let page = 1; page <= 5; page++) {
+      const raw = (await listJournals(q(page))) as any;
+      const rows: any[] = Array.isArray(raw?.results) ? raw.results : Array.isArray(raw) ? raw : [];
+      if (rows.length === 0) break;
+      for (const j of rows) {
+        const items: any[] = Array.isArray(j?.items) ? j.items : [];
+        const hit = items.some((it) => Math.abs((Number(it?.value) || 0) - value) <= tolerance);
+        if (hit && within(j?.date, date, dateWindowDays)) {
+          out.push({ kind: "CC", id: String(j?.id ?? ""), name: String(j?.name ?? ""), date: String(j?.date ?? ""), value, thirdParty: "" });
+        }
+      }
+      if (rows.length < 100) break;
+    }
+  } catch { /* journals puede no soportar created_start; ignoramos */ }
+
+  return out.slice(0, 25);
+}
+
+/**
+ * Versión por lote: trae los RP y CC de Siigo UNA sola vez (paginado) y empareja
+ * todos los movimientos pasados, en vez de una consulta por fila. Devuelve un mapa
+ * movementId → coincidencias.
+ */
+export async function findExistingForValues(
+  items: Array<{ id: string; value: number; date: string }>,
+  tolerance = 1,
+  createdStart?: string,
+  createdEnd?: string,
+  dateWindowDays = 8
+): Promise<Record<string, SiigoEgresoMatch[]>> {
+  const q = (page: number): Record<string, unknown> => {
+    const query: Record<string, unknown> = { page, page_size: 100 };
+    if (createdStart) query.created_start = createdStart;
+    if (createdEnd) query.created_end = createdEnd;
+    return query;
+  };
+
+  // Descarga RP y CC una sola vez.
+  const rps: any[] = [];
+  try {
+    for (let page = 1; page <= 8; page++) {
+      const raw = (await listPaymentReceipts(q(page))) as any;
+      const rows: any[] = Array.isArray(raw?.results) ? raw.results : Array.isArray(raw) ? raw : [];
+      if (rows.length === 0) break;
+      rps.push(...rows);
+      if (rows.length < 100) break;
+    }
+  } catch { /* sigue con CC */ }
+
+  const ccs: any[] = [];
+  try {
+    for (let page = 1; page <= 8; page++) {
+      const raw = (await listJournals(q(page))) as any;
+      const rows: any[] = Array.isArray(raw?.results) ? raw.results : Array.isArray(raw) ? raw : [];
+      if (rows.length === 0) break;
+      ccs.push(...rows);
+      if (rows.length < 100) break;
+    }
+  } catch { /* journals puede no soportar created_start */ }
+
+  const result: Record<string, SiigoEgresoMatch[]> = {};
+  for (const it of items) {
+    if (!Number.isFinite(it.value) || it.value <= 0) continue;
+    const matches: SiigoEgresoMatch[] = [];
+    for (const r of rps) {
+      const val = voucherValue(r);
+      if (Math.abs(val - it.value) <= tolerance && within(r?.date, it.date, dateWindowDays)) {
+        matches.push({ kind: "RP", id: String(r?.id ?? ""), name: String(r?.name ?? ""), date: String(r?.date ?? ""), value: val, thirdParty: String(r?.supplier?.identification ?? "") });
+      }
+    }
+    for (const j of ccs) {
+      const jitems: any[] = Array.isArray(j?.items) ? j.items : [];
+      if (jitems.some((x) => Math.abs((Number(x?.value) || 0) - it.value) <= tolerance) && within(j?.date, it.date, dateWindowDays)) {
+        matches.push({ kind: "CC", id: String(j?.id ?? ""), name: String(j?.name ?? ""), date: String(j?.date ?? ""), value: it.value, thirdParty: "" });
+      }
+    }
+    if (matches.length) result[it.id] = matches.slice(0, 5);
+  }
+  return result;
 }

@@ -64,6 +64,8 @@ import {
   submitEgreso,
   suggestSuppliersByValue,
   findMatchingVouchers,
+  findExistingEgresoInSiigo,
+  findExistingForValues,
   EgresosError,
   type EgresoPayload,
 } from "../services/siigoEgresosService.js";
@@ -965,6 +967,41 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const createdStart = typeof req.query.created_start === "string" ? req.query.created_start : undefined;
       const createdEnd = typeof req.query.created_end === "string" ? req.query.created_end : undefined;
       const data = await findMatchingVouchers(value, tolerance, createdStart, createdEnd);
+      return res.json({ ok: true, data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // ¿Ya existe en Siigo un egreso por ese valor? (RP o Comprobante Contable CC)
+  router.get("/egresos/check-siigo", async (req: Request, res: Response) => {
+    try {
+      const value = Number(req.query.value);
+      if (!Number.isFinite(value) || value <= 0) {
+        return res.status(400).json({ ok: false, message: "Parámetro 'value' inválido." });
+      }
+      const date = typeof req.query.date === "string" ? req.query.date : "";
+      const tolerance = req.query.tolerance ? Number(req.query.tolerance) : 1;
+      const createdStart = typeof req.query.created_start === "string" ? req.query.created_start : undefined;
+      const createdEnd = typeof req.query.created_end === "string" ? req.query.created_end : undefined;
+      const data = await findExistingEgresoInSiigo(value, date, tolerance, createdStart, createdEnd);
+      return res.json({ ok: true, data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Revisión por lote: marca cuáles movimientos ya están causados en Siigo (RP/CC).
+  router.post("/egresos/check-siigo-bulk", async (req: Request, res: Response) => {
+    try {
+      const items = Array.isArray(req.body?.items)
+        ? req.body.items.map((it: any) => ({ id: String(it?.id ?? ""), value: Number(it?.value), date: String(it?.date ?? "") })).filter((it: any) => it.id && Number.isFinite(it.value))
+        : [];
+      if (items.length === 0) return res.json({ ok: true, data: {} });
+      const tolerance = req.body?.tolerance ? Number(req.body.tolerance) : 1;
+      const createdStart = typeof req.body?.created_start === "string" ? req.body.created_start : undefined;
+      const createdEnd = typeof req.body?.created_end === "string" ? req.body.created_end : undefined;
+      const data = await findExistingForValues(items, tolerance, createdStart, createdEnd);
       return res.json({ ok: true, data });
     } catch (error) {
       return handleSiigoError(res, error);

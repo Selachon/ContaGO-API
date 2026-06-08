@@ -27,6 +27,8 @@ export interface EgresoMov {
   direction: "in" | "out";
   balance: number | null;
   status: EgresoMovStatus;
+  note: string;
+  siigoMatch: string; // si ya existe en Siigo (ej. "RP-1-5206 · 2026-05-14")
   receipt: { id?: string; name?: string } | null;
   source: "manual" | "excel" | "pdf";
   fingerprint: string | null;
@@ -56,6 +58,8 @@ function mapDoc(d: any): EgresoMov {
     direction: d.direction === "in" ? "in" : "out",
     balance: d.balance == null ? null : Number(d.balance),
     status: (d.status as EgresoMovStatus) || "pending",
+    note: d.note || "",
+    siigoMatch: d.siigoMatch || "",
     receipt: d.receipt || null,
     source: d.source === "excel" ? "excel" : d.source === "pdf" ? "pdf" : "manual",
     fingerprint: d.fingerprint || null,
@@ -106,6 +110,8 @@ export async function addMovements(companyId: string, movs: NewMovInput[]): Prom
     direction: m.direction === "in" ? "in" : "out",
     balance: m.balance == null ? null : Number(m.balance),
     status: (m.status as EgresoMovStatus) || "pending",
+    note: "",
+    siigoMatch: "",
     receipt: null,
     source: m.source === "excel" ? "excel" : m.source === "pdf" ? "pdf" : "manual",
     fingerprint: null,
@@ -117,7 +123,7 @@ export async function addMovements(companyId: string, movs: NewMovInput[]): Prom
   return docs.map((d, i) => mapDoc({ ...d, _id: result.insertedIds[i] }));
 }
 
-const EDITABLE_FIELDS = ["date", "value", "description", "nit", "kind", "direction", "balance", "status", "receipt", "fingerprint"];
+const EDITABLE_FIELDS = ["date", "value", "description", "nit", "kind", "direction", "balance", "status", "note", "siigoMatch", "receipt", "fingerprint"];
 
 /** Actualiza campos permitidos de un movimiento. */
 export async function updateMovement(

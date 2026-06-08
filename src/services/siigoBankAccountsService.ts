@@ -15,6 +15,8 @@ export interface BankAccount {
   bank: string;
   number: string;
   accountCode: string; // cuenta contable del banco (para el avanzado)
+  paymentTypeId: string; // medio de pago por defecto para esta cuenta
+  paymentTypeName: string;
   createdAt: string;
 }
 
@@ -26,6 +28,8 @@ function mapDoc(d: any): BankAccount {
     bank: d.bank || "",
     number: d.number || "",
     accountCode: d.accountCode || "",
+    paymentTypeId: d.paymentTypeId ? String(d.paymentTypeId) : "",
+    paymentTypeName: d.paymentTypeName || "",
     createdAt: d.createdAt || "",
   };
 }
@@ -42,7 +46,7 @@ export async function listBankAccounts(companyId: string): Promise<BankAccount[]
 
 export async function createBankAccount(
   companyId: string,
-  data: { name: string; bank?: string; number?: string; accountCode?: string }
+  data: { name: string; bank?: string; number?: string; accountCode?: string; paymentTypeId?: string; paymentTypeName?: string }
 ): Promise<BankAccount> {
   const name = String(data?.name || "").trim();
   if (!companyId) throw new Error("Falta la empresa.");
@@ -53,13 +57,15 @@ export async function createBankAccount(
     bank: String(data.bank || "").trim(),
     number: String(data.number || "").trim(),
     accountCode: String(data.accountCode || "").replace(/\D/g, ""),
+    paymentTypeId: data.paymentTypeId ? String(data.paymentTypeId) : "",
+    paymentTypeName: String(data.paymentTypeName || "").trim(),
     createdAt: new Date().toISOString(),
   };
   const r = await getDb().collection<any>(COLLECTION).insertOne(doc);
   return mapDoc({ ...doc, _id: r.insertedId });
 }
 
-const EDITABLE = ["name", "bank", "number", "accountCode"];
+const EDITABLE = ["name", "bank", "number", "accountCode", "paymentTypeId", "paymentTypeName"];
 
 export async function updateBankAccount(
   companyId: string,

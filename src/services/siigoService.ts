@@ -456,6 +456,11 @@ export async function listVouchers(query: Record<string, unknown>): Promise<unkn
   return request("/v1/vouchers", { query });
 }
 
+/** Lista Comprobantes Contables (CC / journals). Para detectar egresos hechos como CC. */
+export async function listJournals(query: Record<string, unknown>): Promise<unknown> {
+  return request("/v1/journals", { query });
+}
+
 export async function getPaymentReceiptById(id: string): Promise<unknown> {
   return request(`/v1/payment-receipts/${encodeURIComponent(id)}`);
 }
