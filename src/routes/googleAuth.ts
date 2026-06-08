@@ -17,7 +17,6 @@ import {
   removeUserGoogleDrive,
   removeUserGoogleDriveById,
   setSelectedUserGoogleDrive,
-  updateUserSentiidoDrive,
 } from "../services/database.js";
 
 const router = Router();
@@ -191,7 +190,6 @@ router.get("/callback", async (req: Request, res: Response) => {
     // Recupera el userId enviado al iniciar OAuth.
     const stateData = JSON.parse(Buffer.from(state, "base64").toString("utf8"));
     const userId = stateData.userId;
-    const target = stateData.target === "sentiido" ? "sentiido" : "default";
 
     if (!userId) {
       return sendResponse(false, "Sesión inválida.");
@@ -213,18 +211,11 @@ router.get("/callback", async (req: Request, res: Response) => {
       encrypted_refresh_token: encryptedTokens.encrypted_refresh_token,
       token_expiry: new Date(expiryDate).toISOString(),
       folder_id: "",
-      folder_name: target === "sentiido" ? "Causación Sentiido" : "ContaGO Facturas",
+      folder_name: "ContaGO Facturas",
       connected_at: new Date().toISOString(),
       last_used: new Date().toISOString(),
       user_email: userEmail,
     };
-
-    if (target === "sentiido") {
-      // Conexión dedicada a la herramienta Causación Sentiido (independiente de las demás).
-      await updateUserSentiidoDrive(userId, driveConfig);
-      console.log(`Google Drive (Sentiido) conectado para usuario ${userId}`);
-      return sendResponse(true, `Cuenta ${userEmail} vinculada a la herramienta Causación Sentiido.`);
-    }
 
     // Crear/obtener carpeta tambien valida la vigencia de tokens.
     const folderId = await getOrCreateFolder(driveConfig);
