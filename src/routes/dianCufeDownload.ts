@@ -589,6 +589,74 @@ async function processCufeDownloadJob(
 
     if (isJobCancelled(jobId)) return;
 
+    // ── Barrido de compleción: ningún CUFE descargable puede quedar sin datos. ──
+    // Bajo concurrencia, DIAN devuelve 403/timeout transitorios que el reintento
+    // único no siempre recupera; también un parseo aislado puede fallar. El
+    // resultado eran filas solo-CUFE (sin número/valores) que se colaban al Excel
+    // y desaparecían de la hoja "Compras". Aquí se re-resuelven y descargan en
+    // SERIE (sin concurrencia → DIAN no throttlea) y se reprocesa su XML,
+    // repitiendo hasta completarlos, agotar intentos o no haber progreso.
+    const MAX_SWEEPS = Math.max(0, Number(process.env.DIAN_CUFE_COMPLETION_SWEEPS ?? 3));
+    for (let sweep = 1; sweep <= MAX_SWEEPS; sweep++) {
+      if (isJobCancelled(jobId)) return;
+      const missing = downloadCufes.filter((c) => !hasData(c));
+      if (missing.length === 0) break;
+      console.log(`[CUFE DL] Barrido de compleción ${sweep}/${MAX_SWEEPS}: ${missing.length} sin datos...`);
+      setProgress(jobId, {
+        step: `Recuperando ${missing.length} faltante(s) (intento ${sweep})...`,
+        current: allCufes.length - missing.length,
+        total: allCufes.length,
+      });
+
+      const missingSet = new Set(missing.map((c) => c.toLowerCase()));
+      const sweepRecords = listingRecords.filter((r) => missingSet.has((r.cufe || "").toLowerCase()));
+
+      // Descarga SERIAL: el callback espera cada descarga (sin semáforo de concurrencia).
+      try {
+        await extractDocumentIdsByCufe(
+          tokenUrl, startDate, endDate, jobId, direction,
+          () => {},
+          async ({ doc, cookies }) => { await downloadDoc(doc, cookies); },
+          sweepRecords,
+        );
+      } catch (err) {
+        console.warn(`[CUFE DL] Error en barrido ${sweep}:`, err instanceof Error ? err.message : err);
+      }
+
+      // Reprocesa el XML de los faltantes que ahora sí se descargaron.
+      let recovered = 0;
+      for (const cufe of missing) {
+        if (hasData(cufe)) continue;
+        const result = dlResults.get(cufe);
+        if (!result?.destPath) continue;
+        try {
+          const zipBuffer = fs.readFileSync(result.destPath);
+          const { xmlBuffer } = await extractFilesFromZip(zipBuffer);
+          if (!xmlBuffer) continue;
+          const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
+            id: result.trackId,
+            docnum: result.docnum || "",
+          });
+          invoiceMap.set(cufe, invoiceData);
+          recovered++;
+        } catch (err) {
+          console.warn(`[CUFE DL] Barrido: error XML ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err);
+        }
+      }
+      const remaining = downloadCufes.filter((c) => !hasData(c)).length;
+      console.log(`[CUFE DL] Barrido ${sweep}: recuperados ${recovered}, faltan ${remaining}`);
+      if (recovered === 0) break; // sin progreso → no insistir
+    }
+
+    // Si tras los barridos aún faltan, dejarlo registrado de forma visible (no silencioso).
+    const finalMissing = downloadCufes.filter((c) => !hasData(c));
+    if (finalMissing.length > 0) {
+      console.error(
+        `[CUFE DL] ADVERTENCIA: ${finalMissing.length}/${downloadCufes.length} CUFEs sin datos tras barridos: ` +
+        finalMissing.map((c) => c.slice(0, 16)).join(", ")
+      );
+    }
+
     // Generate Excel with ALL CUFEs in original order (includes skipped rows with notes)
     const filledCount = downloadCufes.filter(hasData).length;
     setProgress(jobId, { step: "Generando Excel...", current: allCufes.length, total: allCufes.length });
