@@ -4,7 +4,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
-import { extractDocumentIdsByCufe, runDianExtractionPrecheck, REAL_USER_AGENT } from "../services/dianScraper.js";
+import { extractDocumentIdsByCufe, runDianExtractionPrecheck, throttledDianDownload } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import {
@@ -41,8 +41,6 @@ function getOwnNit(issuerNit: string, receiverNit: string, isDocumentoSoporte: b
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
 const BATCH_SIZE = 500; // Procesar en tandas para evitar timeouts
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 2000;
 const JOB_TTL_MS = 2 * 60 * 60 * 1000; // 2 horas para jobs grandes
 const USE_STAGING_PIPELINE = process.env.DIAN_EXCEL_USE_STAGING !== "0";
 
@@ -1031,40 +1029,9 @@ export async function downloadZipFile(
   const cookieHeader = Object.entries(cookies)
     .map(([k, v]) => `${k}=${v}`)
     .join("; ");
-
-  let lastError: Error | null = null;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60_000);
-
-    try {
-      const response = await fetch(url, {
-        headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader },
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
-
-      const buffer = await response.arrayBuffer();
-      return Buffer.from(buffer);
-
-    } catch (err) {
-      clearTimeout(timeout);
-      lastError = err as Error;
-
-      if (attempt < MAX_RETRIES) {
-        const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-        await new Promise((r) => setTimeout(r, delay));
-      }
-    }
-  }
-
-  throw lastError || new Error("Descarga fallida");
+  // Rate-limiter global + backoff (Retry-After) centralizado en dianScraper, para
+  // que el tráfico total a DIAN no dispare 403 aunque corran varios jobs a la vez.
+  return throttledDianDownload(url, cookieHeader, { timeoutMs: 60_000, maxRetries: 4 });
 }
 
 async function runDriveUploadInBackground(

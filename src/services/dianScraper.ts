@@ -61,13 +61,120 @@ const BROWSER_LAUNCH_RETRIES = Number(process.env.PUPPETEER_LAUNCH_RETRIES || 3)
 // agotan los recursos del contenedor y el siguiente lanzamiento falla con
 // "spawn EAGAIN". Además, los procesos que no se cierran bien se acumulan como
 // huérfanos hasta provocar el mismo error de forma intermitente.
-const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 5));
+const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 6));
 const BROWSER_CLOSE_TIMEOUT_MS = Number(process.env.PUPPETEER_CLOSE_TIMEOUT_MS || 15000);
 
 type BrowserWithSlot = Browser & { __releaseSlot?: () => void; __userDataDir?: string };
 
 let activeBrowsers = 0;
 const browserWaitQueue: Array<() => void> = [];
+
+// ── Rate-limiter GLOBAL de descargas a DIAN ──────────────────────────────────
+// DIAN limita por IP del servidor: si varios jobs/usuarios descargan ZIPs a la
+// vez, responde 403 ("muchas peticiones"). Este semáforo global acota el total de
+// descargas simultáneas a DIAN sin importar cuántos navegadores/usuarios corran en
+// paralelo — así subir a 6 navegadores no dispara más 403. Es independiente del
+// cupo de navegadores.
+const MAX_GLOBAL_DOWNLOADS = Math.max(1, Number(process.env.DIAN_MAX_GLOBAL_DOWNLOADS || 10));
+let activeDownloads = 0;
+let queuedDownloads = 0;
+const downloadWaitQueue: Array<() => void> = [];
+
+function acquireDownloadSlot(): Promise<() => void> {
+  return new Promise((resolve) => {
+    const grant = () => {
+      activeDownloads++;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        activeDownloads--;
+        const next = downloadWaitQueue.shift();
+        if (next) { queuedDownloads--; next(); }
+      });
+    };
+    if (activeDownloads < MAX_GLOBAL_DOWNLOADS) {
+      grant();
+    } else {
+      queuedDownloads++;
+      downloadWaitQueue.push(grant);
+    }
+  });
+}
+
+/** Métricas en vivo del rate-limiter de descargas (para el dashboard admin). */
+export function getDownloadStats(): { active: number; queued: number; max: number } {
+  return { active: activeDownloads, queued: queuedDownloads, max: MAX_GLOBAL_DOWNLOADS };
+}
+
+/** Métricas en vivo del pool de navegadores (para el dashboard admin). */
+export function getBrowserStats(): { active: number; queued: number; max: number } {
+  return { active: activeBrowsers, queued: browserWaitQueue.length, max: MAX_CONCURRENT_BROWSERS };
+}
+
+/**
+ * Descarga un recurso de DIAN respetando el rate-limiter global y con backoff
+ * ante 403/429 (honra `Retry-After` si viene). Devuelve el Buffer del cuerpo.
+ * Centraliza el control de tráfico para TODAS las herramientas DIAN.
+ */
+export async function throttledDianDownload(
+  url: string,
+  cookieHeader: string,
+  opts: { timeoutMs?: number; maxRetries?: number } = {}
+): Promise<Buffer> {
+  const timeoutMs = opts.timeoutMs ?? 120_000;
+  // El bloqueo de DIAN ("Solicitud bloqueada"/403) es TRANSITORIO: se limpia
+  // recargando un par de veces (validado: 38/38 recuperados con reintentos de 1s).
+  // Por eso usamos MUCHOS reintentos CORTOS en vez de backoff exponencial largo.
+  const maxRetries = opts.maxRetries ?? 10;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const release = await acquireDownloadSlot();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let retryAfterMs = 0;
+    try {
+      const resp = await fetch(url, {
+        headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (resp.status === 403 || resp.status === 429) {
+        const ra = resp.headers.get("retry-after");
+        const raSec = ra ? Number(ra) : 0;
+        retryAfterMs = Number.isFinite(raSec) && raSec > 0 ? raSec * 1000 : 0;
+        throw new Error(`BLOCKED ${resp.status}`);
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      // Verificar que sea un ZIP real (PK). Si DIAN devuelve 200 con la página
+      // "Solicitud bloqueada" (HTML), tratarlo como bloqueo transitorio y reintentar.
+      const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
+      if (!isZip) {
+        const head = buf.toString("utf8", 0, 600).toLowerCase();
+        if (head.includes("bloqueada") || head.includes("controles de seguridad")) {
+          throw new Error("BLOCKED body");
+        }
+        // No es ZIP ni bloqueo conocido: dato inválido, reintentar también.
+        throw new Error("NOT_ZIP");
+      }
+      release();
+      return buf;
+    } catch (err) {
+      clearTimeout(timer);
+      release(); // liberar el cupo durante el backoff (no retener mientras se espera)
+      lastError = err as Error;
+      if (attempt < maxRetries) {
+        // Reintento CORTO: el bloqueo se limpia rápido. Respeta Retry-After si DIAN
+        // lo envía (raro); si no, ~1s con jitter. Crece levemente si insiste.
+        const quick = 800 + Math.min(attempt, 4) * 250 + Math.floor(Math.random() * 400);
+        await delay(retryAfterMs > 0 ? Math.min(retryAfterMs, 10_000) : quick);
+      }
+    }
+  }
+  throw lastError || new Error("Descarga fallida");
+}
 
 // Registro de navegadores abiertos para cerrarlos todos en un apagado ordenado
 // (SIGTERM en cada redeploy de Railway) y no dejar procesos huérfanos.
@@ -2661,28 +2768,7 @@ export async function downloadDocumentsByCufe(
 }
 
 export async function fetchZipToFile(url: string, destPath: string, cookieHeader: string): Promise<void> {
-  const MAX_RETRIES = 3;
-  const TIMEOUT_MS = 180_000;
-  let lastError: Error | null = null;
-
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    try {
-      const resp = await fetch(url, {
-        headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader },
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const buf = await resp.arrayBuffer();
-      fs.writeFileSync(destPath, Buffer.from(buf));
-      return;
-    } catch (err) {
-      clearTimeout(timer);
-      lastError = err as Error;
-      if (attempt < MAX_RETRIES) await delay(2000 * attempt);
-    }
-  }
-  throw lastError || new Error("Descarga fallida");
+  // Usa el rate-limiter global + backoff (Retry-After) centralizado.
+  const buf = await throttledDianDownload(url, cookieHeader, { timeoutMs: 180_000, maxRetries: 4 });
+  fs.writeFileSync(destPath, buf);
 }

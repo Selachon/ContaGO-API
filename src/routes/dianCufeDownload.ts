@@ -395,12 +395,11 @@ async function processCufeDownloadJob(
   try {
     if (isJobCancelled(jobId)) return;
 
-    // Semáforo de descargas. Por defecto 2: DIAN permite algo de concurrencia y el
-    // segundo cupo absorbe la varianza (descargas lentas) sin estancar la búsqueda
-    // (~2.1s/doc con 2 vs ~3.0s/doc con 1). Genera unos pocos 403 transitorios que
-    // recupera el reintento con sesión fresca al final. Subir a 3-4 acelera poco y
-    // multiplica los 403.
-    const MAX_DL = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 2), 4));
+    // Semáforo de descargas por job. Subido a 8: el bloqueo de DIAN es transitorio
+    // y throttledDianDownload lo recupera con reintentos cortos, así que la alta
+    // concurrencia acelera (objetivo 20-25 descargas/min) sin perder documentos.
+    // El rate-limiter GLOBAL de dianScraper acota el total entre todos los jobs.
+    const MAX_DL = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 8), 12));
     let dlSlots = MAX_DL;
     const dlQueue: Array<() => void> = [];
     const acquireDl = (): Promise<void> =>
