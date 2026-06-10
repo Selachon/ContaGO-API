@@ -1611,15 +1611,9 @@ async function extractListingRecordsFromDownloadTab(
       },
     }).then((r) => r.text());
 
-    // Reutilizar un export previo de la pestaña Export es una OPTIMIZACIÓN riesgosa:
-    // un export almacenado con el mismo rango puede estar desactualizado (no incluye
-    // facturas agregadas después) o ser de tipo "Enviados y Recibidos", que al
-    // filtrarse por dirección entrega conteos incorrectos (se observó reuso=13 vs
-    // generación fresca=0). Como la completitud del listado es innegociable
-    // (de ahí dependen TODAS las facturas), por defecto SIEMPRE se regenera fresco.
-    // El reuso queda como opt-in explícito vía DIAN_EXPORT_REUSE=1.
-    const reuseEnabled = process.env.DIAN_EXPORT_REUSE === "1";
-    const reusableLinks = (reuseEnabled && !receiverNit) ? findReusableExportLinks(exportPageBefore, direction, startDate, endDate) : [];
+    // Si se filtra por NIT receptor, no reutilizamos listados previos (no podemos
+    // garantizar que correspondan al mismo filtro); forzamos regenerar.
+    const reusableLinks = receiverNit ? [] : findReusableExportLinks(exportPageBefore, direction, startDate, endDate);
     if (reusableLinks.length > 0) {
       console.log(`[DIAN Export] Se encontraron ${reusableLinks.length} listados reutilizables para el rango.`);
       for (let i = 0; i < reusableLinks.length; i++) {
@@ -1657,58 +1651,31 @@ async function extractListingRecordsFromDownloadTab(
 
     if (!formData.token) return [];
 
-    // POST que solicita a DIAN generar el export. Reutilizable: si DIAN reporta un
-    // export "Listo" con Total=0 (glitch ocasional de su lado), re-pedimos para no
-    // quedarnos con un listado vacío que perdería todas las facturas.
-    const postExport = async (): Promise<void> => {
-      const body = new URLSearchParams();
-      body.set("__RequestVerificationToken", formData.token);
-      body.set("Type", formData.type || "0");
-      body.set("AmountAdmin", formData.amountAdmin || "100000");
-      body.set("ReceiverCode", receiverNit || "");
-      body.set("GroupCode", direction === "sent" ? "1" : "2");
-      if (startDate) body.set("StartDate", toDianExportDate(startDate));
-      if (endDate) body.set("EndDate", toDianExportDate(endDate, true));
-      await fetch(`${baseUrl}/Document/Export`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader,
-          Referer: `${baseUrl}/Document/Export`,
-        },
-        body: body.toString(),
-      });
-    };
+    const body = new URLSearchParams();
+    body.set("__RequestVerificationToken", formData.token);
+    body.set("Type", formData.type || "0");
+    body.set("AmountAdmin", formData.amountAdmin || "100000");
+    body.set("ReceiverCode", receiverNit || "");
+    body.set("GroupCode", direction === "sent" ? "1" : "2");
+    if (startDate) body.set("StartDate", toDianExportDate(startDate));
+    if (endDate) body.set("EndDate", toDianExportDate(endDate, true));
 
-    await postExport();
+    await fetch(`${baseUrl}/Document/Export`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader,
+        Referer: `${baseUrl}/Document/Export`,
+      },
+      body: body.toString(),
+    });
 
     // DIAN genera el archivo en segundo plano. Polling hasta 5 minutos.
-    // CRÍTICO (no perder facturas): la fila del export aparece en la tabla apenas
-    // EMPIEZA a generarse (Estado="Procesando", sin link de descarga). Descargar en
-    // ese momento baja un archivo incompleto/vacío. Hay que esperar a Estado="Listo"
-    // (con link de descarga), con la columna "Total" YA renderizada, y luego verificar
-    // que el conteo parseado coincida con ese Total. Además, un Total=0 puede ser un
-    // glitch de DIAN: solo se acepta como vacío real si persiste (re-pidiendo).
     const pollTimeoutMs = 300_000;
     const pollEveryMs = 4_000;
     const startedAt = Date.now();
-    const ZERO_GRACE_MS = 60_000;   // tiempo tolerando solo Total=0 antes de aceptarlo como vacío real
-    const REPOST_EVERY_MS = 30_000; // re-pedir el export mientras solo veamos Total=0
-    let firstZeroAt = 0;
-    let lastPostAt = Date.now();
 
-    const requestedStart = startDate ? parseIsoDate(startDate) : null;
-    const requestedEnd = endDate ? parseIsoDate(endDate) : null;
-    const expectedGroups = direction === "sent" ? ["emitid", "enviad"] : ["recibid"];
-    const rowMatches = (r: ExportRow): boolean => {
-      if (requestedStart !== null && requestedEnd !== null) {
-        if (!r.range || r.range.start !== requestedStart || r.range.end !== requestedEnd) return false;
-      }
-      if (r.tipo && !r.tipo.includes("excel")) return false;
-      return expectedGroups.some((g) => r.group.includes(g));
-    };
-
-    let selected: ExportRow | null = null;
+    let selectedLink: string | null = null;
     while (Date.now() - startedAt < pollTimeoutMs) {
       const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
         method: "GET",
@@ -1718,83 +1685,30 @@ async function extractListingRecordsFromDownloadTab(
         },
       }).then((r) => r.text());
 
-      const rows = parseExportTableRows(exportHtml);
-      const matching = rows.filter(rowMatches);
-      // "Listo" de verdad: estado Listo + link de descarga + Total YA renderizado
-      // (total !== null). Un Total vacío = fila recién aparecida, archivo aún escribiéndose.
-      const ready = matching.filter((r) => r.estado.includes("listo") && r.href && r.total !== null);
-      // Elegir el de MAYOR Total entre TODAS las filas listas: los exports del mismo
-      // rango+grupo son el mismo dato y DIAN nunca borra facturas (solo agrega), así que
-      // el Total máximo = el más completo. Evita caer en un export reportado con Total=0.
-      const pick = ready.slice().sort((a, b) => (b.total ?? 0) - (a.total ?? 0))[0] || null;
-      const bestTotal = pick?.total ?? 0;
-      // ¿Sigue alguno de NUESTRO tipo/rango sin terminar? (sin link, en proceso, o Total sin renderizar)
-      const sawProcessing = matching.some((r) => !r.href || r.estado.includes("proces") || (r.estado.includes("listo") && r.total === null));
-
-      if (pick && bestTotal > 0) {
-        // Listado con datos: aceptar cuando ya nada está en proceso (lista estable).
-        if (!sawProcessing) { selected = pick; break; }
-      } else if (!sawProcessing) {
-        // Solo vemos Total=0 y nada en proceso: puede ser glitch de DIAN. Re-pedir y
-        // esperar; aceptar 0 como vacío REAL solo si persiste ZERO_GRACE_MS.
-        if (firstZeroAt === 0) firstZeroAt = Date.now();
-        if (Date.now() - firstZeroAt >= ZERO_GRACE_MS) { selected = pick; break; }
-        if (Date.now() - lastPostAt >= REPOST_EVERY_MS) { await postExport(); lastPostAt = Date.now(); }
+      const links = parseDownloadLinksFromExportHtml(exportHtml);
+      const newlyGenerated = links.find((l) => !existingRks.has(l.rk));
+      if (newlyGenerated) {
+        selectedLink = newlyGenerated.href;
+        break;
       }
-      // Si hay algo en proceso, seguimos esperando (no tocar firstZeroAt).
-      if (sawProcessing) firstZeroAt = 0;
 
       await delay(pollEveryMs);
     }
 
-    if (!selected) {
-      throw new Error("No se detectó un listado COMPLETO (Estado 'Listo') para el rango solicitado dentro de 5 minutos.");
-    }
-    // Listado genuinamente vacío (Total=0 persistente): no hay nada que descargar.
-    if (!selected.href || (selected.total ?? 0) <= 0) {
-      console.log(`[DIAN Export] Listado vacío confirmado (Total=0) para ${direction} ${startDate}..${endDate}.`);
-      return [];
+    if (!selectedLink) {
+      throw new Error("No se detectó un listado nuevo para el rango solicitado dentro de 5 minutos.");
     }
 
-    // Descargar y verificar completitud contra la columna "Total" de la tabla.
-    // Si el archivo descargado trae menos registros que el Total reportado, está
-    // incompleto (aún escribiéndose): reintentar unas veces antes de aceptar.
-    // El endpoint DownloadExportedZipFile de DIAN es FLAKY: la misma URL puede
-    // devolver el .xlsx completo o, intermitentemente, un archivo vacío/HTML de error
-    // (parseListingRecordsFromExportZip entonces lanza o devuelve 0). Por eso cada
-    // intento va en try/catch y se reintenta hasta igualar el "Total" de la tabla.
-    const expectedTotal = selected.total ?? 0;
-    let best: ListingRecord[] = [];
-    const MAX_DL_ATTEMPTS = 8;
-    for (let attempt = 1; attempt <= MAX_DL_ATTEMPTS; attempt++) {
-      try {
-        const downloaded = await fetch(`${baseUrl}${selected.href}`, {
-          method: "GET",
-          headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
-        }).then((r) => r.arrayBuffer());
-        const zipBuffer = Buffer.from(new Uint8Array(downloaded));
-        const records = await parseListingRecordsFromExportZip(zipBuffer, direction);
-        if (records.length > best.length) best = records;
-      } catch (dlErr) {
-        console.warn(`[DIAN Export] Descarga/parseo falló intento ${attempt}/${MAX_DL_ATTEMPTS}: ${(dlErr as Error).message}`);
-      }
-      // Completo si igualamos (o superamos) el Total reportado; Total<=0 → aceptar lo parseado.
-      if (expectedTotal <= 0 || best.length >= expectedTotal) {
-        if (expectedTotal > 0 && best.length !== expectedTotal) {
-          console.warn(`[DIAN Export] Conteo parseado ${best.length} != Total tabla ${expectedTotal} (se acepta el mayor).`);
-        }
-        return best;
-      }
-      console.warn(`[DIAN Export] Listado incompleto intento ${attempt}/${MAX_DL_ATTEMPTS}: ${best.length}/${expectedTotal}. Reintentando...`);
-      await delay(2500);
-    }
-    // Tras reintentos seguimos por debajo del Total: error explícito (no perder facturas en silencio).
-    throw new Error(`INCOMPLETE_LISTING: el listado quedó incompleto (${best.length}/${expectedTotal}) tras ${MAX_DL_ATTEMPTS} intentos.`);
+    const downloaded = await fetch(`${baseUrl}${selectedLink}`, {
+      method: "GET",
+      headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
+    }).then((r) => r.arrayBuffer());
+    const zipBuffer = Buffer.from(new Uint8Array(downloaded));
+
+    return await parseListingRecordsFromExportZip(zipBuffer, direction);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    // Estos errores NO deben silenciarse a [] (devolver 0 = perder facturas): propagar
-    // para que el job falle visiblemente en vez de generar un Excel incompleto.
-    if (msg.includes("TOKEN_EXPIRED") || msg.includes("INCOMPLETE_LISTING")) {
+    if (msg.includes("TOKEN_EXPIRED")) {
       throw err;
     }
     return [];
@@ -2021,43 +1935,6 @@ function decodeXml(value: string): string {
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
-}
-
-interface ExportRow {
-  range: { start: number; end: number } | null;
-  group: string;   // "recibidos" | "emitidos" | ...
-  tipo: string;    // "excel"
-  total: number | null; // conteo reportado por DIAN. null = celda vacía (aún no renderizada); 0 = export genuinamente vacío
-  estado: string;  // "listo" | "procesando" | ...
-  href: string | null; // link de descarga (solo cuando está listo)
-  rk: string | null;
-}
-
-// Parsea las filas de la tabla #tableExport con su estado real y conteo "Total".
-// Columnas: [Fecha, Usuario, Rango, Grupo, Tipo, Total, Estado, Acciones].
-// El Estado viene como ícono con title="Listo"/"Procesando"; el link de descarga
-// solo existe en Acciones cuando el export terminó de generarse.
-function parseExportTableRows(html: string): ExportRow[] {
-  const tbody = html.match(/<table[^>]*id="tableExport"[\s\S]*?<tbody>([\s\S]*?)<\/tbody>/i);
-  if (!tbody) return [];
-  const rows = Array.from(tbody[1].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)).map((m) => m[1]);
-  const out: ExportRow[] = [];
-  for (const row of rows) {
-    const tds = Array.from(row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((m) => m[1]);
-    if (tds.length < 8) continue;
-    const range = parseExportRange(stripHtml(tds[2]).toLowerCase());
-    const group = stripHtml(tds[3]).toLowerCase();
-    const tipo = stripHtml(tds[4]).toLowerCase();
-    const totalRaw = stripHtml(tds[5]).replace(/[^\d]/g, "");
-    const total = totalRaw === "" ? null : parseInt(totalRaw, 10); // "" = aún no renderizado
-    const estadoTitle = tds[6].match(/title="([^"]*)"/i)?.[1] || stripHtml(tds[6]);
-    const estado = estadoTitle.toLowerCase();
-    const hrefMatch = tds[7].match(/href="(\/Document\/DownloadExportedZipFile\?pk=[^"]+)"/i);
-    const href = hrefMatch ? hrefMatch[1].replace(/&amp;/g, "&") : null;
-    const rk = href?.match(/[?&]rk=([^&]+)/i)?.[1] || null;
-    out.push({ range, group, tipo, total, estado, href, rk });
-  }
-  return out;
 }
 
 function parseDownloadLinksFromExportHtml(html: string): Array<{ href: string; rk: string }> {
@@ -2690,15 +2567,29 @@ export async function downloadDocumentsByCufe(
     await waitForTableLoad(page);
 
     const seenIds = new Set<string>();
-    const resultByCufe = new Map<string, CufeDownloadItem>();
 
-    // Busca y descarga un CUFE. Devuelve el item (success true/false). Se reutiliza
-    // en la pasada principal y en los barridos de compleción.
-    const attemptCufe = async (cufe: string): Promise<CufeDownloadItem> => {
+    for (let i = 0; i < cufes.length; i++) {
+      if (cancelled()) {
+        console.log("[CUFE DL] Job cancelado durante bucle");
+        break;
+      }
+
+      const cufe = cufes[i];
+      update({
+        step: `Descargando ${i + 1}/${cufes.length}...`,
+        current: i + 1,
+        total: cufes.length,
+      });
+
       try {
         const doc = await findDocumentByUniqueCodeOrDocnum(page, cufe, "", seenIds, isSent);
+
         if (!doc) {
-          return { cufe, trackId: null, destPath: null, docnum: "", nit: "", success: false, error: "Sin resultados para este CUFE" };
+          const errMsg = "Sin resultados para este CUFE";
+          console.warn(`[CUFE DL] ${errMsg}: ${cufe.slice(0, 16)}...`);
+          results.push({ cufe, trackId: null, destPath: null, docnum: "", nit: "", success: false, error: errMsg });
+          failed++;
+          continue;
         }
 
         const isEquivalente = !!(doc.documentTypeId) || (doc.docType?.toLowerCase().includes("equivalente") ?? false);
@@ -2712,60 +2603,24 @@ export async function downloadDocumentsByCufe(
 
         const safeNit = (nit || "SinNIT").replace(/[^a-zA-Z0-9_\-]/g, "_");
         const safeDoc = (docnum || trackId.slice(0, 12)).replace(/[^a-zA-Z0-9_\-]/g, "_");
-        const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
+        const filename = `${safeNit} - ${safeDoc}.zip`;
+        const destPath = path.join(tempDir, filename);
 
         const cookieArr = await page.cookies();
         const cookieHeader = cookieArr.map((c) => `${c.name}=${c.value}`).join("; ");
 
         await fetchZipToFile(downloadUrl, destPath, cookieHeader);
-        return { cufe, trackId, destPath, docnum, nit, success: true };
+
+        results.push({ cufe, trackId, destPath, docnum, nit, success: true });
+        downloaded++;
+        console.log(`[CUFE DL] OK ${i + 1}/${cufes.length}: ${docnum}`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return { cufe, trackId: null, destPath: null, docnum: "", nit: "", success: false, error: msg };
+        console.warn(`[CUFE DL] Error CUFE ${cufe.slice(0, 16)}...: ${msg}`);
+        results.push({ cufe, trackId: null, destPath: null, docnum: "", nit: "", success: false, error: msg });
+        failed++;
       }
-    };
-
-    // Pasada principal.
-    for (let i = 0; i < cufes.length; i++) {
-      if (cancelled()) {
-        console.log("[CUFE DL] Job cancelado durante bucle");
-        break;
-      }
-      const cufe = cufes[i];
-      update({ step: `Descargando ${i + 1}/${cufes.length}...`, current: i + 1, total: cufes.length });
-      const item = await attemptCufe(cufe);
-      resultByCufe.set(cufe, item);
-      if (item.success) console.log(`[CUFE DL] OK ${i + 1}/${cufes.length}: ${item.docnum}`);
-      else console.warn(`[CUFE DL] Error CUFE ${cufe.slice(0, 16)}...: ${item.error}`);
     }
-
-    // ── Barrido de compleción ──────────────────────────────────────────────────
-    // Reintenta en SERIE los CUFE que fallaron (típicamente 403 transitorios de DIAN
-    // bajo carga). Garantiza que el ZIP/Excel no quede con documentos faltantes.
-    const MAX_SWEEPS = Math.max(0, Number(process.env.DIAN_DOWNLOAD_COMPLETION_SWEEPS ?? 3));
-    for (let sweep = 1; sweep <= MAX_SWEEPS && !cancelled(); sweep++) {
-      const pending = cufes.filter((c) => !resultByCufe.get(c)?.success);
-      if (pending.length === 0) break;
-      console.log(`[CUFE DL] Barrido de compleción ${sweep}/${MAX_SWEEPS}: ${pending.length} por recuperar...`);
-      update({ step: `Recuperando ${pending.length} documento(s) (intento ${sweep})...`, current: cufes.length - pending.length, total: cufes.length });
-      let recovered = 0;
-      for (const cufe of pending) {
-        if (cancelled()) break;
-        const item = await attemptCufe(cufe);
-        if (item.success) { resultByCufe.set(cufe, item); recovered++; }
-      }
-      console.log(`[CUFE DL] Barrido ${sweep}: recuperados ${recovered}/${pending.length}`);
-      if (recovered === 0) break; // sin progreso → no insistir
-      if (sweep < MAX_SWEEPS) await delay(2000 * sweep);
-    }
-
-    // Construir resultados en el orden original; recomputar conteos.
-    for (const cufe of cufes) {
-      const item = resultByCufe.get(cufe) || { cufe, trackId: null, destPath: null, docnum: "", nit: "", success: false, error: "No procesado" };
-      results.push(item);
-      if (item.success) downloaded++; else failed++;
-    }
-    if (failed > 0) console.error(`[CUFE DL] ${failed}/${cufes.length} documento(s) sin recuperar tras ${MAX_SWEEPS} barridos.`);
 
     return { results, downloaded, failed };
   } finally {

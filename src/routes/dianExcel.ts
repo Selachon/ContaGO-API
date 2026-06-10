@@ -440,151 +440,6 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   res.json({ status: "cancelled", message: "Job cancelado exitosamente" });
 });
 
-type DocRef = { id: string; docnum: string; nit: string };
-
-// Construye el objeto emisor con defaults "N/A" a partir del XML parseado.
-function buildIssuer(inv: Partial<InvoiceData>) {
-  return {
-    nit: inv.issuerNit || "N/A",
-    name: inv.issuerName || "N/A",
-    email: inv.issuerEmail || "N/A",
-    phone: inv.issuerPhone || "N/A",
-    address: inv.issuerAddress || "N/A",
-    city: inv.issuerCity || "N/A",
-    department: inv.issuerDepartment || "N/A",
-    country: inv.issuerCountry || "N/A",
-    commercialName: inv.issuerCommercialName || "N/A",
-    taxpayerType: inv.issuerTaxpayerType || "N/A",
-    fiscalRegime: inv.issuerFiscalRegime || "N/A",
-    taxResponsibility: inv.issuerTaxResponsibility || "N/A",
-    economicActivity: inv.issuerEconomicActivity || "N/A",
-  };
-}
-
-// Construye el objeto receptor con defaults "N/A" a partir del XML parseado.
-function buildReceiver(inv: Partial<InvoiceData>) {
-  return {
-    nit: inv.receiverNit || "N/A",
-    name: inv.receiverName || "N/A",
-    email: inv.receiverEmail || "N/A",
-    phone: inv.receiverPhone || "N/A",
-    address: inv.receiverAddress || "N/A",
-    city: inv.receiverCity || "N/A",
-    department: inv.receiverDepartment || "N/A",
-    country: inv.receiverCountry || "N/A",
-    commercialName: inv.receiverCommercialName || "N/A",
-    taxpayerType: inv.receiverTaxpayerType || "N/A",
-    fiscalRegime: inv.receiverFiscalRegime || "N/A",
-    taxResponsibility: inv.receiverTaxResponsibility || "N/A",
-    economicActivity: inv.receiverEconomicActivity || "N/A",
-  };
-}
-
-// Fila completa del Excel a partir del XML parseado. Fuente única de verdad usada
-// por el flujo principal y por el barrido de compleción, para que ambos produzcan
-// filas idénticas (con valores e impuestos).
-function buildInvoiceRow(inv: Partial<InvoiceData>, doc: DocRef, driveUrl?: string): InvoiceData {
-  const issuer = buildIssuer(inv);
-  const receiver = buildReceiver(inv);
-  return {
-    issuerNit: issuer.nit,
-    issuerName: issuer.name,
-    issuerEmail: issuer.email,
-    issuerPhone: issuer.phone,
-    issuerAddress: issuer.address,
-    issuerCity: issuer.city,
-    issuerDepartment: issuer.department,
-    issuerCountry: issuer.country,
-    issuerCommercialName: issuer.commercialName,
-    issuerTaxpayerType: issuer.taxpayerType,
-    issuerFiscalRegime: issuer.fiscalRegime,
-    issuerTaxResponsibility: issuer.taxResponsibility,
-    issuerEconomicActivity: issuer.economicActivity,
-    receiverNit: receiver.nit,
-    receiverName: receiver.name,
-    receiverEmail: receiver.email,
-    receiverPhone: receiver.phone,
-    receiverAddress: receiver.address,
-    receiverCity: receiver.city,
-    receiverDepartment: receiver.department,
-    receiverCountry: receiver.country,
-    receiverCommercialName: receiver.commercialName,
-    receiverTaxpayerType: receiver.taxpayerType,
-    receiverFiscalRegime: receiver.fiscalRegime,
-    receiverTaxResponsibility: receiver.taxResponsibility,
-    receiverEconomicActivity: receiver.economicActivity,
-    issueDate: inv.issueDate || "N/A",
-    issueDateISO: inv.issueDateISO || "9999-12-31",
-    paymentMethod: inv.paymentMethod || "N/A",
-    subtotal: inv.subtotal || 0,
-    iva: inv.iva || 0,
-    total: inv.total || 0,
-    taxes: inv.taxes || [],
-    discount: inv.discount || 0,
-    surcharge: inv.surcharge || 0,
-    concepts: inv.concepts || "N/A",
-    lineItems: inv.lineItems || [],
-    documentType: inv.documentType || "Factura Electrónica",
-    isDocumentoSoporte: inv.isDocumentoSoporte || false,
-    cufe: inv.cufe || "N/A",
-    notes: inv.notes || "",
-    trackId: doc.id,
-    docNumber: inv.docNumber || doc.docnum || doc.id,
-    driveUrl,
-    zipFilename: `${inv.issuerNit || doc.nit} - ${doc.docnum}.zip`,
-  };
-}
-
-// Fila de error (solo info básica del listado DIAN, sin valores) para documentos
-// que NO se pudieron recuperar ni siquiera tras el barrido de compleción.
-function buildErrorRow(doc: DocRef, errMsg: string): InvoiceData {
-  return {
-    issuerNit: doc.nit,
-    issuerName: "N/A",
-    issuerEmail: "N/A",
-    issuerPhone: "N/A",
-    issuerAddress: "N/A",
-    issuerCity: "N/A",
-    issuerDepartment: "N/A",
-    issuerCountry: "N/A",
-    issuerCommercialName: "N/A",
-    issuerTaxpayerType: "N/A",
-    issuerFiscalRegime: "N/A",
-    issuerTaxResponsibility: "N/A",
-    issuerEconomicActivity: "N/A",
-    receiverNit: "N/A",
-    receiverName: "N/A",
-    receiverEmail: "N/A",
-    receiverPhone: "N/A",
-    receiverAddress: "N/A",
-    receiverCity: "N/A",
-    receiverDepartment: "N/A",
-    receiverCountry: "N/A",
-    receiverCommercialName: "N/A",
-    receiverTaxpayerType: "N/A",
-    receiverFiscalRegime: "N/A",
-    receiverTaxResponsibility: "N/A",
-    receiverEconomicActivity: "N/A",
-    issueDate: "N/A",
-    issueDateISO: "9999-12-31",
-    paymentMethod: "N/A",
-    subtotal: 0,
-    iva: 0,
-    total: 0,
-    taxes: [],
-    discount: 0,
-    surcharge: 0,
-    concepts: `ERROR: ${errMsg}`,
-    lineItems: [],
-    documentType: "N/A",
-    cufe: "N/A",
-    trackId: doc.id,
-    docNumber: doc.docnum || doc.id,
-    zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
-    error: errMsg,
-  };
-}
-
 // Worker principal: extrae facturas, parsea XMLs y genera Excel.
 async function processExcelJob(
   jobId: string,
@@ -713,7 +568,7 @@ async function processExcelJob(
     let consecutiveErrors = 0;
     let driveQuotaExceeded = false;
     const MAX_CONSECUTIVE_ERRORS = 10; // Si hay 10 errores seguidos, pausar y reintentar
-    const downloadWorkers = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 2), 4));
+    const downloadWorkers = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 4), 4));
     const zipPrefetch = new Map<number, Promise<Buffer>>();
 
     const scheduleZipPrefetch = (docIndex: number) => {
@@ -727,11 +582,6 @@ async function processExcelJob(
     for (let p = 0; p < Math.min(downloadWorkers, documents.length); p++) {
       scheduleZipPrefetch(p);
     }
-
-    // Documentos cuya descarga/parseo falló (típicamente 403 transitorios de DIAN
-    // bajo carga). Se difieren y se recuperan en un barrido serial al final, para
-    // que el Excel NUNCA quede con filas sin valores/impuestos.
-    const failedDocs: number[] = [];
 
     for (let i = 0; i < documents.length; i++) {
       if (isJobCancelled(jobId)) {
@@ -797,8 +647,37 @@ async function processExcelJob(
           }
         }
 
-        const issuer = buildIssuer(invoiceData);
-        const receiver = buildReceiver(invoiceData);
+        let issuer = {
+          nit: invoiceData.issuerNit || "N/A",
+          name: invoiceData.issuerName || "N/A",
+          email: invoiceData.issuerEmail || "N/A",
+          phone: invoiceData.issuerPhone || "N/A",
+          address: invoiceData.issuerAddress || "N/A",
+          city: invoiceData.issuerCity || "N/A",
+          department: invoiceData.issuerDepartment || "N/A",
+          country: invoiceData.issuerCountry || "N/A",
+          commercialName: invoiceData.issuerCommercialName || "N/A",
+          taxpayerType: invoiceData.issuerTaxpayerType || "N/A",
+          fiscalRegime: invoiceData.issuerFiscalRegime || "N/A",
+          taxResponsibility: invoiceData.issuerTaxResponsibility || "N/A",
+          economicActivity: invoiceData.issuerEconomicActivity || "N/A",
+        };
+
+        let receiver = {
+          nit: invoiceData.receiverNit || "N/A",
+          name: invoiceData.receiverName || "N/A",
+          email: invoiceData.receiverEmail || "N/A",
+          phone: invoiceData.receiverPhone || "N/A",
+          address: invoiceData.receiverAddress || "N/A",
+          city: invoiceData.receiverCity || "N/A",
+          department: invoiceData.receiverDepartment || "N/A",
+          country: invoiceData.receiverCountry || "N/A",
+          commercialName: invoiceData.receiverCommercialName || "N/A",
+          taxpayerType: invoiceData.receiverTaxpayerType || "N/A",
+          fiscalRegime: invoiceData.receiverFiscalRegime || "N/A",
+          taxResponsibility: invoiceData.receiverTaxResponsibility || "N/A",
+          economicActivity: invoiceData.receiverEconomicActivity || "N/A",
+        };
 
 
         // 3.4) Subir archivos a Drive con estructura de carpetas.
@@ -915,7 +794,53 @@ async function processExcelJob(
           job.driveUploadTotal = deferredUploads.length;
         }
 
-        const invoiceRow = buildInvoiceRow(invoiceData, doc, driveUrl);
+        const invoiceRow: InvoiceData = {
+          issuerNit: issuer.nit,
+          issuerName: issuer.name,
+          issuerEmail: issuer.email,
+          issuerPhone: issuer.phone,
+          issuerAddress: issuer.address,
+          issuerCity: issuer.city,
+          issuerDepartment: issuer.department,
+          issuerCountry: issuer.country,
+          issuerCommercialName: issuer.commercialName,
+          issuerTaxpayerType: issuer.taxpayerType,
+          issuerFiscalRegime: issuer.fiscalRegime,
+          issuerTaxResponsibility: issuer.taxResponsibility,
+          issuerEconomicActivity: issuer.economicActivity,
+          receiverNit: receiver.nit,
+          receiverName: receiver.name,
+          receiverEmail: receiver.email,
+          receiverPhone: receiver.phone,
+          receiverAddress: receiver.address,
+          receiverCity: receiver.city,
+          receiverDepartment: receiver.department,
+          receiverCountry: receiver.country,
+          receiverCommercialName: receiver.commercialName,
+          receiverTaxpayerType: receiver.taxpayerType,
+          receiverFiscalRegime: receiver.fiscalRegime,
+          receiverTaxResponsibility: receiver.taxResponsibility,
+          receiverEconomicActivity: receiver.economicActivity,
+          issueDate: invoiceData.issueDate || "N/A",
+          issueDateISO: invoiceData.issueDateISO || "9999-12-31",
+          paymentMethod: invoiceData.paymentMethod || "N/A",
+          subtotal: invoiceData.subtotal || 0,
+          iva: invoiceData.iva || 0,
+          total: invoiceData.total || 0,
+          taxes: invoiceData.taxes || [],
+          discount: invoiceData.discount || 0,
+          surcharge: invoiceData.surcharge || 0,
+          concepts: invoiceData.concepts || "N/A",
+          lineItems: invoiceData.lineItems || [],
+          documentType: invoiceData.documentType || "Factura Electrónica",
+          isDocumentoSoporte: invoiceData.isDocumentoSoporte || false,
+          cufe: invoiceData.cufe || "N/A",
+          notes: invoiceData.notes || "",
+          trackId: doc.id,
+          docNumber: invoiceData.docNumber || doc.docnum || doc.id,
+          driveUrl,
+          zipFilename: `${invoiceData.issuerNit || doc.nit} - ${doc.docnum}.zip`,
+        };
 
         if (stagingWriter) await appendInvoiceToStaging(stagingWriter, invoiceRow);
         else invoices.push(invoiceRow);
@@ -929,16 +854,62 @@ async function processExcelJob(
         }
 
       } catch (err) {
+        errorCount++;
         consecutiveErrors++;
         const errMsg = (err as Error).message;
-        console.warn(`[Excel] Fallo transitorio en ${doc.docnum} (se reintentará en barrido): ${errMsg.substring(0, 100)}`);
+        console.error(`[Excel] Error procesando ${doc.docnum}:`, errMsg.substring(0, 100));
 
-        // Difiere: NO se escribe fila en cero. El barrido de compleción serial al
-        // final recupera el documento con sus valores e impuestos reales.
-        zipPrefetch.delete(i);
-        failedDocs.push(i);
+        // Mantiene trazabilidad del documento fallido dentro del Excel.
+        const errorInvoiceRow: InvoiceData = {
+          issuerNit: doc.nit,
+          issuerName: "N/A",
+          issuerEmail: "N/A",
+          issuerPhone: "N/A",
+          issuerAddress: "N/A",
+          issuerCity: "N/A",
+          issuerDepartment: "N/A",
+          issuerCountry: "N/A",
+          issuerCommercialName: "N/A",
+          issuerTaxpayerType: "N/A",
+          issuerFiscalRegime: "N/A",
+          issuerTaxResponsibility: "N/A",
+          issuerEconomicActivity: "N/A",
+          receiverNit: "N/A",
+          receiverName: "N/A",
+          receiverEmail: "N/A",
+          receiverPhone: "N/A",
+          receiverAddress: "N/A",
+          receiverCity: "N/A",
+          receiverDepartment: "N/A",
+          receiverCountry: "N/A",
+          receiverCommercialName: "N/A",
+          receiverTaxpayerType: "N/A",
+          receiverFiscalRegime: "N/A",
+          receiverTaxResponsibility: "N/A",
+          receiverEconomicActivity: "N/A",
+          issueDate: "N/A",
+          issueDateISO: "9999-12-31",
+          paymentMethod: "N/A",
+          subtotal: 0,
+          iva: 0,
+          total: 0,
+          taxes: [],
+          discount: 0,
+          surcharge: 0,
+          concepts: `ERROR: ${errMsg}`,
+          lineItems: [],
+          documentType: "N/A",
+          cufe: "N/A",
+          trackId: doc.id,
+          docNumber: doc.docnum || doc.id,
+          zipFilename: `${doc.nit} - ${doc.docnum}.zip`,
+          error: errMsg,
+        };
 
-        // Si hay muchos errores consecutivos, pausar para recuperarse.
+        if (stagingWriter) await appendInvoiceToStaging(stagingWriter, errorInvoiceRow);
+        else invoices.push(errorInvoiceRow);
+        
+        // Si hay muchos errores consecutivos, pausar para recuperarse
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
           console.warn(`[Excel] ${MAX_CONSECUTIVE_ERRORS} errores consecutivos, pausando 10s para recuperar...`);
           setProgress(jobId, {
@@ -949,89 +920,6 @@ async function processExcelJob(
           await new Promise(r => setTimeout(r, 10000));
           consecutiveErrors = 0; // Reset después de pausa
         }
-      }
-    }
-
-    // ── Barrido de compleción ──────────────────────────────────────────────────
-    // Recupera en SERIE (sin concurrencia → DIAN no rechaza con 403) los documentos
-    // que fallaron, para que NINGUNA factura quede en el Excel sin valores/impuestos.
-    // Solo si tras los reintentos sigue fallando se escribe una fila de error.
-    const MAX_SWEEPS = Math.max(0, Number(process.env.DIAN_EXCEL_COMPLETION_SWEEPS ?? 3));
-    for (let sweep = 1; sweep <= MAX_SWEEPS && failedDocs.length > 0; sweep++) {
-      if (isJobCancelled(jobId)) break;
-      const pending = failedDocs.splice(0, failedDocs.length);
-      console.log(`[Excel] Barrido de compleción ${sweep}/${MAX_SWEEPS}: ${pending.length} documento(s) por recuperar...`);
-      setProgress(jobId, {
-        step: `Recuperando ${pending.length} documento(s) (intento ${sweep})...`,
-        current: totalDocs,
-        total: totalDocs,
-      });
-      for (const idx of pending) {
-        if (isJobCancelled(jobId)) { failedDocs.push(idx); continue; }
-        const doc = documents[idx];
-        try {
-          const zipBuffer = await downloadZipFile(doc.id, cookies);
-          const { xmlBuffer, pdfBuffer } = await extractFilesFromZip(zipBuffer);
-          if (!xmlBuffer) throw new Error("No se encontro XML en el ZIP");
-          const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
-            id: doc.id,
-            docnum: doc.docnum,
-            docType: doc.docType,
-          });
-          const invoiceRow = buildInvoiceRow(invoiceData, doc);
-          if (stagingWriter) await appendInvoiceToStaging(stagingWriter, invoiceRow);
-          else invoices.push(invoiceRow);
-
-          // Persistir XML/PDF en la estructura del ZIP descargable (igual que el flujo principal).
-          if (xmlBuffer || (pdfBuffer && pdfBuffer.length > 0)) {
-            try {
-              const ownNitForFiles = getOwnNit(
-                invoiceData.issuerNit || doc.nit,
-                invoiceData.receiverNit || "N/A",
-                !!invoiceData.isDocumentoSoporte,
-                documentDirection === "sent" ? "sent" : "received"
-              ).replace(/[^a-zA-Z0-9._-]/g, "_") || "SinNIT";
-              const dateForFolders = invoiceData.issueDate && invoiceData.issueDate !== "N/A"
-                ? invoiceData.issueDate
-                : new Date().toISOString().slice(0, 10);
-              const { year, monthName } = parseInvoiceDate(dateForFolders);
-              const directionLabel = documentDirection === "sent" ? "Emitidas" : "Recibidas";
-              const safeDocNum = (doc.docnum || doc.id).replace(/[^a-zA-Z0-9._-]/g, "_");
-              const baseDir = path.join(tempDir, "files", ownNitForFiles, year, monthName, directionLabel);
-              if (xmlBuffer) {
-                const xmlDir = path.join(baseDir, "XML");
-                fs.mkdirSync(xmlDir, { recursive: true });
-                fs.writeFileSync(path.join(xmlDir, `${safeDocNum}.xml`), xmlBuffer);
-              }
-              if (pdfBuffer && pdfBuffer.length > 0) {
-                const pdfDir = path.join(baseDir, "PDF");
-                fs.mkdirSync(pdfDir, { recursive: true });
-                fs.writeFileSync(path.join(pdfDir, `${safeDocNum}.pdf`), pdfBuffer);
-              }
-            } catch (e) {
-              console.warn(`[Excel] Barrido: no se pudo persistir XML/PDF (${doc.docnum}):`, e);
-            }
-          }
-          successCount++;
-        } catch {
-          failedDocs.push(idx); // sigue fallando → próximo barrido
-        }
-      }
-      if (failedDocs.length > 0 && sweep < MAX_SWEEPS) {
-        await new Promise(r => setTimeout(r, 2000 * sweep));
-      }
-    }
-
-    // Lo que no se pudo recuperar tras todos los barridos: fila de error trazable
-    // (info básica, sin valores), registrado de forma visible y NO silenciosa.
-    if (failedDocs.length > 0) {
-      console.error(`[Excel] Job ${jobId}: ${failedDocs.length} documento(s) SIN recuperar tras ${MAX_SWEEPS} barridos.`);
-      for (const idx of failedDocs) {
-        const doc = documents[idx];
-        const errorRow = buildErrorRow(doc, "No se pudo descargar/parsear tras reintentos");
-        if (stagingWriter) await appendInvoiceToStaging(stagingWriter, errorRow);
-        else invoices.push(errorRow);
-        errorCount++;
       }
     }
 
