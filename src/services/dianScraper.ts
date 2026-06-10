@@ -599,8 +599,25 @@ export async function extractDocumentIdsByCufe(
     page.setDefaultNavigationTimeout(120000);
 
     updateProgress({ step: "Accediendo con token...", current: 0, total: 1 });
-    await navigateWithRetry(page, tokenUrl, 3);
-    await delay(1000);
+    // Entrar al token UNA sola vez. Si la DIAN responde "Solicitud bloqueada por
+    // controles de seguridad" (anti-bot por entradas repetidas), esperar y reintentar
+    // en vez de fallar: el bloqueo es temporal y se limpia tras una pausa.
+    {
+      const MAX_TOKEN_TRIES = 4;
+      for (let t = 1; t <= MAX_TOKEN_TRIES; t++) {
+        await navigateWithRetry(page, tokenUrl, 3);
+        await delay(1000);
+        const blocked = isBlockedPageContent(await page.content().catch(() => ""));
+        if (!blocked) break;
+        if (t >= MAX_TOKEN_TRIES) {
+          throw new Error("DIAN_BLOCKED: La DIAN bloqueó la solicitud por controles de seguridad tras varios intentos. Espera unos minutos y vuelve a intentar.");
+        }
+        const waitMs = 20000 * t;
+        console.warn(`[Scraper] 'Solicitud bloqueada' detectada (intento ${t}/${MAX_TOKEN_TRIES}); esperando ${waitMs / 1000}s...`);
+        updateProgress({ step: `DIAN bloqueó temporalmente; reintentando en ${Math.round(waitMs / 1000)}s...`, current: 0, total: 1 });
+        await delay(waitMs);
+      }
+    }
 
     // Extraer razón social y NIT de la empresa desde el dashboard
     const companyInfo = await page.evaluate(() => {
@@ -713,14 +730,21 @@ export async function extractDocumentIdsByCufe(
       wp.setDefaultTimeout(120000);
       wp.setDefaultNavigationTimeout(120000);
 
-      await navigateWithRetry(wp, tokenUrl, 3);
-      await delay(250);
-      if (isLoginPage(wp.url())) {
-        throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+      // Reusar la sesión YA establecida (cookies) en lugar de volver a entrar al token.
+      // Entrar al token repetidamente dispara el anti-bot de la DIAN ("Solicitud
+      // bloqueada por controles de seguridad"). Con las cookies de sesión basta para
+      // quedar autenticado, y así DIAN ve una sola entrada al token por corrida.
+      try {
+        await wp.setCookie(...baseCookies.map((c) => ({ name: c.name, value: c.value, domain: c.domain, path: c.path })));
+      } catch (e) {
+        console.warn("[DIAN CUFE] No se pudieron fijar cookies de sesión en worker:", (e as Error).message);
       }
 
       await navigateWithRetry(wp, documentUrl, 3);
       await delay(250);
+      if (isLoginPage(wp.url())) {
+        throw new Error("TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN.");
+      }
       if (startDate && endDate) {
         // Ajustar rango sin disparar búsqueda aún; cada CUFE ejecuta su propio
         // submit y evita esperas largas redundantes durante inicialización.
@@ -748,7 +772,7 @@ export async function extractDocumentIdsByCufe(
       let wc = workerCookies[workerIdx] || baseCookieMap;
       let processedByWorker = 0;
       let currentWorkerDir: DocumentDirection | null = direction; // track current worker tab
-      const recycleEvery = Math.max(50, Number(process.env.DIAN_CUFE_RECYCLE_EVERY || 250));
+      const recycleEvery = Math.max(50, Number(process.env.DIAN_CUFE_RECYCLE_EVERY || 1000));
 
       while (true) {
         const i = nextIndex;
@@ -2397,6 +2421,14 @@ function isLoginPage(url: string): boolean {
   
   const lowerUrl = url.toLowerCase();
   return loginIndicators.some(indicator => lowerUrl.includes(indicator.toLowerCase()));
+}
+
+// La DIAN responde con una página "Solicitud bloqueada por controles de seguridad"
+// (anti-bot) cuando se entra al token de forma repetida en poco tiempo. Es temporal:
+// se limpia tras una espera. Detectarla permite esperar+reintentar en vez de fallar.
+function isBlockedPageContent(html: string): boolean {
+  const t = (html || "").toLowerCase();
+  return t.includes("solicitud bloqueada") || t.includes("controles de seguridad");
 }
 
 /**

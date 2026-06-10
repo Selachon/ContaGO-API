@@ -576,7 +576,12 @@ async function processExcelJob(
       if (zipPrefetch.has(docIndex)) return;
       const trackId = documents[docIndex]?.id;
       if (!trackId) return;
-      zipPrefetch.set(docIndex, downloadZipFile(trackId, cookies));
+      const p = downloadZipFile(trackId, cookies);
+      // Marca la promesa como "manejada" para evitar unhandledRejection (que en Node
+      // moderno TUMBA el proceso/job entero) si el prefetch revienta con 403 antes de
+      // ser await-eado. El await en el bucle sigue recibiendo el rechazo y lo captura.
+      p.catch(() => {});
+      zipPrefetch.set(docIndex, p);
     };
 
     for (let p = 0; p < Math.min(downloadWorkers, documents.length); p++) {
