@@ -395,11 +395,12 @@ async function processCufeDownloadJob(
   try {
     if (isJobCancelled(jobId)) return;
 
-    // Semáforo de descargas por job. Subido a 8: el bloqueo de DIAN es transitorio
-    // y throttledDianDownload lo recupera con reintentos cortos, así que la alta
-    // concurrencia acelera (objetivo 20-25 descargas/min) sin perder documentos.
-    // El rate-limiter GLOBAL de dianScraper acota el total entre todos los jobs.
-    const MAX_DL = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 8), 12));
+    // Semáforo de descargas por job. 5 equilibra velocidad (~18-22/min) y presión
+    // sobre DIAN: a mayor concurrencia el bloqueo transitorio se vuelve más intenso y
+    // sostenido (visto en prod), dejando más faltantes para el barrido. throttledDianDownload
+    // recupera con reintentos cortos, y el barrido con reingreso al token + cooldown
+    // garantiza completitud. Tunable por env según tolere la IP del servidor.
+    const MAX_DL = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 5), 12));
     let dlSlots = MAX_DL;
     const dlQueue: Array<() => void> = [];
     const acquireDl = (): Promise<void> =>
@@ -411,7 +412,8 @@ async function processCufeDownloadJob(
 
     // Download results keyed by cufe
     const dlResults = new Map<string, { destPath: string | null; trackId: string; docnum: string; nit: string; error?: string }>();
-    let dlDone = 0;
+    let dlDone = 0;   // intentos terminados (éxito o fallo)
+    let dlOk = 0;     // descargas REALMENTE exitosas (las que avanzan la barra)
     // Descargas disparadas en segundo plano; se esperan todas al final.
     const downloadPromises: Promise<void>[] = [];
 
@@ -454,8 +456,8 @@ async function processCufeDownloadJob(
       jobId,
       direction,
       (p) => setProgress(jobId, {
-        step: `Descargando ${dlDone}/${downloadCufes.length}...`,
-        current: dlDone,
+        step: `Descargando ${dlOk}/${downloadCufes.length}...`,
+        current: dlOk,
         total: downloadCufes.length,
       }),
       async ({ doc, cookies }) => {
@@ -463,12 +465,25 @@ async function processCufeDownloadJob(
         // Mantiene la cola corta → las cookies siguen frescas (sin 403 por sesión vieja).
         await acquireDl();
         const dl = (async () => {
+          let ok = false;
           try {
             await downloadDoc(doc, cookies);
+            ok = !!dlResults.get(doc.cufe || doc.id)?.destPath;
           } finally {
             releaseDl();
             dlDone++;
-            setProgress(jobId, { step: `Descargando ${dlDone}/${downloadCufes.length}...`, current: dlDone, total: allCufes.length });
+            if (ok) dlOk++;
+            // La barra refleja SOLO las descargas exitosas (no los intentos fallidos),
+            // para no dar una falsa sensación de avance cuando aún no se ha obtenido
+            // nada. Los fallidos se recuperan después en la fase de reintento/barrido.
+            const pend = dlDone - dlOk;
+            setProgress(jobId, {
+              step: pend > 0
+                ? `Descargando ${dlOk}/${downloadCufes.length} (${pend} por reintentar)...`
+                : `Descargando ${dlOk}/${downloadCufes.length}...`,
+              current: dlOk,
+              total: allCufes.length,
+            });
           }
         })();
         downloadPromises.push(dl);
@@ -595,22 +610,37 @@ async function processCufeDownloadJob(
     // y desaparecían de la hoja "Compras". Aquí se re-resuelven y descargan en
     // SERIE (sin concurrencia → DIAN no throttlea) y se reprocesa su XML,
     // repitiendo hasta completarlos, agotar intentos o no haber progreso.
-    const MAX_SWEEPS = Math.max(0, Number(process.env.DIAN_CUFE_COMPLETION_SWEEPS ?? 3));
+    // Barridos de compleción robustos. El bloqueo de DIAN es TRANSITORIO y se resetea
+    // al REINGRESAR al token (sesión fresca) + esperar a que "se enfríe". Cada barrido:
+    //  1) espera un cooldown escalado (deja que el bloqueo de la pasada previa expire),
+    //  2) reingresa al token vía extractDocumentIdsByCufe (sesión nueva),
+    //  3) descarga en SERIE (mínima presión → no re-dispara el bloqueo).
+    // NO nos rendimos mientras un barrido siga topando con bloqueo: solo paramos cuando
+    // ya no hay faltantes, o cuando varios barridos seguidos no logran NINGÚN avance
+    // pese a haber esperado (señal de que el resto es genuinamente irrecuperable).
+    const MAX_SWEEPS = Math.max(0, Number(process.env.DIAN_CUFE_COMPLETION_SWEEPS ?? 8));
+    let zeroProgressStreak = 0;
     for (let sweep = 1; sweep <= MAX_SWEEPS; sweep++) {
       if (isJobCancelled(jobId)) return;
       const missing = downloadCufes.filter((c) => !hasData(c));
       if (missing.length === 0) break;
-      console.log(`[CUFE DL] Barrido de compleción ${sweep}/${MAX_SWEEPS}: ${missing.length} sin datos...`);
+
+      // Cooldown para que el bloqueo transitorio expire antes de reintentar.
+      // Crece con cada barrido sin progreso (15s, 30s, 45s...), tope 90s.
+      const cooldownMs = Math.min(15000 * (zeroProgressStreak + 1), 90000);
+      console.log(`[CUFE DL] Barrido ${sweep}/${MAX_SWEEPS}: ${missing.length} sin datos. Enfriando ${cooldownMs/1000}s y reingresando al token...`);
       setProgress(jobId, {
-        step: `Recuperando ${missing.length} faltante(s) (intento ${sweep})...`,
+        step: `Recuperando ${missing.length} faltante(s) (intento ${sweep}, esperando ${Math.round(cooldownMs/1000)}s)...`,
         current: allCufes.length - missing.length,
         total: allCufes.length,
       });
+      await new Promise((r) => setTimeout(r, cooldownMs));
+      if (isJobCancelled(jobId)) return;
 
       const missingSet = new Set(missing.map((c) => c.toLowerCase()));
       const sweepRecords = listingRecords.filter((r) => missingSet.has((r.cufe || "").toLowerCase()));
 
-      // Descarga SERIAL: el callback espera cada descarga (sin semáforo de concurrencia).
+      // Descarga SERIAL con sesión fresca (reingreso al token resetea el bloqueo).
       try {
         await extractDocumentIdsByCufe(
           tokenUrl, startDate, endDate, jobId, direction,
@@ -644,7 +674,13 @@ async function processCufeDownloadJob(
       }
       const remaining = downloadCufes.filter((c) => !hasData(c)).length;
       console.log(`[CUFE DL] Barrido ${sweep}: recuperados ${recovered}, faltan ${remaining}`);
-      if (recovered === 0) break; // sin progreso → no insistir
+      // Solo nos rendimos tras VARIOS barridos seguidos sin avance (con cooldown
+      // creciente ya aplicado): el resto sería genuinamente irrecuperable.
+      zeroProgressStreak = recovered > 0 ? 0 : zeroProgressStreak + 1;
+      if (zeroProgressStreak >= 3) {
+        console.warn(`[CUFE DL] 3 barridos sin avance pese a cooldown; deteniendo. Faltan ${remaining}.`);
+        break;
+      }
     }
 
     // Si tras los barridos aún faltan, dejarlo registrado de forma visible (no silencioso).

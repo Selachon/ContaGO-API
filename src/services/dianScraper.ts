@@ -2768,7 +2768,9 @@ export async function downloadDocumentsByCufe(
 }
 
 export async function fetchZipToFile(url: string, destPath: string, cookieHeader: string): Promise<void> {
-  // Usa el rate-limiter global + backoff (Retry-After) centralizado.
-  const buf = await throttledDianDownload(url, cookieHeader, { timeoutMs: 180_000, maxRetries: 4 });
+  // Usa el rate-limiter global + reintentos cortos centralizados. maxRetries alto
+  // porque el bloqueo de DIAN es transitorio: así se recupera en la PRIMERA pasada
+  // y no cae masivamente en la fase de "Reintentando N descargas".
+  const buf = await throttledDianDownload(url, cookieHeader, { timeoutMs: 180_000, maxRetries: 12 });
   fs.writeFileSync(destPath, buf);
 }
