@@ -2544,7 +2544,13 @@ function isBlockedPageContent(html: string): boolean {
  */
 async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3): Promise<void> {
   let lastError: Error | null = null;
-  
+  // El bloqueo anti-bot de DIAN redirige a /login de forma TRANSITORIA (no es que el
+  // token muriera): reintentar con espera lo resuelve. Solo tras varios reintentos con
+  // cooldown concluimos expiración REAL del token. Antes se rendía a los ~6s (attempt>=2)
+  // y abortaba la recuperación, dejando reportes incompletos bajo bloqueo de IP.
+  const MAX_LOGIN_RETRIES = Math.max(1, Number(process.env.DIAN_LOGIN_REDIRECT_RETRIES ?? 5));
+  let loginRedirects = 0;
+
   // Estrategias de espera progresivas (de más rápido a más robusto)
   const strategies: Array<{ waitUntil: "domcontentloaded" | "load" | "networkidle2"; timeout: number }> = [
     { waitUntil: "domcontentloaded", timeout: 60000 },
@@ -2571,16 +2577,18 @@ async function navigateWithRetry(page: Page, url: string, maxRetries: number = 3
         const tokenExpiredError = new Error(
           "TOKEN_EXPIRED: El token ha expirado. Por favor, genera un nuevo token desde el portal DIAN."
         );
-
-        // Regla operativa solicitada: si al segundo intento redirige a User/Login,
-        // informar expiración de token de inmediato.
-        if (attempt >= 2) {
+        loginRedirects++;
+        // Solo tras agotar los reintentos CON ESPERA concluimos que el token murió de
+        // verdad. La mayoría de las veces es el bloqueo transitorio de DIAN: esperar y
+        // recargar lo resuelve (confirmado en operación).
+        if (loginRedirects > MAX_LOGIN_RETRIES) {
           throw tokenExpiredError;
         }
-
         lastError = tokenExpiredError;
-        console.log(`Redirección a login detectada en intento ${attempt}, reintentando...`);
-        await delay(1200);
+        const wait = Math.min(8000 * loginRedirects, 30000); // 8s,16s,24s,30s,30s...
+        console.log(`Redirección a login (posible bloqueo transitorio) ${loginRedirects}/${MAX_LOGIN_RETRIES}; esperando ${wait / 1000}s y recargando...`);
+        await delay(wait);
+        attempt--; // un login-redirect transitorio NO consume el presupuesto de estrategias
         continue;
       }
       
