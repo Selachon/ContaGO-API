@@ -444,6 +444,14 @@ async function processCufeDownloadJob(
 
     setProgress(jobId, { step: "Buscando y descargando documentos...", current: 0, total: downloadCufes.length });
 
+    // Solo se buscan/descargan los CUFE PROCESABLES. Los omitidos (Application
+    // Response, Nómina) ya tienen su fila-nota en invoiceMap y NO son ZIPs
+    // descargables: incluirlos en la búsqueda desperdiciaba tiempo (cada uno fallaba
+    // y agotaba los reintentos, y volvía a intentarse en el barrido). Filtrarlos aquí
+    // es el mayor ahorro de tiempo sin perder ninguna factura real.
+    const downloadSet = new Set(downloadCufes.map((c) => c.toLowerCase()));
+    const processableRecords = listingRecords.filter((r) => downloadSet.has((r.cufe || "").toLowerCase()));
+
     // Búsqueda serial (1 worker → sin race) + descargas en paralelo con contrapresión.
     // El callback espera SOLO a que haya cupo de descarga libre, dispara la descarga
     // en segundo plano y devuelve el control para que la búsqueda del siguiente CUFE
@@ -489,7 +497,7 @@ async function processCufeDownloadJob(
         downloadPromises.push(dl);
         // No esperamos la descarga: la búsqueda continúa con el siguiente CUFE.
       },
-      listingRecords,
+      processableRecords,
     );
 
     // Esperar a que terminen las descargas en vuelo.
@@ -504,15 +512,23 @@ async function processCufeDownloadJob(
     // problema de robo por race (sigue siendo 1 worker).
     const failedKeys = [...dlResults.entries()].filter(([, r]) => !r.destPath).map(([k]) => k);
     if (failedKeys.length > 0) {
-      console.log(`[CUFE DL] Reintentando ${failedKeys.length} descargas fallidas...`);
-      setProgress(jobId, { step: `Reintentando ${failedKeys.length} descargas...`, current: dlDone, total: allCufes.length });
+      const retryTotal = failedKeys.length;
+      console.log(`[CUFE DL] Reintentando ${retryTotal} descargas fallidas...`);
+      // Barra HONESTA del reintento: escala 0→retryTotal que sube a medida que se
+      // recupera cada faltante (antes quedaba "llena" y el usuario no sabía el avance).
+      let retryOk = 0;
+      setProgress(jobId, { step: `Reintentando descargas: 0/${retryTotal} recuperadas...`, current: 0, total: retryTotal });
       const failedSet = new Set(failedKeys.map((k) => k.toLowerCase()));
       const retryRecords = listingRecords.filter((r) => failedSet.has((r.cufe || "").toLowerCase()));
       try {
         await extractDocumentIdsByCufe(
           tokenUrl, startDate, endDate, jobId, direction,
           () => {},
-          async ({ doc, cookies }) => { await downloadDoc(doc, cookies); },
+          async ({ doc, cookies }) => {
+            await downloadDoc(doc, cookies);
+            if (dlResults.get(doc.cufe || doc.id)?.destPath) retryOk++;
+            setProgress(jobId, { step: `Reintentando descargas: ${retryOk}/${retryTotal} recuperadas...`, current: retryOk, total: retryTotal });
+          },
           retryRecords,
         );
       } catch (err) {
@@ -625,14 +641,16 @@ async function processCufeDownloadJob(
       const missing = downloadCufes.filter((c) => !hasData(c));
       if (missing.length === 0) break;
 
-      // Cooldown para que el bloqueo transitorio expire antes de reintentar.
-      // Crece con cada barrido sin progreso (15s, 30s, 45s...), tope 90s.
-      const cooldownMs = Math.min(15000 * (zeroProgressStreak + 1), 90000);
-      console.log(`[CUFE DL] Barrido ${sweep}/${MAX_SWEEPS}: ${missing.length} sin datos. Enfriando ${cooldownMs/1000}s y reingresando al token...`);
+      // Cooldown para que el bloqueo transitorio expire antes de reintentar. Arranca
+      // corto (el bloqueo se limpia rápido + el reingreso al token lo resetea) y solo
+      // crece si barridos seguidos no logran avance (8s, 16s, 24s..., tope 60s).
+      const cooldownMs = Math.min(8000 * (zeroProgressStreak + 1), 60000);
+      const sweepTotal = missing.length;
+      console.log(`[CUFE DL] Barrido ${sweep}/${MAX_SWEEPS}: ${sweepTotal} sin datos. Enfriando ${cooldownMs/1000}s y reingresando al token...`);
       setProgress(jobId, {
-        step: `Recuperando ${missing.length} faltante(s) (intento ${sweep}, esperando ${Math.round(cooldownMs/1000)}s)...`,
-        current: allCufes.length - missing.length,
-        total: allCufes.length,
+        step: `Recuperando faltantes: 0/${sweepTotal} (intento ${sweep}, esperando ${Math.round(cooldownMs/1000)}s)...`,
+        current: 0,
+        total: sweepTotal,
       });
       await new Promise((r) => setTimeout(r, cooldownMs));
       if (isJobCancelled(jobId)) return;
@@ -641,11 +659,17 @@ async function processCufeDownloadJob(
       const sweepRecords = listingRecords.filter((r) => missingSet.has((r.cufe || "").toLowerCase()));
 
       // Descarga SERIAL con sesión fresca (reingreso al token resetea el bloqueo).
+      // Barra HONESTA: sube a medida que se recupera cada faltante en este barrido.
+      let sweepOk = 0;
       try {
         await extractDocumentIdsByCufe(
           tokenUrl, startDate, endDate, jobId, direction,
           () => {},
-          async ({ doc, cookies }) => { await downloadDoc(doc, cookies); },
+          async ({ doc, cookies }) => {
+            await downloadDoc(doc, cookies);
+            if (dlResults.get(doc.cufe || doc.id)?.destPath) sweepOk++;
+            setProgress(jobId, { step: `Recuperando faltantes: ${sweepOk}/${sweepTotal} (intento ${sweep})...`, current: sweepOk, total: sweepTotal });
+          },
           sweepRecords,
         );
       } catch (err) {
