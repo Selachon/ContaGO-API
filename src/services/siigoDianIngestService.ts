@@ -3,6 +3,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import {
+  acquireDianJobSlot,
   getCufeListing,
   downloadDocumentsByCufe,
   type CufeDownloadItem,
@@ -149,6 +150,15 @@ async function downloadDirectionWithRetries(
  * porque `processXmlBatch` consulta Siigo para detectar facturas ya causadas.
  */
 export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult> {
+  // Misma cola global que las herramientas DIAN: el auto-ingest también scrapea
+  // el catálogo y compite por el presupuesto anti-bot de la IP.
+  const releaseDianJobSlot = await acquireDianJobSlot((pos) =>
+    opts.onProgress?.({ step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`, current: 0, total: 0 })
+  );
+  if (opts.isCancelled?.()) {
+    releaseDianJobSlot();
+    return { items: [], stats: { listed: 0, alreadyRegistered: 0, downloaded: 0, failed: 0, rounds: 0 }, failures: [] };
+  }
   const directions = grupoToDirections(opts.grupo);
   const sessionId = uuidv4();
   const tempDir = path.join(DOWNLOADS_DIR, `siigo-ingest-${sessionId}`);
@@ -260,6 +270,7 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
       failures: allFailures,
     };
   } finally {
+    releaseDianJobSlot();
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {
