@@ -187,6 +187,26 @@ export async function deleteCompany(id: string): Promise<boolean> {
   return res.deletedCount > 0;
 }
 
+/** Liga una conexión de Google Drive (de un usuario) a la empresa, para archivar soportes. */
+export async function setCompanyDrive(companyId: string, ownerUserId: string, connectionId: string): Promise<boolean> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { return false; }
+  const res = await getDb().collection<any>(COMPANIES).updateOne(
+    { _id: oid },
+    { $set: { driveOwnerUserId: ownerUserId, driveConnectionId: connectionId } },
+  );
+  return res.matchedCount > 0;
+}
+
+/** Drive ligado a la empresa (usuario dueño + conexión) + su NIT. */
+export async function getCompanyDrive(companyId: string): Promise<{ ownerUserId: string; connectionId: string; nit: string } | null> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { return null; }
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid }, { projection: { driveOwnerUserId: 1, driveConnectionId: 1, nit: 1 } });
+  if (!doc?.driveOwnerUserId || !doc?.driveConnectionId) return null;
+  return { ownerUserId: doc.driveOwnerUserId, connectionId: doc.driveConnectionId, nit: doc.nit || "" };
+}
+
 /** Comparte una empresa con otro usuario (lo agrega a sharedWith). */
 export async function shareCompany(companyId: string, targetUserId: string): Promise<boolean> {
   let oid: ObjectId;

@@ -6,6 +6,9 @@ import type { DemoAccess } from "../types/auth.js";
 const TOOL_ALIASES: Record<string, string[]> = {
   "dian-mass-download": ["dian-downloader"],
   "dian-cufe-downloader": ["dian-excel-exporter"],
+  // La herramienta "Causación + Caja" reúsa el backend de causación XML
+  // (/integrations/siigo/accounting/*); tener "causacion-caja" da acceso.
+  "siigo-xml-accounting": ["causacion-caja"],
 };
 
 declare global {

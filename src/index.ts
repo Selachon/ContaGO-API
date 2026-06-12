@@ -15,6 +15,7 @@ import portalStatusRoutes from "./routes/portalStatus.js";
 import siigoRoutes from "./routes/siigo.js";
 import causationRoutes from "./routes/causation.js";
 import conciliacionRoutes from "./routes/conciliacion.js";
+import cajaErpRoutes from "./routes/cajaErp.js";
 import dianCufeRoutes from "./routes/dianCufeDownload.js";
 import dianMassDownloadRoutes from "./routes/dianMassDownload.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
@@ -74,6 +75,7 @@ app.use("/dian-mass-download", dianMassDownloadRoutes);
 app.use("/integrations/siigo", siigoRoutes);
 app.use("/causation", causationRoutes);
 app.use("/conciliacion", conciliacionRoutes);
+app.use("/caja-erp", cajaErpRoutes);
 
 // Health check
 app.get("/", (_req, res) => {

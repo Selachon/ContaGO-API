@@ -554,6 +554,39 @@ export async function uploadFileToDrive(
   return response.data.webViewLink || `https://drive.google.com/file/d/${response.data.id}/view`;
 }
 
+/**
+ * Sube un soporte de PAGO a la misma estructura que las facturas, pero en una
+ * subcarpeta "Soportes de pago": Raíz / NIT / Año / Mes / Soportes de pago / {filename}
+ */
+export async function uploadPaymentSupportToDrive(
+  fileBuffer: Buffer,
+  filename: string,
+  mimeType: string,
+  ownNit: string,
+  issueDate: string,
+  driveConfig: GoogleDriveConfig,
+  userId: string,
+  onTokenRefresh?: (newAccessToken: string, expiryDate: number) => Promise<void>
+): Promise<string> {
+  const drive = await getDriveClient(driveConfig, onTokenRefresh);
+  const rootFolderId = await getOrCreateRootFolder(driveConfig, userId, onTokenRefresh);
+  const { year, monthName } = parseInvoiceDate(issueDate);
+  const nit = ownNit || "SinNIT";
+
+  const nitId = (await findFolderByName(drive, nit, rootFolderId)) || (await createFolder(drive, nit, rootFolderId));
+  const yearId = (await findFolderByName(drive, year, nitId)) || (await createFolder(drive, year, nitId));
+  const monthId = (await findFolderByName(drive, monthName, yearId)) || (await createFolder(drive, monthName, yearId));
+  const folderId = (await findFolderByName(drive, "Soportes de pago", monthId)) || (await createFolder(drive, "Soportes de pago", monthId));
+
+  const stream = Readable.from(fileBuffer);
+  const response = await drive.files.create({
+    requestBody: { name: filename, parents: [folderId] },
+    media: { mimeType, body: stream },
+    fields: "id, webViewLink",
+  });
+  return response.data.webViewLink || `https://drive.google.com/file/d/${response.data.id}/view`;
+}
+
 // Revocar acceso
 export async function revokeAccess(driveConfig: GoogleDriveConfig): Promise<void> {
   try {
