@@ -4,7 +4,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
-import { extractDocumentIdsByCufe, runDianExtractionPrecheck, throttledDianDownload } from "../services/dianScraper.js";
+import { acquireDianJobSlot, extractDocumentIdsByCufe, runDianExtractionPrecheck, throttledDianDownload, getFreshDianSessionCookies } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import {
@@ -454,6 +454,16 @@ async function processExcelJob(
   if (!job) return;
 
   job.status = "processing";
+
+  // Cola global DIAN: por defecto 1 job a la vez (env DIAN_MAX_CONCURRENT_JOBS).
+  // Varios jobs simultaneos disparan el bloqueo anti-bot por IP y degradan a todos;
+  // serializar mantiene la precision de proceso unico. El usuario ve su turno.
+  const releaseDianJobSlot = await acquireDianJobSlot((pos) => setProgress(jobId, {
+    step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`,
+    current: 0,
+    total: 0,
+  }));
+  if (isJobCancelled(jobId)) { releaseDianJobSlot(); return; }
   job.startedAt = Date.now();
   const isSentDocs = documentDirection === "sent";
   const directionLabel = isSentDocs ? "emitidos" : "recibidos";
@@ -586,41 +596,14 @@ async function processExcelJob(
       scheduleZipPrefetch(p);
     }
 
-    for (let i = 0; i < documents.length; i++) {
-      if (isJobCancelled(jobId)) {
-        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
-        return;
-      }
+    // Documentos cuya descarga/proceso falló en la pasada principal. NO se escriben
+    // como fila-en-ceros de inmediato: primero se intenta recuperarlos en barridos
+    // con sesión fresca (el fallo típico es el bloqueo 403 transitorio de DIAN).
+    const failedDocs: Array<{ i: number; doc: (typeof documents)[number]; lastError: string }> = [];
 
-      const doc = documents[i];
-      const currentBatch = Math.floor(i / BATCH_SIZE) + 1;
-      const posInBatch = (i % BATCH_SIZE) + 1;
-      
-      // Mensaje de progreso más descriptivo
-      const progressMsg = `Descargando factura ${i + 1} de ${totalDocs}...`;
-      
-      setProgress(jobId, {
-        step: progressMsg,
-        current: i + 1,
-        total: totalDocs,
-      });
-      job.invoicesProcessed = successCount;
-      job.invoicesFailed = errorCount;
-      job.invoicesSkipped = skippedCount;
-      
-      // Pausa entre tandas para evitar sobrecargar
-      if (i > 0 && i % BATCH_SIZE === 0) {
-        console.log(`[Excel] Completada tanda ${currentBatch - 1}/${totalBatches}, pausando 2s...`);
-        await new Promise(r => setTimeout(r, 2000));
-      }
-
-      try {
-        // 3.1) Descargar ZIP del trackId (con prefetch concurrente).
-        const prefetchedZip = zipPrefetch.get(i) || downloadZipFile(doc.id, cookies);
-        const zipBuffer = await prefetchedZip;
-        zipPrefetch.delete(i);
-        scheduleZipPrefetch(i + downloadWorkers);
-
+    // Procesa un documento ya descargado: parseo del XML, Drive, persistencia de
+    // archivos y fila del Excel. Lo usan la pasada principal y los barridos.
+    const processDocumentFromZip = async (i: number, doc: (typeof documents)[number], zipBuffer: Buffer): Promise<void> => {
         // 3.2) Extraer XML y PDF del ZIP.
         const { xmlBuffer, xmlFilename, pdfBuffer, pdfFilename } = await extractFilesFromZip(zipBuffer);
 
@@ -849,20 +832,10 @@ async function processExcelJob(
         else invoices.push(invoiceRow);
 
         successCount++;
-        consecutiveErrors = 0; // Reset en éxito
-        
-        // Log cada 50 documentos para no saturar
-        if ((i + 1) % 50 === 0 || i === totalDocs - 1) {
-          console.log(`[Excel] Progreso ${i + 1}/${totalDocs}: ${successCount} ok, ${errorCount} errores, ${skippedCount} existentes`);
-        }
+    };
 
-      } catch (err) {
-        errorCount++;
-        consecutiveErrors++;
-        const errMsg = (err as Error).message;
-        console.error(`[Excel] Error procesando ${doc.docnum}:`, errMsg.substring(0, 100));
-
-        // Mantiene trazabilidad del documento fallido dentro del Excel.
+    // Escribe la fila de trazabilidad de un documento que NO se pudo recuperar.
+    const appendErrorRow = async (doc: (typeof documents)[number], errMsg: string): Promise<void> => {
         const errorInvoiceRow: InvoiceData = {
           issuerNit: doc.nit,
           issuerName: "N/A",
@@ -911,7 +884,50 @@ async function processExcelJob(
 
         if (stagingWriter) await appendInvoiceToStaging(stagingWriter, errorInvoiceRow);
         else invoices.push(errorInvoiceRow);
-        
+    };
+
+    for (let i = 0; i < documents.length; i++) {
+      if (isJobCancelled(jobId)) {
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
+        return;
+      }
+
+      const doc = documents[i];
+      const currentBatch = Math.floor(i / BATCH_SIZE) + 1;
+
+      setProgress(jobId, {
+        step: `Descargando factura ${i + 1} de ${totalDocs}...`,
+        current: i + 1,
+        total: totalDocs,
+      });
+      job.invoicesProcessed = successCount;
+      job.invoicesFailed = errorCount;
+      job.invoicesSkipped = skippedCount;
+
+      // Pausa entre tandas para evitar sobrecargar
+      if (i > 0 && i % BATCH_SIZE === 0) {
+        console.log(`[Excel] Completada tanda ${currentBatch - 1}/${totalBatches}, pausando 2s...`);
+        await new Promise(r => setTimeout(r, 2000));
+      }
+
+      try {
+        // 3.1) Descargar ZIP del trackId (con prefetch concurrente).
+        const zipBuffer = await (zipPrefetch.get(i) || downloadZipFile(doc.id, cookies));
+        await processDocumentFromZip(i, doc, zipBuffer);
+        consecutiveErrors = 0; // Reset en éxito
+
+        // Log cada 50 documentos para no saturar
+        if ((i + 1) % 50 === 0 || i === totalDocs - 1) {
+          console.log(`[Excel] Progreso ${i + 1}/${totalDocs}: ${successCount} ok, ${errorCount} errores, ${skippedCount} existentes`);
+        }
+      } catch (err) {
+        errorCount++;
+        consecutiveErrors++;
+        const errMsg = (err as Error).message;
+        console.error(`[Excel] Error procesando ${doc.docnum}:`, errMsg.substring(0, 100));
+        // Se difiere al barrido de recuperación en vez de escribir la fila en ceros.
+        failedDocs.push({ i, doc, lastError: errMsg });
+
         // Si hay muchos errores consecutivos, pausar para recuperarse
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
           console.warn(`[Excel] ${MAX_CONSECUTIVE_ERRORS} errores consecutivos, pausando 10s para recuperar...`);
@@ -923,7 +939,80 @@ async function processExcelJob(
           await new Promise(r => setTimeout(r, 10000));
           consecutiveErrors = 0; // Reset después de pausa
         }
+      } finally {
+        // Mantener vivo el pipeline de prefetch también tras un fallo (antes se
+        // drenaba un worker por cada error).
+        zipPrefetch.delete(i);
+        scheduleZipPrefetch(i + downloadWorkers);
       }
+    }
+
+    // ── Barridos de recuperación ───────────────────────────────────────────
+    // Cooldown escalado (deja expirar el bloqueo transitorio de DIAN) + sesión
+    // FRESCA (reingreso al token = reset del bloqueo) + descarga EN SERIE con
+    // muchos reintentos cortos. Solo lo irrecuperable termina como fila de error.
+    if (failedDocs.length > 0 && !isJobCancelled(jobId)) {
+      const MAX_SWEEPS = Math.max(0, Number(process.env.DIAN_EXCEL_COMPLETION_SWEEPS ?? 4));
+      let pending = [...failedDocs];
+      let zeroSweeps = 0;
+      for (let sweep = 1; sweep <= MAX_SWEEPS && pending.length > 0; sweep++) {
+        if (isJobCancelled(jobId)) break;
+        const cooldownMs = Math.min(8000 * sweep, 60000);
+        console.log(`[Excel] Barrido ${sweep}/${MAX_SWEEPS}: ${pending.length} pendientes; cooldown ${cooldownMs / 1000}s`);
+        setProgress(jobId, {
+          step: `Recuperando ${pending.length} facturas pendientes (barrido ${sweep}/${MAX_SWEEPS})...`,
+          current: successCount,
+          total: totalDocs,
+        });
+        await new Promise((r) => setTimeout(r, cooldownMs));
+
+        let freshCookies: Record<string, string>;
+        try {
+          freshCookies = await getFreshDianSessionCookies(tokenUrl);
+        } catch (sessErr) {
+          const msg = sessErr instanceof Error ? sessErr.message : String(sessErr);
+          console.warn(`[Excel] Barrido ${sweep}: no se pudo abrir sesión fresca: ${msg}`);
+          if (msg.includes("TOKEN_EXPIRED")) break;
+          zeroSweeps++;
+          if (zeroSweeps >= 2) break;
+          continue;
+        }
+
+        let recovered = 0;
+        const still: typeof pending = [];
+        for (const item of pending) {
+          if (isJobCancelled(jobId)) break;
+          try {
+            const url = `https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=${item.doc.id}`;
+            const cookieHeader = Object.entries(freshCookies).map(([k, v]) => `${k}=${v}`).join("; ");
+            const zipBuffer = await throttledDianDownload(url, cookieHeader, { timeoutMs: 180_000, maxRetries: 12 });
+            await processDocumentFromZip(item.i, item.doc, zipBuffer);
+            errorCount--;
+            recovered++;
+            setProgress(jobId, {
+              step: `Recuperando facturas: ${recovered}/${pending.length} (barrido ${sweep})...`,
+              current: successCount,
+              total: totalDocs,
+            });
+          } catch (swErr) {
+            still.push({ ...item, lastError: swErr instanceof Error ? swErr.message : String(swErr) });
+          }
+        }
+        console.log(`[Excel] Barrido ${sweep}: recuperadas ${recovered}/${pending.length}`);
+        pending = still;
+        zeroSweeps = recovered === 0 ? zeroSweeps + 1 : 0;
+        // Dos barridos seguidos sin avance = lo que queda no es transitorio.
+        if (zeroSweeps >= 2) break;
+      }
+
+      if (pending.length > 0) {
+        console.warn(`[Excel] ADVERTENCIA: ${pending.length} facturas NO recuperadas tras barridos: ${pending.map((p) => p.doc.docnum).join(", ")}`);
+      }
+      for (const item of pending) {
+        await appendErrorRow(item.doc, item.lastError);
+      }
+      job.invoicesFailed = pending.length;
+      errorCount = pending.length;
     }
 
     if (stagingWriter) {
@@ -1016,6 +1105,8 @@ async function processExcelJob(
 
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
     try { fs.unlinkSync(excelPath); } catch {}
+  } finally {
+    releaseDianJobSlot();
   }
 }
 

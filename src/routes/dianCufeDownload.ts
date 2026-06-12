@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
-import { extractDocumentIdsByCufe, fetchZipToFile, REAL_USER_AGENT, type ListingRecord } from "../services/dianScraper.js";
+import { acquireDianJobSlot, extractDocumentIdsByCufe, fetchZipToFile, REAL_USER_AGENT, type ListingRecord } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile } from "../services/excelGenerator.js";
 import {
@@ -340,6 +340,16 @@ async function processCufeDownloadJob(
   if (!job) return;
 
   job.status = "processing";
+
+  // Cola global DIAN: por defecto 1 job a la vez (env DIAN_MAX_CONCURRENT_JOBS).
+  // Varios jobs simultaneos disparan el bloqueo anti-bot por IP y degradan a todos;
+  // serializar mantiene la precision de proceso unico. El usuario ve su turno.
+  const releaseDianJobSlot = await acquireDianJobSlot((pos) => setProgress(jobId, {
+    step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`,
+    current: 0,
+    total: 0,
+  }));
+  if (isJobCancelled(jobId)) { releaseDianJobSlot(); return; }
 
   const sessionId = uuidv4();
   const tempDir = path.join(DOWNLOADS_DIR, sessionId);
@@ -791,11 +801,12 @@ async function processCufeDownloadJob(
       setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: msg });
     }
   } finally {
+    releaseDianJobSlot();
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
 }
 
-async function extractFilesFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buffer | null; pdfBuffer: Buffer | null }> {
+export async function extractFilesFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buffer | null; pdfBuffer: Buffer | null }> {
   const zip = await JSZip.loadAsync(zipBuffer);
   let xmlBuffer: Buffer | null = null;
   let pdfBuffer: Buffer | null = null;
@@ -809,7 +820,7 @@ async function extractFilesFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buff
   return { xmlBuffer, pdfBuffer };
 }
 
-async function resolveExcelBuffer(file: Express.Multer.File): Promise<Buffer> {
+export async function resolveExcelBuffer(file: Express.Multer.File): Promise<Buffer> {
   if (file.originalname.toLowerCase().endsWith(".zip")) {
     const zip = await JSZip.loadAsync(file.buffer);
     for (const [filename, entry] of Object.entries(zip.files)) {
@@ -848,7 +859,18 @@ function classifyGrupo(grupoVal: string): "sent" | "received" | "nomina" | "appl
   return "unknown";
 }
 
-async function extractCufesFromExcel(buffer: Buffer): Promise<{
+export // Clasifica por la columna "Tipo de documento" de la DIAN. Devuelve un motivo de
+// descarte (no descargable) o null si es un documento procesable (factura, nota,
+// documento equivalente, etc.). Es el filtro fiable cuando "Grupo" no distingue.
+function classifyTipoDocumento(tipoVal: string): "nomina" | "applicationResponse" | null {
+  const norm = (tipoVal || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+  if (!norm) return null;
+  if (norm.includes("nomin")) return "nomina";
+  if (norm.includes("application response") || norm.includes("applicationresponse") || norm.includes("respuesta de aplic")) return "applicationResponse";
+  return null;
+}
+
+export async function extractCufesFromExcel(buffer: Buffer): Promise<{
   cufes: string[];          // only processable (downloadable) CUFEs
   allCufes: string[];       // all CUFEs in original order
   dates: string[];
@@ -906,12 +928,19 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{
     rows.get(rowNum)!.set(col, value);
   }
 
-  // Detect "Grupo" column from header row 1
+  // Detect "Grupo" y "Tipo de documento" desde la fila de encabezado.
+  // El "Grupo" (Recibido/Emitido) da la DIRECCIÓN; el "Tipo de documento" da el
+  // TIPO real (Factura, Application response, Nómina…). Nómina y Application
+  // response NO son descargables y a veces el "Grupo" igual dice "Recibido", así
+  // que el filtro real debe mirar "Tipo de documento".
   let grupoCol = "";
+  let tipoCol = "";
   const headerRow = rows.get(1);
   if (headerRow) {
     for (const [col, val] of headerRow) {
-      if (/^grupo$/i.test(val)) { grupoCol = col; break; }
+      const h = val.trim().toLowerCase();
+      if (!grupoCol && /^grupo$/i.test(val)) grupoCol = col;
+      if (!tipoCol && /tipo de documento/.test(h)) tipoCol = col;
     }
   }
 
@@ -924,7 +953,12 @@ async function extractCufesFromExcel(buffer: Buffer): Promise<{
   const rowClassMap = new Map<number, ReturnType<typeof classifyGrupo>>();
   for (const rowNum of sortedRows) {
     const grupoVal = grupoCol ? (rows.get(rowNum)?.get(grupoCol) || "") : "";
-    const cls = grupoVal ? classifyGrupo(grupoVal) : "unknown";
+    const grupoCls = grupoVal ? classifyGrupo(grupoVal) : "unknown";
+    // El tipo de documento puede marcar Nómina/Application response aunque el
+    // "Grupo" diga Recibido/Emitido: en ese caso, el tipo manda (no descargable).
+    const tipoVal = tipoCol ? (rows.get(rowNum)?.get(tipoCol) || "") : "";
+    const tipoCls = classifyTipoDocumento(tipoVal);
+    const cls = tipoCls ?? grupoCls;
     rowClassMap.set(rowNum, cls);
     if (cls === "sent") dirSet.add("sent");
     else if (cls === "received") dirSet.add("received");

@@ -176,6 +176,57 @@ export async function throttledDianDownload(
   throw lastError || new Error("Descarga fallida");
 }
 
+// ── Cola global de jobs DIAN ──────────────────────────────────────────────────
+// DIAN limita por IP: varios jobs simultáneos disparan el bloqueo anti-bot y
+// degradan a TODOS (verificado: 2 jobs → 5-10% de fallos por 403 sostenido).
+// Serializar los jobs (default 1 a la vez) mantiene la precisión de proceso
+// único; los demás esperan en cola con posición visible para el usuario.
+const MAX_DIAN_JOBS = Math.max(1, Number(process.env.DIAN_MAX_CONCURRENT_JOBS || 1));
+let activeDianJobs = 0;
+interface DianJobWaiter {
+  grant: () => void;
+  onPosition?: (position: number) => void;
+}
+const dianJobQueue: DianJobWaiter[] = [];
+
+function notifyQueuePositions(): void {
+  dianJobQueue.forEach((w, idx) => {
+    try { w.onPosition?.(idx + 1); } catch { /* progreso es best-effort */ }
+  });
+}
+
+/**
+ * Reserva un cupo de job DIAN. Si no hay cupo, espera en cola; `onPosition`
+ * recibe la posición (1 = siguiente) cada vez que la fila avanza.
+ * Devuelve la función que libera el cupo (idempotente; llamarla en finally).
+ */
+export function acquireDianJobSlot(onPosition?: (position: number) => void): Promise<() => void> {
+  return new Promise((resolve) => {
+    const grant = () => {
+      activeDianJobs++;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        activeDianJobs--;
+        const next = dianJobQueue.shift();
+        if (next) next.grant();
+        notifyQueuePositions();
+      });
+    };
+    if (activeDianJobs < MAX_DIAN_JOBS) {
+      grant();
+    } else {
+      dianJobQueue.push({ grant, onPosition });
+      notifyQueuePositions();
+    }
+  });
+}
+
+export function getDianJobStats(): { active: number; queued: number; max: number } {
+  return { active: activeDianJobs, queued: dianJobQueue.length, max: MAX_DIAN_JOBS };
+}
+
 // Registro de navegadores abiertos para cerrarlos todos en un apagado ordenado
 // (SIGTERM en cada redeploy de Railway) y no dejar procesos huérfanos.
 const openBrowsers = new Set<Browser>();
@@ -387,6 +438,38 @@ export function startOrphanBrowserSweep(): void {
 }
 
 /**
+ * Abre un navegador efímero, entra al token (tolerante al bloqueo anti-bot) y
+ * devuelve las cookies de la sesión nueva. Lo usan los barridos de recuperación:
+ * una sesión fresca resetea el bloqueo transitorio y revive descargas 403.
+ */
+export async function getFreshDianSessionCookies(tokenUrl: string): Promise<Record<string, string>> {
+  let browser: Browser | null = null;
+  try {
+    browser = await launchBrowserWithRetry(resolveExecutablePath(), () => {});
+    const page = await browser.newPage();
+    await hardenPageRuntime(page);
+    page.setDefaultTimeout(120000);
+    page.setDefaultNavigationTimeout(120000);
+    const MAX_TOKEN_TRIES = 4;
+    for (let t = 1; t <= MAX_TOKEN_TRIES; t++) {
+      await navigateWithRetry(page, tokenUrl, 3);
+      await delay(1000);
+      const blocked = isBlockedPageContent(await page.content().catch(() => ""));
+      if (!blocked) break;
+      if (t >= MAX_TOKEN_TRIES) throw new Error("DIAN_BLOCKED: bloqueo persistente al reingresar al token.");
+      await delay(15000 * t);
+    }
+    if (isLoginPage(page.url())) {
+      throw new Error("TOKEN_EXPIRED: El token ha expirado.");
+    }
+    const cookieArr = await page.cookies();
+    return Object.fromEntries(cookieArr.map((c) => [c.name, c.value]));
+  } finally {
+    if (browser) await closeBrowserSafely(browser);
+  }
+}
+
+/**
  * Extrae ids de documentos DIAN y cookies de sesion para descargas posteriores.
  */
 export async function extractDocumentIds(
@@ -589,8 +672,15 @@ export async function extractDocumentIds(
       await waitForFullTableLoad(page, 100);
     }
 
-    // 7) Reconciliar con listado maestro por CUFE/numero de documento.
-    const listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
+    // 7) Reconciliar con listado maestro por CUFE/numero de documento. La
+    // reconciliación es un refuerzo: si el listado no se puede obtener (p. ej.
+    // bloqueo anti-bot persistente), seguimos con lo scrapeado en vez de fallar.
+    let listedRecords: ListingRecord[] = [];
+    try {
+      listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
+    } catch (recErr) {
+      console.warn("[Scraper] Reconciliación con listado omitida:", recErr instanceof Error ? recErr.message : recErr);
+    }
     if (listedRecords.length > 0) {
       const byId = new Map(allDocuments.map((d) => [d.id, d]));
       const byDocNum = new Map<string, DocumentInfo>();
@@ -1727,70 +1817,115 @@ async function extractListingRecordsFromDownloadTab(
   endDate?: string,
   receiverNit: string = ""
 ): Promise<ListingRecord[]> {
-  try {
-    const baseUrl = "https://catalogo-vpfe.dian.gov.co";
-    await navigateWithRetry(page, `${baseUrl}/Document/Export`, 2);
-    await delay(800);
+  const baseUrl = "https://catalogo-vpfe.dian.gov.co";
+  // El anti-bot de DIAN puede responder "Solicitud bloqueada" en /Document/Export
+  // (página sin formulario ni __RequestVerificationToken). Es TRANSITORIO: antes se
+  // devolvía [] en silencio y la herramienta reportaba "0 facturas"; ahora se espera
+  // y se reintenta todo el flujo, y solo se lanza error si el bloqueo persiste.
+  const MAX_BLOCK_RETRIES = Math.max(1, Number(process.env.DIAN_EXPORT_BLOCK_RETRIES ?? 4));
 
-    const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
-
-    const exportPageBefore = await fetch(`${baseUrl}/Document/Export`, {
-      method: "GET",
-      headers: {
-        "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader,
-        Referer: `${baseUrl}/Document/Export`,
-      },
-    }).then((r) => r.text());
-
-    // Si se filtra por NIT receptor, no reutilizamos listados previos (no podemos
-    // garantizar que correspondan al mismo filtro); forzamos regenerar.
-    const reusableLinks = receiverNit ? [] : findReusableExportLinks(exportPageBefore, direction, startDate, endDate);
-    if (reusableLinks.length > 0) {
-      console.log(`[DIAN Export] Se encontraron ${reusableLinks.length} listados reutilizables para el rango.`);
-      for (let i = 0; i < reusableLinks.length; i++) {
-        const reusableLink = reusableLinks[i];
-        try {
-          console.log(`[DIAN Export] Reutilizando listado #${i + 1}: ${reusableLink}`);
-          const downloaded = await fetch(`${baseUrl}${reusableLink}`, {
-            method: "GET",
-            headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
-          }).then((r) => r.arrayBuffer());
-
-          const zipBuffer = Buffer.from(new Uint8Array(downloaded));
-          const reusedRecords = await parseListingRecordsFromExportZip(zipBuffer, direction);
-          if (reusedRecords.length > 0) {
-            console.log(`[DIAN Export] Reutilizado OK #${i + 1}: ${reusedRecords.length} CUFEs (${direction}).`);
-            return reusedRecords;
-          }
-
-          console.warn(`[DIAN Export] Listado reutilizado #${i + 1} sin CUFEs válidos.`);
-        } catch (reuseErr) {
-          console.warn(`[DIAN Export] Falló descarga de listado reutilizado #${i + 1}:`, reuseErr);
-        }
+  for (let blockAttempt = 1; ; blockAttempt++) {
+    try {
+      return await generateAndDownloadExportListing(page, baseUrl, direction, startDate, endDate, receiverNit);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("TOKEN_EXPIRED")) throw err;
+      const isBlock = msg.includes("DIAN_BLOCKED");
+      if (isBlock && blockAttempt < MAX_BLOCK_RETRIES) {
+        const waitMs = 15000 * blockAttempt;
+        console.warn(`[DIAN Export] Bloqueo anti-bot en Export (intento ${blockAttempt}/${MAX_BLOCK_RETRIES}); esperando ${waitMs / 1000}s...`);
+        await delay(waitMs);
+        continue;
       }
+      // Errores definitivos PROPAGAN: un listado vacío por bloqueo/fallo no debe
+      // confundirse con "rango sin facturas" (eso causaba pérdidas silenciosas).
+      throw err;
+    }
+  }
+}
 
-      console.warn("[DIAN Export] Ningún listado reutilizable fue válido; se intentará regenerar.");
+async function generateAndDownloadExportListing(
+  page: Page,
+  baseUrl: string,
+  direction: DocumentDirection,
+  startDate?: string,
+  endDate?: string,
+  receiverNit: string = ""
+): Promise<ListingRecord[]> {
+  await navigateWithRetry(page, `${baseUrl}/Document/Export`, 2);
+  await delay(800);
+
+  const cookieHeader = (await page.cookies()).map((c) => `${c.name}=${c.value}`).join("; ");
+  const fetchExportHtml = async (): Promise<string> => fetch(`${baseUrl}/Document/Export`, {
+    method: "GET",
+    headers: {
+      "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader,
+      Referer: `${baseUrl}/Document/Export`,
+    },
+  }).then((r) => r.text());
+
+  const downloadExportZip = async (href: string): Promise<Buffer> => {
+    const downloaded = await fetch(`${baseUrl}${href}`, {
+      method: "GET",
+      headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
+    }).then((r) => r.arrayBuffer());
+    return Buffer.from(new Uint8Array(downloaded));
+  };
+
+  const exportPageBefore = await fetchExportHtml();
+  if (isBlockedPageContent(exportPageBefore)) {
+    throw new Error("DIAN_BLOCKED: 'Solicitud bloqueada' en la pestaña Export.");
+  }
+
+  // Si se filtra por NIT receptor, no reutilizamos listados previos (no podemos
+  // garantizar que correspondan al mismo filtro); forzamos regenerar.
+  const reusableLinks = receiverNit ? [] : findReusableExportLinks(exportPageBefore, direction, startDate, endDate);
+  if (reusableLinks.length > 0) {
+    console.log(`[DIAN Export] Se encontraron ${reusableLinks.length} listados reutilizables para el rango.`);
+    for (let i = 0; i < reusableLinks.length; i++) {
+      const reusableLink = reusableLinks[i];
+      try {
+        console.log(`[DIAN Export] Reutilizando listado #${i + 1}: ${reusableLink}`);
+        const zipBuffer = await downloadExportZip(reusableLink);
+        const reusedRecords = await parseListingRecordsFromExportZip(zipBuffer, direction);
+        if (reusedRecords.length > 0) {
+          console.log(`[DIAN Export] Reutilizado OK #${i + 1}: ${reusedRecords.length} CUFEs (${direction}).`);
+          return reusedRecords;
+        }
+
+        console.warn(`[DIAN Export] Listado reutilizado #${i + 1} sin CUFEs válidos.`);
+      } catch (reuseErr) {
+        console.warn(`[DIAN Export] Falló descarga de listado reutilizado #${i + 1}:`, reuseErr);
+      }
     }
 
-    const existingRks = new Set(parseDownloadLinksFromExportHtml(exportPageBefore).map((l) => l.rk));
-    const formData = await page.evaluate(() => {
-      const token = (document.querySelector("input[name='__RequestVerificationToken']") as HTMLInputElement | null)?.value || "";
-      const type = (document.querySelector("input[name='Type']") as HTMLInputElement | null)?.value || "0";
-      const amountAdmin = (document.querySelector("input[name='AmountAdmin']") as HTMLInputElement | null)?.value || "100000";
-      return { token, type, amountAdmin };
-    });
+    console.warn("[DIAN Export] Ningún listado reutilizable fue válido; se intentará regenerar.");
+  }
 
-    if (!formData.token) return [];
+  const existingRks = new Set(parseDownloadLinksFromExportHtml(exportPageBefore).map((l) => l.rk));
+  const formData = await page.evaluate(() => {
+    const token = (document.querySelector("input[name='__RequestVerificationToken']") as HTMLInputElement | null)?.value || "";
+    const type = (document.querySelector("input[name='Type']") as HTMLInputElement | null)?.value || "0";
+    const amountAdmin = (document.querySelector("input[name='AmountAdmin']") as HTMLInputElement | null)?.value || "100000";
+    return { token, type, amountAdmin };
+  });
 
-    const body = new URLSearchParams();
-    body.set("__RequestVerificationToken", formData.token);
-    body.set("Type", formData.type || "0");
-    body.set("AmountAdmin", formData.amountAdmin || "100000");
-    body.set("ReceiverCode", receiverNit || "");
-    body.set("GroupCode", direction === "sent" ? "1" : "2");
-    if (startDate) body.set("StartDate", toDianExportDate(startDate));
-    if (endDate) body.set("EndDate", toDianExportDate(endDate, true));
+  if (!formData.token) {
+    // Página sin formulario = casi siempre el bloqueo anti-bot (o sesión rota).
+    // Nunca devolver [] aquí: el llamador lo interpretaría como "rango sin facturas".
+    throw new Error("DIAN_BLOCKED: la pestaña Export no entregó el formulario (__RequestVerificationToken vacío).");
+  }
 
+  const body = new URLSearchParams();
+  body.set("__RequestVerificationToken", formData.token);
+  body.set("Type", formData.type || "0");
+  body.set("AmountAdmin", formData.amountAdmin || "100000");
+  body.set("ReceiverCode", receiverNit || "");
+  body.set("GroupCode", direction === "sent" ? "1" : "2");
+  if (startDate) body.set("StartDate", toDianExportDate(startDate));
+  if (endDate) body.set("EndDate", toDianExportDate(endDate, true));
+
+  const postGeneration = async (): Promise<void> => {
     await fetch(`${baseUrl}/Document/Export`, {
       method: "POST",
       headers: {
@@ -1800,50 +1935,78 @@ async function extractListingRecordsFromDownloadTab(
       },
       body: body.toString(),
     });
+  };
 
-    // DIAN genera el archivo en segundo plano. Polling hasta 5 minutos.
-    const pollTimeoutMs = 300_000;
-    const pollEveryMs = 4_000;
-    const startedAt = Date.now();
+  await postGeneration();
 
-    let selectedLink: string | null = null;
-    while (Date.now() - startedAt < pollTimeoutMs) {
-      const exportHtml = await fetch(`${baseUrl}/Document/Export`, {
-        method: "GET",
-        headers: {
-          "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader,
-          Referer: `${baseUrl}/Document/Export`,
-        },
-      }).then((r) => r.text());
+  // DIAN genera el archivo en segundo plano. Polling hasta 5 minutos.
+  const pollTimeoutMs = 300_000;
+  const pollEveryMs = 4_000;
+  // Si el POST cayó dentro de una ventana de bloqueo anti-bot, DIAN lo descarta sin
+  // error y el export nunca aparece. Re-POSTear periódicamente es inocuo (DIAN
+  // conserva todos los exports y el nuestro se identifica por rango + rk nuevo).
+  const rePostEveryMs = 60_000;
+  const startedAt = Date.now();
+  let lastPostAt = startedAt;
 
-      const links = parseDownloadLinksFromExportHtml(exportHtml);
-      const newlyGenerated = links.find((l) => !existingRks.has(l.rk));
-      if (newlyGenerated) {
-        selectedLink = newlyGenerated.href;
-        break;
-      }
+  let selectedLink: string | null = null;
+  while (Date.now() - startedAt < pollTimeoutMs) {
+    const exportHtml = await fetchExportHtml();
 
-      await delay(pollEveryMs);
+    if (isBlockedPageContent(exportHtml)) {
+      // Bloqueo transitorio en medio del polling: esperar un poco más y seguir.
+      await delay(10_000);
+      continue;
     }
 
-    if (!selectedLink) {
-      throw new Error("No se detectó un listado nuevo para el rango solicitado dentro de 5 minutos.");
+    // Solo aceptar exports NUEVOS cuya fila coincida con el rango/tipo solicitado.
+    // Antes se tomaba CUALQUIER rk nuevo: si otro job del mismo contribuyente generaba
+    // un export a la vez (otro rango u otra dirección), este job se llevaba el listado
+    // equivocado y "perdía" facturas sin error alguno.
+    const candidateLinks = startDate && endDate
+      ? findReusableExportLinks(exportHtml, direction, startDate, endDate)
+      : parseDownloadLinksFromExportHtml(exportHtml).map((l) => l.href);
+    const newlyGenerated = candidateLinks.find((href) => {
+      const rk = href.match(/[?&]rk=([^&]+)/i)?.[1] || "";
+      return rk && !existingRks.has(rk);
+    });
+    if (newlyGenerated) {
+      selectedLink = newlyGenerated;
+      break;
     }
 
-    const downloaded = await fetch(`${baseUrl}${selectedLink}`, {
-      method: "GET",
-      headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader, Referer: `${baseUrl}/Document/Export` },
-    }).then((r) => r.arrayBuffer());
-    const zipBuffer = Buffer.from(new Uint8Array(downloaded));
-
-    return await parseListingRecordsFromExportZip(zipBuffer, direction);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("TOKEN_EXPIRED")) {
-      throw err;
+    if (Date.now() - lastPostAt >= rePostEveryMs) {
+      console.log("[DIAN Export] Export aún no aparece; re-enviando solicitud de generación...");
+      lastPostAt = Date.now();
+      await postGeneration().catch(() => {});
     }
-    return [];
+
+    await delay(pollEveryMs);
   }
+
+  if (!selectedLink) {
+    throw new Error("No se detectó un listado nuevo para el rango solicitado dentro de 5 minutos.");
+  }
+
+  // El endpoint DownloadExportedZipFile es flaky: a veces entrega un xlsx vacío o
+  // HTML aunque el export esté listo. Reintentar la descarga+parseo unas veces antes
+  // de aceptar un listado vacío como "rango sin facturas".
+  let records: ListingRecord[] = [];
+  const MAX_ZIP_TRIES = 5;
+  for (let zipTry = 1; zipTry <= MAX_ZIP_TRIES; zipTry++) {
+    try {
+      const zipBuffer = await downloadExportZip(selectedLink);
+      records = await parseListingRecordsFromExportZip(zipBuffer, direction);
+      if (records.length > 0) return records;
+      console.warn(`[DIAN Export] Listado descargado sin CUFEs (intento ${zipTry}/${MAX_ZIP_TRIES}).`);
+    } catch (zipErr) {
+      console.warn(`[DIAN Export] Falló descarga/parseo del listado (intento ${zipTry}/${MAX_ZIP_TRIES}):`, zipErr);
+    }
+    if (zipTry < MAX_ZIP_TRIES) await delay(3000 * zipTry);
+  }
+
+  // Vacío estable tras reintentos = rango genuinamente sin documentos.
+  return records;
 }
 
 function toDianExportDate(dateISO: string, endOfDay: boolean = false): string {
@@ -2767,6 +2930,78 @@ export async function downloadDocumentsByCufe(
         results.push({ cufe, trackId: null, destPath: null, docnum: "", nit: "", success: false, error: msg });
         failed++;
       }
+    }
+
+    // ── Barrido de compleción ──────────────────────────────────────────────
+    // Los fallos aquí son casi siempre 403/bloqueo transitorio de DIAN bajo carga
+    // (verificado: con 2 jobs simultáneos se pierden 5-10% de descargas aunque haya
+    // reintentos en línea). Antes los fallidos simplemente se EXCLUÍAN del ZIP/Excel.
+    // Ahora: cooldown escalado (deja expirar el bloqueo) + reingreso al token (resetea
+    // la sesión) + reintento EN SERIE. No se rinde al primer barrido sin avance.
+    const MAX_SWEEPS = Math.max(0, Number(process.env.DIAN_DOWNLOAD_COMPLETION_SWEEPS ?? 4));
+    let zeroSweeps = 0;
+    for (let sweep = 1; sweep <= MAX_SWEEPS; sweep++) {
+      if (cancelled()) break;
+      const pendingIdx = results
+        .map((r, idx) => ({ r, idx }))
+        .filter(({ r }) => !r.success)
+        .map(({ idx }) => idx);
+      if (pendingIdx.length === 0) break;
+
+      const cooldownMs = Math.min(8000 * sweep, 90000);
+      update({ step: `Recuperando ${pendingIdx.length} documentos pendientes (barrido ${sweep}/${MAX_SWEEPS})...`, current: downloaded, total: cufes.length });
+      console.log(`[CUFE DL] Barrido ${sweep}/${MAX_SWEEPS}: ${pendingIdx.length} pendientes; cooldown ${cooldownMs / 1000}s`);
+      await delay(cooldownMs);
+
+      try {
+        await navigateWithRetry(page, tokenUrl, 3);
+        await delay(1000);
+        await navigateWithRetry(page, documentUrl, 3);
+        await delay(600);
+        if (startDate && endDate) await applyDateFilter(page, startDate, endDate, false);
+        await waitForTableLoad(page);
+      } catch (navErr) {
+        console.warn(`[CUFE DL] Barrido ${sweep}: no se pudo restablecer la sesión:`, navErr instanceof Error ? navErr.message : navErr);
+        continue;
+      }
+
+      let recovered = 0;
+      const sweepSeen = new Set<string>();
+      for (const idx of pendingIdx) {
+        if (cancelled()) break;
+        const item = results[idx];
+        try {
+          const doc = await findDocumentByUniqueCodeOrDocnum(page, item.cufe, "", sweepSeen, isSent);
+          if (!doc) continue;
+          const isEquivalente = !!(doc.documentTypeId) || (doc.docType?.toLowerCase().includes("equivalente") ?? false);
+          const baseUrl = isEquivalente
+            ? "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId="
+            : "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
+          const safeNit = (doc.nit || "SinNIT").replace(/[^a-zA-Z0-9_\-]/g, "_");
+          const safeDoc = (doc.docnum || doc.id.slice(0, 12)).replace(/[^a-zA-Z0-9_\-]/g, "_");
+          const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
+          const cookieArr = await page.cookies();
+          const cookieHeader = cookieArr.map((c) => `${c.name}=${c.value}`).join("; ");
+          await fetchZipToFile(`${baseUrl}${doc.id}`, destPath, cookieHeader);
+          results[idx] = { cufe: item.cufe, trackId: doc.id, destPath, docnum: doc.docnum, nit: doc.nit, success: true };
+          downloaded++;
+          failed--;
+          recovered++;
+          update({ step: `Recuperando documentos: ${recovered}/${pendingIdx.length} (barrido ${sweep})...`, current: downloaded, total: cufes.length });
+        } catch (swErr) {
+          const msg = swErr instanceof Error ? swErr.message : String(swErr);
+          results[idx] = { ...item, error: msg };
+        }
+      }
+      console.log(`[CUFE DL] Barrido ${sweep}: recuperados ${recovered}/${pendingIdx.length}`);
+      zeroSweeps = recovered === 0 ? zeroSweeps + 1 : 0;
+      // Dos barridos seguidos sin ningún avance = el resto no es transitorio.
+      if (zeroSweeps >= 2) break;
+    }
+
+    const stillFailed = results.filter((r) => !r.success);
+    if (stillFailed.length > 0) {
+      console.warn(`[CUFE DL] ADVERTENCIA: ${stillFailed.length} documentos NO se pudieron descargar tras los barridos: ${stillFailed.map((r) => r.cufe.slice(0, 16)).join(", ")}`);
     }
 
     return { results, downloaded, failed };

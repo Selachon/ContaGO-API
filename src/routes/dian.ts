@@ -6,7 +6,7 @@ import archiver from "archiver";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import { extractDocumentIdsByCufe, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
+import { acquireDianJobSlot, extractDocumentIdsByCufe, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
 import { buildDemoLimitInfo, getDemoLimit, type DemoLimitInfo } from "../utils/demoLimit.js";
@@ -426,6 +426,16 @@ async function processDownloadJob(
   if (!job) return;
 
   job.status = "processing";
+
+  // Cola global DIAN: por defecto 1 job a la vez (env DIAN_MAX_CONCURRENT_JOBS).
+  // Varios jobs simultaneos disparan el bloqueo anti-bot por IP y degradan a todos;
+  // serializar mantiene la precision de proceso unico. El usuario ve su turno.
+  const releaseDianJobSlot = await acquireDianJobSlot((pos) => setProgress(jobId, {
+    step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`,
+    current: 0,
+    total: 0,
+  }));
+  if (isJobCancelled(jobId)) { releaseDianJobSlot(); return; }
   const isSentDocs = documentDirection === "sent";
   const directionLabel = isSentDocs ? "emitidos" : "recibidos";
   
@@ -822,6 +832,8 @@ async function processDownloadJob(
     // Mejor esfuerzo de limpieza ante error fatal.
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
     try { fs.unlinkSync(zipPath); } catch {}
+  } finally {
+    releaseDianJobSlot();
   }
 }
 

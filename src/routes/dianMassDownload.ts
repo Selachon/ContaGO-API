@@ -6,7 +6,7 @@ import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import { downloadDocumentsByCufe } from "../services/dianScraper.js";
+import { acquireDianJobSlot, downloadDocumentsByCufe } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
@@ -298,6 +298,16 @@ async function processMassDownloadJob(
   const job = jobTracker.get(jobId);
   if (!job) return;
 
+  // Cola global DIAN: por defecto 1 job a la vez (env DIAN_MAX_CONCURRENT_JOBS).
+  // Varios jobs simultaneos disparan el bloqueo anti-bot por IP y degradan a todos;
+  // serializar mantiene la precision de proceso unico. El usuario ve su turno.
+  const releaseDianJobSlot = await acquireDianJobSlot((pos) => setProgress(jobId, {
+    step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`,
+    current: 0,
+    total: 0,
+  }));
+  if (isJobCancelled(jobId)) { releaseDianJobSlot(); return; }
+
   job.status = "processing";
 
   const sessionId = uuidv4();
@@ -420,6 +430,7 @@ async function processMassDownloadJob(
       setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: msg });
     }
   } finally {
+    releaseDianJobSlot();
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
 }
