@@ -181,7 +181,16 @@ export async function throttledDianDownload(
 // degradan a TODOS (verificado: 2 jobs → 5-10% de fallos por 403 sostenido).
 // Serializar los jobs (default 1 a la vez) mantiene la precisión de proceso
 // único; los demás esperan en cola con posición visible para el usuario.
-const MAX_DIAN_JOBS = Math.max(1, Number(process.env.DIAN_MAX_CONCURRENT_JOBS || 1));
+// DIAN_MAX_CONCURRENT_JOBS: cuántos jobs DIAN corren a la vez.
+//   1 (default) = serializado: un job a la vez, el resto en cola con turno visible.
+//   N > 1       = hasta N jobs simultáneos.
+//   0 u "off"   = SIN límite (comportamiento previo a la cola) — para poder probar
+//                 A/B si la concurrencia de jobs es la causa de las pérdidas.
+const rawMaxDianJobs = String(process.env.DIAN_MAX_CONCURRENT_JOBS ?? "1").trim().toLowerCase();
+const MAX_DIAN_JOBS = rawMaxDianJobs === "0" || rawMaxDianJobs === "off"
+  ? Number.MAX_SAFE_INTEGER
+  : Math.max(1, Number(rawMaxDianJobs) || 1);
+console.log(`[DIAN] Límite de jobs simultáneos: ${MAX_DIAN_JOBS === Number.MAX_SAFE_INTEGER ? "SIN LÍMITE (cola desactivada)" : MAX_DIAN_JOBS}`);
 let activeDianJobs = 0;
 interface DianJobWaiter {
   grant: () => void;
