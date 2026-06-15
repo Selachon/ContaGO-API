@@ -128,6 +128,18 @@ const EPS = 0.01;
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
+const BANK_STATEMENT_GROUP_RX =
+  /impto gobierno 4x1000|4\s*x\s*1000|gmf|cuota manejo suc virt empresa|servicio pago a otros bancos|iva cuota manejo suc virt emp|cobro iva pagos automaticos|iva boton|abono intereses ahorros|comision boton|servicio por pagos a nequi|servicio pago a proveedores|servicio pago de nomina/i;
+
+const BANK_LEDGER_GROUP_RX =
+  /gastos bancarios|intereses y gastos bancarios|comisiones bancarias|cuota manejo|4\s*x\s*1000|gmf|gravamen|servicios bancarios/i;
+
+const isStatementBankGroupItem = (item: RecItem): boolean =>
+  item.kind === "bank_fee" || BANK_STATEMENT_GROUP_RX.test(item.description);
+
+const isLedgerBankGroupItem = (item: RecItem): boolean =>
+  BANK_LEDGER_GROUP_RX.test([item.description, item.thirdParty || "", item.voucher || ""].join(" "));
+
 // ─── Normalización a items con id estable ────────────────────────────────
 function toItems(statement: RecStatementInput, ledger: RecLedgerInput): {
   stmt: RecItem[];
@@ -271,8 +283,30 @@ function matchGroups(
     // 2a) Un renglón de contabilidad ↔ varios del extracto (lo más común).
     let ledTargets = lPool.filter((l) => l.direction === dir).sort((a, b) => b.value - a.value);
     for (const target of ledTargets) {
-      if (!lPool.includes(target)) continue;
-      const candidates = sPool.filter((s) => s.direction === dir);
+      if (!lPool.includes(target) || !isLedgerBankGroupItem(target)) continue;
+
+      const bankCandidates = sPool.filter(isStatementBankGroupItem);
+      const bankIn = round2(bankCandidates.filter((s) => s.direction === "in").reduce((a, s) => a + s.value, 0));
+      const bankOut = round2(bankCandidates.filter((s) => s.direction === "out").reduce((a, s) => a + s.value, 0));
+      const bankNet = target.direction === "in" ? round2(bankIn - bankOut) : round2(bankOut - bankIn);
+      if (bankCandidates.length >= 2 && Math.abs(bankNet - target.value) <= tol) {
+        matches.push({
+          type: "group",
+          direction: dir,
+          statement: bankCandidates,
+          ledger: [target],
+          valueStatement: bankNet,
+          valueLedger: target.value,
+          residual: round2(bankNet - target.value),
+          ambiguous: false,
+        });
+        const bankIds = new Set(bankCandidates.map((s) => s.id));
+        sPool = sPool.filter((s) => !bankIds.has(s.id));
+        lPool = lPool.filter((l) => l.id !== target.id);
+        continue;
+      }
+
+      const candidates = sPool.filter((s) => s.direction === dir && isStatementBankGroupItem(s));
       const subset = findSubset(candidates, target.value, tol, maxSize);
       if (!subset) continue;
       const sum = round2(subset.reduce((a, s) => a + s.value, 0));
@@ -294,8 +328,8 @@ function matchGroups(
     // 2b) Un renglón del extracto ↔ varios de contabilidad.
     let stmtTargets = sPool.filter((s) => s.direction === dir).sort((a, b) => b.value - a.value);
     for (const target of stmtTargets) {
-      if (!sPool.includes(target)) continue;
-      const candidates = lPool.filter((l) => l.direction === dir);
+      if (!sPool.includes(target) || !isStatementBankGroupItem(target)) continue;
+      const candidates = lPool.filter((l) => l.direction === dir && isLedgerBankGroupItem(l));
       const subset = findSubset(candidates, target.value, tol, maxSize);
       if (!subset) continue;
       const sum = round2(subset.reduce((a, l) => a + l.value, 0));
