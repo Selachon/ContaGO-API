@@ -109,6 +109,9 @@ function detectBank(pages: string[][]): string {
   const head = pages.flat().slice(0, 40).join(" ").toLowerCase();
   if (head.includes("bancolombia")) return "bancolombia";
   if (head.includes("itaú") || head.includes("itau")) return "itau";
+  // Occidente se detecta en el encabezado (no en el cuerpo) para no confundir con
+  // statements de otro banco que solo mencionen "Banco de Occidente" en un movimiento.
+  if (head.includes("banco de occidente")) return "occidente";
   return "desconocido";
 }
 
@@ -196,6 +199,59 @@ function parseItau(pages: string[][]): { raws: RawMov[]; opening: number | null;
   return { raws, opening, declared: { credits, debits }, closing };
 }
 
+// ─── Banco de Occidente: extracto CONSOLIDADO; solo la CUENTA CORRIENTE ────
+// Tabla "DIA TRANSACCIÓN IDENT DEBITOS CREDITOS SALDO". Hay que acotar a la
+// sección "Extracto - CUENTA CORRIENTE" (el PDF trae también tarjetas de crédito).
+function parseOccidente(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
+  const all = pages.flat();
+  // Acotar a la sección de cuenta corriente (desde su título hasta la de tarjetas).
+  const startIdx = all.findIndex((l) => /Extracto\s*-\s*CUENTA CORRIENTE/i.test(l));
+  let endIdx = all.length;
+  if (startIdx >= 0) {
+    const rel = all.slice(startIdx + 1).findIndex((l) => /MASTERCARD|TARJETA No\.|CREDENCIAL/i.test(l));
+    if (rel >= 0) endIdx = startIdx + 1 + rel;
+  }
+  const sec = startIdx >= 0 ? all.slice(startIdx, endIdx) : all;
+
+  let year = "", month = "";
+  const corte = sec.find((l) => /FECHA DE CORTE:\s*\d{2}\/\d{2}\/\d{4}/i.test(l));
+  if (corte) { const m = corte.match(/FECHA DE CORTE:\s*\d{2}\/(\d{2})\/(\d{4})/i); if (m) { month = m[1]; year = m[2]; } }
+
+  const findMoney = (rx: RegExp): number | null => {
+    const line = sec.find((l) => rx.test(l));
+    const m = line?.match(rx);
+    return m && m[1] ? num(m[1]) : null;
+  };
+  const opening = findMoney(/SALDO ANTERIOR\s+([\d,]+\.\d{2})/i);
+  const closing = findMoney(/SALDO ACTUAL\s+([\d,]+\.\d{2})/i);
+  const credits = findMoney(/\bCREDITOS\s+([\d,]+\.\d{2})/i);
+  const debits = findMoney(/\bDEBITOS\s+([\d,]+\.\d{2})/i);
+
+  // Tabla: desde el encabezado "DIA TRANSACCI" hasta el texto legal/fin.
+  const hdr = sec.findIndex((l) => /DIA\s+TRANSACCI/i.test(l));
+  const tailRel = hdr >= 0 ? sec.slice(hdr + 1).findIndex((l) => /En caso de mora|Hoja \d+ de/i.test(l)) : -1;
+  const tableLines = hdr >= 0 ? sec.slice(hdr + 1, tailRel >= 0 ? hdr + 1 + tailRel : undefined) : sec;
+
+  const raws: RawMov[] = [];
+  const rowRx = /^(\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$/;
+  for (const line of tableLines) {
+    const m = line.match(rowRx);
+    if (!m) continue;
+    const [, dd, descIdent, debStr, credStr, balStr] = m;
+    const deb = num(debStr), cred = num(credStr);
+    const value = cred > 0 ? cred : deb;
+    // Quitar el identificador final (A700827 / 0000000) de la descripción.
+    const description = descIdent.replace(/\s+(?:[A-Z]\d{4,}|0{4,})$/i, "").replace(/\s+/g, " ").trim();
+    raws.push({
+      date: `${year || new Date().getFullYear()}-${(month || "01").padStart(2, "0")}-${dd.padStart(2, "0")}`,
+      description,
+      value: Math.abs(value),
+      balance: num(balStr),
+    });
+  }
+  return { raws, opening, declared: { credits, debits }, closing };
+}
+
 // ─── Clasificación + motor de cuadre ─────────────────────────────────────
 function classifyAndReconcile(
   raws: RawMov[],
@@ -263,12 +319,15 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
   const bank = detectBank(pages);
   if (bank === "desconocido") {
     throw new StatementError(
-      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú). Sube el Excel de movimientos.",
+      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente). Sube el Excel de movimientos.",
       422,
       "bank_unsupported"
     );
   }
-  const parsed = bank === "bancolombia" ? parseBancolombia(pages) : parseItau(pages);
+  const parsed =
+    bank === "bancolombia" ? parseBancolombia(pages)
+    : bank === "occidente" ? parseOccidente(pages)
+    : parseItau(pages);
   const { movements, reconciliation } = classifyAndReconcile(parsed.raws, parsed.opening, parsed.declared, parsed.closing);
   return { bank, movements, reconciliation };
 }
