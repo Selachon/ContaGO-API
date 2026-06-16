@@ -59,7 +59,7 @@ const TOL = 1; // tolerancia en pesos para el cuadre
 const num = (s: unknown): number => Number(String(s ?? "").replace(/[^\d.-]/g, ""));
 
 const FEE_RX =
-  /4x1000|4 x 1000|gmf|impto gobierno|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (plan|manejo)|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
+  /4x1000|4 x 1000|gmf|impto gobierno|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
 
 // ─── Extracción de texto del PDF (líneas reconstruidas por coordenada Y) ──
 async function extractLines(buffer: Buffer, password?: string): Promise<string[][]> {
@@ -112,6 +112,9 @@ function detectBank(pages: string[][]): string {
   // Occidente se detecta en el encabezado (no en el cuerpo) para no confundir con
   // statements de otro banco que solo mencionen "Banco de Occidente" en un movimiento.
   if (head.includes("banco de occidente")) return "occidente";
+  // Banco de Bogotá: el nombre va en el pie (URL bancodebogota.com), no en el
+  // encabezado. Es marcador específico y los demás bancos ya se descartaron arriba.
+  if (pages.flat().join(" ").toLowerCase().includes("bancodebogota.com")) return "bancobogota";
   return "desconocido";
 }
 
@@ -252,6 +255,54 @@ function parseOccidente(pages: string[][]): { raws: RawMov[]; opening: number | 
   return { raws, opening, declared: { credits, debits }, closing };
 }
 
+// ─── Banco de Bogotá: "DD/MM CODTRANS DESC ... VALOR(±) SALDO" ─────────────
+// Resumen separa Cargos/IVA/GMF/Retención/Intereses; los débitos reales son su suma.
+function parseBancoBogota(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
+  const all = pages.flat();
+  // Año: del rango del periodo (o primer 20xx del encabezado).
+  let year = "";
+  const yhead = all.slice(0, 25).join(" ").match(/\b(20\d{2})\b/);
+  if (yhead) year = yhead[1];
+
+  const findMoney = (rx: RegExp): number | null => {
+    const line = all.find((l) => rx.test(l));
+    const m = line?.match(rx);
+    return m && m[1] ? num(m[1]) : null;
+  };
+  const opening = findMoney(/Saldo Inicial:\s*(-?[\d,]+\.\d{2})/i);
+  const closing = findMoney(/Saldo Final:\s*(-?[\d,]+\.\d{2})/i);
+  const credits = findMoney(/Abonos:\s*(-?[\d,]+\.\d{2})/i);
+  // Débitos declarados = Cargos + IVA + GMF + Retención + Intereses (vienen separados).
+  const sumAbs = (rx: RegExp): number => {
+    const line = all.find((l) => rx.test(l));
+    const m = line?.match(rx);
+    return m && m[1] ? Math.abs(num(m[1])) : 0;
+  };
+  const debits =
+    sumAbs(/Cargos:\s*(-?[\d,]+\.\d{2})/i) +
+    sumAbs(/Total IVA:\s*(-?[\d,]+\.\d{2})/i) +
+    sumAbs(/GMF:\s*(-?[\d,]+\.\d{2})/i) +
+    sumAbs(/Retencion:\s*(-?[\d,]+\.\d{2})/i) +
+    sumAbs(/Total Intereses:\s*(-?[\d,]+\.\d{2})/i);
+
+  // Filas de movimiento: DD/MM ... VALOR(±) SALDO. Las líneas de continuación
+  // (descripción partida, "efectuada el...", "DAVIVIENDA el...") no casan.
+  const raws: RawMov[] = [];
+  const rowRx = /^(\d{2})\/(\d{2})\s+(.+?)\s+(-?[\d,]+\.\d{2})\s+([\d,]+\.\d{2})$/;
+  for (const line of all) {
+    const m = line.match(rowRx);
+    if (!m) continue;
+    const [, dd, mm, desc, valueStr, balanceStr] = m;
+    raws.push({
+      date: `${year || new Date().getFullYear()}-${mm}-${dd}`,
+      description: desc.replace(/\s+(Bogota|Calle 104 Av 19|Gcia Oper Trans)\b/gi, " ").replace(/\s+\d{6,}\s*$/, "").replace(/\s+/g, " ").trim(),
+      value: Math.abs(num(valueStr)),
+      balance: num(balanceStr),
+    });
+  }
+  return { raws, opening, declared: { credits, debits: debits || null }, closing };
+}
+
 // ─── Clasificación + motor de cuadre ─────────────────────────────────────
 function classifyAndReconcile(
   raws: RawMov[],
@@ -319,7 +370,7 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
   const bank = detectBank(pages);
   if (bank === "desconocido") {
     throw new StatementError(
-      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente). Sube el Excel de movimientos.",
+      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente, Banco de Bogotá). Sube el Excel de movimientos.",
       422,
       "bank_unsupported"
     );
@@ -327,6 +378,7 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
   const parsed =
     bank === "bancolombia" ? parseBancolombia(pages)
     : bank === "occidente" ? parseOccidente(pages)
+    : bank === "bancobogota" ? parseBancoBogota(pages)
     : parseItau(pages);
   const { movements, reconciliation } = classifyAndReconcile(parsed.raws, parsed.opening, parsed.declared, parsed.closing);
   return { bank, movements, reconciliation };
