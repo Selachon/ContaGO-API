@@ -315,9 +315,12 @@ async function processMassDownloadJob(
   const outputPath = path.join(DOWNLOADS_DIR, `${sessionId}.zip`);
   job.tempDir = tempDir;
   job.outputPath = outputPath;
+
+  // try/finally desde AQUÍ: si fs.mkdirSync (u otra cosa) falla, el finally igual
+  // libera el cupo de la cola compartida y no la congela para los demás.
+  try {
   fs.mkdirSync(tempDir, { recursive: true });
 
-  try {
     if (isJobCancelled(jobId)) return;
 
     const { results, downloaded, failed } = await downloadDocumentsByCufe(

@@ -343,6 +343,11 @@ async function processCufeDownloadJob(
   const outputPath = path.join(DOWNLOADS_DIR, `${sessionId}.xlsx`);
   job.tempDir = tempDir;
   job.outputPath = outputPath;
+
+  // try/finally desde AQUÍ: si algo falla antes del procesamiento (p.ej.
+  // fs.mkdirSync), el finally igual libera el cupo de la cola compartida y no la
+  // congela para los demás usuarios.
+  try {
   fs.mkdirSync(tempDir, { recursive: true });
 
   const invoiceMap = new Map<string, Partial<InvoiceData>>();
@@ -413,7 +418,6 @@ async function processCufeDownloadJob(
     }
   }
 
-  try {
     if (isJobCancelled(jobId)) return;
     await downloadAndFill(downloadCufes, tempDir, "Descarga");
     if (isJobCancelled(jobId)) return;

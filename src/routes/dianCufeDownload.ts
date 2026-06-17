@@ -23,6 +23,18 @@ import type { InvoiceData } from "../types/dianExcel.js";
 
 const ES_MONTHS = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
 
+// Detecta el error de Google Drive "sin espacio" (cuota agotada). Cuando ocurre,
+// fallarán TODAS las subidas, así que conviene abortar la carga diferida de una
+// en vez de reintentar documento por documento (cada intento gasta ~3s creando
+// carpetas antes de fallar) y llenar los logs.
+function isDriveQuotaError(err: unknown): boolean {
+  const msg = ((err as Error)?.message || "").toLowerCase();
+  return msg.includes("storagequotaexceeded") ||
+    msg.includes("storage quota") ||
+    msg.includes("insufficient storage") ||
+    msg.includes("the user's drive storage quota");
+}
+
 function formatDateES(isoDate: string): string {
   const [y, m, d] = isoDate.split("-");
   const mon = ES_MONTHS[parseInt(m, 10) - 1] || m;
@@ -76,6 +88,7 @@ interface JobData {
   driveUploadStatus?: "uploading" | "done" | "error";
   driveUploadCurrent?: number;
   driveUploadTotal?: number;
+  driveUploadError?: string;
   demoLimit?: DemoLimitInfo;
 }
 
@@ -140,6 +153,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     driveUploadStatus: job.driveUploadStatus,
     driveUploadCurrent: job.driveUploadCurrent,
     driveUploadTotal: job.driveUploadTotal,
+    driveUploadError: job.driveUploadError,
     demoLimit: job.demoLimit,
   });
 });
@@ -356,6 +370,12 @@ async function processCufeDownloadJob(
   const outputPath = path.join(DOWNLOADS_DIR, `${sessionId}.xlsx`);
   job.tempDir = tempDir;
   job.outputPath = outputPath;
+
+  // El cuerpo va dentro de try/finally desde AQUÍ: si algo falla antes del
+  // procesamiento (fs.mkdirSync, o el await a Mongo en getUserGoogleDriveById),
+  // el finally igual libera el cupo de la cola. Si no, una sola excepción
+  // temprana congelaba la cola para todos los usuarios (cupo nunca liberado).
+  try {
   fs.mkdirSync(tempDir, { recursive: true });
 
   // Pre-populate map for all CUFEs — skipped ones get a note; downloadable ones get a placeholder
@@ -402,7 +422,6 @@ async function processCufeDownloadJob(
     return !!(inv?.issuerNit || inv?.docNumber);
   }
 
-  try {
     if (isJobCancelled(jobId)) return;
 
     // Semáforo de descargas por job. 5 equilibra velocidad (~18-22/min) y presión
@@ -764,6 +783,7 @@ async function processCufeDownloadJob(
       job.driveUploadTotal = deferredUploads.length;
       void (async () => {
         console.log(`[CUFE DL] Iniciando carga diferida a Drive: ${deferredUploads.length} documentos`);
+        let quotaHit = false;
         try {
           for (let idx = 0; idx < deferredUploads.length; idx++) {
             if (isJobCancelled(jobId)) break;
@@ -781,14 +801,27 @@ async function processCufeDownloadJob(
                 direction === "sent" ? "sent" : "received"
               );
             } catch (driveErr) {
+              // Cuota agotada = fallará para TODOS los documentos: abortar de
+              // inmediato (cada intento gasta ~3s creando carpetas antes de fallar).
+              if (isDriveQuotaError(driveErr)) {
+                quotaHit = true;
+                console.error(`[CUFE DL] Google Drive sin espacio (cuota) — se aborta la carga diferida tras ${idx} de ${deferredUploads.length}`);
+                break;
+              }
               console.warn(`[CUFE DL] Error carga diferida ${item.docnum}:`, driveErr);
             }
             job.driveUploadCurrent = idx + 1;
           }
-          job.driveUploadStatus = "done";
-          console.log(`[CUFE DL] Carga diferida a Drive completada`);
+          if (quotaHit) {
+            job.driveUploadStatus = "error";
+            job.driveUploadError = `Sin espacio en Google Drive: se subieron ${job.driveUploadCurrent ?? 0} de ${deferredUploads.length} documentos. Libera espacio o desactiva la subida a Drive.`;
+          } else {
+            job.driveUploadStatus = "done";
+            console.log(`[CUFE DL] Carga diferida a Drive completada`);
+          }
         } catch (err) {
           job.driveUploadStatus = "error";
+          job.driveUploadError = (err as Error)?.message || "Error en carga diferida a Drive";
           console.error(`[CUFE DL] Error en carga diferida:`, err);
         }
       })();
