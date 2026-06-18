@@ -72,6 +72,13 @@ export interface IngestOptions {
   retryRounds?: number;
   /** Si true, re-descarga también los CUFEs ya registrados (ignora el registro). */
   forceRedownload?: boolean;
+  /**
+   * CUFEs a OMITIR de la ingesta (ya causados en SIIGO / ya presentes en pantalla).
+   * Para "Causación + Caja": el dedup correcto es contra el buzón "Facturas"
+   * (causadas) + lo que ya está en la tabla de trabajo, NO contra el historial de
+   * descargas. Así las facturas no causadas se mantienen/recuperan al re-traer.
+   */
+  skipCufes?: string[];
   onProgress?: (p: ProgressData) => void;
   isCancelled?: () => boolean;
 }
@@ -209,6 +216,8 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
   // Registro persistente de CUFEs ya descargados por esta empresa (para omitir
   // re-descargas). Si forceRedownload, se ignora.
   const knownCufes = opts.forceRedownload ? new Set<string>() : await getIngestedCufes(opts.companyId);
+  // CUFEs a omitir por estar ya causados / en pantalla (dedup de "Causación + Caja").
+  const skipSet = new Set((opts.skipCufes || []).map((c) => normCufe(c).toLowerCase()).filter(Boolean));
 
   try {
     for (const direction of directions) {
@@ -242,8 +251,12 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
 
       listed += cufes.length;
 
-      // Omitir los ya registrados (descargados en consultas previas).
-      let work = cufes.filter((c) => !knownCufes.has(c));
+      // Omitir: (a) los ya registrados en el historial de descargas (salvo
+      // forceRedownload), y (b) los CUFEs en skipCufes (ya causados / ya en
+      // pantalla). El criterio (b) es el correcto para "Causación + Caja": solo se
+      // omiten los que están en "Facturas" (causados) o ya visibles; el resto se
+      // mantiene/recupera al re-traer hasta que se contabilicen.
+      let work = cufes.filter((c) => !knownCufes.has(c) && !skipSet.has(normCufe(c).toLowerCase()));
       alreadyRegistered += cufes.length - work.length;
 
       if (opts.maxDocuments && opts.maxDocuments > 0 && work.length > opts.maxDocuments) {

@@ -1581,6 +1581,17 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
     const tokenUrl = (req.body?.token_url || req.body?.tokenUrl) as string | undefined;
     const forceRedownload = req.body?.forceRedownload === true || req.body?.forceRedownload === "true";
+    // CUFEs a omitir (ya causados / ya en pantalla). "Causación + Caja" los envía
+    // para que el dedup sea contra el buzón "Facturas", no contra el historial de
+    // descargas (así las no causadas se mantienen al re-traer).
+    let skipCufes: string[] = [];
+    try {
+      const raw = req.body?.skipCufes;
+      if (typeof raw === "string" && raw.trim()) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) skipCufes = parsed.filter((x) => typeof x === "string");
+      }
+    } catch { /* ignora JSON inválido */ }
     const listadoFile = req.file;
 
     if (!tokenUrl || !/catalogo-vpfe\.dian\.gov\.co\/User\/AuthToken/i.test(tokenUrl)) {
@@ -1695,6 +1706,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         maxDocuments,
         retryRounds: 3,
         forceRedownload,
+        skipCufes,
         onProgress: (p) => {
           const job = dianIngestJobs.get(jobId);
           if (job && job.status === "processing") job.progress = p;
