@@ -5,10 +5,11 @@ import { v4 as uuidv4 } from "uuid";
 import {
   acquireDianJobSlot,
   getCufeListing,
-  downloadDocumentsByCufe,
   extractDocumentIds,
+  extractDocumentIdsByCufe,
   fetchZipToFile,
   type CufeDownloadItem,
+  type ListingRecord,
 } from "./dianScraper.js";
 import { processXmlBatch, type BatchItem } from "./siigoAccountingService.js";
 import { getIngestedCufes, getIngestedTrackIds, recordIngestedCufes } from "./siigoIngestedCufesService.js";
@@ -93,61 +94,88 @@ async function downloadDirectionWithRetries(
   cufes: string[],
   tempDir: string
 ): Promise<{ success: CufeDownloadItem[]; failures: IngestFailure[]; rounds: number }> {
+  // Mismo paso a paso que "Exportar Excel DIAN" (dianCufeDownload): entrar al token
+  // UNA vez por sesión, resolver los documentos por CUFE y descargar cada ZIP por
+  // HTTP con las cookies de esa sesión (sin reabrir el token). Reintenta los que
+  // fallen abriendo una sesión nueva. Esto evita el falso "TOKEN_EXPIRED" del
+  // flujo anterior (que reabría el token —de un solo uso— en cada ronda).
   const retryRounds = Math.max(0, opts.retryRounds ?? 3);
-  const successByCufe = new Map<string, CufeDownloadItem>();
-  let lastError = new Map<string, string>();
-  let pending = [...cufes];
-  let round = 0;
+  const dirLabel = direction === "sent" ? "emitidos" : "recibidos";
+  const total = cufes.length;
+  const dlResults = new Map<string, CufeDownloadItem>();
+  let dlOk = 0;
 
+  // Semáforo de descargas en paralelo con contrapresión (cookies frescas).
+  const MAX_DL = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 5), 12));
+  let dlSlots = MAX_DL;
+  const dlQueue: Array<() => void> = [];
+  const acquireDl = (): Promise<void> =>
+    dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((res) => dlQueue.push(res));
+  const releaseDl = () => { const n = dlQueue.shift(); if (n) n(); else dlSlots++; };
+
+  const downloadDoc = async (
+    doc: { id: string; docnum: string; nit?: string; cufe?: string; docType?: string },
+    cookies: Record<string, string>
+  ): Promise<void> => {
+    const key = normCufe(doc.cufe || "") || (doc.id || "").toLowerCase();
+    const isEquiv = doc.docType?.toLowerCase().includes("equivalente") ?? false;
+    const base = isEquiv
+      ? `${DIAN_BASE}/Document/DownloadZipFilesEquivalente?trackId=`
+      : `${DIAN_BASE}/Document/DownloadZipFiles?trackId=`;
+    const safeNit = (doc.nit || "SinNIT").replace(/[^a-zA-Z0-9_-]/g, "_");
+    const safeDoc = (doc.docnum || doc.id.slice(0, 12)).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
+    const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+    try {
+      await fetchZipToFile(`${base}${doc.id}`, destPath, cookieHeader);
+      dlResults.set(key, { cufe: doc.cufe || "", trackId: doc.id, destPath, docnum: doc.docnum, nit: doc.nit || "", success: true });
+      dlOk++;
+      opts.onProgress?.({ step: `Descargando documentos (${dirLabel}): ${dlOk}/${total}…`, current: dlOk, total });
+    } catch (err) {
+      dlResults.set(key, { cufe: doc.cufe || "", trackId: doc.id, destPath: null, docnum: doc.docnum, nit: doc.nit || "", success: false, error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+
+  let pending: ListingRecord[] = cufes.map((c) => ({ cufe: c, docnum: "" }));
+  let round = 0;
   while (pending.length > 0 && round <= retryRounds) {
     if (opts.isCancelled?.()) break;
-
     const label = round === 0 ? "Descargando documentos" : `Reintento ${round}/${retryRounds}`;
-    const batchTotal = pending.length;
-
-    const { results } = await downloadDocumentsByCufe(
-      opts.tokenUrl,
-      pending,
-      opts.fechaInicio,
-      opts.fechaFin,
-      direction,
-      tempDir,
-      (p) =>
-        opts.onProgress?.({
-          step: `${label} (${direction === "sent" ? "emitidos" : "recibidos"})...`,
-          current: p.current ?? 0,
-          total: p.total ?? batchTotal,
-        }),
-      opts.isCancelled
-    );
-
-    const stillPending: string[] = [];
-    lastError = new Map();
-    for (const r of results) {
-      if (r.success && r.destPath) {
-        successByCufe.set(r.cufe, r);
-      } else {
-        stillPending.push(r.cufe);
-        lastError.set(r.cufe, r.error || "No se pudo descargar el documento");
-      }
+    const promises: Promise<void>[] = [];
+    try {
+      await extractDocumentIdsByCufe(
+        opts.tokenUrl,
+        opts.fechaInicio,
+        opts.fechaFin,
+        undefined,
+        direction,
+        () => opts.onProgress?.({ step: `${label} (${dirLabel}): ${dlOk}/${total}…`, current: dlOk, total }),
+        async ({ doc, cookies }) => {
+          await acquireDl();
+          const dl = (async () => { try { await downloadDoc(doc, cookies); } finally { releaseDl(); } })();
+          promises.push(dl);
+        },
+        pending,
+      );
+    } catch (err) {
+      // Fallo de sesión (token bloqueado/expirado, navegación): se deja que el
+      // reintento abra una sesión nueva sobre los CUFEs aún pendientes.
+      console.warn(`[Siigo Ingest] Sesión de descarga falló (${dirLabel}, ronda ${round}): ${err instanceof Error ? err.message : err}`);
     }
+    await Promise.all(promises);
 
-    pending = stillPending;
+    pending = pending.filter((r) => !dlResults.get(normCufe(r.cufe || ""))?.destPath);
     if (pending.length === 0) break;
-
     round++;
-    if (round <= retryRounds && pending.length > 0) {
-      // Backoff incremental entre rondas para dar respiro al portal.
-      await delay(2000 * round);
-    }
+    if (round <= retryRounds) await delay(2000 * round);
   }
 
-  const failures: IngestFailure[] = pending.map((cufe) => ({
-    cufe,
-    error: lastError.get(cufe) || "No se pudo descargar tras agotar reintentos",
+  const success = [...dlResults.values()].filter((r) => r.destPath);
+  const failures: IngestFailure[] = pending.map((r) => ({
+    cufe: r.cufe,
+    error: dlResults.get(normCufe(r.cufe || ""))?.error || "No se pudo descargar tras agotar reintentos",
   }));
-
-  return { success: [...successByCufe.values()], failures, rounds: Math.min(round, retryRounds) };
+  return { success, failures, rounds: Math.min(round, retryRounds) };
 }
 
 /**
