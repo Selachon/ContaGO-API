@@ -14,7 +14,7 @@ import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
-import { userCanAccessCompany, setCompanyDrive, getCompanyDrive, getCompanyContext } from "../services/siigoCompaniesService.js";
+import { userCanAccessCompany, userOwnsCompany, setCompanyDrive, getCompanyDrive, getCompanyContext } from "../services/siigoCompaniesService.js";
 import { runWithSiigoCompany, getPurchaseSupportDocumentById } from "../services/siigoService.js";
 import { ingestNewByDateRange, type IngestResult } from "../services/siigoDianIngestService.js";
 import { latestDianTokenForNit, getDianMailboxStatus } from "../services/dianMailboxService.js";
@@ -37,6 +37,7 @@ import {
   deleteEntry,
   listInvoices,
   saveInvoice,
+  discardInvoice,
   getInvoiceByKey,
   updateInvoiceByKey,
   setInvoicePaid,
@@ -55,6 +56,9 @@ import {
   listPlanes,
   savePlan,
   deletePlan,
+  listDrafts,
+  syncDrafts,
+  clearDrafts,
   type TagKind,
 } from "../services/cajaErpStore.js";
 import ExcelJS from "exceljs";
@@ -191,6 +195,37 @@ router.get("/invoices", async (req, res) => {
   res.json({ ok: true, data: await listInvoices(companyId) });
 });
 
+// ── Bandeja de PENDIENTES (drafts) compartida por empresa ────────────────
+// Facturas importadas aún NO causadas. Persisten en el servidor para sobrevivir
+// al cambio de PC y para que las vean todos los usuarios de la empresa compartida.
+router.get("/drafts", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  res.json({ ok: true, data: await listDrafts(companyId) });
+});
+
+// Sync por diff: el cliente envía las filas a upsertar (cambiadas/nuevas) y los
+// rowId a borrar (causadas/eliminadas). Una sola llamada para todo el lote.
+router.post("/drafts/sync", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const upserts = Array.isArray(req.body?.upserts) ? req.body.upserts : [];
+  const deletes = Array.isArray(req.body?.deletes) ? req.body.deletes : [];
+  try {
+    const r = await syncDrafts(companyId, upserts, deletes, req.user?.userId || "");
+    res.json({ ok: true, data: r });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: err instanceof Error ? err.message : "Error al sincronizar pendientes." });
+  }
+});
+
+router.delete("/drafts", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const deleted = await clearDrafts(companyId);
+  res.json({ ok: true, data: { deleted } });
+});
+
 // Guarda una factura CAUSADA en el buzón (con totales, consecutivo, proyecto, PDF).
 router.post("/invoices/save", async (req, res) => {
   const companyId = await resolveCompany(req, res);
@@ -200,6 +235,22 @@ router.post("/invoices/save", async (req, res) => {
     return res.status(400).json({ ok: false, message: "Falta identificar la factura (key/cufe)." });
   }
   await saveInvoice(companyId, { ...rec, estado: "causada" });
+  res.json({ ok: true });
+});
+
+// Descarta una factura (no se causará): rechazada / otro motivo. Se registra en el
+// buzón con estado "descartada" para mostrarla en su filtro y para que su clave
+// bloquee la re-ingesta desde DIAN. (La "causada manualmente" usa /invoices/save.)
+router.post("/invoices/discard", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const rec = req.body?.invoice || {};
+  const motivo = String(req.body?.motivo || "otro");
+  const nota = String(req.body?.nota || "");
+  if (!rec.key && !rec.cufe && !(rec.supplierNit && rec.docNumber)) {
+    return res.status(400).json({ ok: false, message: "Falta identificar la factura (key/cufe)." });
+  }
+  await discardInvoice(companyId, rec, motivo, nota);
   res.json({ ok: true });
 });
 
@@ -354,18 +405,29 @@ router.get("/drive/status", async (req, res) => {
   const companyId = await resolveCompany(req, res);
   if (!companyId) return;
   const link = await getCompanyDrive(companyId);
-  const available = (await getUserGoogleDrives(req.user!.userId)).map((d) => ({ connectionId: d.connection_id, email: d.user_email }));
+  // El Drive es ÚNICO por empresa y NO modificable: solo el dueño puede vincularlo
+  // (una vez, de inicio). Los demás usuarios (incl. empresa compartida) solo lo ven.
+  const isOwner = await userOwnsCompany(companyId, req.user!.userId);
+  // El selector de cuentas solo le sirve al dueño para la vinculación inicial.
+  const available = isOwner
+    ? (await getUserGoogleDrives(req.user!.userId)).map((d) => ({ connectionId: d.connection_id, email: d.user_email }))
+    : [];
   let linkedEmail = "";
   if (link) {
     const cfg = await getUserGoogleDriveById(link.ownerUserId, link.connectionId);
     linkedEmail = cfg?.user_email || "";
   }
-  res.json({ ok: true, data: { linked: !!link, linkedEmail, connectionId: link?.connectionId || "", available } });
+  res.json({ ok: true, data: { linked: !!link, linkedEmail, connectionId: link?.connectionId || "", available, isOwner } });
 });
 
 router.post("/drive/link", async (req, res) => {
   const companyId = await resolveCompany(req, res);
   if (!companyId) return;
+  // El Drive de la empresa lo vincula SOLO el dueño/admin, una sola vez. No es un
+  // parámetro modificable por los usuarios (incl. los de empresa compartida).
+  if (!(await userOwnsCompany(companyId, req.user!.userId))) {
+    return res.status(403).json({ ok: false, message: "Solo el administrador de la empresa puede vincular su cuenta de Drive." });
+  }
   const connectionId = String(req.body?.connectionId || "");
   if (!connectionId) return res.status(400).json({ ok: false, message: "Falta connectionId." });
   const cfg = await getUserGoogleDriveById(req.user!.userId, connectionId);

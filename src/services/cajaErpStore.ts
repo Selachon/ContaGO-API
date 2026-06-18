@@ -14,6 +14,10 @@ const ENTRIES = "cajaErpEntries";
 const INVOICES = "cajaErpInvoices";
 const PAYMENTS = "cajaErpPayments";
 const BANCOS = "cajaErpBancos";
+// Bandeja de facturas PENDIENTES (importadas, aún no causadas) compartida por
+// empresa: vive en el servidor para que el trabajo sobreviva al cambio de PC y lo
+// vean todos los usuarios de una empresa compartida. Una fila = un doc.
+const DRAFTS = "cajaErpDrafts";
 
 const now = () => new Date().toISOString();
 
@@ -228,7 +232,11 @@ export interface InvoiceRecord {
   neto: number;           // valor a pagar = base + iva − retenciones
   total: number;          // bruto = base + iva
   proyectoId: string;
-  estado: "pendiente" | "causada" | "pagada";
+  estado: "pendiente" | "causada" | "pagada" | "descartada";
+  /** Motivo de descarte (cuando estado = descartada): "rechazada" | "otro" | ... */
+  motivo: string;
+  /** Nota libre del descarte. */
+  nota: string;
   siigoConsecutivo: string;
   siigoId: string;        // id del documento en SIIGO (para reconsultar el timbrado)
   docKind: string;        // "FC" | "DS" | "NC"
@@ -260,7 +268,9 @@ function mapInvoice(d: any): InvoiceRecord & { id: string } {
     neto: Number(d.neto) || 0,
     total: Number(d.total) || 0,
     proyectoId: d.proyectoId || "",
-    estado: d.estado === "pagada" ? "pagada" : d.estado === "causada" ? "causada" : "pendiente",
+    estado: d.estado === "pagada" ? "pagada" : d.estado === "causada" ? "causada" : d.estado === "descartada" ? "descartada" : "pendiente",
+    motivo: d.motivo || "",
+    nota: d.nota || "",
     siigoConsecutivo: d.siigoConsecutivo || "",
     siigoId: d.siigoId || "",
     docKind: d.docKind || "FC",
@@ -274,10 +284,12 @@ function mapInvoice(d: any): InvoiceRecord & { id: string } {
   };
 }
 
-/** Lista del buzón = facturas causadas o pagadas (las pendientes viven en Causación). */
+/** Lista del buzón = facturas causadas, pagadas o DESCARTADAS (las pendientes
+ *  viven en Causación). Las descartadas se incluyen para mostrarlas en su filtro
+ *  y para que su clave bloquee la re-ingesta desde DIAN. */
 export async function listInvoices(companyId: string): Promise<(InvoiceRecord & { id: string })[]> {
   if (!companyId) return [];
-  const docs = await getDb().collection<any>(INVOICES).find({ companyId, estado: { $in: ["causada", "pagada"] } }).sort({ date: -1, createdAt: -1 }).toArray();
+  const docs = await getDb().collection<any>(INVOICES).find({ companyId, estado: { $in: ["causada", "pagada", "descartada"] } }).sort({ date: -1, createdAt: -1 }).toArray();
   return docs.map(mapInvoice);
 }
 
@@ -310,6 +322,27 @@ export async function saveInvoice(companyId: string, rec: Partial<InvoiceRecord>
     if (rec[f] != null) set[f] = Number(rec[f]) || 0;
   }
   set.estado = rec.estado === "pendiente" ? "pendiente" : "causada";
+  await getDb().collection<any>(INVOICES).updateOne(
+    { companyId, key },
+    { $set: set, $setOnInsert: { companyId, key, createdAt: ts } },
+    { upsert: true },
+  );
+}
+
+/** Marca una factura como DESCARTADA (no se causará) con su motivo/nota. Se
+ *  registra en el buzón para mostrarla en su filtro y para que su clave bloquee
+ *  la re-ingesta desde DIAN. Upsert por key. */
+export async function discardInvoice(companyId: string, rec: Partial<InvoiceRecord>, motivo: string, nota: string): Promise<void> {
+  const key = String(rec.key || rec.cufe || `${rec.supplierNit || ""}|${rec.docNumber || ""}`).trim();
+  if (!companyId || !key || key === "|") return;
+  const ts = now();
+  const set: Record<string, unknown> = { updatedAt: ts, estado: "descartada", motivo: String(motivo || "otro"), nota: String(nota || "") };
+  for (const f of ["cufe", "supplierNit", "supplierName", "docNumber", "date", "source", "docKind", "pdfUrl", "proyectoId"] as const) {
+    if (rec[f] != null) set[f] = rec[f];
+  }
+  for (const f of ["base", "iva", "retenciones", "retefuente", "reteica", "reteiva", "neto", "total"] as const) {
+    if (rec[f] != null) set[f] = Number(rec[f]) || 0;
+  }
   await getDb().collection<any>(INVOICES).updateOne(
     { companyId, key },
     { $set: set, $setOnInsert: { companyId, key, createdAt: ts } },
@@ -637,4 +670,55 @@ export async function deletePlan(companyId: string, id: string): Promise<boolean
   let oid: ObjectId; try { oid = new ObjectId(id); } catch { return false; }
   const res = await getDb().collection<any>(PLANES).deleteOne({ companyId, _id: oid });
   return res.deletedCount > 0;
+}
+
+// ── Bandeja de pendientes (drafts) compartida por empresa ────────────────
+// Cada draft guarda la fila de trabajo completa (sin el PDF en base64; el PDF se
+// archiva aparte en Drive y la fila lleva su pdfUrl). rowId = id de la fila en el
+// cliente, único dentro de la empresa.
+export interface DraftRow { rowId: string; row: any; }
+
+export async function listDrafts(companyId: string): Promise<any[]> {
+  if (!companyId) return [];
+  const docs = await getDb().collection<any>(DRAFTS).find({ companyId }).sort({ updatedAt: 1 }).toArray();
+  return docs.map((d) => d.row);
+}
+
+/** Upserta y borra filas en una sola operación (modelo de sync por diff). */
+export async function syncDrafts(
+  companyId: string,
+  upserts: DraftRow[],
+  deletes: string[],
+  userId: string,
+): Promise<{ upserted: number; deleted: number }> {
+  if (!companyId) return { upserted: 0, deleted: 0 };
+  const col = getDb().collection<any>(DRAFTS);
+  const ts = now();
+  let upserted = 0;
+  const ops = (upserts || [])
+    .filter((u) => u && u.rowId && u.row)
+    .map((u) => ({
+      updateOne: {
+        filter: { companyId, rowId: String(u.rowId) },
+        update: { $set: { companyId, rowId: String(u.rowId), row: u.row, updatedAt: ts, updatedBy: userId || "" } },
+        upsert: true,
+      },
+    }));
+  if (ops.length) {
+    const r = await col.bulkWrite(ops, { ordered: false });
+    upserted = (r.upsertedCount || 0) + (r.modifiedCount || 0);
+  }
+  let deleted = 0;
+  const delIds = (deletes || []).filter(Boolean).map(String);
+  if (delIds.length) {
+    const r = await col.deleteMany({ companyId, rowId: { $in: delIds } });
+    deleted = r.deletedCount || 0;
+  }
+  return { upserted, deleted };
+}
+
+export async function clearDrafts(companyId: string): Promise<number> {
+  if (!companyId) return 0;
+  const r = await getDb().collection<any>(DRAFTS).deleteMany({ companyId });
+  return r.deletedCount || 0;
 }
