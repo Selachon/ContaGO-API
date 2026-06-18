@@ -2,13 +2,16 @@ import { Request, Response, NextFunction } from "express";
 import { getUserDemoAccess, hasPurchase, isDemoTrialExpired } from "../services/database.js";
 import type { DemoAccess } from "../types/auth.js";
 
-// Decommissioned tool IDs that still grant access to the new tool
+// IDs de herramienta que también conceden acceso al gate (decomisionadas o
+// co-acceso). hasPurchase trata estos como "cualquiera de estos da acceso".
 const TOOL_ALIASES: Record<string, string[]> = {
   "dian-mass-download": ["dian-downloader"],
   "dian-cufe-downloader": ["dian-excel-exporter"],
-  // La herramienta "Causación + Caja" reúsa el backend de causación XML
-  // (/integrations/siigo/accounting/*); tener "causacion-caja" da acceso.
-  "siigo-xml-accounting": ["causacion-caja"],
+  // El router /integrations/siigo está gateado por "siigo-xml-accounting", pero lo
+  // comparten varias herramientas Siigo: "causacion-caja" (reúsa el backend de
+  // causación) y "siigo-egresos" (usa /integrations/siigo/egresos/* y /companies).
+  // Tener cualquiera de ellas da acceso al router compartido.
+  "siigo-xml-accounting": ["causacion-caja", "siigo-egresos"],
 };
 
 declare global {
