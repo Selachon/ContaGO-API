@@ -38,6 +38,35 @@ export interface ListingRecord {
   cufe: string;
   docnum: string;
   direction?: DocumentDirection;
+  /** Fecha de emisión cruda del listado (texto tal cual viene del export DIAN). */
+  fecha?: string;
+  /** Mes de emisión normalizado "YYYY-MM" (vacío si no se pudo determinar). */
+  monthKey?: string;
+}
+
+/**
+ * Normaliza una fecha del listado DIAN a "YYYY-MM". Soporta ISO (YYYY-MM-DD...),
+ * DD/MM/YYYY, DD-MM-YYYY y serial de Excel. Devuelve "" si no se puede leer
+ * (en ese caso la restricción por mes NO bloquea — es leniente a propósito).
+ */
+export function monthKeyFromDianDate(raw: string): string {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  // ISO: 2026-05-12 / 2026-05-12T... / 2026/05/12
+  const iso = s.match(/^(\d{4})[-/](\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}`;
+  // DD/MM/YYYY o DD-MM-YYYY
+  const dmy = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})/);
+  if (dmy) return `${dmy[3]}-${String(dmy[2]).padStart(2, "0")}`;
+  // Serial de Excel (días desde 1899-12-30)
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const serial = Number(s);
+    if (Number.isFinite(serial) && serial > 59 && serial < 100000) {
+      const d = new Date(Date.UTC(1899, 11, 30) + serial * 86400000);
+      if (!isNaN(d.getTime())) return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+    }
+  }
+  return "";
 }
 
 function normalizeCufe(value: string): string {
@@ -2105,6 +2134,9 @@ export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direct
   const cufeIdx = headers.findIndex((h) => h.includes("cufe") || h.includes("cude") || h.includes("código único") || h.includes("codigo unico"));
   const folioIdx = headers.findIndex((h) => h === "folio");
   const groupIdx = headers.findIndex((h) => h === "grupo");
+  // Columna de fecha de emisión (para la restricción por mes de licencia).
+  const fechaIdx = headers.findIndex((h) => h.includes("fecha") && h.includes("emis"));
+  const fechaFallbackIdx = fechaIdx >= 0 ? fechaIdx : headers.findIndex((h) => h.includes("fecha"));
 
   if (cufeIdx < 0 || folioIdx < 0) {
     console.warn("[DIAN Export] Encabezados esperados no encontrados", {
@@ -2133,7 +2165,8 @@ export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direct
     if (!cufe) continue;
     if (!docnum) continue;
 
-    out.push({ cufe, docnum });
+    const fecha = (fechaFallbackIdx >= 0 ? row[fechaFallbackIdx] : "").trim();
+    out.push({ cufe, docnum, fecha, monthKey: monthKeyFromDianDate(fecha) });
   }
 
   const dedup = new Map<string, ListingRecord>();

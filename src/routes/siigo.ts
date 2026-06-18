@@ -53,7 +53,7 @@ import {
   transferOwner,
   countCompaniesOwnedBy,
 } from "../services/siigoCompaniesService.js";
-import { getUserSiigoCompanies, setUserSiigoCompanies, getUserById } from "../services/database.js";
+import { getUserSiigoCompanies, setUserSiigoCompanies, getUserById, getUserPurchases } from "../services/database.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
@@ -442,6 +442,21 @@ function canManageCompanies(req: Request, res: Response): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * Mes mínimo permitido ("YYYY-MM") para traer facturas, dado el inicio de licencia.
+ * Regla: el mes de inicio de la licencia y de ahí hacia adelante, MÁS el mes
+ * inmediatamente anterior (catch-up). Es un piso: nada anterior a ese mes.
+ * Ej: licencia inicia 2026-06 → piso "2026-05" (mayo). Devuelve "" si no hay fecha.
+ */
+function licenseFloorMonth(licenseStartDate?: string): string {
+  const m = String(licenseStartDate || "").trim().match(/^(\d{4})-(\d{2})/);
+  if (!m) return "";
+  let y = Number(m[1]);
+  let mo = Number(m[2]) - 1; // mes anterior al de inicio
+  if (mo < 1) { mo = 12; y -= 1; }
+  return `${y}-${String(mo).padStart(2, "0")}`;
 }
 
 export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegrationAuth): Router {
@@ -1612,20 +1627,51 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
     // Saca los CUFEs del listado subido (mismo parser que "Exportar Excel DIAN").
     // Filtra estrictamente "Recibidos" y excluye Application Response / Nómina.
-    let cufes: string[] = [];
+    let records: Awaited<ReturnType<typeof parseListingRecordsFromExportZip>>;
     try {
-      const records = await parseListingRecordsFromExportZip(listadoFile.buffer, "received");
-      cufes = Array.from(new Set(records.map((r) => r.cufe).filter(Boolean)));
+      records = await parseListingRecordsFromExportZip(listadoFile.buffer, "received");
     } catch (err) {
       return res.status(400).json({
         ok: false,
         message: `No se pudo leer el listado de la DIAN: ${err instanceof Error ? err.message : "archivo inválido"}.`,
       });
     }
-    if (cufes.length === 0) {
+    if (records.length === 0) {
       return res.status(400).json({
         ok: false,
         message: "El listado no contiene facturas recibidas con CUFE. Verifica que sea el export de 'Recibidos' de la DIAN.",
+      });
+    }
+
+    // ── Restricción por mes de licencia ──────────────────────────────────
+    // Solo aplica a la herramienta vendida (Contabilizar Gastos XML): usuarios
+    // NO admin que NO tengan la herramienta interna "causacion-caja" (Círculo).
+    // Piso = mes anterior al de inicio de licencia; de ahí hacia adelante todo
+    // permitido. Las facturas anteriores se filtran y se informan (leniente con
+    // fechas que no se puedan leer del listado).
+    let outOfWindow = 0;
+    if (req.user?.userId && !req.user.isAdmin) {
+      const purchases = await getUserPurchases(req.user.userId);
+      const exempt = purchases.includes("causacion-caja");
+      if (!exempt) {
+        const user = await getUserById(req.user.userId);
+        const floor = licenseFloorMonth(user?.licenseStartDate);
+        if (floor) {
+          const before = records.length;
+          records = records.filter((r) => !r.monthKey || r.monthKey >= floor);
+          outOfWindow = before - records.length;
+        }
+      }
+    }
+
+    const cufes = Array.from(new Set(records.map((r) => r.cufe).filter(Boolean)));
+    if (cufes.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        code: "all_out_of_window",
+        message: outOfWindow > 0
+          ? `Las ${outOfWindow} factura(s) del listado son de meses anteriores a tu plan. Sube un listado del mes habilitado o el anterior.`
+          : "El listado no contiene facturas recibidas con CUFE. Verifica que sea el export de 'Recibidos' de la DIAN.",
       });
     }
 
@@ -1660,6 +1706,8 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         const job = dianIngestJobs.get(jobId);
         if (!job || job.status === "cancelled") return;
         job.status = "completed";
+        // Adjunta cuántas facturas se omitieron por la restricción de mes de licencia.
+        if (outOfWindow > 0) Object.assign(result.stats as object, { outOfWindow });
         job.result = result;
         job.progress = {
           step: "Completado",

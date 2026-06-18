@@ -194,6 +194,7 @@ function mapUser(record: UserRecord | null): User | null {
     created_at: record.created_at,
     demo: record.demo,
     companiesInPlan: record.companiesInPlan,
+    licenseStartDate: record.licenseStartDate,
   };
 }
 

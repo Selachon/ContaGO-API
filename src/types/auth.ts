@@ -23,6 +23,7 @@ export interface User {
   created_at: string;
   demo?: DemoAccess;
   companiesInPlan?: number;
+  licenseStartDate?: string;
 }
 
 export interface UserPurchase {
