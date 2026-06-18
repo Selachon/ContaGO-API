@@ -10,3 +10,10 @@ data.db
 uploads/
 read-pdf.cjs
 upload-server.mjs
+
+# Datos persistentes de contabilización (config por empresa + jobs)
+data/
+
+# Python bytecode del motor de contabilización
+__pycache__/
+*.pyc

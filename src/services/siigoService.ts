@@ -456,6 +456,11 @@ export async function listVouchers(query: Record<string, unknown>): Promise<unkn
   return request("/v1/vouchers", { query });
 }
 
+/** Crea un Recibo de Caja (RC / voucher). POST a producción: confirmar antes. */
+export async function createVoucher(body: unknown): Promise<unknown> {
+  return request("/v1/vouchers", { method: "POST", body });
+}
+
 /** Lista Comprobantes Contables (CC / journals). Para detectar egresos hechos como CC. */
 export async function listJournals(query: Record<string, unknown>): Promise<unknown> {
   return request("/v1/journals", { query });

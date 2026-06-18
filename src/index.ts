@@ -16,8 +16,11 @@ import siigoRoutes from "./routes/siigo.js";
 import causationRoutes from "./routes/causation.js";
 import conciliacionRoutes from "./routes/conciliacion.js";
 import cajaErpRoutes from "./routes/cajaErp.js";
+import contabilizacionRoutes from "./routes/contabilizacion.js";
 import dianCufeRoutes from "./routes/dianCufeDownload.js";
+import dianExtensionRoutes from "./routes/dianExtension.js";
 import dianMassDownloadRoutes from "./routes/dianMassDownload.js";
+import dianMailRoutes from "./routes/dianMail.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
 import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
 import { closeAllBrowsers, startOrphanBrowserSweep } from "./services/dianScraper.js";
@@ -71,11 +74,14 @@ app.use("/dian", dianRoutes);
 app.use("/dian-excel", dianExcelRoutes);
 app.use("/dian-third-parties", dianThirdPartiesRoutes);
 app.use("/dian-cufe", dianCufeRoutes);
+app.use("/dian-ext", dianExtensionRoutes);
 app.use("/dian-mass-download", dianMassDownloadRoutes);
+app.use("/dian-mail", dianMailRoutes);
 app.use("/integrations/siigo", siigoRoutes);
 app.use("/causation", causationRoutes);
 app.use("/conciliacion", conciliacionRoutes);
 app.use("/caja-erp", cajaErpRoutes);
+app.use("/api/contabilizacion", contabilizacionRoutes);
 
 // Health check
 app.get("/", (_req, res) => {

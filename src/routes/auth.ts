@@ -65,6 +65,7 @@ function buildAuthUser(user: User, purchasedTools: string[], nits: string[]): No
     role,
     purchasedTools,
     nits,
+    companiesInPlan: user.companiesInPlan,
     forcePasswordChange: !!user.force_password_change,
     demo,
   };

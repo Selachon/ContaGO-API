@@ -22,6 +22,7 @@ export interface User {
   force_password_change?: boolean;
   created_at: string;
   demo?: DemoAccess;
+  companiesInPlan?: number;
 }
 
 export interface UserPurchase {
@@ -50,6 +51,7 @@ export interface AuthResponse {
     role?: UserRole;
     purchasedTools: string[];
     nits: string[];
+    companiesInPlan?: number;
     forcePasswordChange?: boolean;
     demo?: DemoAccess & {
       isExpired: boolean;

@@ -51,13 +51,15 @@ import {
   shareCompany,
   unshareCompany,
   transferOwner,
+  countCompaniesOwnedBy,
 } from "../services/siigoCompaniesService.js";
-import { getUserSiigoCompanies, setUserSiigoCompanies } from "../services/database.js";
+import { getUserSiigoCompanies, setUserSiigoCompanies, getUserById } from "../services/database.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import { ingestFromDian, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
+import { parseListingRecordsFromExportZip } from "../services/dianScraper.js";
 import {
   parseBankExcel,
   validateEgresoPayload,
@@ -70,6 +72,15 @@ import {
   type EgresoPayload,
 } from "../services/siigoEgresosService.js";
 import { parseBankPdf, StatementError } from "../services/bankStatementParser.js";
+import {
+  listCustomerInvoices,
+  validateVoucher,
+  submitVoucher,
+  validateIncomeJournal,
+  submitIncomeJournal,
+  type VoucherPayload,
+  type JournalPayload,
+} from "../services/siigoIncomeService.js";
 import {
   listMovements,
   addMovements,
@@ -469,6 +480,23 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const { name, username, accessKey, nit } = req.body || {};
       // El creador queda como dueño. Sin usuario (API key) → admin principal (default en el servicio).
       const ownerUserId = req.integrationAuthMode === "jwt" ? req.user?.userId : undefined;
+
+      // Cupo del plan: un usuario NO admin solo puede tener tantas empresas como
+      // su plan (companiesInPlan). La herramienta se vende por empresa, por mes.
+      // Los admins no tienen límite.
+      if (req.integrationAuthMode === "jwt" && ownerUserId && !req.user?.isAdmin) {
+        const user = await getUserById(ownerUserId);
+        const limit = user?.companiesInPlan && user.companiesInPlan > 0 ? user.companiesInPlan : 1;
+        const owned = await countCompaniesOwnedBy(ownerUserId);
+        if (owned >= limit) {
+          return res.status(403).json({
+            ok: false,
+            code: "COMPANY_LIMIT_REACHED",
+            message: `Tu plan permite ${limit} empresa(s) y ya tienes ${owned}. Para agregar más, amplía tu plan.`,
+          });
+        }
+      }
+
       const company = await createCompany(name, username, accessKey, ownerUserId, nit);
       return res.json({ ok: true, data: company });
     } catch (error) {
@@ -953,6 +981,70 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         ok: false,
         message: error instanceof Error ? error.message : "Error procesando el archivo.",
       });
+    }
+  });
+
+  // Lista las facturas de venta de un cliente (para cruzar en un RC abono a deuda).
+  router.get("/egresos/customer-invoices", async (req: Request, res: Response) => {
+    try {
+      const nit = String(req.query.customer_identification || "").replace(/\D/g, "");
+      if (!nit) return res.status(400).json({ ok: false, message: "Falta el NIT del cliente." });
+      const data = await runInCompanyCtx(req, () => listCustomerInvoices(nit));
+      return res.json({ ok: true, data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Crea un Recibo de Caja (RC): abono a deuda (cruza FV) o anticipo. POST a producción.
+  router.post("/egresos/income/voucher", async (req: Request, res: Response) => {
+    const payload = req.body?.payload as VoucherPayload | undefined;
+    const movementId = req.body?.movementId as string | undefined;
+    const errors = validateVoucher(payload);
+    if (errors.length > 0) return res.status(400).json({ ok: false, code: "invalid_payload", message: errors.join(" "), errors });
+    const companyId = req.header("X-Siigo-Company");
+    try {
+      console.log(`[SiigoRC] Crear RC | cliente ${payload!.customer.identification} | tipo ${payload!.type} | valor ${payload!.payment.value} | doc ${payload!.document.id}`);
+      const result = (await runInCompanyCtx(req, () => submitVoucher(payload!))) as any;
+      if (companyId && movementId) {
+        try {
+          await updateMovement(companyId, movementId, {
+            status: "conciliado", receipt: { id: result?.id, name: result?.name || "RC" },
+            nit: payload!.customer.identification, value: payload!.payment.value, date: payload!.date,
+          });
+        } catch (e) { console.warn("[SiigoRC] No se pudo marcar el movimiento:", e instanceof Error ? e.message : e); }
+      }
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
+      console.error("[SiigoRC] FALLÓ:", error instanceof Error ? error.message : error, "| details:", detalle, "| payload:", JSON.stringify(payload));
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Crea el ingreso "avanzado" como Comprobante Contable (CC). POST a producción.
+  router.post("/egresos/income/journal", async (req: Request, res: Response) => {
+    const payload = req.body?.payload as JournalPayload | undefined;
+    const movementId = req.body?.movementId as string | undefined;
+    const errors = validateIncomeJournal(payload);
+    if (errors.length > 0) return res.status(400).json({ ok: false, code: "invalid_payload", message: errors.join(" "), errors });
+    const companyId = req.header("X-Siigo-Company");
+    const amount = payload!.items.filter((it) => it.account?.movement === "Debit").reduce((s, it) => s + (Number(it.value) || 0), 0);
+    try {
+      console.log(`[SiigoCC] Crear CC (ingreso avanzado) | ${payload!.items.length} partidas | valor ${amount} | doc ${payload!.document.id}`);
+      const result = (await runInCompanyCtx(req, () => submitIncomeJournal(payload!))) as any;
+      if (companyId && movementId) {
+        try {
+          await updateMovement(companyId, movementId, {
+            status: "conciliado", receipt: { id: result?.id, name: result?.name || "CC" }, value: amount, date: payload!.date,
+          });
+        } catch (e) { console.warn("[SiigoCC] No se pudo marcar el movimiento:", e instanceof Error ? e.message : e); }
+      }
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
+      console.error("[SiigoCC] FALLÓ:", error instanceof Error ? error.message : error, "| details:", detalle, "| payload:", JSON.stringify(payload));
+      return handleSiigoError(res, error);
     }
   });
 
@@ -1456,11 +1548,13 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     return ctx ? runWithSiigoCompany(ctx, () => work()) : work();
   });
 
-  // ─── Ingesta automática desde DIAN ───────────────────────────────────
-  // Recibe token + rango de fechas + grupo, obtiene el listado de CUFEs del
-  // portal, descarga cada documento (con reintentos por CUFE) y los parsea.
-  // Devuelve un jobId; el resultado final tiene el mismo shape que process-batch.
-  router.post("/accounting/from-dian", async (req: Request, res: Response) => {
+  // ─── Ingesta desde DIAN por LISTADO ──────────────────────────────────
+  // Recibe token + el listado exportado desde la DIAN (.xlsx o .zip), igual que
+  // "Exportar Excel DIAN". Saca los CUFEs del listado (evitando el paso lento de
+  // generarlo en el portal), descarga cada documento (con reintentos por CUFE) y
+  // los parsea. Devuelve un jobId; el resultado final tiene el mismo shape que
+  // process-batch. SOLO facturas recibidas.
+  router.post("/accounting/from-dian", upload.single("excel"), async (req: Request, res: Response) => {
     const companyId = req.header("X-Siigo-Company");
     if (!companyId) {
       return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
@@ -1470,21 +1564,15 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       return res.status(400).json({ ok: false, message: "Empresa Siigo no encontrada." });
     }
 
-    const { tokenUrl, fechaInicio, fechaFin, forceRedownload } = (req.body || {}) as {
-      tokenUrl?: string;
-      fechaInicio?: string;
-      fechaFin?: string;
-      forceRedownload?: boolean;
-    };
+    const tokenUrl = (req.body?.token_url || req.body?.tokenUrl) as string | undefined;
+    const forceRedownload = req.body?.forceRedownload === true || req.body?.forceRedownload === "true";
+    const listadoFile = req.file;
 
     if (!tokenUrl || !/catalogo-vpfe\.dian\.gov\.co\/User\/AuthToken/i.test(tokenUrl)) {
       return res.status(400).json({ ok: false, message: "Token DIAN inválido. Pega la URL completa de ingreso (/User/AuthToken?...)." });
     }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(fechaInicio || "") || !/^\d{4}-\d{2}-\d{2}$/.test(fechaFin || "")) {
-      return res.status(400).json({ ok: false, message: "Fechas inválidas. Usa el formato YYYY-MM-DD." });
-    }
-    if (fechaInicio! > fechaFin!) {
-      return res.status(400).json({ ok: false, message: "La fecha inicial no puede ser mayor que la final." });
+    if (!listadoFile) {
+      return res.status(400).json({ ok: false, message: "Sube el listado exportado desde la DIAN (.xlsx o .zip)." });
     }
 
     // Esta herramienta SOLO contabiliza facturas RECIBIDAS por la empresa asociada.
@@ -1522,6 +1610,25 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       });
     }
 
+    // Saca los CUFEs del listado subido (mismo parser que "Exportar Excel DIAN").
+    // Filtra estrictamente "Recibidos" y excluye Application Response / Nómina.
+    let cufes: string[] = [];
+    try {
+      const records = await parseListingRecordsFromExportZip(listadoFile.buffer, "received");
+      cufes = Array.from(new Set(records.map((r) => r.cufe).filter(Boolean)));
+    } catch (err) {
+      return res.status(400).json({
+        ok: false,
+        message: `No se pudo leer el listado de la DIAN: ${err instanceof Error ? err.message : "archivo inválido"}.`,
+      });
+    }
+    if (cufes.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        message: "El listado no contiene facturas recibidas con CUFE. Verifica que sea el export de 'Recibidos' de la DIAN.",
+      });
+    }
+
     const maxDocuments = Math.max(1, Number(process.env.DIAN_MAX_DOCUMENTS || 850));
 
     const jobId = uuidv4();
@@ -1537,12 +1644,11 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       ingestFromDian({
         companyId,
         tokenUrl,
-        fechaInicio: fechaInicio!,
-        fechaFin: fechaFin!,
+        providedCufes: cufes,
         grupo: grupoNorm,
         maxDocuments,
         retryRounds: 3,
-        forceRedownload: forceRedownload === true,
+        forceRedownload,
         onProgress: (p) => {
           const job = dianIngestJobs.get(jobId);
           if (job && job.status === "processing") job.progress = p;

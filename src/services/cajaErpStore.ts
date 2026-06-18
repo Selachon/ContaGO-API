@@ -222,15 +222,22 @@ export interface InvoiceRecord {
   base: number;           // valor antes de impuestos
   iva: number;
   retenciones: number;    // suma de retefuente + reteICA + reteIVA
+  retefuente: number;     // desglose
+  reteica: number;
+  reteiva: number;
   neto: number;           // valor a pagar = base + iva − retenciones
   total: number;          // bruto = base + iva
   proyectoId: string;
   estado: "pendiente" | "causada" | "pagada";
   siigoConsecutivo: string;
+  siigoId: string;        // id del documento en SIIGO (para reconsultar el timbrado)
+  docKind: string;        // "FC" | "DS" | "NC"
   pdfUrl: string;         // soporte de la factura
   paymentPdfUrl: string;  // soporte del pago (comprobante)
   fechaPago: string;      // fecha en que se marcó pagada (YYYY-MM-DD)
   source: string;         // "dian" | "upload"
+  // Estado del timbrado electrónico ante la DIAN (solo documentos soporte DS).
+  dianStamp: { state: string; ok: boolean; cuds?: string; label: string; errors?: string[] } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -247,15 +254,21 @@ function mapInvoice(d: any): InvoiceRecord & { id: string } {
     base: Number(d.base) || 0,
     iva: Number(d.iva) || 0,
     retenciones: Number(d.retenciones) || 0,
+    retefuente: Number(d.retefuente) || 0,
+    reteica: Number(d.reteica) || 0,
+    reteiva: Number(d.reteiva) || 0,
     neto: Number(d.neto) || 0,
     total: Number(d.total) || 0,
     proyectoId: d.proyectoId || "",
     estado: d.estado === "pagada" ? "pagada" : d.estado === "causada" ? "causada" : "pendiente",
     siigoConsecutivo: d.siigoConsecutivo || "",
+    siigoId: d.siigoId || "",
+    docKind: d.docKind || "FC",
     pdfUrl: d.pdfUrl || "",
     paymentPdfUrl: d.paymentPdfUrl || "",
     fechaPago: d.fechaPago || "",
     source: d.source || "",
+    dianStamp: d.dianStamp || null,
     createdAt: d.createdAt || "",
     updatedAt: d.updatedAt || "",
   };
@@ -266,6 +279,13 @@ export async function listInvoices(companyId: string): Promise<(InvoiceRecord & 
   if (!companyId) return [];
   const docs = await getDb().collection<any>(INVOICES).find({ companyId, estado: { $in: ["causada", "pagada"] } }).sort({ date: -1, createdAt: -1 }).toArray();
   return docs.map(mapInvoice);
+}
+
+/** Lee una factura del buzón por su key (o null). */
+export async function getInvoiceByKey(companyId: string, key: string): Promise<(InvoiceRecord & { id: string }) | null> {
+  if (!companyId || !key) return null;
+  const d = await getDb().collection<any>(INVOICES).findOne({ companyId, key: String(key) });
+  return d ? mapInvoice(d) : null;
 }
 
 /** Marca/desmarca una factura como pagada (por key). */
@@ -282,10 +302,11 @@ export async function saveInvoice(companyId: string, rec: Partial<InvoiceRecord>
   if (!companyId || !key || key === "|") return;
   const ts = now();
   const set: Record<string, unknown> = { updatedAt: ts };
-  for (const f of ["cufe", "supplierNit", "supplierName", "docNumber", "date", "source", "siigoConsecutivo", "pdfUrl", "paymentPdfUrl", "proyectoId"] as const) {
+  for (const f of ["cufe", "supplierNit", "supplierName", "docNumber", "date", "source", "siigoConsecutivo", "siigoId", "docKind", "pdfUrl", "paymentPdfUrl", "proyectoId"] as const) {
     if (rec[f] != null) set[f] = rec[f];
   }
-  for (const f of ["base", "iva", "retenciones", "neto", "total"] as const) {
+  if (rec.dianStamp !== undefined) set.dianStamp = rec.dianStamp;
+  for (const f of ["base", "iva", "retenciones", "retefuente", "reteica", "reteiva", "neto", "total"] as const) {
     if (rec[f] != null) set[f] = Number(rec[f]) || 0;
   }
   set.estado = rec.estado === "pendiente" ? "pendiente" : "causada";
@@ -330,6 +351,7 @@ export async function updateInvoiceByKey(companyId: string, key: string, patch: 
   for (const f of ["estado", "proyectoId", "siigoConsecutivo", "pdfUrl"] as const) {
     if (patch[f] != null) updates[f] = patch[f];
   }
+  if (patch.dianStamp !== undefined) updates.dianStamp = patch.dianStamp;
   await getDb().collection<any>(INVOICES).updateOne({ companyId, key: String(key) }, { $set: updates });
 }
 

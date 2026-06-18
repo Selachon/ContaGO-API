@@ -1,0 +1,477 @@
+// ────────────────────────────────────────────────────────────────────────────
+// DIAN — Descarga vía extensión de navegador (lado cliente)
+//
+// A diferencia de /dian-cufe (que descarga desde el servidor con Puppeteer y la
+// IP de Railway, expuesta al bloqueo anti-bot de la DIAN), aquí la descarga la
+// hace una extensión instalada en el navegador del usuario, usando SU sesión y
+// SU IP. El backend solo:
+//   1. Parsea el Excel de listado y arma el job + la lista de CUFEs a buscar.
+//   2. Recibe los ZIP que la extensión descarga, extrae el XML y lo parsea.
+//   3. Genera el Excel final reutilizando generateExcelFile.
+//
+// Toda la comunicación extensión→API va autenticada con el MISMO JWT del usuario
+// (la extensión hace login con email+password contra /auth/login). El acceso se
+// valida contra la misma licencia de la herramienta dian-cufe-downloader.
+// ────────────────────────────────────────────────────────────────────────────
+import { Router, Request, Response } from "express";
+import express from "express";
+import multer from "multer";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { v4 as uuidv4 } from "uuid";
+import { requireAuth } from "../middleware/auth.js";
+import { requireToolAccess } from "../middleware/requireToolAccess.js";
+import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
+import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
+import { extractCufesFromExcel, extractFilesFromZip, resolveExcelBuffer } from "./dianCufeDownload.js";
+import { rejectIfWrongDemoNit, getDemoLimit, buildDemoLimitInfo, type DemoLimitInfo } from "../utils/demoLimit.js";
+import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
+import { getOrCreateRootFolder, uploadInvoiceFilesToDrive } from "../services/googleDrive.js";
+import { encryptToken } from "../utils/encryption.js";
+import type { ListingRecord } from "../services/dianScraper.js";
+import type { DocumentDirection } from "../types/dian.js";
+import type { InvoiceData } from "../types/dianExcel.js";
+
+const TOOL_ID = "dian-cufe-downloader";
+const JOB_TTL_MS = 60 * 60 * 1000; // 1h
+const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
+
+type DriveConfig = NonNullable<Awaited<ReturnType<typeof getUserGoogleDriveById>>>;
+
+const normalizeNit = (nit: string) => (nit || "").replace(/[-\s]/g, "").trim();
+
+interface ExtJobData {
+  status: "collecting" | "completed" | "error";
+  userId: string;
+  direction: DocumentDirection;
+  startDate?: string;
+  endDate?: string;
+  allCufes: string[];                       // todos, en orden original
+  processableCufes: string[];               // los que la extensión debe buscar
+  records: ListingRecord[];                 // procesables (cufe + docnum + dirección)
+  invoiceMap: Map<string, Partial<InvoiceData>>;
+  receivedCount: number;                    // procesados (ZIP correcto o miss)
+  okCount: number;
+  missCount: number;
+  companyName: string;
+  companyNit: string;
+  companyWasFromDS: boolean;
+  createdAt: number;
+  outputPath?: string;
+  outputName?: string;
+  error?: string;
+  demoLimit?: DemoLimitInfo;
+  // Restricción por NIT: lista de NITs contratados (normalizados). null = admin
+  // o sin restricción → no se valida.
+  allowedNits: string[] | null;
+  nitVerified: boolean;                     // ya se validó el NIT propio del job
+  // Google Drive (opcional)
+  driveConfig: DriveConfig | null;
+  driveConnectionId?: string;
+  uploadToDrive: boolean;
+  driveFolderUrl?: string;
+  driveErrors: number;
+}
+
+const jobs = new Map<string, ExtJobData>();
+
+// Limpieza periódica de jobs viejos + sus archivos
+setInterval(() => {
+  const now = Date.now();
+  for (const [jobId, job] of jobs) {
+    if (now - job.createdAt > JOB_TTL_MS) {
+      if (job.outputPath && fs.existsSync(job.outputPath)) {
+        try { fs.unlinkSync(job.outputPath); } catch {}
+      }
+      jobs.delete(jobId);
+    }
+  }
+}, 60_000);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024, files: 1 },
+});
+
+const router = Router();
+
+// Auth: mismo JWT que el resto de la app + misma licencia de herramienta.
+router.use(requireAuth);
+router.use(requireToolAccess(TOOL_ID));
+
+function getOwnedJob(req: Request, res: Response): ExtJobData | null {
+  const { jobId } = req.params;
+  if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    res.status(400).json({ status: "error", detalle: "jobId inválido" });
+    return null;
+  }
+  const job = jobs.get(jobId);
+  if (!job) {
+    res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+    return null;
+  }
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    res.status(403).json({ status: "error", detalle: "No autorizado" });
+    return null;
+  }
+  return job;
+}
+
+function progressOf(job: ExtJobData) {
+  return {
+    jobStatus: job.status,
+    direction: job.direction,
+    total: job.processableCufes.length,
+    received: job.receivedCount,
+    ok: job.okCount,
+    miss: job.missCount,
+    error: job.error,
+    outputName: job.outputName,
+    driveFolderUrl: job.driveFolderUrl,
+    driveErrors: job.driveErrors,
+  };
+}
+
+// ── 1) Crear job desde el Excel de listado ──────────────────────────────────
+router.post("/job", upload.single("excel"), async (req: Request, res: Response) => {
+  const file = req.file;
+  if (!file) {
+    return res.status(400).json({ status: "error", detalle: "Debes adjuntar el listado (Excel)." });
+  }
+
+  const { start_date, end_date, token_url, drive_connection_id, upload_to_drive } = req.body as {
+    start_date?: string;
+    end_date?: string;
+    token_url?: string;
+    drive_connection_id?: string;
+    upload_to_drive?: string | boolean;
+  };
+
+  // El NIT demo se valida igual que en /dian-cufe si viene token_url (opcional aquí).
+  if (token_url && rejectIfWrongDemoNit(req, res, token_url)) return;
+
+  // Control de acceso por NIT contratado. El NIT propio no se conoce hasta parsear
+  // el primer XML, así que aquí solo se valida que la cuenta tenga NITs (salvo
+  // admin); el NIT real del job se verifica al recibir el primer documento.
+  let allowedNits: string[] | null = null;
+  if (!req.user?.isAdmin) {
+    const nits = await getUserNits(req.user!.userId);
+    if (nits.length === 0) {
+      return res.status(403).json({ status: "error", detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador." });
+    }
+    allowedNits = nits.map(normalizeNit);
+  }
+
+  if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
+    return res.status(400).json({ status: "error", detalle: "start_date debe ser YYYY-MM-DD" });
+  }
+  if (end_date && !/^\d{4}-\d{2}-\d{2}$/.test(end_date)) {
+    return res.status(400).json({ status: "error", detalle: "end_date debe ser YYYY-MM-DD" });
+  }
+
+  let parsed;
+  try {
+    const excelBuffer = await resolveExcelBuffer(file);
+    parsed = await extractCufesFromExcel(excelBuffer);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return res.status(400).json({ status: "error", detalle: `Error leyendo archivo: ${msg}` });
+  }
+
+  if (parsed.mixedDirections) {
+    return res.status(400).json({ status: "error", detalle: "El listado mezcla documentos emitidos y recibidos. Sube solo un grupo." });
+  }
+  if (!parsed.detectedDirection) {
+    return res.status(400).json({ status: "error", detalle: "No se pudo determinar el tipo de documentos. Usa el listado exportado desde la DIAN (con columna 'Grupo')." });
+  }
+
+  let { cufes: processableCufes, allCufes, skippedEntries, listingRecords } = parsed;
+  const direction = parsed.detectedDirection;
+
+  if (allCufes.length === 0) {
+    return res.status(400).json({ status: "error", detalle: "El listado no contiene CUFEs." });
+  }
+
+  // Límite DEMO (igual que /dian-cufe)
+  let demoLimit: DemoLimitInfo | undefined;
+  const demoLimitValue = getDemoLimit(req);
+  if (demoLimitValue) {
+    demoLimit = buildDemoLimitInfo(allCufes.length, demoLimitValue);
+    const limited = allCufes.slice(0, demoLimitValue);
+    const allowed = new Set(limited);
+    allCufes = limited;
+    processableCufes = processableCufes.filter((c) => allowed.has(c));
+    skippedEntries = skippedEntries.filter((e) => allowed.has(e.cufe));
+    listingRecords = listingRecords.filter((r) => allowed.has(r.cufe));
+  }
+
+  if (processableCufes.length > MAX_CUFES) {
+    return res.status(400).json({
+      status: "error",
+      detalle: `El listado tiene ${processableCufes.length} documentos descargables; el máximo por proceso es ${MAX_CUFES}. Divide el listado en rangos más pequeños.`,
+    });
+  }
+
+  // Pre-poblar invoiceMap: notas para los omitidos (Nómina / Application Response),
+  // placeholder para los procesables. Igual que processCufeDownloadJob.
+  const invoiceMap = new Map<string, Partial<InvoiceData>>();
+  const skippedSet = new Map(skippedEntries.map((e) => [e.cufe, e.reason]));
+  for (const cufe of allCufes) {
+    const reason = skippedSet.get(cufe);
+    if (reason) invoiceMap.set(cufe, { cufe, documentType: reason, taxes: [], lineItems: [] });
+    else invoiceMap.set(cufe, { cufe });
+  }
+
+  const processableRecords = listingRecords.filter((r) => processableCufes.includes(r.cufe));
+
+  // Google Drive (opcional): resolver conexión una sola vez.
+  const wantDrive = upload_to_drive === true || upload_to_drive === "true";
+  let driveConfig: DriveConfig | null = null;
+  let driveFolderUrl: string | undefined;
+  if (wantDrive && drive_connection_id) {
+    driveConfig = await getUserGoogleDriveById(req.user!.userId, drive_connection_id);
+    if (driveConfig) {
+      try {
+        const onTokenRefresh = async (tok: string, exp: number) => {
+          await updateUserDriveTokens(req.user!.userId, encryptToken(tok), new Date(exp).toISOString(), drive_connection_id);
+        };
+        const rootId = await getOrCreateRootFolder(driveConfig, req.user!.userId, onTokenRefresh);
+        driveFolderUrl = `https://drive.google.com/drive/folders/${rootId}`;
+      } catch (e) {
+        console.warn("[DIAN EXT] No se pudo preparar carpeta Drive:", (e as Error).message);
+      }
+    }
+  }
+
+  const jobId = uuidv4().replace(/-/g, "").slice(0, 12);
+  jobs.set(jobId, {
+    status: "collecting",
+    userId: req.user!.userId,
+    direction,
+    startDate: start_date,
+    endDate: end_date,
+    allCufes,
+    processableCufes,
+    records: processableRecords,
+    invoiceMap,
+    receivedCount: 0,
+    okCount: 0,
+    missCount: 0,
+    companyName: "",
+    companyNit: "",
+    companyWasFromDS: false,
+    createdAt: Date.now(),
+    demoLimit,
+    allowedNits,
+    nitVerified: false,
+    driveConfig,
+    driveConnectionId: drive_connection_id,
+    uploadToDrive: !!driveConfig,
+    driveFolderUrl,
+    driveErrors: 0,
+  });
+
+  res.json({
+    status: "accepted",
+    jobId,
+    direction,
+    totalCufes: allCufes.length,
+    totalProcessable: processableCufes.length,
+    skipped: skippedEntries.length,
+    demoLimit,
+    driveFolderUrl,
+    // La extensión usa estos registros para buscar cada documento en la DIAN.
+    records: processableRecords.map((r) => ({ cufe: r.cufe, docnum: r.docnum, direction: r.direction })),
+    startDate: start_date,
+    endDate: end_date,
+  });
+});
+
+// ── 2) Recibir un ZIP descargado por la extensión ───────────────────────────
+// La extensión envía los bytes crudos del ZIP. Query: cufe (requerido),
+// trackId y docnum (opcionales, para el parseo).
+router.post(
+  "/job/:jobId/zip",
+  express.raw({ type: () => true, limit: "30mb" }),
+  async (req: Request, res: Response) => {
+    const job = getOwnedJob(req, res);
+    if (!job) return;
+    if (job.status !== "collecting") {
+      return res.status(400).json({ status: "error", detalle: `Job ya está ${job.status}` });
+    }
+
+    const cufe = String(req.query.cufe || "");
+    const trackId = String(req.query.trackId || "");
+    const docnum = String(req.query.docnum || "");
+    if (!cufe || !job.invoiceMap.has(cufe)) {
+      return res.status(400).json({ status: "error", detalle: "CUFE desconocido para este job" });
+    }
+
+    const zipBuffer = req.body as Buffer;
+    if (!Buffer.isBuffer(zipBuffer) || zipBuffer.length < 4 || zipBuffer[0] !== 0x50 || zipBuffer[1] !== 0x4b) {
+      return res.status(400).json({ status: "error", detalle: "El cuerpo no es un ZIP válido" });
+    }
+
+    try {
+      const { xmlBuffer, pdfBuffer } = await extractFilesFromZip(zipBuffer);
+      if (!xmlBuffer) {
+        job.missCount++;
+        job.receivedCount++;
+        return res.status(422).json({ status: "error", detalle: "El ZIP no contiene XML" });
+      }
+
+      const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
+        id: trackId || cufe,
+        docnum: docnum || "",
+      });
+
+      // Detectar razón social / NIT propio (igual que /dian-cufe)
+      const isDS = !!invoiceData.isDocumentoSoporte;
+      const ownName = job.direction === "received"
+        ? invoiceData.receiverName
+        : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
+      const ownNit = job.direction === "received"
+        ? invoiceData.receiverNit
+        : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
+
+      // ── Control de acceso por NIT contratado ────────────────────────────────
+      // El NIT propio del documento debe estar en la lista del usuario. Si no, se
+      // aborta el job entero (no se entrega Excel de una empresa no contratada).
+      if (job.allowedNits && ownNit && ownNit !== "N/A") {
+        const n = normalizeNit(ownNit);
+        if (!job.allowedNits.includes(n)) {
+          job.status = "error";
+          job.error = `No tienes acceso al NIT ${ownNit}. Este proceso fue bloqueado.`;
+          return res.status(403).json({ status: "error", code: "NIT_FORBIDDEN", detalle: job.error });
+        }
+        job.nitVerified = true;
+      }
+
+      const isNameEmpty = !job.companyName || job.companyName === "N/A";
+      const isCurrentlyDS = job.companyName && job.companyWasFromDS;
+      if (isNameEmpty || (isCurrentlyDS && !isDS)) {
+        if (ownName && ownName !== "N/A") {
+          job.companyName = ownName;
+          job.companyNit = (ownNit && ownNit !== "N/A") ? ownNit : job.companyNit;
+          job.companyWasFromDS = isDS;
+        }
+      }
+
+      // ── Cargue a Google Drive (opcional) ────────────────────────────────────
+      const hasValidData = !!(invoiceData.issueDate && invoiceData.docNumber);
+      if (job.uploadToDrive && job.driveConfig && hasValidData) {
+        const effectivePdf = isDS ? null : (pdfBuffer || null);
+        try {
+          const onTokenRefresh = async (tok: string, exp: number) => {
+            await updateUserDriveTokens(job.userId, encryptToken(tok), new Date(exp).toISOString(), job.driveConnectionId);
+          };
+          const result = await uploadInvoiceFilesToDrive(
+            effectivePdf,
+            xmlBuffer,
+            invoiceData.docNumber!,
+            (ownNit && ownNit !== "N/A") ? ownNit : (job.companyNit || ""),
+            invoiceData.issueDate!,
+            job.driveConfig,
+            job.userId,
+            onTokenRefresh,
+            job.direction === "sent" ? "sent" : "received"
+          );
+          invoiceData.driveUrl = result.pdfUrl || result.folderUrl;
+        } catch (driveErr) {
+          job.driveErrors++;
+          console.warn(`[DIAN EXT] Drive upload error ${cufe.slice(0, 16)}:`, (driveErr as Error).message);
+        }
+      }
+
+      job.invoiceMap.set(cufe, invoiceData);
+      job.okCount++;
+      job.receivedCount++;
+      return res.json({ status: "ok", ...progressOf(job) });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[DIAN EXT] Error parseando XML de ${cufe.slice(0, 16)}: ${msg}`);
+      job.missCount++;
+      job.receivedCount++;
+      return res.status(500).json({ status: "error", detalle: `Error parseando XML: ${msg}` });
+    }
+  }
+);
+
+// ── 3) Reportar un CUFE no encontrado / no descargable ──────────────────────
+router.post("/job/:jobId/miss", (req: Request, res: Response) => {
+  const job = getOwnedJob(req, res);
+  if (!job) return;
+  if (job.status !== "collecting") {
+    return res.status(400).json({ status: "error", detalle: `Job ya está ${job.status}` });
+  }
+  const cufe = String(req.query.cufe || "");
+  if (!cufe || !job.invoiceMap.has(cufe)) {
+    return res.status(400).json({ status: "error", detalle: "CUFE desconocido para este job" });
+  }
+  job.missCount++;
+  job.receivedCount++;
+  res.json({ status: "ok", ...progressOf(job) });
+});
+
+// ── 4) Finalizar: generar el Excel ──────────────────────────────────────────
+router.post("/job/:jobId/finalize", async (req: Request, res: Response) => {
+  const job = getOwnedJob(req, res);
+  if (!job) return;
+  if (job.status === "completed" && job.outputPath && fs.existsSync(job.outputPath)) {
+    return res.json({ status: "ok", ...progressOf(job) });
+  }
+  if (job.status === "error") {
+    return res.status(400).json({ status: "error", detalle: job.error || "Job en error" });
+  }
+
+  try {
+    const invoices = job.allCufes.map((cufe) => job.invoiceMap.get(cufe)!) as InvoiceData[];
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dian-ext-"));
+    const prefix = job.direction === "sent" ? "Facturas Emitidas DIAN" : "Facturas DIAN";
+    const outputName = generateExcelFilename(job.startDate, job.endDate, prefix);
+    const outputPath = path.join(tmpDir, outputName);
+
+    await generateExcelFile(
+      invoices,
+      outputPath,
+      job.uploadToDrive,              // includeDriveColumn (si se subió a Drive)
+      job.direction === "sent",
+      job.companyName,
+      job.companyNit
+    );
+
+    job.outputPath = outputPath;
+    job.outputName = outputName;
+    job.status = "completed";
+    res.json({ status: "ok", ...progressOf(job) });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    job.status = "error";
+    job.error = msg;
+    console.error(`[DIAN EXT] Error generando Excel: ${msg}`);
+    res.status(500).json({ status: "error", detalle: `Error generando Excel: ${msg}` });
+  }
+});
+
+// ── 5) Estado del job ───────────────────────────────────────────────────────
+router.get("/job/:jobId/status", (req: Request, res: Response) => {
+  const job = getOwnedJob(req, res);
+  if (!job) return;
+  res.json({ status: "ok", ...progressOf(job), demoLimit: job.demoLimit });
+});
+
+// ── 6) Descargar el Excel generado ──────────────────────────────────────────
+router.get("/job/:jobId/download", (req: Request, res: Response) => {
+  const job = getOwnedJob(req, res);
+  if (!job) return;
+  if (job.status !== "completed" || !job.outputPath || !fs.existsSync(job.outputPath)) {
+    return res.status(400).json({ status: "error", detalle: "El Excel aún no está listo" });
+  }
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="${job.outputName || "Facturas DIAN.xlsx"}"`);
+  const stream = fs.createReadStream(job.outputPath);
+  stream.pipe(res);
+});
+
+export default router;

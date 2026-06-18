@@ -40,13 +40,14 @@ export function createOAuth2Client() {
   return new google.auth.OAuth2(clientId, clientSecret, redirectUri);
 }
 
-// Generar URL de autorización
-export function getAuthUrl(state?: string): string {
+// Generar URL de autorización. `scopes` permite pedir permisos distintos a los
+// de Drive (p. ej. Gmail readonly para el buzón DIAN); por defecto usa SCOPES.
+export function getAuthUrl(state?: string, scopes?: string[]): string {
   const oauth2Client = createOAuth2Client();
 
   return oauth2Client.generateAuthUrl({
     access_type: "offline",
-    scope: SCOPES,
+    scope: scopes && scopes.length ? scopes : SCOPES,
     prompt: "select_account consent", // Forzar selector de cuenta + refresh_token
     state: state || "",
   });

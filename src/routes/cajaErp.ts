@@ -14,7 +14,11 @@ import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
-import { userCanAccessCompany, setCompanyDrive, getCompanyDrive } from "../services/siigoCompaniesService.js";
+import { userCanAccessCompany, setCompanyDrive, getCompanyDrive, getCompanyContext } from "../services/siigoCompaniesService.js";
+import { runWithSiigoCompany, getPurchaseSupportDocumentById } from "../services/siigoService.js";
+import { ingestNewByDateRange, type IngestResult } from "../services/siigoDianIngestService.js";
+import { latestDianTokenForNit, getDianMailboxStatus } from "../services/dianMailboxService.js";
+import { v4 as uuidv4 } from "uuid";
 import { getUserGoogleDrives, getUserGoogleDriveById, updateUserDriveTokens, getDb } from "../services/database.js";
 import { ObjectId } from "mongodb";
 import { uploadInvoiceFilesToDrive, uploadPaymentSupportToDrive } from "../services/googleDrive.js";
@@ -33,6 +37,8 @@ import {
   deleteEntry,
   listInvoices,
   saveInvoice,
+  getInvoiceByKey,
+  updateInvoiceByKey,
   setInvoicePaid,
   deleteInvoiceByKey,
   listPayments,
@@ -215,6 +221,40 @@ router.delete("/invoices", async (req, res) => {
   res.json({ ok, data: { deleted: ok } });
 });
 
+// Reconsulta a SIIGO el estado del timbrado electrónico (DIAN) de un documento
+// soporte (DS) ya causado y actualiza el buzón. Útil cuando al causar quedó en
+// "procesando" y luego la DIAN lo acepta/rechaza.
+function normalizeDianStamp(stamp: any) {
+  if (!stamp || typeof stamp !== "object") return { state: "unknown", ok: false, label: "Sin información de la DIAN", errors: [] };
+  const raw = String(stamp.status || "").toLowerCase();
+  const cuds = stamp.cuds || stamp.cude || "";
+  const errors = Array.isArray(stamp.errors) ? stamp.errors.map((e: any) => e?.message || e?.Message || String(e)).filter(Boolean) : [];
+  if (raw === "accepted" || raw === "sent" || (cuds && !raw.includes("reject"))) return { state: "accepted", ok: true, cuds, label: "Aceptado por la DIAN", errors: [] };
+  if (raw === "draft" || raw === "") return { state: "draft", ok: false, cuds, label: "Sin transmitir (borrador en SIIGO)", errors };
+  if (raw.includes("reject")) return { state: "rejected", ok: false, cuds, label: "Rechazado por la DIAN", errors };
+  return { state: raw || "pending", ok: false, cuds, label: `Estado DIAN: ${stamp.status}`, errors };
+}
+
+router.post("/invoices/dian-status", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const key = (typeof req.query.key === "string" ? req.query.key : req.body?.key) || "";
+  if (!key) return res.status(400).json({ ok: false, message: "Falta key." });
+  const inv = await getInvoiceByKey(companyId, String(key));
+  if (!inv) return res.status(404).json({ ok: false, message: "Factura no encontrada en el buzón." });
+  if (!inv.siigoId) return res.status(400).json({ ok: false, message: "Este documento no tiene id de SIIGO; no se puede reconsultar." });
+  const ctx = await getCompanyContext(companyId);
+  if (!ctx) return res.status(400).json({ ok: false, message: "Empresa sin conexión a SIIGO." });
+  try {
+    const doc: any = await runWithSiigoCompany(ctx, () => getPurchaseSupportDocumentById(inv.siigoId));
+    const dian = normalizeDianStamp(doc?.stamp);
+    await updateInvoiceByKey(companyId, String(key), { dianStamp: dian });
+    res.json({ ok: true, data: dian });
+  } catch (err) {
+    res.status(502).json({ ok: false, message: err instanceof Error ? err.message : "Error consultando SIIGO." });
+  }
+});
+
 // ── Programación de pagos (lotes) ──────────────────────────────────────
 router.get("/payments", async (req, res) => {
   const companyId = await resolveCompany(req, res);
@@ -353,8 +393,11 @@ router.post("/invoices/archive", upload.single("file"), async (req, res) => {
       drive.driveConfig, drive.ownerUserId, drive.onTokenRefresh,
       "received",
     );
-    // Las pendientes no están en el buzón; el frontend guarda el enlace en la
+    // Si la factura YA está en el buzón (causada), persiste el enlace ahí mismo.
+    // Las pendientes no están en el buzón: el frontend guarda el enlace en la
     // fila de Causación y lo pasa al causar (saveInvoice).
+    const existing = await getInvoiceByKey(companyId, String(key));
+    if (existing && r.pdfUrl) await updateInvoiceByKey(companyId, String(key), { pdfUrl: r.pdfUrl });
     res.json({ ok: true, data: { pdfUrl: r.pdfUrl || "" } });
   } catch (e) {
     res.status(502).json({ ok: false, message: e instanceof Error ? e.message : "Error archivando en Drive." });
@@ -516,6 +559,136 @@ router.get("/report/pdf", async (req, res) => {
   } catch (e) {
     res.status(502).json({ ok: false, message: e instanceof Error ? e.message : "Error generando PDF." });
   }
+});
+
+// ── Traer facturas nuevas desde DIAN (token del buzón + rango por mes) ──────
+// "La magia": toma el token reenviado al buzón de ContaGO para el NIT de la
+// empresa activa y descarga las facturas RECIBIDAS del mes elegido, descartando
+// las ya importadas (dedup por CUFE). No requiere pegar token ni subir archivos.
+const onlyDigits = (s?: string) => String(s || "").replace(/\D/g, "").replace(/^0+/, "");
+
+interface DianFetchJob {
+  status: "processing" | "completed" | "cancelled" | "error";
+  progress: { step: string; current: number; total: number };
+  userId: string;
+  createdAt: number;
+  result?: IngestResult;
+  error?: string;
+}
+const dianFetchJobs = new Map<string, DianFetchJob>();
+const DIAN_FETCH_TTL_MS = 2 * 60 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, job] of dianFetchJobs) if (now - job.createdAt > DIAN_FETCH_TTL_MS) dianFetchJobs.delete(id);
+}, 30 * 60 * 1000).unref?.();
+
+// Rango [primer día, último día] de un mes (YYYY-MM-DD).
+function monthRange(year: number, month: number): { fechaInicio: string; fechaFin: string } {
+  const mm = String(month).padStart(2, "0");
+  const lastDay = new Date(year, month, 0).getDate();
+  return { fechaInicio: `${year}-${mm}-01`, fechaFin: `${year}-${mm}-${String(lastDay).padStart(2, "0")}` };
+}
+
+// Estado del token disponible para la empresa: ¿hay uno en el buzón? ¿hace cuánto?
+router.get("/dian/token-status", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const ctx = await getCompanyContext(companyId);
+  const nit = onlyDigits(ctx?.nit || "");
+  if (!nit) return res.json({ ok: true, data: { mailbox: await getDianMailboxStatus(), companyNit: "", token: null } });
+  let token = null;
+  try {
+    const t = await latestDianTokenForNit(nit, 7);
+    if (t) token = { receivedAt: t.receivedAt, ageMinutes: Math.round((Date.now() - t.receivedAt) / 60000), subject: t.subject };
+  } catch { /* buzón no conectado: token queda null */ }
+  res.json({ ok: true, data: { mailbox: await getDianMailboxStatus(), companyNit: nit, token } });
+});
+
+// Dispara la descarga del mes. Body: { year, month }. Devuelve { jobId } o, si no
+// hay token fresco en el buzón, { ok:false, code:"NO_TOKEN" } para que la UI guíe.
+router.post("/dian/fetch-new", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const year = Number(req.body?.year);
+  const month = Number(req.body?.month);
+  if (!year || !month || month < 1 || month > 12) {
+    return res.status(400).json({ ok: false, message: "Indica el año y el mes a consultar." });
+  }
+  const ctx = await getCompanyContext(companyId);
+  if (!ctx) return res.status(400).json({ ok: false, message: "Empresa sin conexión a SIIGO." });
+  const companyNit = onlyDigits(ctx.nit);
+  if (!companyNit) {
+    return res.status(400).json({ ok: false, code: "NO_COMPANY_NIT", message: "La empresa no tiene NIT configurado." });
+  }
+
+  let token;
+  try {
+    token = await latestDianTokenForNit(companyNit, 7);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "";
+    if (msg === "DIAN_MAILBOX_NOT_CONNECTED") {
+      return res.status(409).json({ ok: false, code: "MAILBOX_OFF", message: "El buzón DIAN de ContaGO no está conectado. Avísale al administrador." });
+    }
+    return res.status(502).json({ ok: false, message: "No se pudo leer el buzón DIAN." });
+  }
+  if (!token) {
+    return res.status(409).json({
+      ok: false,
+      code: "NO_TOKEN",
+      message: `No hay un token reciente para el NIT ${companyNit}. Solicita un token en el portal DIAN y reenvíalo al buzón de ContaGO; luego vuelve a intentar.`,
+    });
+  }
+
+  const { fechaInicio, fechaFin } = monthRange(year, month);
+  const maxDocuments = Math.max(1, Number(process.env.DIAN_MAX_DOCUMENTS || 850));
+  const jobId = uuidv4();
+  dianFetchJobs.set(jobId, { status: "processing", progress: { step: "En cola...", current: 0, total: 0 }, userId: req.user?.userId || "", createdAt: Date.now() });
+
+  runWithSiigoCompany(ctx, () =>
+    ingestNewByDateRange({
+      companyId,
+      tokenUrl: token!.tokenUrl,
+      fechaInicio,
+      fechaFin,
+      nitReceptor: companyNit,
+      maxDocuments,
+      onProgress: (p) => { const j = dianFetchJobs.get(jobId); if (j && j.status === "processing") j.progress = p; },
+      isCancelled: () => dianFetchJobs.get(jobId)?.status === "cancelled",
+    })
+  )
+    .then((result) => {
+      const j = dianFetchJobs.get(jobId);
+      if (!j || j.status === "cancelled") return;
+      j.status = "completed"; j.result = result;
+      j.progress = { step: "Completado", current: result.stats.downloaded, total: result.stats.listed };
+    })
+    .catch((err) => {
+      const j = dianFetchJobs.get(jobId);
+      if (!j) return;
+      j.status = "error"; j.error = err instanceof Error ? err.message : "Error en la descarga DIAN.";
+    });
+
+  res.json({ ok: true, jobId, range: { fechaInicio, fechaFin }, tokenAgeMinutes: Math.round((Date.now() - token.receivedAt) / 60000) });
+});
+
+router.get("/dian/fetch-new/status/:jobId", (req, res) => {
+  const job = dianFetchJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, message: "Job no encontrado." });
+  res.json({ ok: true, status: job.status, progress: job.progress, error: job.error, stats: job.result?.stats });
+});
+
+router.get("/dian/fetch-new/result/:jobId", (req, res) => {
+  const job = dianFetchJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, message: "Job no encontrado." });
+  if (job.status !== "completed" || !job.result) return res.status(409).json({ ok: false, message: "El job aún no ha terminado.", status: job.status });
+  res.json({ ok: true, data: job.result.items, stats: job.result.stats, failures: job.result.failures });
+});
+
+router.post("/dian/fetch-new/cancel/:jobId", (req, res) => {
+  const job = dianFetchJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ ok: false, message: "Job no encontrado." });
+  if (job.status === "processing") job.status = "cancelled";
+  res.json({ ok: true });
 });
 
 export default router;

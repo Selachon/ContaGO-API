@@ -193,6 +193,7 @@ function mapUser(record: UserRecord | null): User | null {
     force_password_change: !!record.force_password_change,
     created_at: record.created_at,
     demo: record.demo,
+    companiesInPlan: record.companiesInPlan,
   };
 }
 

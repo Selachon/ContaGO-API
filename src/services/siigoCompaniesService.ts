@@ -85,6 +85,11 @@ export async function userOwnsCompany(companyId: string, userId: string): Promis
   return !!doc;
 }
 
+/** Cuántas empresas es DUEÑO un usuario (para hacer cumplir el cupo del plan). */
+export async function countCompaniesOwnedBy(userId: string): Promise<number> {
+  return getDb().collection<any>(COMPANIES).countDocuments({ ownerUserId: userId });
+}
+
 /** Credenciales completas (descifradas) de una empresa, listas para el contexto Siigo. */
 export async function getCompanyContext(id: string): Promise<SiigoContext | null> {
   let oid: ObjectId;

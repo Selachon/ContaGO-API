@@ -486,7 +486,11 @@ export async function extractDocumentIds(
   startDate: string | undefined,
   endDate: string | undefined,
   progressUid?: string,
-  documentDirection: DocumentDirection = "received"
+  documentDirection: DocumentDirection = "received",
+  // Si true, NO reconcilia contra la pestaña Export (que genera un listado en el
+  // portal y a veces tarda/ falla hasta 5 min). El scrapeo de la tabla basta para
+  // "Traer facturas nuevas del mes". Por defecto false (no afecta otras tools).
+  skipReconciliation = false
 ): Promise<ExtractionResult> {
   const direction = documentDirection || "received";
   const isSent = direction === "sent";
@@ -519,6 +523,19 @@ export async function extractDocumentIds(
     updateProgress({ step: "Accediendo con token..." });
     await navigateWithRetry(page, tokenUrl, 3);
     await delay(1000);
+
+    // La página /User/AuthToken crea la sesión por JavaScript y LUEGO redirige al
+    // dashboard. Con `domcontentloaded` la navegación resuelve antes de que la
+    // sesión exista; esperar a que la URL deje de ser AuthToken hasta ~25s.
+    {
+      const startWait = Date.now();
+      while (Date.now() - startWait < 25000) {
+        if (!/\/User\/AuthToken/i.test(page.url())) break;
+        if (isLoginPage(page.url())) break;
+        await delay(1000);
+      }
+      await delay(1500);
+    }
 
     // Extraer razón social y NIT de la empresa desde el dashboard
     const companyInfo = await page.evaluate(() => {
@@ -685,10 +702,12 @@ export async function extractDocumentIds(
     // reconciliación es un refuerzo: si el listado no se puede obtener (p. ej.
     // bloqueo anti-bot persistente), seguimos con lo scrapeado en vez de fallar.
     let listedRecords: ListingRecord[] = [];
-    try {
-      listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
-    } catch (recErr) {
-      console.warn("[Scraper] Reconciliación con listado omitida:", recErr instanceof Error ? recErr.message : recErr);
+    if (!skipReconciliation) {
+      try {
+        listedRecords = await extractListingRecordsFromDownloadTab(page, direction, startDate, endDate);
+      } catch (recErr) {
+        console.warn("[Scraper] Reconciliación con listado omitida:", recErr instanceof Error ? recErr.message : recErr);
+      }
     }
     if (listedRecords.length > 0) {
       const byId = new Map(allDocuments.map((d) => [d.id, d]));
@@ -823,6 +842,22 @@ export async function extractDocumentIdsByCufe(
         updateProgress({ step: `DIAN bloqueó temporalmente; reintentando en ${Math.round(waitMs / 1000)}s...`, current: 0, total: 1 });
         await delay(waitMs);
       }
+    }
+
+    // La página /User/AuthToken crea la sesión por JavaScript y LUEGO redirige al
+    // dashboard. Con `domcontentloaded` la navegación resuelve en la propia página
+    // AuthToken, ANTES de que la sesión exista: si seguimos de inmediato a otra
+    // ruta, la DIAN nos manda a /User/Login. Esperamos a que la URL deje de ser
+    // AuthToken (sesión lista) hasta ~25s antes de continuar.
+    {
+      const SESSION_WAIT_MS = 25000;
+      const startWait = Date.now();
+      while (Date.now() - startWait < SESSION_WAIT_MS) {
+        if (!/\/User\/AuthToken/i.test(page.url())) break;
+        if (isLoginPage(page.url())) break;
+        await delay(1000);
+      }
+      await delay(1500); // respiro para que el dashboard termine de cargar
     }
 
     // Extraer razón social y NIT de la empresa desde el dashboard

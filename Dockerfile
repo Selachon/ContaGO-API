@@ -45,10 +45,15 @@ RUN apt-get update && apt-get install -y \
     xdg-utils \
     tini \
     python3 \
+    python3-pip \
     make \
     g++ \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
+
+# Dependencias del motor Python (DIAN -> Siigo). bookworm aplica PEP 668,
+# por eso --break-system-packages para instalar en el entorno del sistema.
+RUN pip3 install --no-cache-dir --break-system-packages pandas openpyxl
 
 # Set Puppeteer to use installed Chromium
 ENV NODE_ENV=production
@@ -68,9 +73,12 @@ RUN npm install --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/templates ./templates
 
+# Motor Python (se ejecuta como subproceso desde el servicio de contabilización).
+COPY motor ./motor
+
 # Create directories writable by node user
-RUN mkdir -p /app/downloads /app/.cache/puppeteer \
-    && chown node:node /app/downloads \
+RUN mkdir -p /app/downloads /app/.cache/puppeteer /app/data \
+    && chown node:node /app/downloads /app/data \
     && chown -R node:node /app/.cache
 
 # Expose port
