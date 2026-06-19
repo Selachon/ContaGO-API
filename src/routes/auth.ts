@@ -14,6 +14,7 @@ import {
 } from "../services/database.js";
 import {
   getPersonalKanbanBoard,
+  getPortalStatusConfig,
   logAdminAction,
   updatePersonalKanbanBoard,
   type AdminKanbanBoard,
@@ -106,11 +107,22 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
     return res.status(403).json(response);
   }
 
+  const role = user.role || (user.is_admin ? "ADMIN" : "USER");
+  const isAdmin = !!user.is_admin;
+  const portalStatus = await getPortalStatusConfig();
+  if (!isAdmin && portalStatus.global.enabled && portalStatus.global.disableLogin) {
+    const response: AuthResponse = {
+      ok: false,
+      message: portalStatus.global.message || portalStatus.global.title || "El portal está temporalmente en mantenimiento. Intenta nuevamente más tarde.",
+    };
+    return res.status(503).json(response);
+  }
+
   const payload: JWTPayload = {
     userId: user.id,
     email: user.email,
-    isAdmin: !!user.is_admin,
-    role: user.role || (user.is_admin ? "ADMIN" : "USER"),
+    isAdmin,
+    role,
   };
 
   const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
