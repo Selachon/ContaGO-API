@@ -39,8 +39,10 @@ import {
 import {
   createEmpresa,
   dataRoot,
+  getPuc,
   getTabla,
   guardarConsecutivos,
+  importarPuc,
   importarTabla,
   listEmpresasForUser,
   materializarConfig,
@@ -173,8 +175,8 @@ function getDians(req: Request): Express.Multer.File[] {
  * con la info del DIAN y devuelve los datos para que el front navegue y resalte
  * la fila. Devuelve null si el error es de otro tipo.
  *
- * - proveedores_faltantes      → tabla de proveedores del proceso (compras/ventas)
- * - terceros_soporte_faltantes → siempre la tabla de Compras (documento soporte)
+ * - proveedores_faltantes / clientes_no_parametrizados → tabla del proceso
+ * - terceros_soporte_faltantes / soporte_no_parametrizado → siempre Compras (documento soporte)
  */
 async function precrearDesdeError(
   empresaId: string,
@@ -184,8 +186,8 @@ async function precrearDesdeError(
 ): Promise<PrecreacionResultado | null> {
   if (!(err instanceof MotorError)) return null;
   let slot: TablaSlot | null = null;
-  if (err.tipo === "proveedores_faltantes") slot = slotProveedores;
-  else if (err.tipo === "terceros_soporte_faltantes") slot = "paramCompras";
+  if (err.tipo === "proveedores_faltantes" || err.tipo === "clientes_no_parametrizados") slot = slotProveedores;
+  else if (err.tipo === "terceros_soporte_faltantes" || err.tipo === "soporte_no_parametrizado") slot = "paramCompras";
   if (!slot) return null;
 
   const nits = (err.detalle || []).map((d) => String(d));
@@ -340,6 +342,37 @@ router.put("/empresas/:id/tablas/:slot", async (req: Request, res: Response) => 
   }
 });
 
+router.post("/empresas/:id/puc", upload.single("puc"), async (req: Request, res: Response) => {
+  try {
+    await exigirAcceso(req);
+    const f = req.file as Express.Multer.File | undefined;
+    if (!f) throw new MotorError("sin_archivos", "No se subió el PUC.", [], 400);
+    try {
+      const cuentas = await importarPuc(req.params.id, f.buffer, f.originalname);
+      res.json({ status: "ok", cuentas: cuentas.length, empresa: await empresaActualizada(req, req.params.id) });
+    } catch (e) {
+      throw new MotorError(
+        "puc_invalido",
+        `No se pudo leer "${f.originalname}": ${e instanceof Error ? e.message : String(e)}`,
+        [],
+        422
+      );
+    }
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
+router.get("/empresas/:id/puc", async (req: Request, res: Response) => {
+  try {
+    await exigirAcceso(req);
+    const cuentas = await getPuc(req.params.id);
+    res.json({ status: "ok", cuentas });
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
 // Sube la plantilla de terceros (.xlsm). Esta SÍ sigue por archivo.
 router.post("/empresas/:id/plantilla", upload.single("plantillaTerceros"), async (req: Request, res: Response) => {
   try {
@@ -424,7 +457,18 @@ router.post("/ventas/prefijos", upload.array("dian"), async (req: Request, res: 
     exigirArchivos(config, ["paramVentas", "paramCompras", "impuestos"]);
     const dians = guardarDians(inDir, dianFiles);
 
-    const result = await ejecutarMotor("ventas", { ...baseOpts(config, out, dians), soloPrefijos: true });
+    let result;
+    try {
+      result = await ejecutarMotor("ventas", { ...baseOpts(config, out, dians), soloPrefijos: true });
+    } catch (err) {
+      const precreacion = await precrearDesdeError(empresaId, err, dians, "paramVentas");
+      if (precreacion) {
+        const e = err as MotorError;
+        res.status(422).json({ status: "error", tipo: e.tipo, mensaje: e.message, detalle: e.detalle, precreacion });
+        return;
+      }
+      throw err;
+    }
     if (result.status !== "prefijos") throw new MotorError("inesperado", "El motor no devolvió prefijos.", [], 500);
     res.json({ status: "prefijos", facturas: result.facturas, ds: result.ds, nc: result.nc });
   } catch (err) {

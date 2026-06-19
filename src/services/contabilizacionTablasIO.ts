@@ -85,6 +85,66 @@ export async function leerHoja(buffer: Buffer, sheetName?: string): Promise<Tabl
   return { sheetName: ws.name, columns, rows };
 }
 
+
+function leerHojaDesdeFila(ws: ExcelJS.Worksheet, headerRowNumber: number): Tabla {
+  const headerRow = ws.getRow(headerRowNumber);
+  const columns: string[] = [];
+  const colIndex: number[] = [];
+  headerRow.eachCell({ includeEmpty: false }, (cell, col) => {
+    const name = String(valorCelda(cell.value) ?? "").trim();
+    if (name) {
+      columns.push(name);
+      colIndex.push(col);
+    }
+  });
+  if (!columns.length) throw new Error(`La hoja "${ws.name}" no tiene encabezados.`);
+
+  const rows: Record<string, Celda>[] = [];
+  for (let r = headerRowNumber + 1; r <= ws.rowCount; r++) {
+    const row = ws.getRow(r);
+    const obj: Record<string, Celda> = {};
+    let algo = false;
+    for (let i = 0; i < columns.length; i++) {
+      const val = valorCelda(row.getCell(colIndex[i]).value);
+      obj[columns[i]] = val;
+      if (val !== null && val !== "") algo = true;
+    }
+    if (algo) rows.push(obj);
+  }
+
+  return { sheetName: ws.name, columns, rows };
+}
+
+export async function leerHojaConEncabezadoDinamico(
+  buffer: Buffer,
+  candidatos: (columns: string[]) => boolean,
+  sheetName?: string
+): Promise<Tabla> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer as unknown as ArrayBuffer);
+
+  const ws = sheetName ? wb.getWorksheet(sheetName) : wb.worksheets[0];
+  if (!ws) {
+    throw new Error(
+      sheetName
+        ? `El archivo no tiene la hoja "${sheetName}".`
+        : "El archivo no tiene ninguna hoja."
+    );
+  }
+
+  const limite = Math.min(30, ws.rowCount);
+  for (let r = 1; r <= limite; r++) {
+    const columns: string[] = [];
+    ws.getRow(r).eachCell({ includeEmpty: false }, (cell) => {
+      const name = String(valorCelda(cell.value) ?? "").trim();
+      if (name) columns.push(name);
+    });
+    if (columns.length && candidatos(columns)) return leerHojaDesdeFila(ws, r);
+  }
+
+  return leerHojaDesdeFila(ws, 1);
+}
+
 /** Materializa una tabla a un archivo .xlsx en `path` (hoja + columnas + valores). */
 export async function escribirTabla(tabla: Tabla, path: string): Promise<void> {
   const wb = new ExcelJS.Workbook();

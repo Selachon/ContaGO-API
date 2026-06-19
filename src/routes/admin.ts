@@ -1,6 +1,12 @@
 import { Router, Request, Response } from "express";
 import { ObjectId } from "mongodb";
 import ExcelJS from "exceljs";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
+import { v4 as uuidv4 } from "uuid";
+import JSZip from "jszip";
+import multer from "multer";
 import {
   listUsers,
   getUserById,
@@ -22,8 +28,20 @@ import {
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
 import { createDemoInvite, listDemoInvites, TOOL_SUCCESSOR, updateUserPassword } from "../services/database.js";
+import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
+import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
+import type { InvoiceData } from "../types/dianExcel.js";
 
 const router = Router();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
+const manualDianUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 50 * 1024 * 1024,
+    files: 2000,
+  },
+});
 
 const DEMO_ALLOWED_TOOLS = new Set([
   "dian-cufe-downloader",
@@ -52,6 +70,175 @@ router.use((req: Request, res: Response, next) => {
     return res.status(403).json({ ok: false, message: "Acceso denegado. Se requiere rol de administrador." });
   }
   next();
+});
+
+function normalizeManualValue(value: string | undefined, fallback = "N/A"): string {
+  const trimmed = String(value || "").trim();
+  return trimmed || fallback;
+}
+
+function buildManualInvoiceRow(invoiceData: Partial<InvoiceData>, fallbackDocNumber: string): InvoiceData {
+  const cufe = normalizeManualValue(invoiceData.cufe || invoiceData.trackId, "N/A");
+  const docNumber = normalizeManualValue(invoiceData.docNumber, fallbackDocNumber);
+
+  return {
+    issuerNit: normalizeManualValue(invoiceData.issuerNit),
+    issuerName: normalizeManualValue(invoiceData.issuerName),
+    issuerEmail: normalizeManualValue(invoiceData.issuerEmail),
+    issuerPhone: normalizeManualValue(invoiceData.issuerPhone),
+    issuerAddress: normalizeManualValue(invoiceData.issuerAddress),
+    issuerCity: normalizeManualValue(invoiceData.issuerCity),
+    issuerDepartment: normalizeManualValue(invoiceData.issuerDepartment),
+    issuerCountry: normalizeManualValue(invoiceData.issuerCountry),
+    issuerCommercialName: normalizeManualValue(invoiceData.issuerCommercialName),
+    issuerTaxpayerType: normalizeManualValue(invoiceData.issuerTaxpayerType),
+    issuerFiscalRegime: normalizeManualValue(invoiceData.issuerFiscalRegime),
+    issuerTaxResponsibility: normalizeManualValue(invoiceData.issuerTaxResponsibility),
+    issuerEconomicActivity: normalizeManualValue(invoiceData.issuerEconomicActivity),
+    receiverNit: normalizeManualValue(invoiceData.receiverNit),
+    receiverName: normalizeManualValue(invoiceData.receiverName),
+    receiverEmail: normalizeManualValue(invoiceData.receiverEmail),
+    receiverPhone: normalizeManualValue(invoiceData.receiverPhone),
+    receiverAddress: normalizeManualValue(invoiceData.receiverAddress),
+    receiverCity: normalizeManualValue(invoiceData.receiverCity),
+    receiverDepartment: normalizeManualValue(invoiceData.receiverDepartment),
+    receiverCountry: normalizeManualValue(invoiceData.receiverCountry),
+    receiverCommercialName: normalizeManualValue(invoiceData.receiverCommercialName),
+    receiverTaxpayerType: normalizeManualValue(invoiceData.receiverTaxpayerType),
+    receiverFiscalRegime: normalizeManualValue(invoiceData.receiverFiscalRegime),
+    receiverTaxResponsibility: normalizeManualValue(invoiceData.receiverTaxResponsibility),
+    receiverEconomicActivity: normalizeManualValue(invoiceData.receiverEconomicActivity),
+    issueDate: normalizeManualValue(invoiceData.issueDate),
+    issueDateISO: invoiceData.issueDateISO || "9999-12-31",
+    paymentMethod: normalizeManualValue(invoiceData.paymentMethod),
+    subtotal: invoiceData.subtotal || 0,
+    iva: invoiceData.iva || 0,
+    total: invoiceData.total || 0,
+    taxes: invoiceData.taxes || [],
+    discount: invoiceData.discount || 0,
+    surcharge: invoiceData.surcharge || 0,
+    concepts: normalizeManualValue(invoiceData.concepts),
+    lineItems: invoiceData.lineItems || [],
+    documentType: normalizeManualValue(invoiceData.documentType, "Factura Electrónica"),
+    isDocumentoSoporte: invoiceData.isDocumentoSoporte || false,
+    cufe,
+    notes: invoiceData.notes || "",
+    trackId: cufe,
+    docNumber,
+    zipFilename: `${normalizeManualValue(invoiceData.issuerNit)} - ${docNumber}.zip`,
+  };
+}
+
+async function collectXmlBuffersFromAdminUpload(files: Express.Multer.File[]): Promise<Array<{ buffer: Buffer; filename: string }>> {
+  const xmlFiles: Array<{ buffer: Buffer; filename: string }> = [];
+
+  for (const uploaded of files) {
+    const lowerName = uploaded.originalname.toLowerCase();
+
+    if (lowerName.endsWith(".xml")) {
+      xmlFiles.push({ buffer: uploaded.buffer, filename: uploaded.originalname });
+      continue;
+    }
+
+    if (!lowerName.endsWith(".zip")) continue;
+
+    const zip = await JSZip.loadAsync(uploaded.buffer);
+    for (const [filename, file] of Object.entries(zip.files)) {
+      if (file.dir || !filename.toLowerCase().endsWith(".xml")) continue;
+      xmlFiles.push({
+        buffer: await file.async("nodebuffer"),
+        filename: `${uploaded.originalname}/${filename}`,
+      });
+    }
+  }
+
+  return xmlFiles;
+}
+
+function inferManualCompany(invoices: InvoiceData[], direction: "received" | "sent", companyName: string, companyNit: string) {
+  let inferredName = companyName;
+  let inferredNit = companyNit;
+
+  if (inferredName && inferredNit) return { companyName: inferredName, companyNit: inferredNit };
+
+  for (const invoice of invoices) {
+    const nit = direction === "sent" ? invoice.issuerNit : invoice.receiverNit;
+    const name = direction === "sent" ? invoice.issuerName : invoice.receiverName;
+    if (!inferredNit && nit && nit !== "N/A") inferredNit = nit;
+    if (!inferredName && name && name !== "N/A") inferredName = name;
+    if (inferredName && inferredNit) break;
+  }
+
+  return { companyName: inferredName, companyNit: inferredNit };
+}
+
+// ============================================
+// POST /admin/dian-xml-excel - Excel DIAN desde XML subidos manualmente
+// ============================================
+router.post("/dian-xml-excel", manualDianUpload.array("files", 2000), async (req: Request, res: Response) => {
+  const uploadedFiles = Array.isArray(req.files) ? req.files as Express.Multer.File[] : [];
+  const direction = req.body?.document_direction === "sent" ? "sent" : "received";
+  const requestedCompanyName = typeof req.body?.company_name === "string" ? req.body.company_name.trim() : "";
+  const requestedCompanyNit = typeof req.body?.company_nit === "string" ? req.body.company_nit.trim() : "";
+
+  if (uploadedFiles.length === 0) {
+    return res.status(400).json({ ok: false, message: "Sube al menos un archivo .xml o .zip con XML." });
+  }
+
+  let excelPath = "";
+  try {
+    fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+
+    const xmlFiles = await collectXmlBuffersFromAdminUpload(uploadedFiles);
+    if (xmlFiles.length === 0) {
+      return res.status(400).json({ ok: false, message: "No se encontraron XML en los archivos subidos." });
+    }
+
+    const invoices: InvoiceData[] = [];
+    for (let i = 0; i < xmlFiles.length; i++) {
+      const xmlFile = xmlFiles[i];
+      const fallbackDocNumber = path.basename(xmlFile.filename).replace(/\.xml$/i, "") || `XML-${i + 1}`;
+      const parsed = await extractInvoiceDataFromXml(xmlFile.buffer, {
+        id: fallbackDocNumber,
+        docnum: fallbackDocNumber,
+      });
+      invoices.push(buildManualInvoiceRow(parsed, fallbackDocNumber));
+    }
+
+    if (invoices.length === 0) {
+      return res.status(400).json({ ok: false, message: "No se pudo construir ninguna fila para el Excel." });
+    }
+
+    const { companyName, companyNit } = inferManualCompany(invoices, direction, requestedCompanyName, requestedCompanyNit);
+    const jobId = `admin-xml-${uuidv4()}`;
+    excelPath = path.join(DOWNLOADS_DIR, `${jobId}.xlsx`);
+    await generateExcelFile(invoices, excelPath, false, direction === "sent", companyName, companyNit);
+
+    const basePrefix = direction === "sent" ? "Facturas Emitidas DIAN" : "Facturas DIAN";
+    const filePrefix = companyName
+      ? `${companyNit ? `${companyNit} - ` : ""}${companyName} - ${basePrefix}`
+      : (companyNit ? `${companyNit} - ${basePrefix}` : basePrefix);
+    const filename = generateExcelFilename(undefined, undefined, filePrefix);
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(filename)}"`);
+
+    const stream = fs.createReadStream(excelPath);
+    stream.pipe(res);
+    stream.on("close", () => {
+      if (excelPath && fs.existsSync(excelPath)) {
+        try { fs.unlinkSync(excelPath); } catch {}
+      }
+    });
+  } catch (err) {
+    console.error("[Admin] Error generando Excel DIAN manual:", err);
+    if (excelPath && fs.existsSync(excelPath)) {
+      try { fs.unlinkSync(excelPath); } catch {}
+    }
+    if (!res.headersSent) {
+      res.status(500).json({ ok: false, message: (err as Error).message || "Error al generar Excel desde XML." });
+    }
+  }
 });
 
 // ============================================
