@@ -27,7 +27,73 @@ type OnDocumentFound = (ctx: {
   index: number;
   total: number;
   cookies: Record<string, string>;
+  /** Página del worker (ya pasó Cloudflare). Permite descargar el ZIP DENTRO del
+   *  navegador (fetch en contexto de página), evitando que Cloudflare bloquee la
+   *  descarga directa por fetch de Node (cuyo fingerprint TLS no es de Chrome). */
+  page?: Page;
 }) => Promise<void> | void;
+
+/**
+ * Descarga un ZIP de la DIAN disparando la descarga REAL del portal (su botón/JS),
+ * que ejecuta el reCAPTCHA v3 y adjunta el token. La descarga directa por URL ya no
+ * funciona: la DIAN responde "Recaptcha inválido". Capturamos el archivo bajado por
+ * el navegador vía CDP (Page.setDownloadBehavior) y lo devolvemos validado (PK).
+ *
+ * `destDir` debe ser un directorio donde el navegador pueda escribir la descarga.
+ * Devuelve el Buffer del ZIP. La fila del documento (trackId) debe estar visible en
+ * la página (es el resultado de la búsqueda por CUFE).
+ */
+export async function downloadZipInPage(page: Page, trackId: string, isEquivalente: boolean, destDir: string): Promise<Buffer> {
+  fs.mkdirSync(destDir, { recursive: true });
+  const before = new Set(fs.existsSync(destDir) ? fs.readdirSync(destDir) : []);
+
+  // Habilita la descarga a disco para esta página (CDP).
+  const client = await page.target().createCDPSession();
+  try {
+    await client.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: destDir });
+  } catch {
+    try { await client.send("Browser.setDownloadBehavior" as any, { behavior: "allow", downloadPath: destDir, eventsEnabled: true } as any); } catch { /* noop */ }
+  }
+
+  // Dispara la descarga como el portal: invoca su función JS (corre el reCAPTCHA) o,
+  // si no existe, hace click en el elemento de descarga de esa fila.
+  const fnName = isEquivalente ? "DownloadZipFilesEquivalente" : "DownloadZipFiles";
+  const triggered = await page.evaluate((fn: string, id: string) => {
+    const w = window as unknown as Record<string, unknown>;
+    if (typeof w[fn] === "function") { (w[fn] as (x: string) => void)(id); return "fn"; }
+    // Fallback: click en el elemento cuyo onclick/href referencia este trackId.
+    const sel = `[onclick*="${id}"], a[href*="${id}"], [data-trackid="${id}"], [data-id="${id}"]`;
+    const el = document.querySelector(sel) as HTMLElement | null;
+    if (el) { el.click(); return "click"; }
+    return "none";
+  }, fnName, trackId).catch(() => "error");
+
+  if (triggered === "none" || triggered === "error") {
+    throw new Error(`DOWNLOAD_TRIGGER_FAILED: no se pudo iniciar la descarga del portal (trigger=${triggered}).`);
+  }
+
+  // Espera a que aparezca un .zip nuevo y completo (sin .crdownload).
+  const deadline = Date.now() + 90_000;
+  let zipPath: string | null = null;
+  while (Date.now() < deadline) {
+    const now = fs.existsSync(destDir) ? fs.readdirSync(destDir) : [];
+    const partial = now.some((f) => f.endsWith(".crdownload") || f.endsWith(".part"));
+    const fresh = now.filter((f) => !before.has(f) && f.toLowerCase().endsWith(".zip"));
+    if (fresh.length && !partial) { zipPath = path.join(destDir, fresh[0]); break; }
+    await delay(500);
+  }
+  if (!zipPath) {
+    throw new Error("RECAPTCHA_DOWNLOAD_TIMEOUT: la descarga del portal no produjo un ZIP (probable rechazo del reCAPTCHA en modo automatizado).");
+  }
+  const buf = fs.readFileSync(zipPath);
+  const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
+  if (!isZip) {
+    const snippet = buf.toString("utf8", 0, 200).replace(/\s+/g, " ").trim();
+    console.warn(`[InPage DL] Archivo capturado NO es ZIP: ${zipPath} head="${snippet}"`);
+    throw new Error("NOT_ZIP");
+  }
+  return buf;
+}
 
 interface PrecheckResult {
   ok: true;
@@ -181,9 +247,22 @@ export async function throttledDianDownload(
       // "Solicitud bloqueada" (HTML), tratarlo como bloqueo transitorio y reintentar.
       const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
       if (!isZip) {
-        const head = buf.toString("utf8", 0, 600).toLowerCase();
+        const head = buf.toString("utf8", 0, 800).toLowerCase();
         if (head.includes("bloqueada") || head.includes("controles de seguridad")) {
           throw new Error("BLOCKED body");
+        }
+        // Si la DIAN devuelve la página de LOGIN (sesión/token rechazado para la
+        // descarga directa), reintentar es inútil: el token está consumido/expirado
+        // o la IP fue marcada. Cortamos de inmediato (sin agotar los 12 reintentos
+        // por documento, que harían parecer "colgada" la herramienta) con un error
+        // claro para solicitar un token nuevo.
+        const looksLikeLogin =
+          head.includes("/user/login") || head.includes("iniciar sesión") ||
+          head.includes("authtoken") || head.includes("microsoftonline") ||
+          (head.includes("<html") && head.includes("login"));
+        if (looksLikeLogin) {
+          // El release lo hace el catch (evita doble liberación del cupo).
+          throw new Error("SESSION_REJECTED: La DIAN rechazó la sesión al descargar (devolvió la página de inicio de sesión). El token está consumido/expirado o la IP fue bloqueada temporalmente. Solicita un token NUEVO en la DIAN y espera unos minutos antes de reintentar.");
         }
         // No es ZIP ni bloqueo conocido: dato inválido, reintentar también.
         throw new Error("NOT_ZIP");
@@ -194,6 +273,9 @@ export async function throttledDianDownload(
       clearTimeout(timer);
       release(); // liberar el cupo durante el backoff (no retener mientras se espera)
       lastError = err as Error;
+      // Sesión rechazada (login): no tiene sentido reintentar este ni los demás
+      // documentos con el mismo token muerto. Propagar de inmediato.
+      if (lastError.message?.startsWith("SESSION_REJECTED")) throw lastError;
       if (attempt < maxRetries) {
         // Reintento CORTO: el bloqueo se limpia rápido. Respeta Retry-After si DIAN
         // lo envía (raro); si no, ~1s con jitter. Crece levemente si insiste.
@@ -1115,6 +1197,7 @@ export async function extractDocumentIdsByCufe(
                   index: i + 1,
                   total: cufes.length,
                   cookies: wc,
+                  page: wp,
                 });
               }
             }
@@ -1203,7 +1286,7 @@ export async function extractDocumentIdsByCufe(
                 documents.push(found);
                 recovered++;
                 if (onDocumentFound) {
-                  await onDocumentFound({ doc: found, index: documents.length, total: cufes.length, cookies: retry.cookies });
+                  await onDocumentFound({ doc: found, index: documents.length, total: cufes.length, cookies: retry.cookies, page: retry.page });
                 }
               }
             }

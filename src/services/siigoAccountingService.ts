@@ -304,19 +304,8 @@ export async function processXmlBatch(
     }
   }
 
-  // Marcar las que ya están causadas en Siigo (NIT + número de factura)
-  try {
-    const causadas = await fetchCausadasKeys();
-    console.log(`[SiigoAccounting] Duplicados: ${causadas.size} compras en los últimos 12 meses`);
-    for (const item of results) {
-      if (!item.ok || !item.xml) continue;
-      const nit = nitKey(item.xml.supplierNit);
-      const num = onlyDigits(item.xml.providerInvoiceNumber);
-      if (nit && num && causadas.has(`${nit}|${num}`)) item.alreadyCausada = true;
-    }
-  } catch (e) {
-    console.warn("[SiigoAccounting] No se pudo consultar duplicados:", e instanceof Error ? e.message : e);
-  }
+  // La verificación de duplicados contra Siigo fue removida: la herramienta
+  // permite subir todas las facturas y deja al usuario decidir cuáles causar.
 
   return results;
 }

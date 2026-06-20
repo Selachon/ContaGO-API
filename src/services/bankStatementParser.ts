@@ -59,7 +59,7 @@ const TOL = 1; // tolerancia en pesos para el cuadre
 const num = (s: unknown): number => Number(String(s ?? "").replace(/[^\d.-]/g, ""));
 
 const FEE_RX =
-  /4x1000|4 x 1000|gmf|impto gobierno|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
+  /4x1000|4 x 1000|gmf|gravamen|rendimientos financ|cobro transf|manejo portal|cobro serv disp|davipl|impto gobierno|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
 
 // ─── Extracción de texto del PDF (líneas reconstruidas por coordenada Y) ──
 async function extractLines(buffer: Buffer, password?: string): Promise<string[][]> {
@@ -106,15 +106,21 @@ async function extractLines(buffer: Buffer, password?: string): Promise<string[]
 }
 
 function detectBank(pages: string[][]): string {
-  const head = pages.flat().slice(0, 40).join(" ").toLowerCase();
-  if (head.includes("bancolombia")) return "bancolombia";
-  if (head.includes("itaú") || head.includes("itau")) return "itau";
+  const allText = pages.flat().join(" ").toLowerCase();
+  const head = allText; // reutilizamos allText para los checks de encabezado también
+  // Davivienda primero: extractos Davivienda siempre traen "davivienda.com" en el pie,
+  // pero sus movimientos pueden mencionar "BANCOLOMBIA" en transferencias entrantes,
+  // lo que dispararía una detección falsa si se verifica bancolombia antes.
+  if (allText.includes("davivienda")) return "davivienda";
+  const head40 = pages.flat().slice(0, 40).join(" ").toLowerCase();
+  if (head40.includes("bancolombia")) return "bancolombia";
+  if (head40.includes("itaú") || head40.includes("itau")) return "itau";
   // Occidente se detecta en el encabezado (no en el cuerpo) para no confundir con
   // statements de otro banco que solo mencionen "Banco de Occidente" en un movimiento.
-  if (head.includes("banco de occidente")) return "occidente";
+  if (head40.includes("banco de occidente")) return "occidente";
   // Banco de Bogotá: el nombre va en el pie (URL bancodebogota.com), no en el
   // encabezado. Es marcador específico y los demás bancos ya se descartaron arriba.
-  if (pages.flat().join(" ").toLowerCase().includes("bancodebogota.com")) return "bancobogota";
+  if (allText.includes("bancodebogota.com")) return "bancobogota";
   return "desconocido";
 }
 
@@ -303,6 +309,61 @@ function parseBancoBogota(pages: string[][]): { raws: RawMov[]; opening: number 
   return { raws, opening, declared: { credits, debits: debits || null }, closing };
 }
 
+// ─── Davivienda: cuenta de ahorros/corriente ──────────────────────────────
+// Formato por fila: "DD MM $ MONTO +/- DOCNUM DESCRIPCION [refs...]"
+// Sin columna de saldo corriente: se computa desde Saldo Anterior.
+// Los totales de control vienen en el encabezado (Más Créditos / Menos Débitos).
+function parseDavivienda(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
+  const all = pages.flat();
+
+  // Año desde "INFORME DEL MES: MARZO /2026"
+  let year = "";
+  const informe = all.find((l) => /INFORME DEL MES:/i.test(l));
+  if (informe) { const m = informe.match(/\/(\d{4})/); if (m) year = m[1]; }
+  if (!year) { const m = all.slice(0, 30).join(" ").match(/\b(20\d{2})\b/); if (m) year = m[1]; }
+
+  // Totales del encabezado (cada label en su propia línea, valor en la siguiente).
+  const findNextMoney = (rx: RegExp): number | null => {
+    const idx = all.findIndex((l) => rx.test(l));
+    if (idx < 0) return null;
+    const next = all[idx + 1];
+    const m = next?.match(/\$([\d,]+\.\d{2})/);
+    return m ? num(m[1]) : null;
+  };
+  const opening = findNextMoney(/^Saldo Anterior$/i);
+  const credits  = findNextMoney(/^Más Créditos$/i);
+  const debits   = findNextMoney(/^Menos Débitos$/i);
+  const closing  = findNextMoney(/^Nuevo Saldo$/i);
+
+  // Fila de movimiento: "DD MM $ MONTO +/- DOCNUM DESCRIPCION [refs...]"
+  const rowRx = /^(\d{2})\s+(\d{2})\s+\$\s*([\d,]+\.\d{2})\s+([+-])\s+\d{1,6}\s+(.+)/;
+  let runBal = opening ?? 0;
+  const raws: RawMov[] = [];
+
+  for (const line of all) {
+    const m = line.match(rowRx);
+    if (!m) continue;
+    const [, dd, mm, amountStr, sign, descRaw] = m;
+    const value = num(amountStr);
+    // Quitar números de referencia largos (NIT, orden de pago); conservar sufijo textual
+    // (destinatario CIC069, AMELIA, etc.) que viene después del NIT 9016750463.
+    // Deduplicar tokens consecutivos idénticos que el PDF a veces duplica.
+    const description = descRaw
+      .replace(/\s+\d{7,}/g, "")
+      .replace(/\b(\w+)\s+\1\b/gi, "$1")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (sign === "+") runBal += value; else runBal -= value;
+    raws.push({
+      date: `${year || new Date().getFullYear()}-${mm}-${dd}`,
+      description,
+      value,
+      balance: Math.round(runBal * 100) / 100,
+    });
+  }
+  return { raws, opening, declared: { credits, debits }, closing };
+}
+
 // ─── Clasificación + motor de cuadre ─────────────────────────────────────
 function classifyAndReconcile(
   raws: RawMov[],
@@ -370,7 +431,7 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
   const bank = detectBank(pages);
   if (bank === "desconocido") {
     throw new StatementError(
-      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente, Banco de Bogotá). Sube el Excel de movimientos.",
+      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente, Banco de Bogotá, Davivienda). Sube el Excel de movimientos.",
       422,
       "bank_unsupported"
     );
@@ -379,6 +440,7 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
     bank === "bancolombia" ? parseBancolombia(pages)
     : bank === "occidente" ? parseOccidente(pages)
     : bank === "bancobogota" ? parseBancoBogota(pages)
+    : bank === "davivienda" ? parseDavivienda(pages)
     : parseItau(pages);
   const { movements, reconciliation } = classifyAndReconcile(parsed.raws, parsed.opening, parsed.declared, parsed.closing);
   return { bank, movements, reconciliation };

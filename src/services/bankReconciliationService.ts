@@ -279,6 +279,11 @@ function matchGroups(
   let sPool = [...stmtLeft];
   let lPool = [...ledLeft];
 
+  // Tolerancia ampliada para grupos bancarios: el IVA sobre comisiones y pequeños
+  // redondeos se acumulan cuando hay muchos cargos, por lo que un grupo puede
+  // diferir más que una partida individual.
+  const bankGroupTol = Math.max(tol, 1000);
+
   for (const dir of ["in", "out"] as Dir[]) {
     // 2a) Un renglón de contabilidad ↔ varios del extracto (lo más común).
     let ledTargets = lPool.filter((l) => l.direction === dir).sort((a, b) => b.value - a.value);
@@ -289,7 +294,7 @@ function matchGroups(
       const bankIn = round2(bankCandidates.filter((s) => s.direction === "in").reduce((a, s) => a + s.value, 0));
       const bankOut = round2(bankCandidates.filter((s) => s.direction === "out").reduce((a, s) => a + s.value, 0));
       const bankNet = target.direction === "in" ? round2(bankIn - bankOut) : round2(bankOut - bankIn);
-      if (bankCandidates.length >= 2 && Math.abs(bankNet - target.value) <= tol) {
+      if (bankCandidates.length >= 2 && Math.abs(bankNet - target.value) <= bankGroupTol) {
         matches.push({
           type: "group",
           direction: dir,
@@ -307,7 +312,7 @@ function matchGroups(
       }
 
       const candidates = sPool.filter((s) => s.direction === dir && isStatementBankGroupItem(s));
-      const subset = findSubset(candidates, target.value, tol, maxSize);
+      const subset = findSubset(candidates, target.value, bankGroupTol, maxSize);
       if (!subset) continue;
       const sum = round2(subset.reduce((a, s) => a + s.value, 0));
       matches.push({
@@ -330,7 +335,7 @@ function matchGroups(
     for (const target of stmtTargets) {
       if (!sPool.includes(target) || !isStatementBankGroupItem(target)) continue;
       const candidates = lPool.filter((l) => l.direction === dir && isLedgerBankGroupItem(l));
-      const subset = findSubset(candidates, target.value, tol, maxSize);
+      const subset = findSubset(candidates, target.value, bankGroupTol, maxSize);
       if (!subset) continue;
       const sum = round2(subset.reduce((a, l) => a + l.value, 0));
       matches.push({

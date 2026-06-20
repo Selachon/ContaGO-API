@@ -1348,6 +1348,12 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     }
   });
 
+  // Invalida la caché del índice de terceros (para forzar recarga tras crear uno en Siigo directamente).
+  router.delete("/accounting/customers-cache", (_req: Request, res: Response) => {
+    invalidateCustomersIndex();
+    return res.json({ ok: true });
+  });
+
   // Índice de terceros (id, NIT, nombre) para autocompletar en el cliente.
   router.get("/accounting/customers-index", async (_req: Request, res: Response) => {
     try {
@@ -1688,6 +1694,22 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
     const maxDocuments = Math.max(1, Number(process.env.DIAN_MAX_DOCUMENTS || 850));
 
+    // Rango de fechas derivado del listado. La búsqueda por CUFE en el portal DIAN
+    // RESPETA el filtro de fechas: sin rango, la página Received usa su ventana por
+    // defecto (mes actual) y los CUFEs de meses anteriores NO se encuentran (la
+    // descarga se queda en 0/N). Cubrimos todos los meses presentes en el listado:
+    // del 1° del mes más antiguo al último día del mes más reciente.
+    const months = records.map((r) => r.monthKey).filter((m): m is string => /^\d{4}-\d{2}$/.test(m || "")).sort();
+    let fechaInicio: string | undefined;
+    let fechaFin: string | undefined;
+    if (months.length) {
+      const [yi, mi] = months[0].split("-").map(Number);
+      const [yf, mf] = months[months.length - 1].split("-").map(Number);
+      const lastDay = new Date(yf, mf, 0).getDate(); // mf es 1-based → día 0 del siguiente = último día
+      fechaInicio = `${yi}-${String(mi).padStart(2, "0")}-01`;
+      fechaFin = `${yf}-${String(mf).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
+    }
+
     const jobId = uuidv4();
     dianIngestJobs.set(jobId, {
       status: "processing",
@@ -1702,6 +1724,8 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         companyId,
         tokenUrl,
         providedCufes: cufes,
+        fechaInicio,
+        fechaFin,
         grupo: grupoNorm,
         maxDocuments,
         retryRounds: 3,

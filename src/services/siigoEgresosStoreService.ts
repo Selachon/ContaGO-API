@@ -12,7 +12,7 @@ import { getDb } from "./database.js";
 
 const COLLECTION = "siigoEgresoMovs";
 
-export type EgresoMovStatus = "pending" | "done" | "ignored" | "conciliado" | "sin_rc";
+export type EgresoMovStatus = "pending" | "done" | "ignored" | "conciliado" | "sin_rc" | "enviado_caja";
 export type MovKind = "ingreso" | "egreso" | "bank_fee";
 
 export interface EgresoMov {
@@ -32,6 +32,7 @@ export interface EgresoMov {
   receipt: { id?: string; name?: string } | null;
   source: "manual" | "excel" | "pdf";
   fingerprint: string | null;
+  cajaEntryId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -63,6 +64,7 @@ function mapDoc(d: any): EgresoMov {
     receipt: d.receipt || null,
     source: d.source === "excel" ? "excel" : d.source === "pdf" ? "pdf" : "manual",
     fingerprint: d.fingerprint || null,
+    cajaEntryId: d.cajaEntryId || null,
     createdAt: d.createdAt || "",
     updatedAt: d.updatedAt || "",
   };
@@ -123,7 +125,7 @@ export async function addMovements(companyId: string, movs: NewMovInput[]): Prom
   return docs.map((d, i) => mapDoc({ ...d, _id: result.insertedIds[i] }));
 }
 
-const EDITABLE_FIELDS = ["date", "value", "description", "nit", "kind", "direction", "balance", "status", "note", "siigoMatch", "receipt", "fingerprint"];
+const EDITABLE_FIELDS = ["date", "value", "description", "nit", "kind", "direction", "balance", "status", "note", "siigoMatch", "receipt", "fingerprint", "cajaEntryId"];
 
 /** Actualiza campos permitidos de un movimiento. */
 export async function updateMovement(
@@ -139,6 +141,13 @@ export async function updateMovement(
   const db = getDb().collection<any>(COLLECTION);
   await db.updateOne({ _id: new ObjectId(id), companyId }, { $set: set });
   const doc = await db.findOne({ _id: new ObjectId(id), companyId });
+  return doc ? mapDoc(doc) : null;
+}
+
+/** Obtiene un movimiento por ID. */
+export async function getMovement(companyId: string, id: string): Promise<EgresoMov | null> {
+  if (!companyId || !ObjectId.isValid(id)) return null;
+  const doc = await getDb().collection<any>(COLLECTION).findOne({ _id: new ObjectId(id), companyId });
   return doc ? mapDoc(doc) : null;
 }
 

@@ -21,7 +21,7 @@ import {
   type RecLedgerInput,
   type RecOptions,
 } from "../services/bankReconciliationService.js";
-import { generateReconciliationExcel } from "../services/conciliacionExcelGenerator.js";
+import { generateReconciliationExcel, type GenMeta } from "../services/conciliacionExcelGenerator.js";
 
 export const CONCILIACION_TOOL_ID = "conciliacion-bancaria";
 
@@ -149,13 +149,18 @@ router.post("/export", async (req: Request, res: Response) => {
       statement?: RecStatementInput;
       ledger?: RecLedgerInput;
       options?: RecOptions;
-      meta?: { bank?: string; accountCode?: string; accountName?: string; period?: string };
+      meta?: GenMeta;
     };
     if (!statement?.movements || !ledger?.entries) {
       return res.status(400).json({ ok: false, message: "Faltan los datos de extracto/auxiliar." });
     }
     const result = reconcile(statement, ledger, options ?? {});
-    const buffer = await generateReconciliationExcel(result, meta ?? {});
+    const buffer = await generateReconciliationExcel(
+      result,
+      meta ?? {},
+      statement.movements,
+      ledger.entries,
+    );
     const fname = `Conciliacion_${(meta?.accountName || "banco").replace(/[^\w]+/g, "_")}.xlsx`;
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);

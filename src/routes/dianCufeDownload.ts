@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
-import { acquireDianJobSlot, extractDocumentIdsByCufe, fetchZipToFile, REAL_USER_AGENT, type ListingRecord } from "../services/dianScraper.js";
+import { acquireDianJobSlot, extractDocumentIdsByCufe, fetchZipToFile, downloadZipInPage, REAL_USER_AGENT, type ListingRecord } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile } from "../services/excelGenerator.js";
 import {
@@ -451,6 +451,7 @@ async function processCufeDownloadJob(
     const downloadDoc = async (
       doc: { id: string; docnum: string; nit?: string; cufe?: string; docType?: string },
       cookies: Record<string, string>,
+      page?: import("puppeteer").Page,
     ): Promise<void> => {
       const isEquivalente = doc.docType?.toLowerCase().includes("equivalente") ?? false;
       const baseUrl = isEquivalente
@@ -459,10 +460,20 @@ async function processCufeDownloadJob(
       const safeNit = (doc.nit || "SinNIT").replace(/[^a-zA-Z0-9_\-]/g, "_");
       const safeDoc = (doc.docnum || doc.id.slice(0, 12)).replace(/[^a-zA-Z0-9_\-]/g, "_");
       const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
-      const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+      const isEquiv = doc.docType?.toLowerCase().includes("equivalente") ?? false;
       const key = doc.cufe || doc.id;
       try {
-        await fetchZipToFile(`${baseUrl}${doc.id}`, destPath, cookieHeader);
+        // Descarga disparando el botón del portal (corre el reCAPTCHA) y captura el
+        // ZIP. Fallback a fetch de Node si no hay página.
+        if (page) {
+          const dlDir = path.join(tempDir, `_dl_${(doc.id || "x").slice(0, 16)}`);
+          const buf = await downloadZipInPage(page, doc.id, isEquiv, dlDir);
+          fs.writeFileSync(destPath, buf);
+          try { fs.rmSync(dlDir, { recursive: true, force: true }); } catch { /* noop */ }
+        } else {
+          const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+          await fetchZipToFile(`${baseUrl}${doc.id}`, destPath, cookieHeader);
+        }
         dlResults.set(key, { destPath, trackId: doc.id, docnum: doc.docnum, nit: doc.nit || "" });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -497,7 +508,29 @@ async function processCufeDownloadJob(
         current: dlOk,
         total: downloadCufes.length,
       }),
-      async ({ doc, cookies }) => {
+      async ({ doc, cookies, page }) => {
+        // Con descarga EN-navegador (Cloudflare) hay que serializar sobre la página
+        // del worker: se espera la descarga antes de la siguiente búsqueda. Sin
+        // página (sin Cloudflare) se mantiene el pipeline en paralelo con contrapresión.
+        if (page) {
+          let ok = false;
+          try {
+            await downloadDoc(doc, cookies, page);
+            ok = !!dlResults.get(doc.cufe || doc.id)?.destPath;
+          } finally {
+            dlDone++;
+            if (ok) dlOk++;
+            const pend = dlDone - dlOk;
+            setProgress(jobId, {
+              step: pend > 0
+                ? `Descargando ${dlOk}/${downloadCufes.length} (${pend} por reintentar)...`
+                : `Descargando ${dlOk}/${downloadCufes.length}...`,
+              current: dlOk,
+              total: allCufes.length,
+            });
+          }
+          return;
+        }
         // Contrapresión: bloquea la búsqueda solo si ya hay MAX_DL descargas en vuelo.
         // Mantiene la cola corta → las cookies siguen frescas (sin 403 por sesión vieja).
         await acquireDl();
@@ -553,8 +586,8 @@ async function processCufeDownloadJob(
         await extractDocumentIdsByCufe(
           tokenUrl, startDate, endDate, jobId, direction,
           () => {},
-          async ({ doc, cookies }) => {
-            await downloadDoc(doc, cookies);
+          async ({ doc, cookies, page }) => {
+            await downloadDoc(doc, cookies, page);
             if (dlResults.get(doc.cufe || doc.id)?.destPath) retryOk++;
             setProgress(jobId, { step: `Reintentando descargas: ${retryOk}/${retryTotal} recuperadas...`, current: retryOk, total: retryTotal });
           },
@@ -694,8 +727,8 @@ async function processCufeDownloadJob(
         await extractDocumentIdsByCufe(
           tokenUrl, startDate, endDate, jobId, direction,
           () => {},
-          async ({ doc, cookies }) => {
-            await downloadDoc(doc, cookies);
+          async ({ doc, cookies, page }) => {
+            await downloadDoc(doc, cookies, page);
             if (dlResults.get(doc.cufe || doc.id)?.destPath) sweepOk++;
             setProgress(jobId, { step: `Recuperando faltantes: ${sweepOk}/${sweepTotal} (intento ${sweep})...`, current: sweepOk, total: sweepTotal });
           },

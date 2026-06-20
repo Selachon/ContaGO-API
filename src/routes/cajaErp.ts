@@ -59,10 +59,28 @@ import {
   listDrafts,
   syncDrafts,
   clearDrafts,
+  listGastosFijos,
+  createGastoFijo,
+  updateGastoFijo,
+  deleteGastoFijo,
+  initGastosFijosDefaults,
+  listPlanProyectos,
+  upsertPlanProyecto,
+  computeProyeccion,
+  getGastosOverrides,
+  setGastoOverride,
+  listPlanIngresos,
+  upsertPlanIngreso,
+  deletePlanIngreso,
+  computeFlujoEditable,
+  getCajaConfig,
+  updateCajaConfig,
+  listProvDinamica,
+  upsertProvDinamica,
   type TagKind,
 } from "../services/cajaErpStore.js";
 import ExcelJS from "exceljs";
-import { listMovements } from "../services/siigoEgresosStoreService.js";
+import { listMovements, getMovement, updateMovement as updateBankMov } from "../services/siigoEgresosStoreService.js";
 import { generarCajaPdf } from "../services/cajaPdf.js";
 
 export const CAJA_ERP_TOOL_ID = "causacion-caja";
@@ -750,6 +768,225 @@ router.post("/dian/fetch-new/cancel/:jobId", (req, res) => {
   const job = dianFetchJobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ ok: false, message: "Job no encontrado." });
   if (job.status === "processing") job.status = "cancelled";
+  res.json({ ok: true });
+});
+
+// ─── PLAN FINANCIERO ──────────────────────────────────────────────────────────
+
+router.get("/plan/gastos-fijos", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  await initGastosFijosDefaults(companyId);
+  const items = await listGastosFijos(companyId);
+  res.json({ ok: true, items });
+});
+
+router.post("/plan/gastos-fijos", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const { nombre, monto, frecuenciaMeses, activo } = req.body;
+  if (!nombre || !monto) return res.status(400).json({ ok: false, message: "nombre y monto requeridos." });
+  const item = await createGastoFijo(companyId, {
+    nombre,
+    monto: Number(monto),
+    frecuenciaMeses: Number(frecuenciaMeses) || 1,
+    activo: activo !== false,
+  });
+  res.json({ ok: true, item });
+});
+
+router.patch("/plan/gastos-fijos/:id", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const ok = await updateGastoFijo(companyId, req.params.id, req.body);
+  res.json({ ok });
+});
+
+router.delete("/plan/gastos-fijos/:id", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const ok = await deleteGastoFijo(companyId, req.params.id);
+  res.json({ ok });
+});
+
+router.get("/plan/proyectos-plan", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const items = await listPlanProyectos(companyId);
+  res.json({ ok: true, items });
+});
+
+router.patch("/plan/proyectos-plan/:proyectoId", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const { proyectoId } = req.params;
+  const { valorContrato, fechaInicio, fechaFin, aporteOficinaMensual, honorariosArquitectasMensual } = req.body;
+  const item = await upsertPlanProyecto(companyId, proyectoId, {
+    valorContrato: Number(valorContrato) || 0,
+    fechaInicio: fechaInicio || "",
+    fechaFin: fechaFin || "",
+    aporteOficinaMensual: Number(aporteOficinaMensual) || 0,
+    honorariosArquitectasMensual: Number(honorariosArquitectasMensual) || 0,
+  });
+  res.json({ ok: true, item });
+});
+
+router.get("/plan/proyeccion", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const meses = Math.min(12, Math.max(1, Number(req.query.meses) || 6));
+  const data = await computeProyeccion(companyId, meses);
+  res.json({ ok: true, data });
+});
+
+// ── Flujo de caja editable ────────────────────────────────────────────────────
+
+router.get("/plan/flujo", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const meses = Math.min(12, Math.max(1, Number(req.query.meses) || 6));
+  const data = await computeFlujoEditable(companyId, meses);
+  res.json({ ok: true, data });
+});
+
+router.patch("/plan/gastos-mes", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const { mes, gastoFijoId, monto } = req.body;
+  if (!mes || !gastoFijoId) return res.status(400).json({ ok: false, message: "mes y gastoFijoId requeridos." });
+  await setGastoOverride(companyId, mes, gastoFijoId, monto === null || monto === undefined ? null : Number(monto));
+  res.json({ ok: true });
+});
+
+router.get("/plan/ingresos", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const items = await listPlanIngresos(companyId);
+  res.json({ ok: true, items });
+});
+
+router.post("/plan/ingresos", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const { concepto, tipo, pagos } = req.body;
+  if (!concepto) return res.status(400).json({ ok: false, message: "concepto requerido." });
+  const item = await upsertPlanIngreso(companyId, { concepto, tipo: tipo === "probable" ? "probable" : "confirmado", pagos: pagos || [] });
+  res.json({ ok: true, item });
+});
+
+router.patch("/plan/ingresos/:id", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const { concepto, tipo, pagos } = req.body;
+  const item = await upsertPlanIngreso(companyId, { id: req.params.id, concepto, tipo: tipo === "probable" ? "probable" : "confirmado", pagos: pagos || [] });
+  res.json({ ok: true, item });
+});
+
+router.delete("/plan/ingresos/:id", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const ok = await deletePlanIngreso(companyId, req.params.id);
+  res.json({ ok });
+});
+
+// ── Ingreso bancario → entrada en Caja por proyecto ──────────────────────────
+// Crea una cajaErpEntry (direction:"in") a partir de un movimiento del extracto
+// bancario y marca ese movimiento como "enviado_caja".
+
+router.post("/from-mov/:movId", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+
+  const { proyectoId, rcRef, categoria } = req.body || {};
+  if (!proyectoId) return res.status(400).json({ ok: false, message: "proyectoId requerido." });
+
+  const mov = await getMovement(companyId, req.params.movId);
+  if (!mov) return res.status(404).json({ ok: false, message: "Movimiento no encontrado." });
+  if (mov.kind !== "ingreso") return res.status(400).json({ ok: false, message: "Solo ingresos se pueden enviar a caja." });
+  if (mov.cajaEntryId) return res.status(409).json({ ok: false, message: "Este ingreso ya fue enviado a caja.", cajaEntryId: mov.cajaEntryId });
+
+  // Descripción: incluye referencia RC si la hay
+  const rcPart = rcRef ? ` [${rcRef}]` : (mov.receipt?.name ? ` [${mov.receipt.name}]` : "");
+  const descripcion = `${mov.description || "Ingreso banco"}${rcPart}`.trim();
+
+  const entry = await createEntry(companyId, {
+    proyectoId,
+    fecha: mov.date || new Date().toISOString().slice(0, 10),
+    descripcion,
+    valor: mov.value,
+    direction: "in",
+    categoria: categoria || rcRef || mov.receipt?.name || "Ingreso banco",
+  });
+
+  // Marcar el movimiento bancario como procesado
+  await updateBankMov(companyId, req.params.movId, {
+    cajaEntryId: entry.id,
+    status: "enviado_caja",
+  });
+
+  res.json({ ok: true, entry });
+});
+
+// ── Configuración del flujo (saldo inicial, tarifa ICA) ───────────────────────
+
+router.get("/plan/config", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const config = await getCajaConfig(companyId);
+  res.json({ ok: true, config });
+});
+
+router.patch("/plan/config", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const { saldoInicial, tarifaIca } = req.body;
+  const config = await updateCajaConfig(companyId, {
+    ...(saldoInicial !== undefined ? { saldoInicial: Number(saldoInicial) } : {}),
+    ...(tarifaIca    !== undefined ? { tarifaIca:    Number(tarifaIca)    } : {}),
+  });
+  res.json({ ok: true, config });
+});
+
+// ── Provisiones dinámicas (IVA / ICA por mes) ────────────────────────────────
+
+router.get("/plan/prov-dinamica", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const mesesParam = String(req.query.meses || "");
+  const meses = mesesParam ? mesesParam.split(",").map((m) => m.trim()).filter(Boolean) : [];
+  if (!meses.length) return res.status(400).json({ ok: false, message: "Param meses requerido (YYYY-MM,…)." });
+  const items = await listProvDinamica(companyId, meses);
+  res.json({ ok: true, items });
+});
+
+router.patch("/plan/prov-dinamica", async (req: Request, res: Response) => {
+  const companyId = req.headers["x-siigo-company"] as string;
+  if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
+    return res.status(403).json({ ok: false, message: "Sin acceso." });
+  const { mes, ivaGenerado, ivaDescontable, ingresosFact } = req.body;
+  if (!mes) return res.status(400).json({ ok: false, message: "mes requerido (YYYY-MM)." });
+  await upsertProvDinamica(companyId, mes, {
+    ...(ivaGenerado    !== undefined ? { ivaGenerado:    Number(ivaGenerado)    } : {}),
+    ...(ivaDescontable !== undefined ? { ivaDescontable: Number(ivaDescontable) } : {}),
+    ...(ingresosFact   !== undefined ? { ingresosFact:   Number(ingresosFact)   } : {}),
+  });
   res.json({ ok: true });
 });
 

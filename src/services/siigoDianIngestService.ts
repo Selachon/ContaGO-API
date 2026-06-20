@@ -2,12 +2,14 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
+import type { Page } from "puppeteer";
 import {
   acquireDianJobSlot,
   getCufeListing,
   extractDocumentIds,
   extractDocumentIdsByCufe,
   fetchZipToFile,
+  downloadZipInPage,
   type CufeDownloadItem,
   type ListingRecord,
 } from "./dianScraper.js";
@@ -122,19 +124,29 @@ async function downloadDirectionWithRetries(
 
   const downloadDoc = async (
     doc: { id: string; docnum: string; nit?: string; cufe?: string; docType?: string },
-    cookies: Record<string, string>
+    cookies: Record<string, string>,
+    page?: Page
   ): Promise<void> => {
     const key = normCufe(doc.cufe || "") || (doc.id || "").toLowerCase();
     const isEquiv = doc.docType?.toLowerCase().includes("equivalente") ?? false;
-    const base = isEquiv
-      ? `${DIAN_BASE}/Document/DownloadZipFilesEquivalente?trackId=`
-      : `${DIAN_BASE}/Document/DownloadZipFiles?trackId=`;
     const safeNit = (doc.nit || "SinNIT").replace(/[^a-zA-Z0-9_-]/g, "_");
     const safeDoc = (doc.docnum || doc.id.slice(0, 12)).replace(/[^a-zA-Z0-9_-]/g, "_");
     const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
-    const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
     try {
-      await fetchZipToFile(`${base}${doc.id}`, destPath, cookieHeader);
+      // Descarga disparando el botón del portal (corre el reCAPTCHA) y captura el
+      // ZIP. Si no hay página, cae al fetch de Node (entornos sin reCAPTCHA).
+      if (page) {
+        const dlDir = path.join(tempDir, `_dl_${key.slice(0, 16)}`);
+        const buf = await downloadZipInPage(page, doc.id, isEquiv, dlDir);
+        fs.writeFileSync(destPath, buf);
+        try { fs.rmSync(dlDir, { recursive: true, force: true }); } catch { /* noop */ }
+      } else {
+        const base = isEquiv
+          ? `${DIAN_BASE}/Document/DownloadZipFilesEquivalente?trackId=`
+          : `${DIAN_BASE}/Document/DownloadZipFiles?trackId=`;
+        const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
+        await fetchZipToFile(`${base}${doc.id}`, destPath, cookieHeader);
+      }
       dlResults.set(key, { cufe: doc.cufe || "", trackId: doc.id, destPath, docnum: doc.docnum, nit: doc.nit || "", success: true });
       dlOk++;
       opts.onProgress?.({ step: `Descargando documentos (${dirLabel}): ${dlOk}/${total}…`, current: dlOk, total });
@@ -156,18 +168,42 @@ async function downloadDirectionWithRetries(
         opts.fechaFin,
         undefined,
         direction,
-        () => opts.onProgress?.({ step: `${label} (${dirLabel}): ${dlOk}/${total}…`, current: dlOk, total }),
-        async ({ doc, cookies }) => {
-          await acquireDl();
-          const dl = (async () => { try { await downloadDoc(doc, cookies); } finally { releaseDl(); } })();
-          promises.push(dl);
+        (p) => opts.onProgress?.({
+          // Mientras no se complete ninguna descarga, muestra la fase REAL del
+          // scraper (navegando/buscando) para no parecer congelado en 0/N.
+          step: dlOk > 0 ? `${label} (${dirLabel}): ${dlOk}/${total}…` : (p?.step || `${label} (${dirLabel})…`),
+          current: dlOk,
+          total,
+        }),
+        async ({ doc, cookies, page }) => {
+          // Con descarga EN-navegador hay que serializar sobre la página del worker
+          // (no se puede fetch en paralelo mientras el worker navega a la siguiente
+          // búsqueda). onDocumentFound ya se await en serie, así que esperamos aquí.
+          if (page) {
+            await downloadDoc(doc, cookies, page);
+          } else {
+            await acquireDl();
+            const dl = (async () => { try { await downloadDoc(doc, cookies); } finally { releaseDl(); } })();
+            promises.push(dl);
+          }
         },
         pending,
       );
     } catch (err) {
-      // Fallo de sesión (token bloqueado/expirado, navegación): se deja que el
-      // reintento abra una sesión nueva sobre los CUFEs aún pendientes.
-      console.warn(`[Siigo Ingest] Sesión de descarga falló (${dirLabel}, ronda ${round}): ${err instanceof Error ? err.message : err}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[Siigo Ingest] Sesión de descarga falló (${dirLabel}, ronda ${round}): ${msg}`);
+      // El token DIAN es de UN SOLO USO: si expiró/lo bloquearon, reabrir la sesión
+      // con el mismo token es inútil (vuelve a fallar) y RETIENE el cupo global de
+      // jobs (deja a los demás en "turno 1"). Abortamos de inmediato con un error
+      // claro para que el usuario solicite un token nuevo. `extractDocumentIdsByCufe`
+      // ya reintenta internamente los bloqueos transitorios antes de lanzar esto.
+      if (/TOKEN_EXPIRED|DIAN_BLOCKED|expirad/i.test(msg)) {
+        await Promise.all(promises);
+        if (dlOk === 0) {
+          throw new Error("El token de la DIAN expiró o fue bloqueado por el portal. Solicita un token nuevo en la DIAN y vuelve a intentar (no reutilices el mismo token).");
+        }
+        break; // algo se alcanzó a descargar: corta y devuelve lo logrado
+      }
     }
     await Promise.all(promises);
 

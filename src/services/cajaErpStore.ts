@@ -722,3 +722,522 @@ export async function clearDrafts(companyId: string): Promise<number> {
   const r = await getDb().collection<any>(DRAFTS).deleteMany({ companyId });
   return r.deletedCount || 0;
 }
+
+// ─── PLAN FINANCIERO ──────────────────────────────────────────────────────────
+
+const GASTOS_FIJOS = "cajaErpGastosFijos";
+const PLAN_PROYECTOS = "cajaErpPlanProyectos";
+
+/**
+ * frecuenciaMeses: cada cuántos meses se paga este gasto.
+ *   1 = mensual · 4 = cuatrimestral · 6 = semestral · 12 = anual
+ * La PROVISIÓN MENSUAL = monto / frecuenciaMeses.
+ * La proyección siempre usa la provisión, sin picos por mes de pago.
+ */
+export interface GastoFijo {
+  id: string;
+  companyId: string;
+  nombre: string;
+  monto: number;           // monto del pago real cuando ocurre
+  frecuenciaMeses: number; // 1 | 4 | 6 | 12
+  activo: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function mapGastoFijo(d: any): GastoFijo {
+  // Migración transparente: docs viejos con periodicidad → frecuenciaMeses
+  let freq = Number(d.frecuenciaMeses) || 0;
+  if (!freq) freq = d.periodicidad === "anual" ? 12 : 1;
+  return {
+    id: d._id.toString(),
+    companyId: d.companyId || "",
+    nombre: d.nombre || "",
+    monto: Number(d.monto) || 0,
+    frecuenciaMeses: freq,
+    activo: d.activo !== false,
+    createdAt: d.createdAt || "",
+    updatedAt: d.updatedAt || "",
+  };
+}
+
+export async function listGastosFijos(companyId: string): Promise<GastoFijo[]> {
+  if (!companyId) return [];
+  const docs = await getDb()
+    .collection<any>(GASTOS_FIJOS)
+    .find({ companyId })
+    .sort({ frecuenciaMeses: 1, nombre: 1 })
+    .toArray();
+  return docs.map(mapGastoFijo);
+}
+
+export async function createGastoFijo(
+  companyId: string,
+  data: Omit<GastoFijo, "id" | "companyId" | "createdAt" | "updatedAt">,
+): Promise<GastoFijo> {
+  const ts = now();
+  const doc = { companyId, ...data, createdAt: ts, updatedAt: ts };
+  const r = await getDb().collection<any>(GASTOS_FIJOS).insertOne(doc);
+  return mapGastoFijo({ _id: r.insertedId, ...doc });
+}
+
+export async function updateGastoFijo(
+  companyId: string,
+  id: string,
+  data: Partial<Omit<GastoFijo, "id" | "companyId" | "createdAt">>,
+): Promise<boolean> {
+  if (!ObjectId.isValid(id)) return false;
+  const r = await getDb()
+    .collection<any>(GASTOS_FIJOS)
+    .updateOne({ _id: new ObjectId(id), companyId }, { $set: { ...data, updatedAt: now() } });
+  return r.modifiedCount > 0;
+}
+
+export async function deleteGastoFijo(companyId: string, id: string): Promise<boolean> {
+  if (!ObjectId.isValid(id)) return false;
+  const r = await getDb()
+    .collection<any>(GASTOS_FIJOS)
+    .deleteOne({ _id: new ObjectId(id), companyId });
+  return r.deletedCount > 0;
+}
+
+// Valores por defecto con el modelo de provisión mensual.
+// monto = pago real al vencimiento · frecuenciaMeses = cada cuántos meses ocurre
+// provisión/mes = monto ÷ frecuenciaMeses (lo que se debe apartar cada mes)
+const GASTOS_FIJOS_DEFAULT: Omit<GastoFijo, "id" | "companyId" | "createdAt" | "updatedAt">[] = [
+  // ── Mensuales (frecuencia 1) ──────────────────────────────────────────────
+  { nombre: "Nómina oficina",          monto: 6067000, frecuenciaMeses: 1,  activo: true },
+  { nombre: "Seguridad social",         monto: 1852000, frecuenciaMeses: 1,  activo: true },
+  { nombre: "Arriendo oficina",         monto: 1784000, frecuenciaMeses: 1,  activo: true },
+  { nombre: "Honorarios contabilidad",  monto: 1607000, frecuenciaMeses: 1,  activo: true },
+  { nombre: "Seguros Metlife",          monto:  967000, frecuenciaMeses: 1,  activo: true },
+  { nombre: "Gastos bancarios",         monto:  350000, frecuenciaMeses: 1,  activo: true },
+  // ── Cuatrimestrales (frecuencia 4) — IVA may/sep/ene ─────────────────────
+  // Actualizar cuando se liquide cada declaración
+  { nombre: "IVA cuatrimestral",        monto: 2000000, frecuenciaMeses: 4,  activo: true },
+  // ── Semestrales (frecuencia 6) — jun/dic ─────────────────────────────────
+  { nombre: "Prima semestral",          monto: 3765000, frecuenciaMeses: 6,  activo: true },
+  // ── Anuales (frecuencia 12) ───────────────────────────────────────────────
+  { nombre: "ICA anual",                monto: 5059000, frecuenciaMeses: 12, activo: true },
+  { nombre: "Cesantías",                monto: 4400000, frecuenciaMeses: 12, activo: true },
+  { nombre: "Licencias software",       monto: 1533000, frecuenciaMeses: 12, activo: true },
+  { nombre: "Cámara de comercio",       monto:  450000, frecuenciaMeses: 12, activo: true },
+];
+
+export async function initGastosFijosDefaults(companyId: string): Promise<void> {
+  const existing = await listGastosFijos(companyId);
+  if (existing.length > 0) return;
+  const ts = now();
+  const docs = GASTOS_FIJOS_DEFAULT.map((g) => ({ companyId, ...g, createdAt: ts, updatedAt: ts }));
+  await getDb().collection<any>(GASTOS_FIJOS).insertMany(docs);
+}
+
+// ─── PLAN POR PROYECTO ────────────────────────────────────────────────────────
+
+export interface PlanProyecto {
+  id: string;
+  companyId: string;
+  proyectoId: string;
+  valorContrato: number;
+  fechaInicio: string;
+  fechaFin: string;
+  aporteOficinaMensual: number;
+  honorariosArquitectasMensual: number;
+  updatedAt: string;
+}
+
+function mapPlanProyecto(d: any): PlanProyecto {
+  return {
+    id: d._id.toString(),
+    companyId: d.companyId || "",
+    proyectoId: d.proyectoId || "",
+    valorContrato: Number(d.valorContrato) || 0,
+    fechaInicio: d.fechaInicio || "",
+    fechaFin: d.fechaFin || "",
+    aporteOficinaMensual: Number(d.aporteOficinaMensual) || 0,
+    honorariosArquitectasMensual: Number(d.honorariosArquitectasMensual) || 0,
+    updatedAt: d.updatedAt || "",
+  };
+}
+
+export async function listPlanProyectos(companyId: string): Promise<PlanProyecto[]> {
+  if (!companyId) return [];
+  const docs = await getDb().collection<any>(PLAN_PROYECTOS).find({ companyId }).toArray();
+  return docs.map(mapPlanProyecto);
+}
+
+export async function upsertPlanProyecto(
+  companyId: string,
+  proyectoId: string,
+  data: Omit<PlanProyecto, "id" | "companyId" | "proyectoId" | "updatedAt">,
+): Promise<PlanProyecto> {
+  const r = await getDb()
+    .collection<any>(PLAN_PROYECTOS)
+    .findOneAndUpdate(
+      { companyId, proyectoId },
+      { $set: { companyId, proyectoId, ...data, updatedAt: now() } },
+      { upsert: true, returnDocument: "after" },
+    );
+  return mapPlanProyecto(r);
+}
+
+// ─── PROYECCIÓN FINANCIERA ────────────────────────────────────────────────────
+
+const MESES_ES = [
+  "", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+];
+
+export interface MesProyeccion {
+  mes: string;
+  label: string;
+  totalGastos: number;
+  gastosFijos: { nombre: string; provision: number; monto: number; frecuenciaMeses: number }[];
+  totalAportes: number;
+  proyectosActivos: { nombre: string; aporte: number; honorarios: number }[];
+  resultado: number;
+}
+
+export async function computeProyeccion(companyId: string, meses: number): Promise<MesProyeccion[]> {
+  const [gastosFijos, planProyectos, proyectos] = await Promise.all([
+    listGastosFijos(companyId),
+    listPlanProyectos(companyId),
+    listProyectos(companyId),
+  ]);
+
+  const proyectoMap = new Map(proyectos.map((p) => [p.id, p.nombre]));
+  const activos = gastosFijos.filter((g) => g.activo);
+
+  const result: MesProyeccion[] = [];
+  const base = new Date();
+
+  for (let i = 0; i < meses; i++) {
+    const d = new Date(base.getFullYear(), base.getMonth() + i, 1);
+    const mes = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    const mesNum = d.getMonth() + 1;
+    const label = `${MESES_ES[mesNum]} ${d.getFullYear()}`;
+
+    // Cada gasto aporta su PROVISIÓN MENSUAL = monto ÷ frecuenciaMeses,
+    // sin importar el mes. Así la proyección es plana y predecible.
+    const gastosDet = activos.map((g) => ({
+      nombre: g.nombre,
+      provision: Math.round(g.monto / (g.frecuenciaMeses || 1)),
+      monto: g.monto,
+      frecuenciaMeses: g.frecuenciaMeses || 1,
+    }));
+    const totalGastos = gastosDet.reduce((s, g) => s + g.provision, 0);
+
+    const proyDet: { nombre: string; aporte: number; honorarios: number }[] = [];
+    for (const p of planProyectos) {
+      if (!p.fechaInicio || !p.fechaFin) continue;
+      if (mes >= p.fechaInicio && mes <= p.fechaFin) {
+        const nombre = proyectoMap.get(p.proyectoId) || "—";
+        proyDet.push({ nombre, aporte: p.aporteOficinaMensual, honorarios: p.honorariosArquitectasMensual });
+      }
+    }
+    const totalAportes = proyDet.reduce((s, p) => s + p.aporte, 0);
+
+    result.push({
+      mes, label, totalGastos, gastosFijos: gastosDet,
+      totalAportes, proyectosActivos: proyDet,
+      resultado: totalAportes - totalGastos,
+    });
+  }
+
+  return result;
+}
+
+// ─── FLUJO DE CAJA EDITABLE ───────────────────────────────────────────────────
+// Proyección interactiva: gastos editables por mes + ingresos manuales libres.
+
+const PLAN_GASTOS_MES = "cajaErpPlanGastosMes";
+const PLAN_INGRESOS   = "cajaErpPlanIngresos";
+
+/** Devuelve { mes → { gastoFijoId → montoOverride } } */
+export async function getGastosOverrides(
+  companyId: string,
+  meses: string[],
+): Promise<Record<string, Record<string, number>>> {
+  if (!companyId || !meses.length) return {};
+  const docs = await getDb()
+    .collection<any>(PLAN_GASTOS_MES)
+    .find({ companyId, mes: { $in: meses } })
+    .toArray();
+  const out: Record<string, Record<string, number>> = {};
+  docs.forEach((d) => {
+    if (!out[d.mes]) out[d.mes] = {};
+    out[d.mes][d.gastoFijoId] = Number(d.monto);
+  });
+  return out;
+}
+
+/** monto=null → borra el override (vuelve al default de provisión). */
+export async function setGastoOverride(
+  companyId: string,
+  mes: string,
+  gastoFijoId: string,
+  monto: number | null,
+): Promise<void> {
+  const col = getDb().collection<any>(PLAN_GASTOS_MES);
+  if (monto === null) {
+    await col.deleteOne({ companyId, mes, gastoFijoId });
+  } else {
+    await col.updateOne(
+      { companyId, mes, gastoFijoId },
+      { $set: { companyId, mes, gastoFijoId, monto, updatedAt: now() } },
+      { upsert: true },
+    );
+  }
+}
+
+export interface PlanIngreso {
+  id: string;
+  companyId: string;
+  concepto: string;
+  tipo: "confirmado" | "probable";
+  pagos: { mes: string; monto: number }[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+function mapPlanIngreso(d: any): PlanIngreso {
+  return {
+    id: d._id.toString(),
+    companyId: d.companyId || "",
+    concepto: d.concepto || "",
+    tipo: d.tipo === "probable" ? "probable" : "confirmado",
+    pagos: (d.pagos || []).filter((p: any) => p?.mes && Number(p.monto) > 0),
+    createdAt: d.createdAt || "",
+    updatedAt: d.updatedAt || "",
+  };
+}
+
+export async function listPlanIngresos(companyId: string): Promise<PlanIngreso[]> {
+  if (!companyId) return [];
+  const docs = await getDb()
+    .collection<any>(PLAN_INGRESOS)
+    .find({ companyId })
+    .sort({ createdAt: 1 })
+    .toArray();
+  return docs.map(mapPlanIngreso);
+}
+
+export async function upsertPlanIngreso(
+  companyId: string,
+  data: { id?: string; concepto: string; tipo: "confirmado" | "probable"; pagos: { mes: string; monto: number }[] },
+): Promise<PlanIngreso> {
+  const ts = now();
+  if (data.id && ObjectId.isValid(data.id)) {
+    const r = await getDb()
+      .collection<any>(PLAN_INGRESOS)
+      .findOneAndUpdate(
+        { _id: new ObjectId(data.id), companyId },
+        { $set: { concepto: data.concepto, tipo: data.tipo, pagos: data.pagos, updatedAt: ts } },
+        { returnDocument: "after" },
+      );
+    return mapPlanIngreso(r);
+  }
+  const doc = { companyId, concepto: data.concepto, tipo: data.tipo, pagos: data.pagos, createdAt: ts, updatedAt: ts };
+  const r = await getDb().collection<any>(PLAN_INGRESOS).insertOne(doc);
+  return mapPlanIngreso({ _id: r.insertedId, ...doc });
+}
+
+export async function deletePlanIngreso(companyId: string, id: string): Promise<boolean> {
+  if (!ObjectId.isValid(id)) return false;
+  const r = await getDb().collection<any>(PLAN_INGRESOS).deleteOne({ _id: new ObjectId(id), companyId });
+  return r.deletedCount > 0;
+}
+
+// ─── CONFIG DEL FLUJO ─────────────────────────────────────────────────────────
+
+const CAJA_CONFIG    = "cajaErpConfig";
+const PROV_DINAMICA  = "cajaErpProvDinamica";
+
+export interface CajaConfig {
+  companyId: string;
+  saldoInicial: number;   // saldo real de caja hoy
+  tarifaIca: number;      // ej. 0.00966 para Bogotá servicios profesionales
+}
+
+export async function getCajaConfig(companyId: string): Promise<CajaConfig> {
+  const doc = await getDb().collection<any>(CAJA_CONFIG).findOne({ companyId });
+  return {
+    companyId,
+    saldoInicial: Number(doc?.saldoInicial || 0),
+    tarifaIca: Number(doc?.tarifaIca ?? 0.00966),
+  };
+}
+
+export async function updateCajaConfig(
+  companyId: string,
+  data: Partial<Pick<CajaConfig, "saldoInicial" | "tarifaIca">>,
+): Promise<CajaConfig> {
+  await getDb()
+    .collection<any>(CAJA_CONFIG)
+    .updateOne({ companyId }, { $set: { ...data, companyId, updatedAt: now() } }, { upsert: true });
+  return getCajaConfig(companyId);
+}
+
+export interface ProvDinamica {
+  companyId: string;
+  mes: string;
+  ivaGenerado: number;      // IVA cobrado a clientes ese mes
+  ivaDescontable: number;   // IVA pagado a proveedores ese mes
+  ingresosFact: number;     // ingresos facturados ese mes (base ICA)
+}
+
+export async function listProvDinamica(
+  companyId: string,
+  meses: string[],
+): Promise<ProvDinamica[]> {
+  if (!companyId || !meses.length) return [];
+  const docs = await getDb()
+    .collection<any>(PROV_DINAMICA)
+    .find({ companyId, mes: { $in: meses } })
+    .toArray();
+  return docs.map((d) => ({
+    companyId,
+    mes: d.mes,
+    ivaGenerado:    Number(d.ivaGenerado    || 0),
+    ivaDescontable: Number(d.ivaDescontable || 0),
+    ingresosFact:   Number(d.ingresosFact   || 0),
+  }));
+}
+
+export async function upsertProvDinamica(
+  companyId: string,
+  mes: string,
+  data: Partial<Pick<ProvDinamica, "ivaGenerado" | "ivaDescontable" | "ingresosFact">>,
+): Promise<void> {
+  await getDb()
+    .collection<any>(PROV_DINAMICA)
+    .updateOne(
+      { companyId, mes },
+      { $set: { ...data, companyId, mes, updatedAt: now() } },
+      { upsert: true },
+    );
+}
+
+// IVA cuatrimestral: pago en enero (1), mayo (5) y agosto (8)
+// El período de acumulación cierra al final del mes anterior al pago.
+const IVA_PAGO_MESES = new Set([1, 5, 8]);
+
+export interface MesFlujo {
+  mes: string;
+  label: string;
+  gastos: { id: string; nombre: string; monto: number; esDefault: boolean }[];
+  totalGastosFijos: number;
+  // Provisiones dinámicas
+  ivaGenerado: number;
+  ivaDescontable: number;
+  ivaNeto: number;        // = generado - descontable (provisión mensual a cajita)
+  ivaCajita: number;      // acumulado desde último pago (cajita en curso)
+  ivaPagoEseMes: number;  // si es mes de pago: cuánto sale de la cajita
+  icaProvision: number;   // = ingresosFact × tarifaIca
+  ingresosFact: number;
+  totalGastos: number;    // fijos + ivaNeto + icaProvision
+  ingresos: { id: string; concepto: string; tipo: string; monto: number }[];
+  totalIngresos: number;
+  resultado: number;
+  saldoAcumulado: number;
+}
+
+export async function computeFlujoEditable(companyId: string, numMeses: number): Promise<MesFlujo[]> {
+  const base = new Date();
+  const mesKeys = Array.from({ length: numMeses }, (_, i) => {
+    const d = new Date(base.getFullYear(), base.getMonth() + i, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  });
+
+  // Necesitamos datos IVA históricos para inicializar la cajita correctamente:
+  // desde el inicio del período cuatrimestral actual hacia atrás.
+  const firstMesDate = new Date(base.getFullYear(), base.getMonth(), 1);
+  // Buscar el último mes de pago IVA anterior al período proyectado
+  const pastMeses: string[] = [];
+  for (let i = 1; i <= 5; i++) {
+    const d = new Date(firstMesDate.getFullYear(), firstMesDate.getMonth() - i, 1);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+    pastMeses.push(key);
+    if (IVA_PAGO_MESES.has(d.getMonth() + 1)) break; // encontramos el último pago
+  }
+  const allMeses = [...pastMeses, ...mesKeys];
+
+  const [gastosFijos, overrides, planIngresos, provsDin, config] = await Promise.all([
+    listGastosFijos(companyId),
+    getGastosOverrides(companyId, mesKeys),
+    listPlanIngresos(companyId),
+    listProvDinamica(companyId, allMeses),
+    getCajaConfig(companyId),
+  ]);
+
+  const activos = gastosFijos.filter((g) => g.activo);
+  const provMap = new Map(provsDin.map((p) => [p.mes, p]));
+
+  // Inicializar cajita IVA con los meses pasados del período actual
+  let ivaCajita = 0;
+  for (const m of pastMeses.reverse()) {
+    const mn = new Date(m + "-01").getMonth() + 1;
+    if (IVA_PAGO_MESES.has(mn)) {
+      // Mes de pago anterior → cajita reset en ese punto
+      ivaCajita = 0;
+    }
+    const p = provMap.get(m);
+    if (p) ivaCajita += p.ivaGenerado - p.ivaDescontable;
+  }
+
+  let saldo = config.saldoInicial;
+
+  return mesKeys.map((mes, i) => {
+    const d = new Date(base.getFullYear(), base.getMonth() + i, 1);
+    const mesNum = d.getMonth() + 1;
+    const label = `${MESES_ES[mesNum]} ${d.getFullYear()}`;
+    const mesOv = overrides[mes] || {};
+    const prov  = provMap.get(mes);
+
+    // Gastos fijos con overrides
+    const gastos = activos.map((g) => {
+      const def = Math.round(g.monto / (g.frecuenciaMeses || 1));
+      const esDefault = !(g.id in mesOv);
+      return { id: g.id, nombre: g.nombre, monto: esDefault ? def : mesOv[g.id], esDefault };
+    });
+    const totalGastosFijos = gastos.reduce((s, g) => s + g.monto, 0);
+
+    // IVA dinámico
+    const ivaGenerado    = prov?.ivaGenerado    || 0;
+    const ivaDescontable = prov?.ivaDescontable || 0;
+    const ivaNeto        = ivaGenerado - ivaDescontable;
+    // Cajita antes del pago de este mes
+    ivaCajita += ivaNeto;
+    let ivaPagoEseMes = 0;
+    if (IVA_PAGO_MESES.has(mesNum)) {
+      ivaPagoEseMes = Math.max(0, ivaCajita);
+      ivaCajita = 0; // reset cajita tras el pago
+    }
+    const cajitaSnap = ivaCajita; // balance tras las operaciones de este mes
+
+    // ICA dinámico — provisión mensual suave
+    const ingresosFact = prov?.ingresosFact || 0;
+    const icaProvision = Math.round(ingresosFact * (config.tarifaIca || 0.00966));
+
+    // Total gastos = fijos + provisión IVA del mes + provisión ICA del mes
+    const totalGastos = totalGastosFijos + ivaNeto + icaProvision;
+
+    // Ingresos planificados
+    const ingresos = planIngresos.flatMap((ing) => {
+      const pago = ing.pagos.find((p) => p.mes === mes);
+      if (!pago || pago.monto === 0) return [];
+      return [{ id: ing.id, concepto: ing.concepto, tipo: ing.tipo, monto: pago.monto }];
+    });
+    const totalIngresos = ingresos.reduce((s, x) => s + x.monto, 0);
+
+    const resultado = totalIngresos - totalGastos;
+    saldo += resultado;
+
+    return {
+      mes, label, gastos, totalGastosFijos,
+      ivaGenerado, ivaDescontable, ivaNeto, ivaCajita: cajitaSnap, ivaPagoEseMes,
+      icaProvision, ingresosFact,
+      totalGastos, ingresos, totalIngresos, resultado, saldoAcumulado: saldo,
+    };
+  });
+}
