@@ -115,7 +115,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
       ok: false,
       message: portalStatus.global.message || portalStatus.global.title || "El portal está temporalmente en mantenimiento. Intenta nuevamente más tarde.",
     };
-    return res.status(503).json(response);
+    return res.status(200).json(response);
   }
 
   const payload: JWTPayload = {
