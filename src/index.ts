@@ -61,7 +61,7 @@ app.use(
 // ============================================
 // Body parsing (con límite de tamaño)
 // ============================================
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 // ============================================
 // Routes

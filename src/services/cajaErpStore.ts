@@ -678,9 +678,9 @@ export async function deletePlan(companyId: string, id: string): Promise<boolean
 // cliente, único dentro de la empresa.
 export interface DraftRow { rowId: string; row: any; }
 
-export async function listDrafts(companyId: string): Promise<any[]> {
+export async function listDrafts(companyId: string, tool = "caja"): Promise<any[]> {
   if (!companyId) return [];
-  const docs = await getDb().collection<any>(DRAFTS).find({ companyId }).sort({ updatedAt: 1 }).toArray();
+  const docs = await getDb().collection<any>(DRAFTS).find({ companyId, tool }).sort({ updatedAt: 1 }).toArray();
   return docs.map((d) => d.row);
 }
 
@@ -690,6 +690,7 @@ export async function syncDrafts(
   upserts: DraftRow[],
   deletes: string[],
   userId: string,
+  tool = "caja",
 ): Promise<{ upserted: number; deleted: number }> {
   if (!companyId) return { upserted: 0, deleted: 0 };
   const col = getDb().collection<any>(DRAFTS);
@@ -699,8 +700,8 @@ export async function syncDrafts(
     .filter((u) => u && u.rowId && u.row)
     .map((u) => ({
       updateOne: {
-        filter: { companyId, rowId: String(u.rowId) },
-        update: { $set: { companyId, rowId: String(u.rowId), row: u.row, updatedAt: ts, updatedBy: userId || "" } },
+        filter: { companyId, tool, rowId: String(u.rowId) },
+        update: { $set: { companyId, tool, rowId: String(u.rowId), row: u.row, updatedAt: ts, updatedBy: userId || "" } },
         upsert: true,
       },
     }));
@@ -711,15 +712,15 @@ export async function syncDrafts(
   let deleted = 0;
   const delIds = (deletes || []).filter(Boolean).map(String);
   if (delIds.length) {
-    const r = await col.deleteMany({ companyId, rowId: { $in: delIds } });
+    const r = await col.deleteMany({ companyId, tool, rowId: { $in: delIds } });
     deleted = r.deletedCount || 0;
   }
   return { upserted, deleted };
 }
 
-export async function clearDrafts(companyId: string): Promise<number> {
+export async function clearDrafts(companyId: string, tool = "caja"): Promise<number> {
   if (!companyId) return 0;
-  const r = await getDb().collection<any>(DRAFTS).deleteMany({ companyId });
+  const r = await getDb().collection<any>(DRAFTS).deleteMany({ companyId, tool });
   return r.deletedCount || 0;
 }
 

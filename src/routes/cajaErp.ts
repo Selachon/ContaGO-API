@@ -238,18 +238,18 @@ router.get("/invoices", async (req, res) => {
 router.get("/drafts", async (req, res) => {
   const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
-  res.json({ ok: true, data: await listDrafts(companyId) });
+  const tool = String(req.query.tool || "caja");
+  res.json({ ok: true, data: await listDrafts(companyId, tool) });
 });
 
-// Sync por diff: el cliente envía las filas a upsertar (cambiadas/nuevas) y los
-// rowId a borrar (causadas/eliminadas). Una sola llamada para todo el lote.
 router.post("/drafts/sync", async (req, res) => {
   const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
+  const tool = String(req.body?.tool || "caja");
   const upserts = Array.isArray(req.body?.upserts) ? req.body.upserts : [];
   const deletes = Array.isArray(req.body?.deletes) ? req.body.deletes : [];
   try {
-    const r = await syncDrafts(companyId, upserts, deletes, req.user?.userId || "");
+    const r = await syncDrafts(companyId, upserts, deletes, req.user?.userId || "", tool);
     res.json({ ok: true, data: r });
   } catch (err) {
     res.status(500).json({ ok: false, message: err instanceof Error ? err.message : "Error al sincronizar pendientes." });
@@ -259,7 +259,8 @@ router.post("/drafts/sync", async (req, res) => {
 router.delete("/drafts", async (req, res) => {
   const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
-  const deleted = await clearDrafts(companyId);
+  const tool = String(req.query.tool || "caja");
+  const deleted = await clearDrafts(companyId, tool);
   res.json({ ok: true, data: { deleted } });
 });
 
