@@ -1551,7 +1551,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     }
   });
 
-  router.post("/accounting/process-batch", upload.array("files", 200), async (req: Request, res: Response) => {
+  router.post("/accounting/process-batch", upload.array("files", 1000), async (req: Request, res: Response) => {
     // El ALS context puede haberse perdido durante multer. Lo re-aplicamos dentro
     // del handler para garantizar aislamiento por empresa en processXmlBatch.
     const companyId = req.header("X-Siigo-Company");
