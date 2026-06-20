@@ -118,6 +118,25 @@ async function resolveCompany(req: Request, res: Response): Promise<string | nul
   return companyId;
 }
 
+// Igual que resolveCompany pero permite a admins de ContaGO gestionar la bandeja
+// de borradores de cualquier empresa cliente (solo lectura/escritura de drafts,
+// no da acceso a las rutas de causación ni a Siigo).
+async function resolveCompanyForDrafts(req: Request, res: Response): Promise<string | null> {
+  const companyId = req.header("X-Siigo-Company");
+  if (!companyId) {
+    res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    return null;
+  }
+  const userId = req.user?.userId;
+  const isAdmin = req.user?.isAdmin === true;
+  const allowed = isAdmin || (userId ? await userCanAccessCompany(companyId, userId) : false);
+  if (!allowed) {
+    res.status(403).json({ ok: false, message: "No tiene acceso a esta empresa." });
+    return null;
+  }
+  return companyId;
+}
+
 const isKind = (k: unknown): k is TagKind => k === "mov" || k === "invoice";
 
 // ── Proyectos ──────────────────────────────────────────────────────────
@@ -217,7 +236,7 @@ router.get("/invoices", async (req, res) => {
 // Facturas importadas aún NO causadas. Persisten en el servidor para sobrevivir
 // al cambio de PC y para que las vean todos los usuarios de la empresa compartida.
 router.get("/drafts", async (req, res) => {
-  const companyId = await resolveCompany(req, res);
+  const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
   res.json({ ok: true, data: await listDrafts(companyId) });
 });
@@ -225,7 +244,7 @@ router.get("/drafts", async (req, res) => {
 // Sync por diff: el cliente envía las filas a upsertar (cambiadas/nuevas) y los
 // rowId a borrar (causadas/eliminadas). Una sola llamada para todo el lote.
 router.post("/drafts/sync", async (req, res) => {
-  const companyId = await resolveCompany(req, res);
+  const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
   const upserts = Array.isArray(req.body?.upserts) ? req.body.upserts : [];
   const deletes = Array.isArray(req.body?.deletes) ? req.body.deletes : [];
@@ -238,7 +257,7 @@ router.post("/drafts/sync", async (req, res) => {
 });
 
 router.delete("/drafts", async (req, res) => {
-  const companyId = await resolveCompany(req, res);
+  const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
   const deleted = await clearDrafts(companyId);
   res.json({ ok: true, data: { deleted } });
