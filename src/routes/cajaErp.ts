@@ -85,9 +85,16 @@ import { generarCajaPdf } from "../services/cajaPdf.js";
 
 export const CAJA_ERP_TOOL_ID = "causacion-caja";
 
+// Router principal: requiere tool causacion-caja (para Caja ERP).
 const router = Router();
 router.use(requireAuth);
 router.use(requireToolAccess(CAJA_ERP_TOOL_ID));
+
+// Router de bandeja (drafts): solo requiere auth + acceso a la empresa.
+// Lo usan tanto CausacionCaja (tool=caja) como SiigoXmlAccounting (tool=xml)
+// que tienen tools distintos, por eso va separado del router principal.
+export const draftsRouter = Router();
+draftsRouter.use(requireAuth);
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
 
@@ -235,14 +242,16 @@ router.get("/invoices", async (req, res) => {
 // ── Bandeja de PENDIENTES (drafts) compartida por empresa ────────────────
 // Facturas importadas aún NO causadas. Persisten en el servidor para sobrevivir
 // al cambio de PC y para que las vean todos los usuarios de la empresa compartida.
-router.get("/drafts", async (req, res) => {
+// Registradas en draftsRouter (sin requireToolAccess) para que funcionen tanto con
+// tool=caja (CausacionCaja) como tool=xml (SiigoXmlAccounting).
+draftsRouter.get("/drafts", async (req, res) => {
   const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
   const tool = String(req.query.tool || "caja");
   res.json({ ok: true, data: await listDrafts(companyId, tool) });
 });
 
-router.post("/drafts/sync", async (req, res) => {
+draftsRouter.post("/drafts/sync", async (req, res) => {
   const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
   const tool = String(req.body?.tool || "caja");
@@ -256,7 +265,7 @@ router.post("/drafts/sync", async (req, res) => {
   }
 });
 
-router.delete("/drafts", async (req, res) => {
+draftsRouter.delete("/drafts", async (req, res) => {
   const companyId = await resolveCompanyForDrafts(req, res);
   if (!companyId) return;
   const tool = String(req.query.tool || "caja");

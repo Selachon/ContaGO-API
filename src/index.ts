@@ -15,7 +15,7 @@ import portalStatusRoutes from "./routes/portalStatus.js";
 import siigoRoutes from "./routes/siigo.js";
 import causationRoutes from "./routes/causation.js";
 import conciliacionRoutes from "./routes/conciliacion.js";
-import cajaErpRoutes from "./routes/cajaErp.js";
+import cajaErpRoutes, { draftsRouter } from "./routes/cajaErp.js";
 import contabilizacionRoutes from "./routes/contabilizacion.js";
 import dianCufeRoutes from "./routes/dianCufeDownload.js";
 import dianExtensionRoutes from "./routes/dianExtension.js";
@@ -80,6 +80,7 @@ app.use("/dian-mail", dianMailRoutes);
 app.use("/integrations/siigo", siigoRoutes);
 app.use("/causation", causationRoutes);
 app.use("/conciliacion", conciliacionRoutes);
+app.use("/caja-erp", draftsRouter);
 app.use("/caja-erp", cajaErpRoutes);
 app.use("/api/contabilizacion", contabilizacionRoutes);
 
