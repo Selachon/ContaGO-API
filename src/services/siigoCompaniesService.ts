@@ -13,6 +13,14 @@ export interface CompanySettings {
   useProducts?: boolean;
   /** ID de bodega Siigo a usar cuando useProducts=true. */
   warehouseId?: string | null;
+  /** Código de producto Siigo predeterminado para todos los ítems. */
+  defaultProductCode?: string | null;
+  /** ID de forma de pago Siigo predeterminada para todas las facturas. */
+  defaultPaymentTypeId?: string | null;
+  /** Si true, el centro de costo no es obligatorio ni se muestra. */
+  skipCostCenter?: boolean;
+  /** Si true, los ítems nunca se condensan por impuesto; siempre van separados. */
+  noCondenseItems?: boolean;
 }
 
 export interface SiigoCompanyPublic {
@@ -130,6 +138,10 @@ export async function updateCompanySettings(companyId: string, settings: Company
   const patch: Record<string, unknown> = {};
   if (settings.useProducts !== undefined) patch["settings.useProducts"] = Boolean(settings.useProducts);
   if (settings.warehouseId !== undefined) patch["settings.warehouseId"] = settings.warehouseId || null;
+  if (settings.defaultProductCode !== undefined) patch["settings.defaultProductCode"] = settings.defaultProductCode || null;
+  if (settings.defaultPaymentTypeId !== undefined) patch["settings.defaultPaymentTypeId"] = settings.defaultPaymentTypeId || null;
+  if (settings.skipCostCenter !== undefined) patch["settings.skipCostCenter"] = Boolean(settings.skipCostCenter);
+  if (settings.noCondenseItems !== undefined) patch["settings.noCondenseItems"] = Boolean(settings.noCondenseItems);
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");

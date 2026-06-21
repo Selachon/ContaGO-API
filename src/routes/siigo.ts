@@ -475,6 +475,23 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     return toolGate(req, res, next);
   });
 
+  // Settings por empresa: no necesita contexto Siigo (solo escribe MongoDB),
+  // por eso va ANTES de withSiigoCompany.
+  router.patch("/companies/:id/settings", async (req: Request, res: Response) => {
+    try {
+      if (req.integrationAuthMode === "jwt") {
+        const userId = req.user?.userId;
+        const allowed = userId ? await userCanAccessCompany(req.params.id, userId) : false;
+        if (!allowed) return res.status(403).json({ ok: false, message: "Sin acceso a esta empresa." });
+      }
+      const { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems } = req.body || {};
+      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems });
+      return res.json({ ok: true, data: saved });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error actualizando configuración." });
+    }
+  });
+
   router.use(withSiigoCompany);
 
   // ─── Empresas Siigo (multi-empresa) ──────────────────────────────────
@@ -546,21 +563,6 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         ok: false,
         message: error instanceof Error ? error.message : "Error actualizando la empresa",
       });
-    }
-  });
-
-  router.patch("/companies/:id/settings", async (req: Request, res: Response) => {
-    try {
-      if (req.integrationAuthMode === "jwt") {
-        const userId = req.user?.userId;
-        const allowed = userId ? await userCanAccessCompany(req.params.id, userId) : false;
-        if (!allowed) return res.status(403).json({ ok: false, message: "Sin acceso a esta empresa." });
-      }
-      const { useProducts, warehouseId } = req.body || {};
-      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId });
-      return res.json({ ok: true, data: saved });
-    } catch (error) {
-      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error actualizando configuración." });
     }
   });
 
