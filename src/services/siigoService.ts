@@ -581,6 +581,10 @@ export async function listProducts(query: Record<string, unknown> = {}): Promise
   return request("/v1/products", { query });
 }
 
+export async function listWarehouses(): Promise<unknown> {
+  return request("/v1/warehouses");
+}
+
 export async function listAccounts(query: Record<string, unknown> = {}): Promise<unknown> {
   return request("/v1/accounts", { query });
 }

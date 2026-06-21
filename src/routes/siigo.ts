@@ -31,6 +31,7 @@ import {
   listPaymentTypes,
   listTaxes,
   listProducts,
+  listWarehouses,
   listAccounts,
   listCreditNoteDocumentTypes,
   listPurchaseSupportDocumentTypes,
@@ -47,6 +48,7 @@ import {
   deleteCompany,
   getCompanyContext,
   setCompanyNit,
+  updateCompanySettings,
   normalizeNit,
   shareCompany,
   unshareCompany,
@@ -544,6 +546,21 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         ok: false,
         message: error instanceof Error ? error.message : "Error actualizando la empresa",
       });
+    }
+  });
+
+  router.patch("/companies/:id/settings", async (req: Request, res: Response) => {
+    try {
+      if (req.integrationAuthMode === "jwt") {
+        const userId = req.user?.userId;
+        const allowed = userId ? await userCanAccessCompany(req.params.id, userId) : false;
+        if (!allowed) return res.status(403).json({ ok: false, message: "Sin acceso a esta empresa." });
+      }
+      const { useProducts, warehouseId } = req.body || {};
+      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId });
+      return res.json({ ok: true, data: saved });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error actualizando configuración." });
     }
   });
 
@@ -1506,6 +1523,15 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     try {
       const query = getAllowedQuery(req, ["code", "name", "page", "page_size"]);
       const data = await listProducts(query);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
+  });
+
+  router.get("/warehouses", async (_req: Request, res: Response) => {
+    try {
+      const data = await listWarehouses();
       return res.json({ ok: true, source: "siigo", data });
     } catch (error) {
       return handleSiigoError(res, error);

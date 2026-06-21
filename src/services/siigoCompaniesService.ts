@@ -8,6 +8,13 @@ const COMPANIES = "siigoCompanies";
 const baseUrl = () => process.env.SIIGO_API_BASE_URL || "https://api.siigo.com";
 const partnerId = () => process.env.SIIGO_PARTNER_ID || "SentiidoAI";
 
+export interface CompanySettings {
+  /** Si true, la causación usa productos Siigo en lugar de cuentas contables PUC. */
+  useProducts?: boolean;
+  /** ID de bodega Siigo a usar cuando useProducts=true. */
+  warehouseId?: string | null;
+}
+
 export interface SiigoCompanyPublic {
   id: string;
   name: string;
@@ -16,6 +23,7 @@ export interface SiigoCompanyPublic {
   nit?: string;
   ownerUserId?: string;
   sharedWith?: string[];
+  settings?: CompanySettings;
 }
 
 /** Normaliza un NIT para comparación: descarta el dígito de verificación y deja solo dígitos. */
@@ -31,6 +39,7 @@ function toPublic(doc: any): SiigoCompanyPublic {
     nit: doc.nit || "",
     ownerUserId: doc.ownerUserId ? String(doc.ownerUserId) : undefined,
     sharedWith: Array.isArray(doc.sharedWith) ? doc.sharedWith.map(String) : [],
+    settings: doc.settings || {},
   };
 }
 
@@ -115,6 +124,19 @@ export async function getCompanyContext(id: string): Promise<SiigoContext | null
  * validar que un token DIAN pertenezca a esta empresa. Guarda el NIT normalizado
  * (solo dígitos, sin DV).
  */
+export async function updateCompanySettings(companyId: string, settings: CompanySettings): Promise<CompanySettings> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { throw new Error("Empresa inválida."); }
+  const patch: Record<string, unknown> = {};
+  if (settings.useProducts !== undefined) patch["settings.useProducts"] = Boolean(settings.useProducts);
+  if (settings.warehouseId !== undefined) patch["settings.warehouseId"] = settings.warehouseId || null;
+  if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
+  const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
+  if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid }, { projection: { settings: 1 } });
+  return doc?.settings || {};
+}
+
 export async function setCompanyNit(companyId: string, nit: string): Promise<string> {
   let oid: ObjectId;
   try {
