@@ -73,6 +73,9 @@ RUN npm install --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/templates ./templates
 
+# Paquete de la extensión (lo sirve /ext/download y /ext/download.crx)
+COPY assets ./assets
+
 # Motor Python (se ejecuta como subproceso desde el servicio de contabilización).
 COPY motor ./motor
 
