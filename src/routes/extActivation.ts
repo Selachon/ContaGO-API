@@ -18,6 +18,7 @@ import jwt from "jsonwebtoken";
 import fs from "fs";
 import path from "path";
 import { requireAuth } from "../middleware/auth.js";
+import { checkToolAccess } from "../middleware/requireToolAccess.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import {
   generateExtActivationCode,
@@ -62,6 +63,23 @@ router.get("/download.crx", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "application/x-chrome-extension");
   res.setHeader("Content-Disposition", 'attachment; filename="ContaGO-DIAN-Extension.crx"');
   fs.createReadStream(EXT_CRX_PATH).pipe(res);
+});
+
+// ── Herramientas habilitadas para el usuario (las usa la extensión) ─────────
+// Modos de la extensión → id de herramienta. La extensión solo habilita los modos
+// cuyo acceso devuelve true (misma lógica que el resto del portal: admin/demo/compra).
+const EXT_MODE_TOOLS: Record<string, string> = {
+  masiva: "dian-mass-download",
+  exportador: "dian-cufe-downloader",
+  terceros: "dian-third-parties-excel",
+};
+router.get("/tools", requireAuth, async (req: Request, res: Response) => {
+  const modes: Record<string, boolean> = {};
+  for (const [mode, toolId] of Object.entries(EXT_MODE_TOOLS)) {
+    const r = await checkToolAccess(req.user!.userId, !!req.user?.isAdmin, toolId);
+    modes[mode] = r.ok;
+  }
+  res.json({ ok: true, modes, isAdmin: !!req.user?.isAdmin });
 });
 
 // ── Estado de la activación (portal) ────────────────────────────────────────
