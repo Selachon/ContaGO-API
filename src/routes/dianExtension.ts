@@ -21,9 +21,9 @@ import os from "os";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import { requireAuth } from "../middleware/auth.js";
-import { requireToolAccess } from "../middleware/requireToolAccess.js";
-import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
-import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
+import { checkToolAccess } from "../middleware/requireToolAccess.js";
+import { extractInvoiceDataFromXml, extractThirdPartyDataFromXml } from "../services/xmlParser.js";
+import { generateExcelFile, generateThirdPartiesExcelFile } from "../services/excelGenerator.js";
 import { extractCufesFromExcel, extractFilesFromZip, resolveExcelBuffer } from "./dianCufeDownload.js";
 import { rejectIfWrongDemoNit, getDemoLimit, buildDemoLimitInfo, type DemoLimitInfo } from "../utils/demoLimit.js";
 import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
@@ -34,6 +34,7 @@ import type { DocumentDirection } from "../types/dian.js";
 import type { InvoiceData } from "../types/dianExcel.js";
 
 const TOOL_ID = "dian-cufe-downloader";
+const TERCEROS_TOOL_ID = "dian-third-parties-excel";
 const JOB_TTL_MS = 60 * 60 * 1000; // 1h
 const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
 
@@ -41,8 +42,43 @@ type DriveConfig = NonNullable<Awaited<ReturnType<typeof getUserGoogleDriveById>
 
 const normalizeNit = (nit: string) => (nit || "").replace(/[-\s]/g, "").trim();
 
+// Nombre del Excel idéntico a las herramientas internas (/dian-cufe y terceros).
+const ES_MONTHS = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
+function formatDateES(isoDate?: string): string {
+  if (!isoDate || !/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) return "";
+  const [y, m, d] = isoDate.split("-");
+  const mon = ES_MONTHS[parseInt(m, 10) - 1] || m;
+  return `${mon} ${d} ${y}`;
+}
+function buildExtOutputName(
+  mode: "invoices" | "terceros",
+  direction: DocumentDirection,
+  companyNit: string,
+  companyName: string,
+  startDate?: string,
+  endDate?: string
+): string {
+  const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
+  const startFmt = formatDateES(startDate);
+  const endFmt = formatDateES(endDate);
+  const range = startFmt && endFmt ? `${startFmt} - ${endFmt}` : startFmt || endFmt || new Date().toISOString().slice(0, 10);
+  if (mode === "terceros") {
+    // Igual que la herramienta de terceros: "<NIT> - Terceros DIAN <dir> <rango>.xlsx"
+    const base = `Terceros DIAN ${dirLabel}`;
+    const prefix = companyNit ? `${companyNit} - ${base}` : base;
+    return `${prefix} ${range}.xlsx`;
+  }
+  // Igual que /dian-cufe: "<NIT> - <Empresa> - Facturas <dir> DIAN <rango>.xlsx"
+  const base = `Facturas ${dirLabel} DIAN`;
+  const prefix = companyName
+    ? `${companyNit} - ${companyName} - ${base}`
+    : (companyNit ? `${companyNit} - ${base}` : base);
+  return `${prefix} ${range}.xlsx`;
+}
+
 interface ExtJobData {
   status: "collecting" | "completed" | "error";
+  mode: "invoices" | "terceros";   // terceros = hoja "Datos de terceros", sin Drive
   userId: string;
   direction: DocumentDirection;
   startDate?: string;
@@ -70,6 +106,7 @@ interface ExtJobData {
   driveConfig: DriveConfig | null;
   driveConnectionId?: string;
   uploadToDrive: boolean;
+  includeDriveLinks: boolean;     // columna de enlaces de Drive en el Excel
   driveFolderUrl?: string;
   driveErrors: number;
 }
@@ -96,9 +133,10 @@ const upload = multer({
 
 const router = Router();
 
-// Auth: mismo JWT que el resto de la app + misma licencia de herramienta.
+// Auth: mismo JWT que el resto de la app. La licencia de herramienta se valida
+// en POST /job según el modo (exportador vs terceros); el resto de rutas se
+// protegen por propiedad del job (getOwnedJob).
 router.use(requireAuth);
-router.use(requireToolAccess(TOOL_ID));
 
 function getOwnedJob(req: Request, res: Response): ExtJobData | null {
   const { jobId } = req.params;
@@ -140,13 +178,25 @@ router.post("/job", upload.single("excel"), async (req: Request, res: Response) 
     return res.status(400).json({ status: "error", detalle: "Debes adjuntar el listado (Excel)." });
   }
 
-  const { start_date, end_date, token_url, drive_connection_id, upload_to_drive } = req.body as {
+  const { start_date, end_date, token_url, drive_connection_id, upload_to_drive, include_drive_links, mode: modeRaw } = req.body as {
     start_date?: string;
     end_date?: string;
     token_url?: string;
     drive_connection_id?: string;
     upload_to_drive?: string | boolean;
+    include_drive_links?: string | boolean;
+    mode?: string;
   };
+  const mode: "invoices" | "terceros" = modeRaw === "terceros" ? "terceros" : "invoices";
+  const includeDriveLinks = mode === "terceros" ? false : (include_drive_links === true || include_drive_links === "true");
+
+  // Licencia según el modo: el Exportador usa dian-cufe-downloader; Terceros usa
+  // dian-third-parties-excel. (El router ya validó el JWT.)
+  const access = await checkToolAccess(req.user!.userId, !!req.user?.isAdmin, mode === "terceros" ? TERCEROS_TOOL_ID : TOOL_ID);
+  if (!access.ok) {
+    return res.status(access.status || 403).json({ status: "error", code: access.code, detalle: access.detalle });
+  }
+  if (access.demoAccess) req.demoAccess = access.demoAccess;
 
   // El NIT demo se valida igual que en /dian-cufe si viene token_url (opcional aquí).
   if (token_url && rejectIfWrongDemoNit(req, res, token_url)) return;
@@ -244,13 +294,21 @@ router.post("/job", upload.single("excel"), async (req: Request, res: Response) 
     }
   }
 
+  // Rango de fechas para el nombre del Excel: usa lo que llegue por parámetro o,
+  // si no, lo deriva del propio listado (min/max), para que el nombre quede igual
+  // que en la herramienta del portal: "Facturas DIAN <inicio> - <fin>.xlsx".
+  const validDates = (parsed.dates || []).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+  const startDate = start_date || validDates[0];
+  const endDate = end_date || validDates[validDates.length - 1];
+
   const jobId = uuidv4().replace(/-/g, "").slice(0, 12);
   jobs.set(jobId, {
     status: "collecting",
+    mode,
     userId: req.user!.userId,
     direction,
-    startDate: start_date,
-    endDate: end_date,
+    startDate,
+    endDate,
     allCufes,
     processableCufes,
     records: processableRecords,
@@ -265,9 +323,10 @@ router.post("/job", upload.single("excel"), async (req: Request, res: Response) 
     demoLimit,
     allowedNits,
     nitVerified: false,
-    driveConfig,
+    driveConfig: mode === "terceros" ? null : driveConfig,
     driveConnectionId: drive_connection_id,
-    uploadToDrive: !!driveConfig,
+    uploadToDrive: mode === "terceros" ? false : !!driveConfig,
+    includeDriveLinks,
     driveFolderUrl,
     driveErrors: 0,
   });
@@ -309,22 +368,31 @@ router.post(
     }
 
     const zipBuffer = req.body as Buffer;
+    const dbgLen = Buffer.isBuffer(zipBuffer) ? zipBuffer.length : -1;
+    const dbgMagic = Buffer.isBuffer(zipBuffer) ? zipBuffer.slice(0, 4).toString("hex") : "n/a";
+    console.log(`[DIAN EXT][DBG] zip recibido cufe=${cufe.slice(0, 16)} len=${dbgLen} magic=${dbgMagic}`);
     if (!Buffer.isBuffer(zipBuffer) || zipBuffer.length < 4 || zipBuffer[0] !== 0x50 || zipBuffer[1] !== 0x4b) {
+      console.log(`[DIAN EXT][DBG] -> RECHAZADO: no es ZIP válido (magic=${dbgMagic})`);
       return res.status(400).json({ status: "error", detalle: "El cuerpo no es un ZIP válido" });
     }
 
     try {
       const { xmlBuffer, pdfBuffer } = await extractFilesFromZip(zipBuffer);
       if (!xmlBuffer) {
+        // Diagnóstico: listar las entradas del ZIP para entender por qué no hay XML
+        try {
+          const JSZip = (await import("jszip")).default;
+          const z = await JSZip.loadAsync(zipBuffer);
+          console.log(`[DIAN EXT][DBG] -> sin XML. Entradas: ${Object.keys(z.files).join(", ")}`);
+        } catch (e) { console.log(`[DIAN EXT][DBG] -> sin XML y no se pudo abrir el ZIP: ${(e as Error).message}`); }
         job.missCount++;
         job.receivedCount++;
         return res.status(422).json({ status: "error", detalle: "El ZIP no contiene XML" });
       }
 
-      const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
-        id: trackId || cufe,
-        docnum: docnum || "",
-      });
+      const invoiceData = job.mode === "terceros"
+        ? await extractThirdPartyDataFromXml(xmlBuffer, { id: trackId || cufe, docnum: docnum || "" })
+        : await extractInvoiceDataFromXml(xmlBuffer, { id: trackId || cufe, docnum: docnum || "" });
 
       // Detectar razón social / NIT propio (igual que /dian-cufe)
       const isDS = !!invoiceData.isDocumentoSoporte;
@@ -428,18 +496,28 @@ router.post("/job/:jobId/finalize", async (req: Request, res: Response) => {
   try {
     const invoices = job.allCufes.map((cufe) => job.invoiceMap.get(cufe)!) as InvoiceData[];
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "dian-ext-"));
-    const prefix = job.direction === "sent" ? "Facturas Emitidas DIAN" : "Facturas DIAN";
-    const outputName = generateExcelFilename(job.startDate, job.endDate, prefix);
+    const isTerceros = job.mode === "terceros";
+    const outputName = buildExtOutputName(job.mode, job.direction, job.companyNit, job.companyName, job.startDate, job.endDate);
     const outputPath = path.join(tmpDir, outputName);
 
-    await generateExcelFile(
-      invoices,
-      outputPath,
-      job.uploadToDrive,              // includeDriveColumn (si se subió a Drive)
-      job.direction === "sent",
-      job.companyName,
-      job.companyNit
-    );
+    if (isTerceros) {
+      await generateThirdPartiesExcelFile(
+        invoices,
+        outputPath,
+        job.direction === "sent",
+        job.companyName,
+        job.companyNit
+      );
+    } else {
+      await generateExcelFile(
+        invoices,
+        outputPath,
+        job.includeDriveLinks,          // columna de enlaces de Drive (toggle del portal)
+        job.direction === "sent",
+        job.companyName,
+        job.companyNit
+      );
+    }
 
     job.outputPath = outputPath;
     job.outputName = outputName;

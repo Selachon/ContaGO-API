@@ -79,6 +79,22 @@ interface UserRecord {
   companiesInPlan?: number;
   invoiceRef?: string;
   siigoCompanies?: string[];
+  // Activación de la extensión de navegador (descargador DIAN).
+  // El usuario genera el código UNA vez desde el portal; la extensión lo canjea
+  // por un token de larga duración. Un admin puede restablecerlo para regenerar.
+  ext_activation?: {
+    code: string | null;          // código en claro; null = nunca generado / restablecido
+    codeGeneratedAt?: string;     // ISO — cuándo se generó
+    activatedAt?: string;         // ISO — cuándo lo canjeó la extensión (consume el código)
+    deviceLabel?: string;         // etiqueta opcional del dispositivo que activó
+  };
+  // Preferencias del Exportador DIAN que se configuran en el portal y la extensión
+  // lee para seguirlas tal cual (Drive sí/no, qué cuenta, incluir enlaces).
+  exporter_prefs?: {
+    uploadToDrive: boolean;
+    includeDriveLinks: boolean;
+    driveConnectionId: string | null;
+  };
 }
 
 
@@ -156,6 +172,8 @@ export async function connectMongo(): Promise<void> {
   await ensureIndex(users, { email: 1 }, { unique: true });
   await ensureIndex(users, { legacyId: 1 });
   await ensureIndex(users, { role: 1 });
+  // Búsqueda por código de activación de la extensión (único, solo donde existe).
+  await ensureIndex(users, { "ext_activation.code": 1 }, { unique: true, sparse: true });
   const demoInvites = demoInvitesCollection();
   await ensureIndex(demoInvites, { tokenHash: 1 }, { unique: true });
   await ensureIndex(demoInvites, { normalizedNit: 1 });
@@ -860,6 +878,149 @@ export async function migrateToolSlugs(): Promise<void> {
     console.log("[DB] Tool slug migration completed");
   } catch (err) {
     console.error("[DB] Tool slug migration failed:", err);
+  }
+}
+
+// ============================================
+// Activación de la extensión de navegador (DIAN)
+// ============================================
+
+// Código legible y sin caracteres ambiguos (sin 0/O/1/I/L). Formato CTG-XXXX-XXXX.
+const EXT_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+function makeExtCode(): string {
+  const block = () =>
+    Array.from({ length: 4 }, () => EXT_CODE_ALPHABET[Math.floor(Math.random() * EXT_CODE_ALPHABET.length)]).join("");
+  return `CTG-${block()}-${block()}`;
+}
+
+export interface ExtActivationStatus {
+  generated: boolean;
+  activated: boolean;
+  code?: string | null;          // se devuelve solo si aún no se ha canjeado
+  codeGeneratedAt?: string;
+  activatedAt?: string;
+  deviceLabel?: string;
+}
+
+export async function getExtActivationStatus(userId: string): Promise<ExtActivationStatus | null> {
+  try {
+    const record = await usersCollection().findOne({ _id: new ObjectId(userId) });
+    if (!record) return null;
+    const ext = record.ext_activation;
+    if (!ext || !ext.code) return { generated: false, activated: false };
+    return {
+      generated: true,
+      activated: !!ext.activatedAt,
+      code: ext.activatedAt ? null : ext.code, // tras canjearlo no se vuelve a mostrar
+      codeGeneratedAt: ext.codeGeneratedAt,
+      activatedAt: ext.activatedAt,
+      deviceLabel: ext.deviceLabel,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Genera el código UNA sola vez. Si ya existe → { already: true } sin tocar nada.
+export async function generateExtActivationCode(
+  userId: string
+): Promise<{ ok: boolean; already?: boolean; code?: string; status?: ExtActivationStatus }> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne({ _id: oid });
+    if (!record) return { ok: false };
+    if (record.ext_activation && record.ext_activation.code) {
+      return { ok: true, already: true, status: (await getExtActivationStatus(userId)) || undefined };
+    }
+    // Reintentar ante colisión del índice único (muy improbable).
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = makeExtCode();
+      try {
+        await usersCollection().updateOne(
+          { _id: oid },
+          { $set: { ext_activation: { code, codeGeneratedAt: new Date().toISOString() } } }
+        );
+        return { ok: true, code };
+      } catch (e: any) {
+        if (e?.code === 11000) continue; // colisión → otro código
+        throw e;
+      }
+    }
+    return { ok: false };
+  } catch (err) {
+    console.error("Error generando código de activación:", err);
+    return { ok: false };
+  }
+}
+
+// Canjea el código: lo marca como activado (un solo uso) y devuelve el usuario.
+export async function activateExtensionByCode(
+  code: string,
+  deviceLabel?: string
+): Promise<{ user: User; reactivated: boolean } | null> {
+  try {
+    const clean = String(code || "").trim().toUpperCase();
+    if (!clean) return null;
+    const record = await usersCollection().findOne({ "ext_activation.code": clean });
+    if (!record) return null;
+    if (record.status === "suspended") return null;
+    const already = !!record.ext_activation?.activatedAt;
+    // Único uso: si ya fue activado, no se permite canjear de nuevo (pide reset admin).
+    if (already) return null;
+    await usersCollection().updateOne(
+      { _id: record._id },
+      { $set: { "ext_activation.activatedAt": new Date().toISOString(), "ext_activation.deviceLabel": deviceLabel || "" } }
+    );
+    return { user: mapUser(record)!, reactivated: false };
+  } catch (err) {
+    console.error("Error activando extensión:", err);
+    return null;
+  }
+}
+
+// ── Preferencias del Exportador DIAN (portal ↔ extensión) ─────────────────────
+export interface ExporterPrefs {
+  uploadToDrive: boolean;
+  includeDriveLinks: boolean;
+  driveConnectionId: string | null;
+}
+
+export async function getExporterPrefs(userId: string): Promise<ExporterPrefs> {
+  try {
+    const rec = await usersCollection().findOne({ _id: new ObjectId(userId) });
+    const p = rec?.exporter_prefs;
+    return {
+      uploadToDrive: !!p?.uploadToDrive,
+      includeDriveLinks: !!p?.includeDriveLinks,
+      driveConnectionId: p?.driveConnectionId ?? null,
+    };
+  } catch {
+    return { uploadToDrive: false, includeDriveLinks: false, driveConnectionId: null };
+  }
+}
+
+export async function setExporterPrefs(userId: string, prefs: Partial<ExporterPrefs>): Promise<ExporterPrefs> {
+  const cur = await getExporterPrefs(userId);
+  const next: ExporterPrefs = {
+    uploadToDrive: prefs.uploadToDrive ?? cur.uploadToDrive,
+    includeDriveLinks: prefs.includeDriveLinks ?? cur.includeDriveLinks,
+    driveConnectionId: prefs.driveConnectionId !== undefined ? prefs.driveConnectionId : cur.driveConnectionId,
+  };
+  await usersCollection().updateOne({ _id: new ObjectId(userId) }, { $set: { exporter_prefs: next } });
+  return next;
+}
+
+// Admin: restablece la activación para que el usuario pueda generar un código nuevo.
+export async function resetExtActivation(userId: string): Promise<boolean> {
+  try {
+    const result = await usersCollection().updateOne(
+      { _id: new ObjectId(userId) },
+      { $unset: { ext_activation: "" } }
+    );
+    return result.matchedCount > 0;
+  } catch (err) {
+    console.error("Error restableciendo activación:", err);
+    return false;
   }
 }
 

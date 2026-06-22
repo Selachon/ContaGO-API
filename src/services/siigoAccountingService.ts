@@ -7,6 +7,8 @@ import {
   listPurchases,
   listCustomers,
   getCurrentSiigoCompanyId,
+  getDocumentType,
+  SiigoError,
 } from "./siigoService.js";
 import { getSupplierProfile, type SupplierProfile } from "./siigoSuggestionsService.js";
 
@@ -355,8 +357,37 @@ export async function getCustomersIndex(): Promise<CustomerIndexEntry[]> {
   return out;
 }
 
+function isNumberRequiredError(details: unknown): boolean {
+  const errs = ((details as any)?.errors ?? (details as any)?.Errors);
+  if (!Array.isArray(errs)) return false;
+  return errs.some((e: any) => {
+    const code = String(e?.code ?? e?.Code ?? "").toLowerCase();
+    const params = Array.isArray(e?.params ?? e?.Params) ? (e?.params ?? e?.Params) : [];
+    return code === "parameter_required" && params.includes("number");
+  });
+}
+
 export async function submitToSiigo(type: "FC" | "DS" | "NC", payload: unknown) {
-  if (type === "FC") return createPurchase(payload);
+  if (type === "FC") {
+    try {
+      return await createPurchase(payload);
+    } catch (err) {
+      if (err instanceof SiigoError && isNumberRequiredError(err.details)) {
+        const docId = (payload as any)?.document?.id;
+        if (docId) {
+          try {
+            const docType = await getDocumentType(Number(docId)) as any;
+            const nextNumber = docType?.consecutive ?? docType?.next_consecutive ?? docType?.consecutive_number;
+            if (nextNumber != null) {
+              console.log(`[SiigoAccounting] Reintentando con number=${nextNumber} (tipo documento manual)`);
+              return await createPurchase({ ...(payload as any), number: Number(nextNumber) });
+            }
+          } catch { /* si falla el fallback, propagar error original */ }
+        }
+      }
+      throw err;
+    }
+  }
   if (type === "DS") return createPurchaseSupportDocument(payload);
   if (type === "NC") return createCreditNote(payload);
   throw new Error("Tipo de documento no soportado");

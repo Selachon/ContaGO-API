@@ -492,6 +492,10 @@ export async function listDocumentTypes(query: Record<string, unknown>): Promise
   return request("/v1/document-types", { query });
 }
 
+export async function getDocumentType(id: number): Promise<unknown> {
+  return request(`/v1/document-types/${id}`);
+}
+
 export async function listPurchaseDocumentTypes(query: Record<string, unknown> = {}): Promise<unknown> {
   return request("/v1/document-types", {
     query: {

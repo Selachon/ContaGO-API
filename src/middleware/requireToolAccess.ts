@@ -22,57 +22,54 @@ declare global {
   }
 }
 
+export interface ToolAccessResult {
+  ok: boolean;
+  status?: number;
+  code?: string;
+  detalle?: string;
+  demoAccess?: DemoAccess;
+}
+
+// Lógica central de acceso a una herramienta, reutilizable fuera del middleware
+// (p. ej. cuando la herramienta requerida depende del cuerpo de la petición).
+export async function checkToolAccess(userId: string, isAdmin: boolean, toolId: string): Promise<ToolAccessResult> {
+  if (isAdmin) return { ok: true };
+
+  const demoAccess = await getUserDemoAccess(userId);
+  if (demoAccess) {
+    const allowedToolIds = new Set([demoAccess.toolId, ...(TOOL_ALIASES[demoAccess.toolId] || [])]);
+    const requestedAliases = TOOL_ALIASES[toolId] || [];
+    const requestedMatchesDemo = allowedToolIds.has(toolId) || requestedAliases.includes(demoAccess.toolId);
+
+    if (isDemoTrialExpired(demoAccess)) {
+      return { ok: false, status: 403, code: "DEMO_EXPIRED", detalle: "Tu prueba DEMO terminó. Si la herramienta te ahorró tiempo, escríbenos para activar tu licencia completa." };
+    }
+    if (!requestedMatchesDemo) {
+      return { ok: false, status: 403, code: "DEMO_TOOL_RESTRICTED", detalle: "Tu prueba DEMO está habilitada sólo para la herramienta asignada en el enlace." };
+    }
+    return { ok: true, demoAccess };
+  }
+
+  const aliases = TOOL_ALIASES[toolId] ?? [];
+  const allowed = await hasPurchase(userId, toolId, aliases);
+  if (!allowed) {
+    return { ok: false, status: 403, detalle: "No tienes acceso a esta herramienta. Contacta al administrador." };
+  }
+  return { ok: true };
+}
+
 export function requireToolAccess(toolId: string) {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     if (!req.user) {
       res.status(401).json({ status: "error", detalle: "Token no proporcionado" });
       return;
     }
-
-    if (req.user.isAdmin) {
-      next();
+    const result = await checkToolAccess(req.user.userId, !!req.user.isAdmin, toolId);
+    if (!result.ok) {
+      res.status(result.status || 403).json({ status: "error", code: result.code, detalle: result.detalle });
       return;
     }
-
-    const demoAccess = await getUserDemoAccess(req.user.userId);
-    if (demoAccess) {
-      const allowedToolIds = new Set([demoAccess.toolId, ...(TOOL_ALIASES[demoAccess.toolId] || [])]);
-      const requestedAliases = TOOL_ALIASES[toolId] || [];
-      const requestedMatchesDemo = allowedToolIds.has(toolId) || requestedAliases.includes(demoAccess.toolId);
-
-      if (isDemoTrialExpired(demoAccess)) {
-        res.status(403).json({
-          status: "error",
-          code: "DEMO_EXPIRED",
-          detalle: "Tu prueba DEMO terminó. Si la herramienta te ahorró tiempo, escríbenos para activar tu licencia completa.",
-        });
-        return;
-      }
-
-      if (!requestedMatchesDemo) {
-        res.status(403).json({
-          status: "error",
-          code: "DEMO_TOOL_RESTRICTED",
-          detalle: "Tu prueba DEMO está habilitada sólo para la herramienta asignada en el enlace.",
-        });
-        return;
-      }
-
-      req.demoAccess = demoAccess;
-      next();
-      return;
-    }
-
-    const aliases = TOOL_ALIASES[toolId] ?? [];
-    const allowed = await hasPurchase(req.user.userId, toolId, aliases);
-    if (!allowed) {
-      res.status(403).json({
-        status: "error",
-        detalle: "No tienes acceso a esta herramienta. Contacta al administrador.",
-      });
-      return;
-    }
-
+    if (result.demoAccess) req.demoAccess = result.demoAccess;
     next();
   };
 }

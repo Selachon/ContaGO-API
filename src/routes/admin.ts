@@ -27,7 +27,7 @@ import {
   type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
-import { createDemoInvite, listDemoInvites, TOOL_SUCCESSOR, updateUserPassword } from "../services/database.js";
+import { createDemoInvite, listDemoInvites, TOOL_SUCCESSOR, updateUserPassword, resetExtActivation } from "../services/database.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import type { InvoiceData } from "../types/dianExcel.js";
@@ -647,6 +647,43 @@ router.post("/users/:id/reset-password", async (req: Request, res: Response) => 
   } catch (err) {
     console.error("[Admin] Error restableciendo contraseña:", err);
     return res.status(500).json({ ok: false, message: "Error interno al restablecer contraseña" });
+  }
+});
+
+// ============================================
+// POST /admin/users/:id/reset-ext-activation
+// Restablece la activación de la extensión (el usuario podrá generar un código nuevo)
+// ============================================
+router.post("/users/:id/reset-ext-activation", async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const actorId = req.user!.userId;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+    }
+
+    const user = await getUserById(id);
+    if (!user) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    const ok = await resetExtActivation(id);
+    if (!ok) {
+      return res.status(500).json({ ok: false, message: "No se pudo restablecer la activación" });
+    }
+
+    await logAdminAction({
+      actorId,
+      action: "reset_ext_activation",
+      targetUserId: id,
+      reason: "Restablecimiento de activación de extensión por administrador",
+    });
+
+    return res.json({ ok: true, message: "Activación de extensión restablecida. El usuario ya puede generar un código nuevo." });
+  } catch (err) {
+    console.error("[Admin] Error restableciendo activación de extensión:", err);
+    return res.status(500).json({ ok: false, message: "Error interno al restablecer la activación" });
   }
 });
 

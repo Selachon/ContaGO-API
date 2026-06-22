@@ -6,6 +6,7 @@ import puppeteer from "puppeteer";
 import fs from "fs";
 import { execSync } from "child_process";
 import authRoutes from "./routes/auth.js";
+import extActivationRoutes from "./routes/extActivation.js";
 import dianRoutes from "./routes/dian.js";
 import dianExcelRoutes from "./routes/dianExcel.js";
 import dianThirdPartiesRoutes from "./routes/dianThirdParties.js";
@@ -67,6 +68,7 @@ app.use(express.json({ limit: "5mb" }));
 // Routes
 // ============================================
 app.use("/auth", authRoutes);
+app.use("/ext", extActivationRoutes);
 app.use("/auth/google", googleAuthRoutes);
 app.use("/portal-status", portalStatusRoutes);
 app.use("/admin", adminRoutes);
