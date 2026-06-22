@@ -484,8 +484,8 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         const allowed = userId ? await userCanAccessCompany(req.params.id, userId) : false;
         if (!allowed) return res.status(403).json({ ok: false, message: "Sin acceso a esta empresa." });
       }
-      const { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems } = req.body || {};
-      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems });
+      const { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts } = req.body || {};
+      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts });
       return res.json({ ok: true, data: saved });
     } catch (error) {
       return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error actualizando configuración." });
@@ -1859,15 +1859,11 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
   router.post("/accounting/credit-note-journal", async (req: Request, res: Response) => {
     try {
-      const payload = req.body;
-      if (!payload || !payload.document?.id) {
-        return res.status(400).json({ ok: false, message: "Falta document.id (tipo de comprobante contable)" });
-      }
-      if (!Array.isArray(payload.items) || payload.items.length === 0) {
-        return res.status(400).json({ ok: false, message: "El comprobante no tiene partidas" });
-      }
+      const payload = req.body as JournalPayload;
+      const errors = validateIncomeJournal(payload);
+      if (errors.length) return res.status(400).json({ ok: false, message: errors.join(" | ") });
       console.log(`[SiigoJournal] NC → journal: ${payload.items.length} partidas | doc ${payload.document.id}`);
-      const result = await createJournalVoucher(payload);
+      const result = await runInCompanyCtx(req, () => submitIncomeJournal(payload));
       return res.json({ ok: true, data: result });
     } catch (error) {
       const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";

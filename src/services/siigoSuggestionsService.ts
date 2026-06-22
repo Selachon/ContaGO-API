@@ -26,6 +26,10 @@ export interface RetentionHint {
 export interface AccountCatalogEntry {
   code: string;
   name: string;
+  /** Valor de la columna "Relación con" del PUC de Siigo (ej. "Impuesto", "Activo fijo", "Proveedor"). */
+  relatedTo?: string;
+  /** Valor de la columna "Maneja vencimientos" del PUC (ej. "Con vencimiento en proveedores", "Con vencimiento en cartera"). */
+  maturity?: string;
 }
 
 export interface SupplierProfile {
@@ -310,19 +314,51 @@ export async function rebuildProfilesFromSiigoReport(year: number, monthStart: n
 
 export async function savePlanCuentas(buffer: Buffer): Promise<{ count: number }> {
   const rows = await robustReadExcel(buffer);
+
+  // Detectar columnas por nombre de header (la primera fila con texto reconocible)
+  let headerRow = -1;
+  let colCode = 0, colName = 1, colMaturity = -1, colRelatedTo = -1, colActivo = 7, colNivel = 8;
+  for (let i = 0; i < Math.min(5, rows.length); i++) {
+    const r = rows[i];
+    const found = r.findIndex((c) => /^c[oó]digo/i.test(String(c ?? "").trim()));
+    if (found >= 0) {
+      headerRow = i;
+      colCode = found;
+      r.forEach((c, j) => {
+        const v = String(c ?? "").trim().toLowerCase();
+        if (/^nombre/i.test(v)) colName = j;
+        else if (/vencim/i.test(v)) colMaturity = j;
+        else if (/relaci/i.test(v)) colRelatedTo = j;
+        else if (/^activo/i.test(v)) colActivo = j;
+        else if (/^nivel/i.test(v)) colNivel = j;
+      });
+      break;
+    }
+  }
+
   const accounts: AccountCatalogEntry[] = [];
   const seen = new Set<string>();
-  for (const r of rows) {
-    const code = String(r[0] ?? "").trim();
-    const name = String(r[1] ?? "").trim();
-    const activo = String(r[7] ?? "").trim().toLowerCase();
-    const nivel = String(r[8] ?? "").trim().toLowerCase();
+  for (let i = headerRow + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const code = String(r[colCode] ?? "").trim();
+    const name = String(r[colName] ?? "").trim();
+    const activo = String(r[colActivo] ?? "").trim().toLowerCase();
+    const nivel = String(r[colNivel] ?? "").trim().toLowerCase();
     if (!/^\d/.test(code)) continue;
     if (nivel !== "transaccional") continue;
     if (activo && activo !== "sí" && activo !== "si") continue;
     if (seen.has(code)) continue;
     seen.add(code);
-    accounts.push({ code, name });
+    const entry: AccountCatalogEntry = { code, name };
+    if (colRelatedTo >= 0) {
+      const v = String(r[colRelatedTo] ?? "").trim();
+      if (v) entry.relatedTo = v;
+    }
+    if (colMaturity >= 0) {
+      const v = String(r[colMaturity] ?? "").trim();
+      if (v) entry.maturity = v;
+    }
+    accounts.push(entry);
   }
   if (accounts.length === 0) throw new Error("No se encontraron cuentas transaccionales.");
   accounts.sort((a, b) => a.code.localeCompare(b.code));

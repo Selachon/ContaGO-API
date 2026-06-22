@@ -12,12 +12,21 @@ import {
 } from "./siigoService.js";
 import { getSupplierProfile, type SupplierProfile } from "./siigoSuggestionsService.js";
 
+/** Impuesto extra (ICL, IBUA, IC, Bolsas…) de una línea del XML. */
+export interface XmlExtraTax {
+  taxName: string; // "ICL", "IBUA", "IC Porcentual", etc.
+  amount: number;  // valor monetario ya calculado
+  percent: number; // tasa porcentual (0 si es específico)
+}
+
 /** Una línea del XML lista para volcar como ítem de causación. */
 export interface XmlCausacionItem {
-  description: string; // Concepto (hoja "Detallado")
-  base: number; // Base del impuesto / valor unitario
-  ivaPercent: number; // 0 si la línea no tiene IVA
-  incPercent: number; // 0 si la línea no tiene Impoconsumo
+  description: string;
+  base: number;
+  ivaPercent: number;
+  incPercent: number;
+  /** Impuestos adicionales distintos de IVA/Retefte que generan líneas separadas. */
+  extraTaxes?: XmlExtraTax[];
 }
 
 /** Borrador de tercero (proveedor) prellenado desde el XML para crearlo en Siigo. */
@@ -142,14 +151,20 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
   const validDate =
     xmlData.issueDateISO && xmlData.issueDateISO !== "9999-12-31" ? xmlData.issueDateISO : "";
 
-  const items: XmlCausacionItem[] = lineItems.map((li) => ({
-    description: li.description || "",
-    base:
-      Number(li.totalUnitPrice) ||
-      (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0),
-    ivaPercent: Number(li.ivaPercent) || 0,
-    incPercent: Number(li.incPercent) || 0,
-  }));
+  // Impuestos que NO son IVA/Retefte y se envían como ítems separados a Siigo
+  const IVA_LIKE = new Set(["IVA", "Retefuente", "ReteICA", "ReteIVA"]);
+  const items: XmlCausacionItem[] = lineItems.map((li) => {
+    const extraTaxes: XmlExtraTax[] = (li.taxes || [])
+      .filter((t: any) => !IVA_LIKE.has(t.taxName) && Number(t.amount) > 0)
+      .map((t: any) => ({ taxName: t.taxName, amount: Number(t.amount) || 0, percent: Number(t.percent) || 0 }));
+    return {
+      description: li.description || "",
+      base: Number(li.totalUnitPrice) || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0),
+      ivaPercent: Number(li.ivaPercent) || 0,
+      incPercent: Number(li.incPercent) || 0,
+      extraTaxes: extraTaxes.length ? extraTaxes : undefined,
+    };
+  });
 
   console.log(
     `[SiigoAccounting] XML ${xmlData.docNumber || "?"} — NIT ${xmlData.issuerNit}, ${items.length} ítem(s)`

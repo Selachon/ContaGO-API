@@ -21,6 +21,8 @@ export interface CompanySettings {
   skipCostCenter?: boolean;
   /** Si true, los ítems nunca se condensan por impuesto; siempre van separados. */
   noCondenseItems?: boolean;
+  /** Mapa de nombre de impuesto extra → código de cuenta PUC para causación (ej. { ICL: "239530", IBUA: "239590" }). */
+  extraTaxAccounts?: Record<string, string>;
 }
 
 export interface SiigoCompanyPublic {
@@ -142,6 +144,7 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.defaultPaymentTypeId !== undefined) patch["settings.defaultPaymentTypeId"] = settings.defaultPaymentTypeId || null;
   if (settings.skipCostCenter !== undefined) patch["settings.skipCostCenter"] = Boolean(settings.skipCostCenter);
   if (settings.noCondenseItems !== undefined) patch["settings.noCondenseItems"] = Boolean(settings.noCondenseItems);
+  if (settings.extraTaxAccounts !== undefined) patch["settings.extraTaxAccounts"] = settings.extraTaxAccounts || {};
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");

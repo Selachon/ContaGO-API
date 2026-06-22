@@ -112,12 +112,15 @@ function detectBank(pages: string[][]): string {
   // pero sus movimientos pueden mencionar "BANCOLOMBIA" en transferencias entrantes,
   // lo que dispararía una detección falsa si se verifica bancolombia antes.
   if (allText.includes("davivienda")) return "davivienda";
+  // Occidente antes de bancolombia: un extracto de Occidente puede tener transacciones
+  // "PAGO ACH BANCOLOMBIA" que dispararían la detección incorrecta si se verificara primero.
+  // La frase "banco de occidente" es suficientemente específica para buscarse en todo el texto.
+  if (allText.includes("banco de occidente")) return "occidente";
+  // Bancolombia se detecta por el dominio "bancolombia.com" (pie de página DCF) para
+  // evitar falsos positivos por transacciones ACH que mencionan el nombre del banco.
+  if (allText.includes("bancolombia.com")) return "bancolombia";
   const head40 = pages.flat().slice(0, 40).join(" ").toLowerCase();
-  if (head40.includes("bancolombia")) return "bancolombia";
   if (head40.includes("itaú") || head40.includes("itau")) return "itau";
-  // Occidente se detecta en el encabezado (no en el cuerpo) para no confundir con
-  // statements de otro banco que solo mencionen "Banco de Occidente" en un movimiento.
-  if (head40.includes("banco de occidente")) return "occidente";
   // Banco de Bogotá: el nombre va en el pie (URL bancodebogota.com), no en el
   // encabezado. Es marcador específico y los demás bancos ya se descartaron arriba.
   if (allText.includes("bancodebogota.com")) return "bancobogota";
@@ -213,8 +216,8 @@ function parseItau(pages: string[][]): { raws: RawMov[]; opening: number | null;
 // sección "Extracto - CUENTA CORRIENTE" (el PDF trae también tarjetas de crédito).
 function parseOccidente(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
   const all = pages.flat();
-  // Acotar a la sección de cuenta corriente (desde su título hasta la de tarjetas).
-  const startIdx = all.findIndex((l) => /Extracto\s*-\s*CUENTA CORRIENTE/i.test(l));
+  // Acotar a la sección de cuenta (corriente o ahorros), desde su título hasta tarjetas/crédito.
+  const startIdx = all.findIndex((l) => /Extracto\s*-\s*CUENTA\s+(CORRIENTE|AHORROS)/i.test(l));
   let endIdx = all.length;
   if (startIdx >= 0) {
     const rel = all.slice(startIdx + 1).findIndex((l) => /MASTERCARD|TARJETA No\.|CREDENCIAL/i.test(l));
@@ -236,13 +239,15 @@ function parseOccidente(pages: string[][]): { raws: RawMov[]; opening: number | 
   const credits = findMoney(/\bCREDITOS\s+([\d,]+\.\d{2})/i);
   const debits = findMoney(/\bDEBITOS\s+([\d,]+\.\d{2})/i);
 
-  // Tabla: desde el encabezado "DIA TRANSACCI" hasta el texto legal/fin.
+  // Tabla: desde el primer encabezado "DIA TRANSACCI" hasta el fin de sec.
+  // No se corta con "Hoja X de Y" porque en el formato unificado esa etiqueta aparece
+  // como pie de página intermedio entre páginas, no al final del estado de cuenta.
+  // sec ya está acotado hasta MASTERCARD/tarjeta por el startIdx/endIdx de arriba.
   const hdr = sec.findIndex((l) => /DIA\s+TRANSACCI/i.test(l));
-  const tailRel = hdr >= 0 ? sec.slice(hdr + 1).findIndex((l) => /En caso de mora|Hoja \d+ de/i.test(l)) : -1;
-  const tableLines = hdr >= 0 ? sec.slice(hdr + 1, tailRel >= 0 ? hdr + 1 + tailRel : undefined) : sec;
+  const tableLines = hdr >= 0 ? sec.slice(hdr + 1) : sec;
 
   const raws: RawMov[] = [];
-  const rowRx = /^(\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$/;
+  const rowRx = /^(\d{1,2})\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})$/;
   for (const line of tableLines) {
     const m = line.match(rowRx);
     if (!m) continue;
