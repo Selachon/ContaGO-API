@@ -35,7 +35,7 @@ import type { InvoiceData } from "../types/dianExcel.js";
 
 const TOOL_ID = "dian-cufe-downloader";
 const TERCEROS_TOOL_ID = "dian-third-parties-excel";
-const JOB_TTL_MS = 60 * 60 * 1000; // 1h
+const JOB_TTL_MS = 3 * 60 * 60 * 1000; // 3h de inactividad (se refresca con cada interacción)
 const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
 
 type DriveConfig = NonNullable<Awaited<ReturnType<typeof getUserGoogleDriveById>>>;
@@ -153,6 +153,10 @@ function getOwnedJob(req: Request, res: Response): ExtJobData | null {
     res.status(403).json({ status: "error", detalle: "No autorizado" });
     return null;
   }
+  // Keep-alive: cualquier interacción (subir ZIP, miss, estado, finalize) mantiene
+  // vivo el job. Así un proceso largo (cientos de facturas, re-login de token) no
+  // expira a mitad y pierde el Excel. El TTL cuenta inactividad, no duración total.
+  job.createdAt = Date.now();
   return job;
 }
 
