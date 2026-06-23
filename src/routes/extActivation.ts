@@ -17,6 +17,7 @@ import { Router, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import fs from "fs";
 import path from "path";
+import JSZip from "jszip";
 import { requireAuth } from "../middleware/auth.js";
 import { checkToolAccess } from "../middleware/requireToolAccess.js";
 import { rateLimit } from "../middleware/rateLimit.js";
@@ -53,6 +54,25 @@ router.get("/download", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "application/zip");
   res.setHeader("Content-Disposition", 'attachment; filename="ContaGO-DIAN-Extension.zip"');
   fs.createReadStream(EXT_ZIP_PATH).pipe(res);
+});
+
+// Versión de la extensión publicada (leída del manifest dentro del zip servido),
+// para que el portal avise cuando un usuario tiene una versión vieja instalada.
+let cachedVer = { mtime: 0, version: "" };
+async function getExtVersion(): Promise<string> {
+  try {
+    const st = fs.statSync(EXT_ZIP_PATH);
+    if (cachedVer.mtime === st.mtimeMs && cachedVer.version) return cachedVer.version;
+    const zip = await JSZip.loadAsync(fs.readFileSync(EXT_ZIP_PATH));
+    const mf = zip.file(/manifest\.json$/i)[0];
+    const txt = mf ? await mf.async("string") : "{}";
+    const version = JSON.parse(txt).version || "";
+    cachedVer = { mtime: st.mtimeMs, version };
+    return version;
+  } catch { return ""; }
+}
+router.get("/version", async (_req: Request, res: Response) => {
+  res.json({ ok: true, version: await getExtVersion() });
 });
 
 // .crx firmado, para arrastrar a chrome://extensions (Modo desarrollador).
