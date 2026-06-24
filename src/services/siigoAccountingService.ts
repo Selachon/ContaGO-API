@@ -27,6 +27,12 @@ export interface XmlCausacionItem {
   incPercent: number;
   /** Impuestos adicionales distintos de IVA/Retefte que generan líneas separadas. */
   extraTaxes?: XmlExtraTax[];
+  /**
+   * Obsequio/bonificación: el proveedor regala el producto (base a pagar = 0) pero
+   * traslada el IVA. La base se ignora y el IVA se causa como impuesto extra en una
+   * cuenta PUC parametrizable. La UI omite la línea normal (precio 0) de estos ítems.
+   */
+  isGift?: boolean;
 }
 
 /** Borrador de tercero (proveedor) prellenado desde el XML para crearlo en Siigo. */
@@ -153,16 +159,32 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
 
   // Impuestos que NO son IVA/Retefte y se envían como ítems separados a Siigo
   const IVA_LIKE = new Set(["IVA", "Retefuente", "ReteICA", "ReteIVA"]);
+  // Nombre del "impuesto extra" bajo el cual se causa el IVA de obsequios (cuenta PUC parametrizable).
+  const GIFT_TAX_NAME = "IVA Obsequio";
   const items: XmlCausacionItem[] = lineItems.map((li) => {
+    const lineExt = Number(li.totalUnitPrice) || 0;
+    const ivaAmt = Number(li.ivaAmount) || 0;
+    const incAmt = Number(li.incAmount) || 0;
+    // Obsequio/bonificación: base a pagar = 0 (LineExtensionAmount) pero con IVA/INC > 0.
+    // Se ignora la base; el impuesto se enruta como ítem extra hacia su cuenta PUC.
+    const isGift = lineExt === 0 && (ivaAmt > 0 || incAmt > 0);
+
     const extraTaxes: XmlExtraTax[] = (li.taxes || [])
       .filter((t: any) => !IVA_LIKE.has(t.taxName) && Number(t.amount) > 0)
       .map((t: any) => ({ taxName: t.taxName, amount: Number(t.amount) || 0, percent: Number(t.percent) || 0 }));
+
+    if (isGift) {
+      if (ivaAmt > 0) extraTaxes.push({ taxName: GIFT_TAX_NAME, amount: ivaAmt, percent: Number(li.ivaPercent) || 0 });
+      if (incAmt > 0) extraTaxes.push({ taxName: GIFT_TAX_NAME, amount: incAmt, percent: Number(li.incPercent) || 0 });
+    }
+
     return {
       description: li.description || "",
-      base: Number(li.totalUnitPrice) || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0),
-      ivaPercent: Number(li.ivaPercent) || 0,
-      incPercent: Number(li.incPercent) || 0,
+      base: isGift ? 0 : (lineExt || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0)),
+      ivaPercent: isGift ? 0 : (Number(li.ivaPercent) || 0),
+      incPercent: isGift ? 0 : (Number(li.incPercent) || 0),
       extraTaxes: extraTaxes.length ? extraTaxes : undefined,
+      isGift: isGift || undefined,
     };
   });
 
@@ -382,10 +404,75 @@ function isNumberRequiredError(details: unknown): boolean {
   });
 }
 
+/**
+ * Si el error de Siigo es `invalid_total_payments`, devuelve el total de compra
+ * que Siigo calculó (lo informa en el mensaje: "The total purchase calculated is 97999.94").
+ * Ese es exactamente el valor que `payments` debe sumar. Devuelve null si no aplica.
+ */
+function extractCalculatedPurchaseTotal(details: unknown): number | null {
+  const errs = ((details as any)?.errors ?? (details as any)?.Errors);
+  if (!Array.isArray(errs)) return null;
+  for (const e of errs as Array<Record<string, unknown>>) {
+    const code = String(e?.code ?? e?.Code ?? "").toLowerCase();
+    if (code !== "invalid_total_payments") continue;
+    const message = String(e?.message ?? e?.Message ?? "");
+    // Siigo responde en formato en-US: punto decimal, coma como separador de miles.
+    const m = message.match(/calculated is\s*([\d,]+\.?\d*)/i);
+    if (m) {
+      const num = Number(m[1].replace(/,/g, ""));
+      if (Number.isFinite(num)) return num;
+    }
+  }
+  return null;
+}
+
+const round2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
+
+/**
+ * Devuelve una copia del payload con `payments` ajustado para que sume `total`.
+ * Con un solo pago, fija su valor; con varios, ajusta el último por la diferencia.
+ */
+function applyCorrectedPaymentTotal(payload: unknown, total: number): unknown {
+  const p = payload as any;
+  const payments = Array.isArray(p?.payments) ? p.payments.map((x: any) => ({ ...x })) : [];
+  if (payments.length === 0) return payload;
+  if (payments.length === 1) {
+    payments[0].value = round2(total);
+  } else {
+    const sum = round2(payments.reduce((a: number, x: any) => a + (Number(x.value) || 0), 0));
+    const last = payments[payments.length - 1];
+    last.value = round2((Number(last.value) || 0) + (round2(total) - sum));
+  }
+  return { ...p, payments };
+}
+
+/**
+ * Ejecuta `fn(payload)` y, si Siigo rechaza por `invalid_total_payments`,
+ * reenvía una sola vez con el total exacto que Siigo informó.
+ */
+async function createWithTotalRetry(
+  fn: (body: unknown) => Promise<unknown>,
+  payload: unknown
+): Promise<unknown> {
+  try {
+    return await fn(payload);
+  } catch (err) {
+    if (err instanceof SiigoError) {
+      const total = extractCalculatedPurchaseTotal(err.details);
+      if (total != null) {
+        console.log(`[SiigoAccounting] invalid_total_payments: reintentando con total exacto de Siigo=${total}`);
+        return await fn(applyCorrectedPaymentTotal(payload, total));
+      }
+    }
+    throw err;
+  }
+}
+
 export async function submitToSiigo(type: "FC" | "DS" | "NC", payload: unknown) {
   if (type === "FC") {
+    const create = (body: unknown) => createWithTotalRetry(createPurchase, body);
     try {
-      return await createPurchase(payload);
+      return await create(payload);
     } catch (err) {
       if (err instanceof SiigoError && isNumberRequiredError(err.details)) {
         const docId = (payload as any)?.document?.id;
@@ -395,7 +482,7 @@ export async function submitToSiigo(type: "FC" | "DS" | "NC", payload: unknown) 
             const nextNumber = docType?.consecutive ?? docType?.next_consecutive ?? docType?.consecutive_number;
             if (nextNumber != null) {
               console.log(`[SiigoAccounting] Reintentando con number=${nextNumber} (tipo documento manual)`);
-              return await createPurchase({ ...(payload as any), number: Number(nextNumber) });
+              return await create({ ...(payload as any), number: Number(nextNumber) });
             }
           } catch { /* si falla el fallback, propagar error original */ }
         }
@@ -403,7 +490,7 @@ export async function submitToSiigo(type: "FC" | "DS" | "NC", payload: unknown) 
       throw err;
     }
   }
-  if (type === "DS") return createPurchaseSupportDocument(payload);
+  if (type === "DS") return createWithTotalRetry(createPurchaseSupportDocument, payload);
   if (type === "NC") return createCreditNote(payload);
   throw new Error("Tipo de documento no soportado");
 }
