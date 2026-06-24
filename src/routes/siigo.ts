@@ -59,7 +59,7 @@ import { getUserSiigoCompanies, setUserSiigoCompanies, getUserById, getUserPurch
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
-import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
+import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, taxRequiredItemIndex, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import { ingestFromDian, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
 import { parseListingRecordsFromExportZip } from "../services/dianScraper.js";
 import {
@@ -1850,6 +1850,21 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
             message: nit
               ? `El proveedor con NIT ${nit} no existe en Siigo. Puedes crearlo con los datos de la factura antes de causar.`
               : "El proveedor de esta factura no existe en Siigo. Puedes crearlo con los datos de la factura antes de causar.",
+          });
+        }
+        const taxIdx = taxRequiredItemIndex(error.details);
+        if (taxIdx !== null) {
+          const items = (req.body as any)?.payload?.items;
+          const acc = Array.isArray(items) && items[taxIdx] ? items[taxIdx] : null;
+          const code = acc?.code ? String(acc.code) : "";
+          const desc = acc?.description ? String(acc.description).trim() : "";
+          return res.status(409).json({
+            ok: false,
+            source: "siigo",
+            code: "TAX_REQUIRED",
+            itemIndex: taxIdx,
+            accountCode: code,
+            message: `La cuenta ${code || "(sin código)"}${desc ? ` — ${desc}` : ""} de la línea ${taxIdx + 1} está configurada en Siigo para manejar impuesto. Selecciona el impuesto (IVA) en esa línea y vuelve a causar.`,
           });
         }
       }

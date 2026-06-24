@@ -518,3 +518,24 @@ export function supplierNotFoundNit(details: unknown): string | null {
   }
   return null;
 }
+
+/**
+ * Si el error de Siigo es `parameter_required` sobre `items[N].tax.id` (la cuenta de
+ * esa línea está configurada en Siigo para manejar impuesto y se envió sin él),
+ * devuelve el índice N de la línea. Si no aplica, devuelve null.
+ */
+export function taxRequiredItemIndex(details: unknown): number | null {
+  const rec = details as Record<string, unknown> | null;
+  const errs = (rec?.errors ?? rec?.Errors) as unknown;
+  if (!Array.isArray(errs)) return null;
+  for (const e of errs as Array<Record<string, unknown>>) {
+    const code = String(e?.code ?? e?.Code ?? "").toLowerCase();
+    if (code !== "parameter_required") continue;
+    const params = (Array.isArray(e?.params ?? e?.Params) ? (e?.params ?? e?.Params) : []) as unknown[];
+    for (const p of params) {
+      const m = String(p).match(/items\[(\d+)\]\.tax(?:es)?\.id/i);
+      if (m) return Number(m[1]);
+    }
+  }
+  return null;
+}
