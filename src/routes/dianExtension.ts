@@ -298,10 +298,30 @@ router.post("/job", upload.single("excel"), async (req: Request, res: Response) 
     }
   }
 
-  // Rango de fechas para el nombre del Excel: usa lo que llegue por parámetro o,
-  // si no, lo deriva del propio listado (min/max), para que el nombre quede igual
-  // que en la herramienta del portal: "Facturas DIAN <inicio> - <fin>.xlsx".
-  const validDates = (parsed.dates || []).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+  // Rango de fechas para el nombre del Excel y para el filtro de la DIAN: usa lo que
+  // llegue por parámetro o, si no, lo deriva del propio listado (min/max). Las fechas
+  // del listado vienen en formato crudo (DD/MM/YYYY, YYYY-MM-DD, con/sin hora); se
+  // normalizan a ISO antes de ordenar/usar (DIAN colombiana = día primero).
+  const toIsoLoose = (raw: string): string | null => {
+    const s = (raw || "").trim().split(/[ T]/)[0];
+    let m: RegExpMatchArray | null;
+    if ((m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/))) {
+      return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+    }
+    if ((m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/))) {
+      return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`; // DD/MM/YYYY
+    }
+    if ((m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2})$/))) {
+      const yy = Number(m[3]);
+      const yyyy = yy < 70 ? 2000 + yy : 1900 + yy;
+      return `${yyyy}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`; // DD/MM/YY
+    }
+    return null;
+  };
+  const validDates = (parsed.dates || [])
+    .map(toIsoLoose)
+    .filter((d): d is string => !!d && /^\d{4}-\d{2}-\d{2}$/.test(d))
+    .sort();
   const startDate = start_date || validDates[0];
   const endDate = end_date || validDates[validDates.length - 1];
 
