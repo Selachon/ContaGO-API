@@ -174,6 +174,8 @@ export interface EgresoAccount {
 export interface EgresoItem {
   due?: EgresoDue;
   account?: EgresoAccount;
+  /** Impuesto(s) de la cuenta (método avanzado): algunas cuentas en Siigo lo exigen. */
+  taxes?: Array<{ id: number }>;
   description?: string;
   value: number;
 }

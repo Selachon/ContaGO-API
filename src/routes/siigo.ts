@@ -1,5 +1,6 @@
 import { Router, Request, Response, type NextFunction, type RequestHandler } from "express";
 import multer from "multer";
+import ExcelJS from "exceljs";
 import { requireIntegrationAuth } from "../middleware/requireIntegrationAuth.js";
 import {
   authenticateWithSiigo,
@@ -1328,6 +1329,20 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
               : "El proveedor de este pago no existe en Siigo.",
           });
         }
+        const taxIdx = taxRequiredItemIndex(error.details);
+        if (taxIdx !== null) {
+          const item = Array.isArray(payload?.items) && payload!.items[taxIdx] ? payload!.items[taxIdx] : null;
+          const code = item?.account?.code ? String(item.account.code) : "";
+          const desc = item?.description ? String(item.description).trim() : "";
+          return res.status(409).json({
+            ok: false,
+            source: "siigo",
+            code: "TAX_REQUIRED",
+            itemIndex: taxIdx,
+            accountCode: code,
+            message: `La cuenta ${code || "(sin código)"}${desc ? ` — ${desc}` : ""} de la partida ${taxIdx + 1} está configurada en Siigo para manejar impuesto. En el método avanzado debes seleccionar el impuesto de esa cuenta antes de causar.`,
+          });
+        }
       }
       return handleSiigoError(res, error);
     }
@@ -1852,23 +1867,50 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
               : "El proveedor de esta factura no existe en Siigo. Puedes crearlo con los datos de la factura antes de causar.",
           });
         }
-        const taxIdx = taxRequiredItemIndex(error.details);
-        if (taxIdx !== null) {
-          const items = (req.body as any)?.payload?.items;
-          const acc = Array.isArray(items) && items[taxIdx] ? items[taxIdx] : null;
-          const code = acc?.code ? String(acc.code) : "";
-          const desc = acc?.description ? String(acc.description).trim() : "";
-          return res.status(409).json({
-            ok: false,
-            source: "siigo",
-            code: "TAX_REQUIRED",
-            itemIndex: taxIdx,
-            accountCode: code,
-            message: `La cuenta ${code || "(sin código)"}${desc ? ` — ${desc}` : ""} de la línea ${taxIdx + 1} está configurada en Siigo para manejar impuesto. Selecciona el impuesto (IVA) en esa línea y vuelve a causar.`,
-          });
-        }
       }
       return handleSiigoError(res, error);
+    }
+  });
+
+  // Exporta a Excel las facturas de la vista (todas / causadas / pendientes).
+  // Recibe columnas + filas ya aplanadas desde el frontend (que tiene los totales calculados).
+  router.post("/accounting/export-xlsx", async (req: Request, res: Response) => {
+    try {
+      const body = req.body as {
+        columns?: Array<{ header: string; key: string; type?: "number" | "text" }>;
+        data?: Array<Record<string, unknown>>;
+        sheetName?: string;
+        fileName?: string;
+      };
+      const columns = Array.isArray(body.columns) ? body.columns : [];
+      const data = Array.isArray(body.data) ? body.data : [];
+      if (columns.length === 0) return res.status(400).json({ ok: false, message: "Faltan columnas para exportar" });
+
+      const wb = new ExcelJS.Workbook();
+      const ws = wb.addWorksheet(body.sheetName || "Facturas");
+      ws.columns = columns.map((c) => ({
+        header: c.header,
+        key: c.key,
+        width: Math.min(40, Math.max(12, c.header.length + 4)),
+      }));
+      for (const r of data) ws.addRow(r);
+
+      // Encabezado en negrita + congelado.
+      ws.getRow(1).font = { bold: true };
+      ws.views = [{ state: "frozen", ySplit: 1 }];
+      // Formato de miles para columnas numéricas.
+      columns.forEach((c, i) => {
+        if (c.type === "number") ws.getColumn(i + 1).numFmt = "#,##0.##";
+      });
+
+      const fileName = (body.fileName || "facturas").replace(/[^\w.-]+/g, "_") + ".xlsx";
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="${fileName}"`);
+      await wb.xlsx.write(res);
+      res.end();
+    } catch (error) {
+      console.error("[SiigoAccounting] export-xlsx FALLÓ:", error instanceof Error ? error.message : error);
+      return res.status(500).json({ ok: false, message: "No se pudo generar el Excel" });
     }
   });
 

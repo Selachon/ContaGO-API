@@ -44,6 +44,13 @@ export interface SupplierProfile {
   paymentName: string | null;
   paymentCode: string | null; // ID numérico de Siigo (ej: 113)
   cxpCode: string | null; // Cuenta por pagar dominante en el balance (21xx)
+  /**
+   * Variante de IVA inferida del balance según la cuenta de IVA descontable que
+   * mueve el proveedor: "servicios" (cuenta "...por servicios"), "bienes"
+   * ("...por compras"), o null si no hay señal (p. ej. el IVA se contabiliza bajo
+   * DIAN, no bajo el proveedor). Determina el default IVA 19% Servicios vs IVA 19%.
+   */
+  ivaKind: "servicios" | "bienes" | null;
   updatedAt: string;
 }
 
@@ -206,7 +213,7 @@ function buildFromBalance(
   };
 
   const cell = (r: string[], i: number) => (i >= 0 ? String(r[i] ?? "").trim() : "");
-  const raw = new Map<string, { nit: string; name: string; gasto: AccRow[]; refte: AccRow[]; reiva: AccRow[]; reica: AccRow[]; pago: (AccRow & { paymentName: string; paymentCode: string })[] }>();
+  const raw = new Map<string, { nit: string; name: string; gasto: AccRow[]; refte: AccRow[]; reiva: AccRow[]; reica: AccRow[]; ivades: AccRow[]; pago: (AccRow & { paymentName: string; paymentCode: string })[] }>();
   const catalog = new Map<string, string>();
 
   for (let i = headerIdx + 1; i < rows.length; i++) {
@@ -229,12 +236,14 @@ function buildFromBalance(
     };
 
     let p = raw.get(nit);
-    if (!p) { p = { nit, name: tercero, gasto: [], refte: [], reiva: [], reica: [], pago: [] }; raw.set(nit, p); }
+    if (!p) { p = { nit, name: tercero, gasto: [], refte: [], reiva: [], reica: [], ivades: [], pago: [] }; raw.set(nit, p); }
 
     if (/^[567]/.test(code)) p.gasto.push(acc);
     else if (code.startsWith("2365")) p.refte.push(acc);
     else if (code.startsWith("2367")) p.reiva.push(acc);
     else if (code.startsWith("2368")) p.reica.push(acc);
+    // IVA descontable (2408..) cuyo nombre describe el tipo: "...por compras" vs "...por servicios".
+    else if (code.startsWith("2408") && /descont/i.test(accName)) p.ivades.push(acc);
     
     if (/^2[123]/.test(code) && paymentMap[code]) {
       p.pago.push({ ...acc, paymentName: paymentMap[code].name, paymentCode: paymentMap[code].code });
@@ -256,12 +265,21 @@ function buildFromBalance(
     const ri = top(p.reiva, "credito");
     const rc = top(p.reica, "credito");
     const pg = top(p.pago, "credito");
+    // Cuenta de IVA descontable con mayor movimiento → su nombre define la variante.
+    const ivaTop = p.ivades.slice().sort(
+      (a, b) => (Math.abs(b.debito) + Math.abs(b.credito)) - (Math.abs(a.debito) + Math.abs(a.credito))
+    )[0] || null;
+    let ivaKind: "servicios" | "bienes" | null = null;
+    if (ivaTop) {
+      if (/servicio/i.test(ivaTop.name)) ivaKind = "servicios";
+      else if (/compra|bien/i.test(ivaTop.name)) ivaKind = "bienes";
+    }
     out.push({
       nit: p.nit, name: p.name, gastoCode: gastoAccounts[0]?.code ?? null, gastoName: gastoAccounts[0]?.name ?? null, gastoAccounts,
       retefuente: rf ? { accountName: rf.name, rate: parseRate(rf.name) } : null,
       reteiva: ri ? { accountName: ri.name, rate: parseRate(ri.name) } : null,
       reteica: rc ? { accountName: rc.name, rate: parseRate(rc.name) } : null,
-      paymentName: pg?.paymentName ?? null, paymentCode: pg?.paymentCode ?? null, cxpCode: pg?.code ?? null, updatedAt: now,
+      paymentName: pg?.paymentName ?? null, paymentCode: pg?.paymentCode ?? null, cxpCode: pg?.code ?? null, ivaKind, updatedAt: now,
     });
   }
   return { profiles: out, accountsCatalog: [...catalog.entries()].map(([code, name]) => ({ code, name })).sort((a, b) => a.code.localeCompare(b.code)) };
@@ -281,7 +299,7 @@ async function getStoredPaymentMap(): Promise<Record<string, PaymentMapEntry>> {
   return (doc?.map as Record<string, PaymentMapEntry>) || {};
 }
 
-interface RebuildResult { profiles: number; withGasto: number; withPayment: number; accounts: number; }
+interface RebuildResult { profiles: number; withGasto: number; withPayment: number; withIvaServicios?: number; withIvaBienes?: number; accounts: number; }
 
 async function storeProfiles(rows: string[][]): Promise<RebuildResult> {
   const paymentMap = await getStoredPaymentMap();
@@ -293,7 +311,14 @@ async function storeProfiles(rows: string[][]): Promise<RebuildResult> {
   await col.deleteMany({ $or: [{ companyId: cid }, { companyId: { $exists: false } }] });
   await col.insertMany(profiles.map((p) => ({ _id: `${cid}:${p.nit}`, companyId: cid, ...p })));
   await db.collection<any>(CONFIG).updateOne({ _id: cfgId(ACCOUNTS_ID) }, { $set: { accounts: accountsCatalog, updatedAt: new Date().toISOString() } }, { upsert: true });
-  return { profiles: profiles.length, withGasto: profiles.filter((p) => p.gastoCode).length, withPayment: profiles.filter((p) => p.paymentName).length, accounts: accountsCatalog.length };
+  return {
+    profiles: profiles.length,
+    withGasto: profiles.filter((p) => p.gastoCode).length,
+    withPayment: profiles.filter((p) => p.paymentName).length,
+    withIvaServicios: profiles.filter((p) => p.ivaKind === "servicios").length,
+    withIvaBienes: profiles.filter((p) => p.ivaKind === "bienes").length,
+    accounts: accountsCatalog.length,
+  };
 }
 
 export async function rebuildProfilesFromBalance(buffer: Buffer): Promise<RebuildResult> {
