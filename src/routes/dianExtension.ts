@@ -383,15 +383,35 @@ router.post(
     try {
       const { xmlBuffer, pdfBuffer } = await extractFilesFromZip(zipBuffer);
       if (!xmlBuffer) {
-        // Diagnóstico: listar las entradas del ZIP para entender por qué no hay XML
+        // Diagnóstico: listar entradas (con tamaño), explorar ZIP anidado y GUARDAR el
+        // ZIP a disco para inspección directa.
+        let entryNames: string[] = [];
         try {
           const JSZip = (await import("jszip")).default;
           const z = await JSZip.loadAsync(zipBuffer);
-          console.log(`[DIAN EXT][DBG] -> sin XML. Entradas: ${Object.keys(z.files).join(", ")}`);
+          const entries: string[] = [];
+          for (const [name, f] of Object.entries(z.files)) entries.push(`${name}${(f as any).dir ? "/" : ""}`);
+          entryNames = entries;
+          console.log(`[DIAN EXT][DBG] -> sin XML cufe=${cufe.slice(0, 24)} len=${dbgLen}. Entradas: ${entries.join(", ")}`);
+          // ¿ZIP anidado? explorar un nivel
+          for (const [name, f] of Object.entries(z.files)) {
+            if (!(f as any).dir && /\.zip$/i.test(name)) {
+              try {
+                const inner = await JSZip.loadAsync(await (f as any).async("nodebuffer"));
+                console.log(`[DIAN EXT][DBG]    nested ${name}: ${Object.keys(inner.files).join(", ")}`);
+              } catch (e2) { console.log(`[DIAN EXT][DBG]    nested ${name}: no se pudo abrir (${(e2 as Error).message})`); }
+            }
+          }
+          try {
+            const dumpDir = path.resolve(process.cwd(), "../_evidencia");
+            fs.mkdirSync(dumpDir, { recursive: true });
+            fs.writeFileSync(path.join(dumpDir, `noxml_${cufe.slice(0, 24)}.zip`), zipBuffer);
+            console.log(`[DIAN EXT][DBG]    ZIP guardado en _evidencia/noxml_${cufe.slice(0, 24)}.zip`);
+          } catch (e3) { console.log(`[DIAN EXT][DBG]    no se pudo guardar el zip: ${(e3 as Error).message}`); }
         } catch (e) { console.log(`[DIAN EXT][DBG] -> sin XML y no se pudo abrir el ZIP: ${(e as Error).message}`); }
         job.missCount++;
         job.receivedCount++;
-        return res.status(422).json({ status: "error", detalle: "El ZIP no contiene XML" });
+        return res.status(422).json({ status: "error", detalle: `El ZIP no contiene XML${entryNames.length ? ` (entradas: ${entryNames.slice(0, 6).join(", ")})` : ""}` });
       }
 
       const invoiceData = job.mode === "terceros"
