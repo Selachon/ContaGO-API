@@ -734,6 +734,7 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
       let ivaPercent = 0;
       let incAmount = 0;
       let incPercent = 0;
+      let taxableBase = 0; // base gravable (TaxableAmount), prioriza la del IVA
 
       // Mapa para acumular todos los impuestos dinámicamente
       const taxesMap = new Map<string, TaxDetail>();
@@ -749,11 +750,11 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
           const taxSchemeName = String(getText(subtotal.TaxCategory?.TaxScheme?.Name)).toUpperCase();
           const taxAmount = parseAmount(subtotal.TaxAmount);
           const taxPercentRaw = parseAmount(subtotal.TaxCategory?.Percent);
-          const taxableBase = parseAmount(subtotal.TaxableAmount);
+          const subTaxableBase = parseAmount(subtotal.TaxableAmount);
           const taxPercent = taxPercentRaw > 0
             ? taxPercentRaw
-            : taxableBase > 0
-              ? (taxAmount / taxableBase) * 100
+            : subTaxableBase > 0
+              ? (taxAmount / subTaxableBase) * 100
               : 0;
 
           // Normalizar el ID del impuesto
@@ -764,10 +765,13 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
           if (normalizedId === "1") {
             ivaAmount += taxAmount;
             ivaPercent = taxPercent || ivaPercent;
+            if (subTaxableBase > 0) taxableBase = subTaxableBase; // base gravable del IVA (neta de descuentos)
           } else if (normalizedId === "4") {
             incAmount += taxAmount;
             incPercent = taxPercent || incPercent;
           }
+          // Si aún no hay base del IVA, usar la primera base disponible como respaldo.
+          if (taxableBase === 0 && subTaxableBase > 0) taxableBase = subTaxableBase;
 
           // Agregar al mapa de impuestos dinámicos
           if (taxesMap.has(taxName)) {
@@ -807,6 +811,7 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
         incAmount,
         incPercent,
         totalUnitPrice: lineExtensionAmount,
+        taxableBase,
       };
     });
   } catch {

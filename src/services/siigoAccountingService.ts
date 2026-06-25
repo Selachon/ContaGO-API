@@ -33,6 +33,12 @@ export interface XmlCausacionItem {
    * cuenta PUC parametrizable. La UI omite la línea normal (precio 0) de estos ítems.
    */
   isGift?: boolean;
+  /**
+   * Recargo a nivel documento (ChargeTotalAmount): se aplica DESPUÉS del total y no
+   * afecta impuestos. Se causa como ítem aparte en una cuenta PUC parametrizable, sin
+   * IVA. La UI omite la línea normal (igual que isGift).
+   */
+  isSurcharge?: boolean;
 }
 
 /** Borrador de tercero (proveedor) prellenado desde el XML para crearlo en Siigo. */
@@ -178,9 +184,12 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
       if (incAmt > 0) extraTaxes.push({ taxName: GIFT_TAX_NAME, amount: incAmt, percent: Number(li.incPercent) || 0 });
     }
 
+    // Base = base gravable del IVA (TaxableAmount), que ya viene neta de descuentos de
+    // línea. Si el XML no la trae, se cae a LineExtensionAmount o cantidad×precio.
+    const taxBase = Number(li.taxableBase) || 0;
     return {
       description: li.description || "",
-      base: isGift ? 0 : (lineExt || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0)),
+      base: isGift ? 0 : (taxBase > 0 ? taxBase : (lineExt || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0))),
       ivaPercent: isGift ? 0 : (Number(li.ivaPercent) || 0),
       incPercent: isGift ? 0 : (Number(li.incPercent) || 0),
       extraTaxes: extraTaxes.length ? extraTaxes : undefined,
@@ -188,8 +197,23 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
     };
   });
 
+  // Recargo a nivel documento (ChargeTotalAmount): se aplica después del total, sin IVA.
+  // Se causa como ítem aparte hacia una cuenta PUC parametrizable "Recargo".
+  const surcharge = Number(xmlData.surcharge) || 0;
+  if (surcharge > 0) {
+    items.push({
+      description: "RECARGO",
+      base: 0,
+      ivaPercent: 0,
+      incPercent: 0,
+      extraTaxes: [{ taxName: "Recargo", amount: Math.round(surcharge * 100) / 100, percent: 0 }],
+      isSurcharge: true,
+    });
+  }
+
   console.log(
-    `[SiigoAccounting] XML ${xmlData.docNumber || "?"} — NIT ${xmlData.issuerNit}, ${items.length} ítem(s)`
+    `[SiigoAccounting] XML ${xmlData.docNumber || "?"} — NIT ${xmlData.issuerNit}, ${items.length} ítem(s)` +
+      (surcharge > 0 ? ` (incluye recargo ${surcharge})` : "")
   );
 
   return {

@@ -112,6 +112,7 @@ export interface InvoiceLineItem {
   incPercent: number;           // % INC
 
   totalUnitPrice: number;       // Precio unitario de venta
+  taxableBase?: number;         // Base gravable del IVA (TaxableAmount), ya neta de descuentos de línea
 }
 
 export interface ExcelJobData {
