@@ -902,7 +902,18 @@ export async function resolveExcelBuffer(file: Express.Multer.File): Promise<Buf
 }
 
 const DATE_RE = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$|^\d{4}[\/\-]\d{2}[\/\-]\d{2}$/;
-const DATE_SCAN_COLS = ["A","C","D","E","F","G","H","I","J","K"];
+const DATE_SCAN_COLS = ["A","C","D","E","F","G","H","I","J","K","L","M","N","O","P"];
+// Excel serial date: 1 = 1900-01-01. Rango plausible para facturas DIAN: 2000-2040.
+const EXCEL_SERIAL_MIN = 36526; // 2000-01-01
+const EXCEL_SERIAL_MAX = 51544; // 2041-01-19
+function excelSerialToIso(serial: number): string | null {
+  if (serial < EXCEL_SERIAL_MIN || serial > EXCEL_SERIAL_MAX) return null;
+  // Excel erróneamente cuenta 1900-02-29 como válido; compensar para fechas > 28 Feb 1900
+  const ms = (serial - 25569) * 86400000;
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
 
 function buildLimitMessage(total: number, dates: string[], limit: number): string {
   const partes = Math.ceil(total / limit);
@@ -1032,15 +1043,29 @@ export async function extractCufesFromExcel(buffer: Buffer): Promise<{
   if (dirSet.size === 1) detectedDirection = dirSet.has("sent") ? "sent" : "received";
   else if (dirSet.size > 1) mixedDirections = true;
 
-  // Detect date column by sampling first 15 data rows
+  // Detect date column by sampling first 15 data rows (texto DD/MM/YYYY o serial numérico)
   const sample = sortedRows.slice(0, 15);
   let dateCol = "";
   let bestScore = 0;
+  let dateColIsSerial = false;
   for (const col of DATE_SCAN_COLS) {
-    const hits = sample.filter((r) => DATE_RE.test(rows.get(r)?.get(col) || "")).length;
-    if (hits > bestScore) { bestScore = hits; dateCol = col; }
+    const textHits = sample.filter((r) => DATE_RE.test(rows.get(r)?.get(col) || "")).length;
+    if (textHits > bestScore) { bestScore = textHits; dateCol = col; dateColIsSerial = false; }
+    if (bestScore === 0) {
+      const serialHits = sample.filter((r) => {
+        const n = Number(rows.get(r)?.get(col));
+        return Number.isFinite(n) && excelSerialToIso(Math.round(n)) !== null;
+      }).length;
+      if (serialHits > 0) { bestScore = serialHits; dateCol = col; dateColIsSerial = true; }
+    }
   }
   if (bestScore === 0) dateCol = "";
+
+  const normalizeDate = (raw: string): string => {
+    if (!raw) return raw;
+    if (dateColIsSerial) return excelSerialToIso(Math.round(Number(raw))) ?? raw;
+    return raw;
+  };
 
   const cufes: string[] = [];        // processable
   const allCufes: string[] = [];     // all in original order
@@ -1052,7 +1077,7 @@ export async function extractCufesFromExcel(buffer: Buffer): Promise<{
     const cufe = rows.get(rowNum)?.get("B") || "";
     if (!cufe) continue;
     const docnum = rows.get(rowNum)?.get("C") || "";
-    const date = dateCol ? (rows.get(rowNum)?.get(dateCol) || "") : "";
+    const date = dateCol ? normalizeDate(rows.get(rowNum)?.get(dateCol) || "") : "";
     const cls = rowClassMap.get(rowNum) ?? "unknown";
     allCufes.push(cufe);
     dates.push(date);
