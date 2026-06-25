@@ -346,8 +346,11 @@ router.post("/job", upload.single("excel"), async (req: Request, res: Response) 
     driveFolderUrl,
     // La extensión usa estos registros para buscar cada documento en la DIAN.
     records: processableRecords.map((r) => ({ cufe: r.cufe, docnum: r.docnum, direction: r.direction })),
-    startDate: start_date,
-    endDate: end_date,
+    // Rango de fechas derivado del propio listado (o de los parámetros). La extensión
+    // lo aplica en el filtro de fechas de la DIAN para que la búsqueda por CUFE encuentre
+    // documentos de cualquier periodo (p. ej. reportes de años anteriores).
+    startDate: startDate || null,
+    endDate: endDate || null,
   });
 });
 
