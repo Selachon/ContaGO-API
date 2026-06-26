@@ -190,8 +190,8 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
     return {
       description: li.description || "",
       base: isGift ? 0 : (taxBase > 0 ? taxBase : (lineExt || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0))),
-      ivaPercent: isGift ? 0 : (Number(li.ivaPercent) || 0),
-      incPercent: isGift ? 0 : (Number(li.incPercent) || 0),
+      ivaPercent: isGift ? 0 : (ivaAmt > 0 ? (Number(li.ivaPercent) || 0) : 0),
+      incPercent: isGift ? 0 : (incAmt > 0 ? (Number(li.incPercent) || 0) : 0),
       extraTaxes: extraTaxes.length ? extraTaxes : undefined,
       isGift: isGift || undefined,
     };
@@ -316,8 +316,10 @@ export async function processXmlBatch(
 
   console.log(`[SiigoAccounting] Lote: ${files.length} archivo(s) → ${xmlFiles.length} XML, ${pdfMap.size} PDF`);
 
-  // Empareja un PDF al XML por: 1) basename exacto, 2) PDF cuyo nombre contenga
-  // el número de factura del proveedor (con o sin prefijo).
+  // Empareja un PDF al XML por:
+  //  1) basename exacto
+  //  2) PDF cuyo nombre contenga el número de factura del proveedor (con o sin prefijo)
+  //  3) Si solo hay 1 PDF y 1 XML en el ZIP (o en todo el lote), se asignan directamente
   const findPdf = (xmlName: string, xml?: XmlCausacionData) => {
     const baseXml = stripExt(xmlName).toLowerCase();
     const direct = pdfMap.get(baseXml);
@@ -325,11 +327,16 @@ export async function processXmlBatch(
     if (!xml) return null;
     const num = onlyDigits(xml.providerInvoiceNumber);
     const pref = (xml.providerInvoicePrefix || "").toUpperCase();
-    if (!num) return null;
-    for (const [key, entry] of pdfMap) {
-      const u = key.toUpperCase();
-      if (pref && u.includes(`${pref}${num}`)) return entry;
-      if (u.includes(num)) return entry;
+    if (num) {
+      for (const [key, entry] of pdfMap) {
+        const u = key.toUpperCase();
+        if (pref && u.includes(`${pref}${num}`)) return entry;
+        if (u.includes(num)) return entry;
+      }
+    }
+    // Fallback: si solo hay un PDF disponible y un solo XML en el lote, es suyo
+    if (pdfMap.size === 1 && xmlFiles.length === 1) {
+      return pdfMap.values().next().value ?? null;
     }
     return null;
   };

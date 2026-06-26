@@ -448,6 +448,32 @@ router.post("/payments/:id/support", upload.single("file"), async (req, res) => 
   }
 });
 
+// Sube soporte de pago de una factura individual (pagada por otro medio / descartada)
+// Guarda la URL en el campo soportePagoUrl de la factura.
+router.post("/invoices/support", upload.single("file"), async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const file = req.file;
+  const { key, date } = req.body || {};
+  if (!file || !key) return res.status(400).json({ ok: false, message: "Falta archivo o key." });
+  const drive = await resolveCompanyDrive(companyId);
+  if (!drive) return res.status(409).json({ ok: false, message: "La empresa no tiene Drive vinculado." });
+  try {
+    const url = await uploadPaymentSupportToDrive(
+      file.buffer, file.originalname, file.mimetype,
+      String(drive.nit || "").replace(/\D/g, ""), String(date || ""),
+      drive.driveConfig, drive.ownerUserId, drive.onTokenRefresh,
+    );
+    await getDb().collection<any>("cajaErpInvoices").updateOne(
+      { companyId, key: String(key) },
+      { $set: { paymentPdfUrl: url, updatedAt: new Date().toISOString() } },
+    );
+    res.json({ ok: true, data: { url } });
+  } catch (e) {
+    res.status(502).json({ ok: false, message: e instanceof Error ? e.message : "Error subiendo el soporte." });
+  }
+});
+
 // ── Google Drive de la empresa (para archivar las facturas) ────────────
 router.get("/drive/status", async (req, res) => {
   const companyId = await resolveCompany(req, res);
@@ -573,27 +599,115 @@ router.get("/report/excel", async (req, res) => {
   const companyId = await resolveCompany(req, res);
   if (!companyId) return;
   const proyectoId = typeof req.query.proyectoId === "string" ? req.query.proyectoId : "";
+  const allProjects = req.query.all === "true";
   const { rows, bancos, totalCaja, totalBancos } = await buildCajaData(companyId);
   const money = (n: number) => Math.round(Number(n) || 0);
   const wb = new ExcelJS.Workbook();
+  wb.creator = "ContaGO"; wb.created = new Date();
 
-  if (proyectoId) {
-    // Detalle de un proyecto: ingresos primero, luego egresos.
+  const BLUE = "1E3A5F"; const WHITE = "FFFFFF";
+  const GREEN_FILL = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FFE8F5E9" } };
+  const RED_FILL   = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FFFFEBEE" } };
+  const HEAD_FILL  = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FF" + BLUE } };
+  const ALT_FILL   = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FFF5F5F5" } };
+
+  const addDetailSheet = (ws: ExcelJS.Worksheet, r: typeof rows[0]) => {
+    const nombre = r.proyecto.nombre;
+    // Encabezado
+    ws.mergeCells("A1:F1");
+    const t = ws.getCell("A1"); t.value = `Caja · ${nombre}`;
+    t.font = { bold: true, size: 14, color: { argb: "FF" + BLUE } };
+    t.alignment = { vertical: "middle" };
+    ws.getRow(1).height = 26;
+
+    ws.addRow(["Saldo inicial", "", "", "", "", money(r.proyecto.saldoInicial || 0)]);
+    ws.addRow(["Ingresos",      "", "", "", "", money(r.ingresos)]);
+    ws.addRow(["Egresos",       "", "", "", "", money(r.egresos)]);
+    const sRow = ws.addRow(["Saldo final", "", "", "", "", money(r.saldo)]);
+    sRow.font = { bold: true }; ws.addRow([]);
+
+    const hRow = ws.addRow(["Fecha", "Mes", "Proyecto", "Descripción", "Categoría", "Valor"]);
+    hRow.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; c.alignment = { horizontal: "center" }; });
+    ws.getRow(hRow.number).height = 20;
+
+    const items = (r.items || []).slice().sort((a: any, b: any) => String(a.fecha).localeCompare(String(b.fecha)));
+    let rowIdx = hRow.number + 1;
+    for (const it of items) {
+      const mes = String(it.fecha || "").slice(0, 7);
+      const val = money(it.valor) * (it.direction === "in" ? 1 : -1);
+      const dRow = ws.addRow([it.fecha, mes, nombre, it.descripcion, it.categoria || it.origen || "", val]);
+      const fill = (rowIdx % 2 === 0) ? ALT_FILL : undefined;
+      dRow.getCell(6).numFmt = "#,##0";
+      dRow.getCell(6).font = { color: { argb: val >= 0 ? "FF1B5E20" : "FFB71C1C" } };
+      if (fill) dRow.eachCell((c) => { c.fill = fill; });
+      rowIdx++;
+    }
+    ws.columns = [{ width: 12 }, { width: 10 }, { width: 28 }, { width: 50 }, { width: 26 }, { width: 18 }];
+    ws.autoFilter = { from: { row: hRow.number, column: 1 }, to: { row: hRow.number, column: 6 } };
+  };
+
+  if (allProjects) {
+    // ── Hoja "Todos" filtrable ─────────────────────────────────────────────
+    const wsTodos = wb.addWorksheet("Todos los movimientos");
+    const hRow = wsTodos.addRow(["Fecha", "Mes", "Proyecto", "Descripción", "Categoría", "Valor"]);
+    hRow.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; c.alignment = { horizontal: "center" }; });
+    wsTodos.getRow(1).height = 22;
+
+    const allItems: any[] = [];
+    for (const r of rows) {
+      for (const it of r.items || []) allItems.push({ ...it, proyNombre: r.proyecto.nombre });
+    }
+    allItems.sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
+
+    let ri = 2;
+    for (const it of allItems) {
+      const mes = String(it.fecha || "").slice(0, 7);
+      const val = money(it.valor) * (it.direction === "in" ? 1 : -1);
+      const dRow = wsTodos.addRow([it.fecha, mes, it.proyNombre, it.descripcion, it.categoria || it.origen || "", val]);
+      dRow.getCell(6).numFmt = "#,##0";
+      dRow.getCell(6).font = { color: { argb: val >= 0 ? "FF1B5E20" : "FFB71C1C" } };
+      if (ri % 2 === 0) dRow.eachCell((c) => { c.fill = ALT_FILL; });
+      ri++;
+    }
+    wsTodos.columns = [{ width: 12 }, { width: 10 }, { width: 28 }, { width: 50 }, { width: 26 }, { width: 18 }];
+    wsTodos.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: 6 } };
+    wsTodos.views = [{ state: "frozen", ySplit: 1 }];
+
+    // ── Una hoja por proyecto ──────────────────────────────────────────────
+    for (const r of rows) {
+      if (!r.items?.length && !r.proyecto.saldoInicial) continue;
+      const safeName = r.proyecto.nombre.replace(/[\\\/\?\*\[\]]/g, "").slice(0, 31);
+      const ws = wb.addWorksheet(safeName);
+      addDetailSheet(ws, r);
+    }
+
+    // ── Hoja resumen ───────────────────────────────────────────────────────
+    const wsRes = wb.addWorksheet("Resumen");
+    wsRes.mergeCells("A1:D1");
+    const rt = wsRes.getCell("A1"); rt.value = "Caja por proyecto — resumen";
+    rt.font = { bold: true, size: 14, color: { argb: "FF" + BLUE } }; wsRes.getRow(1).height = 26;
+    wsRes.addRow(["Generado", new Date().toISOString().slice(0, 10)]);
+    wsRes.addRow([]);
+    const rh = wsRes.addRow(["Proyecto", "Saldo inicial", "Ingresos", "Egresos", "Saldo"]);
+    rh.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
+    for (const r of rows.slice().sort((a, b) => b.saldo - a.saldo)) {
+      const row = wsRes.addRow([r.proyecto.nombre, money(r.proyecto.saldoInicial || 0), money(r.ingresos), money(r.egresos), money(r.saldo)]);
+      row.getCell(5).font = { bold: true, color: { argb: money(r.saldo) >= 0 ? "FF1B5E20" : "FFB71C1C" } };
+    }
+    const totRow = wsRes.addRow(["TOTAL CAJA", "", "", "", money(totalCaja)]);
+    totRow.font = { bold: true }; totRow.getCell(5).numFmt = "#,##0";
+    wsRes.addRow([]);
+    const bh = wsRes.addRow(["Cuenta bancaria", "Saldo banco", "Fecha"]); bh.font = { bold: true };
+    for (const b of bancos) wsRes.addRow([b.nombre, money(b.saldo), b.fechaSaldo]);
+    wsRes.addRow(["TOTAL BANCOS", money(totalBancos)]).font = { bold: true };
+    wsRes.addRow(["Diferencia banco − caja", money(totalBancos - totalCaja)]).font = { bold: true };
+    wsRes.columns = [{ width: 32 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 16 }];
+
+  } else if (proyectoId) {
     const r = rows.find((x) => x.proyecto.id === proyectoId);
-    const ws = wb.addWorksheet("Detalle");
-    const nombre = r?.proyecto.nombre || "Proyecto";
-    ws.addRow([`Caja del proyecto: ${nombre}`]); ws.getRow(1).font = { bold: true, size: 14 };
-    ws.addRow([`Saldo inicial`, money(r?.proyecto.saldoInicial || 0)]);
-    ws.addRow([`Ingresos`, money(r?.ingresos || 0)]);
-    ws.addRow([`Egresos`, money(r?.egresos || 0)]);
-    ws.addRow([`Saldo`, money(r?.saldo || 0)]); ws.getRow(5).font = { bold: true };
-    ws.addRow([]);
-    const head = ws.addRow(["Fecha", "Descripción", "Origen", "Tipo", "Valor"]); head.font = { bold: true };
-    const items = (r?.items || []).slice().sort((a, b) => (a.direction === b.direction ? String(a.fecha).localeCompare(String(b.fecha)) : a.direction === "in" ? -1 : 1));
-    for (const it of items) ws.addRow([it.fecha, it.descripcion, it.origen, it.direction === "in" ? "Ingreso" : "Egreso", money(it.valor) * (it.direction === "in" ? 1 : -1)]);
-    ws.columns = [{ width: 12 }, { width: 50 }, { width: 10 }, { width: 10 }, { width: 16 }];
+    if (r) addDetailSheet(wb.addWorksheet("Detalle"), r);
   } else {
-    // Resumen total + comparación con bancos.
+    // Resumen simple
     const ws = wb.addWorksheet("Resumen");
     ws.addRow([`Caja por proyecto — resumen`]); ws.getRow(1).font = { bold: true, size: 14 };
     ws.addRow([`Generado`, new Date().toISOString().slice(0, 10)]);
@@ -608,7 +722,11 @@ router.get("/report/excel", async (req, res) => {
     ws.addRow(["DIFERENCIA (banco − caja)", money(totalBancos - totalCaja)]).font = { bold: true };
     ws.columns = [{ width: 32 }, { width: 16 }, { width: 16 }, { width: 16 }];
   }
-  const fname = proyectoId ? `caja_proyecto_${new Date().toISOString().slice(0, 10)}.xlsx` : `caja_resumen_${new Date().toISOString().slice(0, 10)}.xlsx`;
+
+  const fname = allProjects
+    ? `caja_todos_proyectos_${new Date().toISOString().slice(0, 10)}.xlsx`
+    : proyectoId ? `caja_proyecto_${new Date().toISOString().slice(0, 10)}.xlsx`
+    : `caja_resumen_${new Date().toISOString().slice(0, 10)}.xlsx`;
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
   await wb.xlsx.write(res);

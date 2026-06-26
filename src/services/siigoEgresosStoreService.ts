@@ -30,6 +30,9 @@ export interface EgresoMov {
   note: string;
   siigoMatch: string; // si ya existe en Siigo (ej. "RP-1-5206 · 2026-05-14")
   receipt: { id?: string; name?: string } | null;
+  pdfUrl: string;   // enlace Drive del soporte de pago adjunto
+  pdfName: string;  // nombre del archivo adjunto
+  proyectoId: string; // asignación a proyecto (para Caja por Proyecto)
   source: "manual" | "excel" | "pdf";
   fingerprint: string | null;
   cajaEntryId: string | null;
@@ -62,6 +65,9 @@ function mapDoc(d: any): EgresoMov {
     note: d.note || "",
     siigoMatch: d.siigoMatch || "",
     receipt: d.receipt || null,
+    pdfUrl: d.pdfUrl || "",
+    pdfName: d.pdfName || "",
+    proyectoId: d.proyectoId || "",
     source: d.source === "excel" ? "excel" : d.source === "pdf" ? "pdf" : "manual",
     fingerprint: d.fingerprint || null,
     cajaEntryId: d.cajaEntryId || null,
@@ -84,15 +90,18 @@ export interface NewMovInput {
   dedupeKey?: string;
 }
 
-/** Lista los movimientos de una empresa, opcionalmente filtrados por cuenta bancaria. */
-export async function listMovements(companyId: string, bankAccountId?: string): Promise<EgresoMov[]> {
+/** Lista los movimientos de una empresa, filtrados opcionalmente por cuenta y mes (YYYY-MM). */
+export async function listMovements(companyId: string, bankAccountId?: string, month?: string): Promise<EgresoMov[]> {
   if (!companyId) return [];
   const filter: Record<string, unknown> = { companyId };
   if (bankAccountId) filter.bankAccountId = bankAccountId;
+  if (month && /^\d{4}-\d{2}$/.test(month)) {
+    filter.date = { $gte: `${month}-01`, $lte: `${month}-31` };
+  }
   const docs = await getDb()
     .collection<any>(COLLECTION)
     .find(filter)
-    .sort({ createdAt: -1 })
+    .sort({ date: -1, createdAt: -1 })
     .toArray();
   return docs.map(mapDoc);
 }
@@ -125,7 +134,7 @@ export async function addMovements(companyId: string, movs: NewMovInput[]): Prom
   return docs.map((d, i) => mapDoc({ ...d, _id: result.insertedIds[i] }));
 }
 
-const EDITABLE_FIELDS = ["date", "value", "description", "nit", "kind", "direction", "balance", "status", "note", "siigoMatch", "receipt", "fingerprint", "cajaEntryId"];
+const EDITABLE_FIELDS = ["date", "value", "description", "nit", "kind", "direction", "balance", "status", "note", "siigoMatch", "receipt", "fingerprint", "cajaEntryId", "pdfUrl", "pdfName", "proyectoId"];
 
 /** Actualiza campos permitidos de un movimiento. */
 export async function updateMovement(
@@ -159,11 +168,14 @@ export async function deleteMovement(companyId: string, id: string): Promise<boo
 }
 
 /** Borra movimientos (por defecto solo pendientes/ignorados), filtrando por cuenta si se indica. */
-export async function clearMovements(companyId: string, bankAccountId?: string, includeDone = false): Promise<number> {
+export async function clearMovements(companyId: string, bankAccountId?: string, includeDone = false, month?: string): Promise<number> {
   if (!companyId) return 0;
   const filter: Record<string, unknown> = { companyId };
   if (bankAccountId) filter.bankAccountId = bankAccountId;
   if (!includeDone) filter.status = { $ne: "done" };
+  if (month && /^\d{4}-\d{2}$/.test(month)) {
+    filter.date = { $gte: `${month}-01`, $lte: `${month}-31` };
+  }
   const r = await getDb().collection<any>(COLLECTION).deleteMany(filter);
   return r.deletedCount || 0;
 }

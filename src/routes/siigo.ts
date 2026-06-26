@@ -1289,6 +1289,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     const movementId = req.body?.movementId as string | undefined;
     const force = req.body?.force === true;
     const proyectoId = req.body?.proyectoId as string | undefined;
+    const categoria  = req.body?.categoria  as string | undefined;
     const errors = validateEgresoPayload(payload);
     if (errors.length > 0) {
       return res.status(400).json({ ok: false, code: "invalid_payload", message: errors.join(" "), errors });
@@ -1351,10 +1352,12 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
             const entry = await createCajaEntry(companyId, {
               proyectoId,
               fecha: payload!.date,
-              descripcion: `${payload!.supplier.identification} · ${receiptName}`,
+              descripcion: categoria
+                ? `${categoria} · ${receiptName}`
+                : `${payload!.supplier.identification} · ${receiptName}`,
               valor: egresoAmount,
               direction: "out",
-              categoria: receiptName,
+              categoria: categoria || receiptName,
             });
             cajaEntryId = entry.id;
             await updateMovement(companyId, movementId, { cajaEntryId: entry.id });

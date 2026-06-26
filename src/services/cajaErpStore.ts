@@ -188,6 +188,16 @@ export async function createEntry(companyId: string, input: NewEntryInput): Prom
     createdAt: ts,
     updatedAt: ts,
   };
+  // Idempotency guard: reject exact duplicate (same company+project+date+value+direction+description)
+  const existing = await getDb().collection<any>(ENTRIES).findOne({
+    companyId,
+    proyectoId: doc.proyectoId,
+    fecha: doc.fecha,
+    valor: doc.valor,
+    direction: doc.direction,
+    descripcion: doc.descripcion,
+  });
+  if (existing) return mapEntry(existing);
   const res = await getDb().collection<any>(ENTRIES).insertOne(doc);
   return mapEntry({ ...doc, _id: res.insertedId });
 }

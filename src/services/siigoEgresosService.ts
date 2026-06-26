@@ -185,7 +185,7 @@ function tryParseDavivienda(sheet: BankSheet): ParsedMovement[] | null {
   const movs: ParsedMovement[] = [];
   for (const row of sheet.rows) {
     const tx    = String(row[colTx] ?? "").trim();
-    const dir   = /cr[eé]dito/i.test(tx) ? "in" : "out";
+    const dir   = /cr[eé]dito|dep[oó]sito/i.test(tx) ? "in" : "out";
     const value = parseCopAmount(row[colValT]);
     if (!value || value <= 0) continue;
     const date  = parseDdMmYyyy(row[colDate]);
