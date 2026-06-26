@@ -205,7 +205,8 @@ router.get("/entries", async (req, res) => {
   const companyId = await resolveCompany(req, res);
   if (!companyId) return;
   const proyectoId = typeof req.query.proyectoId === "string" ? req.query.proyectoId : undefined;
-  res.json({ ok: true, data: await listEntries(companyId, proyectoId) });
+  const month = typeof req.query.month === "string" ? req.query.month : undefined;
+  res.json({ ok: true, data: await listEntries(companyId, proyectoId, month) });
 });
 
 router.post("/entries", async (req, res) => {
@@ -452,11 +453,8 @@ router.get("/drive/status", async (req, res) => {
   const companyId = await resolveCompany(req, res);
   if (!companyId) return;
   const link = await getCompanyDrive(companyId);
-  // El Drive es ÚNICO por empresa y NO modificable: solo el dueño puede vincularlo
-  // (una vez, de inicio). Los demás usuarios (incl. empresa compartida) solo lo ven.
-  const isOwner = await userOwnsCompany(companyId, req.user!.userId);
-  // El selector de cuentas solo le sirve al dueño para la vinculación inicial.
-  const available = isOwner
+  const canManage = req.user!.isAdmin || (await userOwnsCompany(companyId, req.user!.userId));
+  const available = canManage
     ? (await getUserGoogleDrives(req.user!.userId)).map((d) => ({ connectionId: d.connection_id, email: d.user_email }))
     : [];
   let linkedEmail = "";
@@ -464,15 +462,14 @@ router.get("/drive/status", async (req, res) => {
     const cfg = await getUserGoogleDriveById(link.ownerUserId, link.connectionId);
     linkedEmail = cfg?.user_email || "";
   }
-  res.json({ ok: true, data: { linked: !!link, linkedEmail, connectionId: link?.connectionId || "", available, isOwner } });
+  res.json({ ok: true, data: { linked: !!link, linkedEmail, connectionId: link?.connectionId || "", available, isOwner: canManage } });
 });
 
 router.post("/drive/link", async (req, res) => {
   const companyId = await resolveCompany(req, res);
   if (!companyId) return;
-  // El Drive de la empresa lo vincula SOLO el dueño/admin, una sola vez. No es un
-  // parámetro modificable por los usuarios (incl. los de empresa compartida).
-  if (!(await userOwnsCompany(companyId, req.user!.userId))) {
+  const canManage = req.user!.isAdmin || (await userOwnsCompany(companyId, req.user!.userId));
+  if (!canManage) {
     return res.status(403).json({ ok: false, message: "Solo el administrador de la empresa puede vincular su cuenta de Drive." });
   }
   const connectionId = String(req.body?.connectionId || "");

@@ -99,6 +99,10 @@ import {
   updateBankAccount,
   deleteBankAccount,
 } from "../services/siigoBankAccountsService.js";
+import { createEntry as createCajaEntry } from "../services/cajaErpStore.js";
+import { getCompanyDrive } from "../services/siigoCompaniesService.js";
+import { getUserGoogleDriveById } from "../services/database.js";
+import { uploadPaymentSupportToDrive } from "../services/googleDrive.js";
 import { v4 as uuidv4 } from "uuid";
 import type { ProgressData } from "../types/dian.js";
 import {
@@ -1199,7 +1203,8 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
     try {
       const bankAccountId = typeof req.query.bankAccountId === "string" ? req.query.bankAccountId : undefined;
-      return res.json({ ok: true, data: await listMovements(companyId, bankAccountId) });
+      const month = typeof req.query.month === "string" ? req.query.month : undefined; // YYYY-MM
+      return res.json({ ok: true, data: await listMovements(companyId, bankAccountId, month) });
     } catch (error) {
       return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
     }
@@ -1239,13 +1244,39 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     }
   });
 
+  // Adjunta un PDF de soporte de pago al movimiento y lo sube al Drive de la empresa.
+  router.post("/egresos/movements/:id/attach", upload.single("file"), async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
+    const file = req.file;
+    if (!file) return res.status(400).json({ ok: false, message: "Falta el archivo." });
+    try {
+      const driveLink = await getCompanyDrive(companyId);
+      if (!driveLink) return res.status(409).json({ ok: false, message: "La empresa no tiene Drive vinculado." });
+      const driveCfg = await getUserGoogleDriveById(driveLink.ownerUserId, driveLink.connectionId);
+      if (!driveCfg) return res.status(409).json({ ok: false, message: "Conexión de Drive no encontrada." });
+      const { id } = req.params;
+      const date = String(req.body?.date || new Date().toISOString().slice(0, 10));
+      const filename = file.originalname || `soporte_${id}.pdf`;
+      const url = await uploadPaymentSupportToDrive(
+        file.buffer, filename, file.mimetype,
+        driveLink.nit, date, driveCfg, driveLink.ownerUserId
+      );
+      const updated = await updateMovement(companyId, id, { pdfUrl: url, pdfName: filename });
+      return res.json({ ok: true, data: { url, name: filename, movement: updated } });
+    } catch (error) {
+      return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error subiendo a Drive." });
+    }
+  });
+
   router.delete("/egresos/movements", async (req: Request, res: Response) => {
     const companyId = req.header("X-Siigo-Company");
     if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
     try {
       const includeDone = req.query.includeDone === "true";
       const bankAccountId = typeof req.query.bankAccountId === "string" ? req.query.bankAccountId : undefined;
-      return res.json({ ok: true, deleted: await clearMovements(companyId, bankAccountId, includeDone) });
+      const month = typeof req.query.month === "string" ? req.query.month : undefined;
+      return res.json({ ok: true, deleted: await clearMovements(companyId, bankAccountId, includeDone, month) });
     } catch (error) {
       return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
     }
@@ -1257,6 +1288,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     const payload = req.body?.payload as EgresoPayload | undefined;
     const movementId = req.body?.movementId as string | undefined;
     const force = req.body?.force === true;
+    const proyectoId = req.body?.proyectoId as string | undefined;
     const errors = validateEgresoPayload(payload);
     if (errors.length > 0) {
       return res.status(400).json({ ok: false, code: "invalid_payload", message: errors.join(" "), errors });
@@ -1295,6 +1327,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const result = await runInCompanyCtx(req, () => submitEgreso(payload!));
       console.log(`[SiigoEgreso] RP creado para ${payload!.supplier.identification}`);
       // Marca el movimiento como causado + guarda la huella.
+      let cajaEntryId: string | undefined;
       if (companyId && movementId) {
         const r = result as Record<string, unknown> | undefined;
         const receipt = { id: r?.id as string | undefined, name: (r?.name as string | undefined) || "RP" };
@@ -1310,8 +1343,27 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         } catch (e) {
           console.warn("[SiigoEgreso] No se pudo marcar el movimiento:", e instanceof Error ? e.message : e);
         }
+        // Crear entrada en Caja por Proyecto si se indicó un proyecto
+        if (proyectoId) {
+          try {
+            const r2 = result as Record<string, unknown> | undefined;
+            const receiptName = (r2?.name as string | undefined) || "RP";
+            const entry = await createCajaEntry(companyId, {
+              proyectoId,
+              fecha: payload!.date,
+              descripcion: `${payload!.supplier.identification} · ${receiptName}`,
+              valor: egresoAmount,
+              direction: "out",
+              categoria: receiptName,
+            });
+            cajaEntryId = entry.id;
+            await updateMovement(companyId, movementId, { cajaEntryId: entry.id });
+          } catch (e) {
+            console.warn("[SiigoEgreso] No se pudo crear entrada de caja:", e instanceof Error ? e.message : e);
+          }
+        }
       }
-      return res.json({ ok: true, data: result });
+      return res.json({ ok: true, data: result, cajaEntryId });
     } catch (error) {
       const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
       console.error("[SiigoEgreso] FALLÓ:", error instanceof Error ? error.message : error, "| details:", detalle);

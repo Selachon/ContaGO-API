@@ -21,8 +21,19 @@ export interface BankSheet {
   rows: Record<string, unknown>[];
 }
 
+export interface ParsedMovement {
+  date: string;
+  value: number;
+  description: string;
+  direction: "in" | "out";
+  kind: "ingreso" | "egreso" | "bank_fee";
+  balance: number | null;
+  nit: string;
+}
+
 export interface ParsedBankFile {
-  sheets: BankSheet[];
+  sheets?: BankSheet[];
+  movements?: ParsedMovement[];
 }
 
 export class EgresosError extends Error {
@@ -130,6 +141,62 @@ function buildSheet(name: string, rows: unknown[][]): BankSheet {
   return { name, columns, rows: dataRows };
 }
 
+// ─── Parser específico Davivienda (extracto Excel portal) ────────────────
+
+function parseCopAmount(raw: unknown): number | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw === "number") return raw;
+  // "$ 17.400.000,00" → 17400000
+  const s = String(raw).replace(/[^\d,.-]/g, "").replace(/\./g, "").replace(",", ".");
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseDdMmYyyy(raw: unknown): string {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  // DD/MM/YYYY
+  const m = s.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})/);
+  if (m) return `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+  // YYYY-MM-DD passthrough
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  return "";
+}
+
+const BANK_FEE_RX = /gravamen|4x1000|comis[ií]|manejo.*portal|cobro.*transf|cobro.*serv|cobro.*iva|iva.*serv|ajuste.*gravamen|ajuste.*grav/i;
+
+function classifyKind(desc: string, dir: "in" | "out"): "ingreso" | "egreso" | "bank_fee" {
+  if (dir === "out" && BANK_FEE_RX.test(desc)) return "bank_fee";
+  return dir === "in" ? "ingreso" : "egreso";
+}
+
+function tryParseDavivienda(sheet: BankSheet): ParsedMovement[] | null {
+  const cols = sheet.columns;
+  const hasTx   = cols.some((c) => /transacci[oó]n/i.test(c));
+  const hasValT  = cols.some((c) => /valor\s+total/i.test(c));
+  if (!hasTx || !hasValT) return null;
+
+  const colTx   = cols.find((c) => /transacci[oó]n/i.test(c))!;
+  const colValT = cols.find((c) => /valor\s+total/i.test(c))!;
+  const colDate = cols.find((c) => /fecha/i.test(c)) ?? "";
+  const colDesc = cols.find((c) => /descripci[oó]n/i.test(c)) ?? "";
+  const colNit  = cols.find((c) => /id\s+origen|id\s+dest/i.test(c)) ?? "";
+
+  const movs: ParsedMovement[] = [];
+  for (const row of sheet.rows) {
+    const tx    = String(row[colTx] ?? "").trim();
+    const dir   = /cr[eé]dito/i.test(tx) ? "in" : "out";
+    const value = parseCopAmount(row[colValT]);
+    if (!value || value <= 0) continue;
+    const date  = parseDdMmYyyy(row[colDate]);
+    if (!date) continue;
+    const desc  = String(row[colDesc] ?? "").trim().replace(/\s+/g, " ");
+    const nit   = String(row[colNit]  ?? "").replace(/^0+$/, "").trim();
+    movs.push({ date, value, description: desc, direction: dir, kind: classifyKind(desc, dir), balance: null, nit });
+  }
+  return movs.length ? movs : null;
+}
+
 /** Lee el Excel del extracto y devuelve todas las hojas como tablas. */
 export async function parseBankExcel(buffer: Buffer): Promise<ParsedBankFile> {
   const wb = new ExcelJS.Workbook();
@@ -152,6 +219,13 @@ export async function parseBankExcel(buffer: Buffer): Promise<ParsedBankFile> {
     throw new EgresosError("El archivo no contiene movimientos.", 422, "excel_vacio");
   }
 
+  // Intentar parser Davivienda en la primera hoja con datos
+  for (const sh of sheets) {
+    const movs = tryParseDavivienda(sh);
+    if (movs) return { movements: movs };
+  }
+
+  // Formato desconocido → devolver hojas crudas para mapeo manual en frontend
   return { sheets };
 }
 

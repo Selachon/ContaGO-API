@@ -163,10 +163,13 @@ export interface NewEntryInput {
   soporteUrl?: string;
 }
 
-export async function listEntries(companyId: string, proyectoId?: string): Promise<Entry[]> {
+export async function listEntries(companyId: string, proyectoId?: string, month?: string): Promise<Entry[]> {
   if (!companyId) return [];
   const q: Record<string, unknown> = { companyId };
   if (proyectoId) q.proyectoId = proyectoId;
+  if (month && /^\d{4}-\d{2}$/.test(month)) {
+    q.fecha = { $gte: `${month}-01`, $lte: `${month}-31` };
+  }
   const docs = await getDb().collection<any>(ENTRIES).find(q).sort({ fecha: -1, createdAt: -1 }).toArray();
   return docs.map(mapEntry);
 }
