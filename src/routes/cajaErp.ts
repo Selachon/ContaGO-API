@@ -78,12 +78,105 @@ import {
   listProvDinamica,
   upsertProvDinamica,
   type TagKind,
+  getPublicToken,
+  generatePublicToken,
+  revokePublicToken,
+  resolveCompanyByToken,
 } from "../services/cajaErpStore.js";
 import ExcelJS from "exceljs";
 import { listMovements, getMovement, updateMovement as updateBankMov } from "../services/siigoEgresosStoreService.js";
 import { generarCajaPdf } from "../services/cajaPdf.js";
 
 export const CAJA_ERP_TOOL_ID = "causacion-caja";
+
+// ── Router público (sin auth) — solo lectura vía token ────────────────────────
+export const publicCajaRouter = Router();
+
+publicCajaRouter.get("/public/:token/report", async (req, res) => {
+  const companyId = await resolveCompanyByToken(req.params.token);
+  if (!companyId) return res.status(404).json({ ok: false, message: "Token inválido." });
+  const { rows, bancos, totalCaja, totalBancos } = await buildCajaData(companyId);
+  const round = (n: number) => Math.round(Number(n) || 0);
+  const totalSaldoInicial = rows.reduce((a, r) => a + (r.proyecto.saldoInicial || 0), 0);
+  const totalIngresos = rows.reduce((a, r) => a + r.ingresos, 0);
+  const totalEgresos = rows.reduce((a, r) => a + r.egresos, 0);
+  res.json({ ok: true, data: {
+    generadoEn: new Date().toISOString(),
+    kpis: {
+      totalSaldoInicial: round(totalSaldoInicial),
+      totalIngresos: round(totalIngresos),
+      totalEgresos: round(totalEgresos),
+      totalCaja: round(totalCaja),
+      totalBancos: round(totalBancos),
+    },
+    proyectos: rows
+      .filter((r) => r.saldo !== 0 || r.items.length > 0)
+      .map((r) => ({
+        id: r.proyecto.id,
+        nombre: r.proyecto.nombre,
+        esTransversal: r.proyecto.esTransversal,
+        saldoInicial: round(r.proyecto.saldoInicial || 0),
+        ingresos: round(r.ingresos),
+        egresos: round(r.egresos),
+        saldo: round(r.saldo),
+        items: (r.items || []).map((it: any) => ({
+          fecha: it.fecha,
+          descripcion: it.descripcion,
+          valor: round(it.valor),
+          direction: it.direction,
+          origen: it.origen || it.source || "",
+          categoria: it.categoria || "",
+        })),
+      })),
+    bancos,
+  }});
+});
+
+publicCajaRouter.get("/public/:token/excel", async (req, res) => {
+  const companyId = await resolveCompanyByToken(req.params.token);
+  if (!companyId) return res.status(404).json({ ok: false, message: "Token inválido." });
+  const { rows, bancos: _bancos, totalCaja, totalBancos: _tb } = await buildCajaData(companyId);
+  const round = (n: number) => Math.round(Number(n) || 0);
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "ContaGO"; wb.created = new Date();
+  const BLUE = "1E3A5F"; const WHITE = "FFFFFF";
+  const HEAD_FILL = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FF" + BLUE } };
+  const ALT_FILL  = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FFF5F5F5" } };
+
+  // Hoja "Todos los movimientos"
+  const wsTodos = wb.addWorksheet("Todos los movimientos");
+  const hRow = wsTodos.addRow(["Fecha", "Mes", "Proyecto", "Descripción", "Categoría", "Valor"]);
+  hRow.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
+  const allItems: any[] = [];
+  for (const r of rows) for (const it of r.items || []) allItems.push({ ...it, proyNombre: r.proyecto.nombre });
+  allItems.sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
+  let ri = 2;
+  for (const it of allItems) {
+    const val = round(it.valor) * (it.direction === "in" ? 1 : -1);
+    const dRow = wsTodos.addRow([it.fecha, String(it.fecha || "").slice(0, 7), it.proyNombre, it.descripcion, it.categoria || it.origen || "", val]);
+    dRow.getCell(6).numFmt = "#,##0";
+    dRow.getCell(6).font = { color: { argb: val >= 0 ? "FF1B5E20" : "FFB71C1C" } };
+    if (ri % 2 === 0) dRow.eachCell((c) => { c.fill = ALT_FILL; });
+    ri++;
+  }
+  wsTodos.columns = [{ width: 12 }, { width: 10 }, { width: 28 }, { width: 50 }, { width: 26 }, { width: 18 }];
+  wsTodos.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: 6 } };
+  wsTodos.views = [{ state: "frozen", ySplit: 1 }];
+
+  // Hoja resumen
+  const wsRes = wb.addWorksheet("Resumen");
+  const rh = wsRes.addRow(["Proyecto", "Saldo inicial", "Ingresos", "Egresos", "Saldo"]);
+  rh.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
+  for (const r of rows.slice().sort((a, b) => b.saldo - a.saldo))
+    wsRes.addRow([r.proyecto.nombre, round(r.proyecto.saldoInicial || 0), round(r.ingresos), round(r.egresos), round(r.saldo)]);
+  wsRes.addRow(["TOTAL CAJA", "", "", "", round(totalCaja)]).font = { bold: true };
+  wsRes.columns = [{ width: 32 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 16 }];
+
+  const fname = `caja_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
+  await wb.xlsx.write(res); res.end();
+});
 
 // Router principal: requiere tool causacion-caja (para Caja ERP).
 const router = Router();
@@ -1131,6 +1224,23 @@ router.patch("/plan/prov-dinamica", async (req: Request, res: Response) => {
     ...(ivaDescontable !== undefined ? { ivaDescontable: Number(ivaDescontable) } : {}),
     ...(ingresosFact   !== undefined ? { ingresosFact:   Number(ingresosFact)   } : {}),
   });
+  res.json({ ok: true });
+});
+
+// ── Gestión del token público (autenticado) ───────────────────────────────────
+router.get("/public-token", async (req, res) => {
+  const companyId = await resolveCompany(req, res); if (!companyId) return;
+  const token = await getPublicToken(companyId);
+  res.json({ ok: true, data: { token } });
+});
+router.post("/public-token", async (req, res) => {
+  const companyId = await resolveCompany(req, res); if (!companyId) return;
+  const token = await generatePublicToken(companyId);
+  res.json({ ok: true, data: { token } });
+});
+router.delete("/public-token", async (req, res) => {
+  const companyId = await resolveCompany(req, res); if (!companyId) return;
+  await revokePublicToken(companyId);
   res.json({ ok: true });
 });
 

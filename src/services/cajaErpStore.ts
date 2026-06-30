@@ -14,6 +14,7 @@ const ENTRIES = "cajaErpEntries";
 const INVOICES = "cajaErpInvoices";
 const PAYMENTS = "cajaErpPayments";
 const BANCOS = "cajaErpBancos";
+const PUBLIC_TOKENS = "cajaPublicTokens";
 // Bandeja de facturas PENDIENTES (importadas, aún no causadas) compartida por
 // empresa: vive en el servidor para que el trabajo sobreviva al cambio de PC y lo
 // vean todos los usuarios de una empresa compartida. Una fila = un doc.
@@ -1254,4 +1255,31 @@ export async function computeFlujoEditable(companyId: string, numMeses: number):
       totalGastos, ingresos, totalIngresos, resultado, saldoAcumulado: saldo,
     };
   });
+}
+
+// ── Token público de acceso de solo lectura ───────────────────────────────────
+import { randomBytes } from "crypto";
+
+export async function getPublicToken(companyId: string): Promise<string | null> {
+  const doc = await getDb().collection<any>(PUBLIC_TOKENS).findOne({ companyId });
+  return doc?.token || null;
+}
+
+export async function generatePublicToken(companyId: string): Promise<string> {
+  const token = randomBytes(24).toString("hex");
+  await getDb().collection<any>(PUBLIC_TOKENS).updateOne(
+    { companyId },
+    { $set: { companyId, token, createdAt: now() } },
+    { upsert: true },
+  );
+  return token;
+}
+
+export async function revokePublicToken(companyId: string): Promise<void> {
+  await getDb().collection<any>(PUBLIC_TOKENS).deleteOne({ companyId });
+}
+
+export async function resolveCompanyByToken(token: string): Promise<string | null> {
+  const doc = await getDb().collection<any>(PUBLIC_TOKENS).findOne({ token });
+  return doc?.companyId || null;
 }
