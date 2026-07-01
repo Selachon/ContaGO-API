@@ -59,7 +59,7 @@ const TOL = 1; // tolerancia en pesos para el cuadre
 const num = (s: unknown): number => Number(String(s ?? "").replace(/[^\d.-]/g, ""));
 
 const FEE_RX =
-  /4x1000|4 x 1000|gmf|gravamen|rendimientos financ|cobro transf|manejo portal|cobro serv disp|davipl|impto gobierno|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
+  /4x1000|4 x 1000|gmf|gravamen|rendimientos financ|cobro transf|manejo portal|cobro serv disp|davipl|impto gobierno|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|manejo tarj|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
 
 // ─── Extracción de texto del PDF (líneas reconstruidas por coordenada Y) ──
 async function extractLines(buffer: Buffer, password?: string): Promise<string[][]> {
@@ -116,9 +116,9 @@ function detectBank(pages: string[][]): string {
   // "PAGO ACH BANCOLOMBIA" que dispararían la detección incorrecta si se verificara primero.
   // La frase "banco de occidente" es suficientemente específica para buscarse en todo el texto.
   if (allText.includes("banco de occidente")) return "occidente";
-  // Bancolombia se detecta por el dominio "bancolombia.com" (pie de página DCF) para
-  // evitar falsos positivos por transacciones ACH que mencionan el nombre del banco.
-  if (allText.includes("bancolombia.com")) return "bancolombia";
+  // Bancolombia se detecta por el dominio "bancolombia.com" (pie DCF del extracto) o
+  // por la cabecera "Sucursal Virtual Personas" del reporte de movimientos online.
+  if (allText.includes("bancolombia.com") || /sucursal\s+virtual\s+personas/i.test(allText)) return "bancolombia";
   const head40 = pages.flat().slice(0, 40).join(" ").toLowerCase();
   if (head40.includes("itaú") || head40.includes("itau")) return "itau";
   // Banco de Bogotá: el nombre va en el pie (URL bancodebogota.com), no en el
@@ -132,6 +132,59 @@ interface RawMov {
   description: string;
   value: number;
   balance: number;
+}
+
+// ─── Bancolombia Sucursal Virtual: "DD mmm YYYY DESCRIPCIÓN [-] $ VALOR" ──
+// Reporte de movimientos descargado desde la banca en línea. No incluye saldo
+// anterior ni corriente; la dirección se infiere del signo del valor.
+function parseBancolombiaVirtual(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
+  const all = pages.flat();
+  const MONTH: Record<string, string> = {
+    ene: "01", feb: "02", mar: "03", abr: "04", may: "05", jun: "06",
+    jul: "07", ago: "08", sep: "09", oct: "10", nov: "11", dic: "12",
+  };
+  const rowRx = /^(\d{1,2})\s+(\w{3})\s+(\d{4})\s+(.+?)\s*(-\s*)?\$\s*([\d.]+,\d{2})$/;
+  const skipRx = /^Fecha\s+Descripci|^Direcci[oó]n\s+IP/i;
+  const dateRx = /^\d{1,2}\s+\w{3}\s+\d{4}/;
+  const numCo  = (s: string) => parseFloat(s.replace(/\./g, "").replace(",", "."));
+
+  let runBal = 0;
+  const raws: RawMov[] = [];
+
+  for (let i = 0; i < all.length; i++) {
+    const line = all[i];
+    if (skipRx.test(line)) continue;
+    const m = line.match(rowRx);
+    if (!m) continue;
+
+    const [, dd, mmm, yyyy, descRaw, sign] = m;
+    const value = numCo(m[6]);
+    const isDebit = !!sign;
+
+    // La línea siguiente puede ser una continuación de la descripción
+    // (ej. "VIRTUAL", "NEQUI") si no empieza con fecha ni es encabezado.
+    let desc = descRaw;
+    const next = all[i + 1];
+    if (next && !skipRx.test(next) && !dateRx.test(next)) {
+      desc = `${desc} ${next}`.trim();
+      i++;
+    }
+
+    // Limpiar referencia numérica larga y "null" del texto de descripción.
+    desc = desc
+      .replace(/\s+null\b/gi, "")
+      .replace(/\s+\d{6,}\b/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const mm = MONTH[mmm.toLowerCase()] ?? "01";
+    const date = `${yyyy}-${mm}-${dd.padStart(2, "0")}`;
+
+    if (isDebit) runBal -= value; else runBal += value;
+    raws.push({ date, description: desc, value, balance: Math.round(runBal * 100) / 100 });
+  }
+
+  return { raws, opening: 0, declared: { credits: null, debits: null }, closing: null };
 }
 
 // ─── Bancolombia: "D/MM DESCRIPCIÓN VALOR(±) SALDO" ───────────────────────
@@ -441,8 +494,10 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
       "bank_unsupported"
     );
   }
+  const isSucursalVirtual = /sucursal\s+virtual\s+personas/i.test(pages.flat().join(" "));
   const parsed =
-    bank === "bancolombia" ? parseBancolombia(pages)
+    bank === "bancolombia" && isSucursalVirtual ? parseBancolombiaVirtual(pages)
+    : bank === "bancolombia" ? parseBancolombia(pages)
     : bank === "occidente" ? parseOccidente(pages)
     : bank === "bancobogota" ? parseBancoBogota(pages)
     : bank === "davivienda" ? parseDavivienda(pages)
