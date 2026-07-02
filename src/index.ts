@@ -22,6 +22,7 @@ import dianCufeRoutes from "./routes/dianCufeDownload.js";
 import dianExtensionRoutes from "./routes/dianExtension.js";
 import dianMassDownloadRoutes from "./routes/dianMassDownload.js";
 import dianMailRoutes from "./routes/dianMail.js";
+import pdfParseRoutes from "./routes/pdfParse.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
 import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
 import { closeAllBrowsers, startOrphanBrowserSweep } from "./services/dianScraper.js";
@@ -86,6 +87,7 @@ app.use("/caja-erp", publicCajaRouter);
 app.use("/caja-erp", draftsRouter);
 app.use("/caja-erp", cajaErpRoutes);
 app.use("/api/contabilizacion", contabilizacionRoutes);
+app.use("/api/pdf-parse", pdfParseRoutes);
 
 // Health check
 app.get("/", (_req, res) => {
