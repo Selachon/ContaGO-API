@@ -7,6 +7,7 @@ import os from "os";
 import { requireAuth } from "../middleware/auth.js";
 import { generateExcelFile } from "../services/excelGenerator.js";
 import type { InvoiceData, TaxDetail, InvoiceLineItem } from "../types/dianExcel.js";
+import { parseLineItemsPositional } from "../services/pdfPositionalParser.js";
 
 const router = Router();
 const upload = multer({
@@ -345,7 +346,15 @@ router.post("/to-excel", requireAuth, upload.array("pdfs", 600), async (req: Req
   for (const file of files) {
     try {
       const parsed = await pdfParse(file.buffer);
-      rawInvoices.push(parsePdfText(parsed.text, file.originalname));
+      const invoice = parsePdfText(parsed.text, file.originalname);
+      // Replace text-flow line items with positional parse (preserves table structure)
+      try {
+        invoice.lineItems = await parseLineItemsPositional(file.buffer);
+      } catch (e) {
+        // Fallback to text-based line items on pdfjs error
+        errors.push(`${file.originalname} (positional): ${(e as Error).message}`);
+      }
+      rawInvoices.push(invoice);
     } catch (e) {
       errors.push(`${file.originalname}: ${(e as Error).message}`);
     }
