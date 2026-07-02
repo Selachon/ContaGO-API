@@ -351,7 +351,10 @@ router.post("/to-excel", requireAuth, upload.array("pdfs", 600), async (req: Req
     await generateExcelFile(invoices, tmpPath, false, false, companyName, companyNit);
     const buf = fs.readFileSync(tmpPath);
     const dateStr = new Date().toISOString().slice(0, 10);
-    const xlsxName = `Facturas PDF DIAN ${dateStr}.xlsx`;
+    const cleanName = (s: string) => s.replace(/[^a-zA-Z0-9À-ÿ\s.\-]/g, "").trim().slice(0, 60);
+    const nitTxt  = companyNit  ? `${companyNit} - `  : "";
+    const nomTxt  = companyName ? `${cleanName(companyName)} - ` : "";
+    const xlsxName = `${nitTxt}${nomTxt}Facturas Recibidas DIAN ${dateStr}.xlsx`;
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(xlsxName)}"`);
     if (errors.length) res.setHeader("X-Parse-Errors", errors.join(" | "));
