@@ -73,10 +73,14 @@ function parseLineItems(sectionText: string): InvoiceLineItem[] {
         rows.push(current);
         current = null;
       } else if (pN) {
-        // Pure digits: new item OR fragment of the previous description line
-        // e.g. "CIGARRILLOS MALBORO X" + "10" → the "10" is part of "X10", not a new Nro.
-        // If the accumulated text ends with a letter, append as description continuation.
-        if (/[A-Za-záéíóúüñÁÉÍÓÚÜÑ]$/.test(current.trimEnd())) {
+        // Pure digits: new item number OR fragment of the previous description line.
+        // Continuation cases:
+        //   (a) current ends with a letter  → "MALBORO X" + "10" → "MALBORO X10"
+        //   (b) single digit (0-9)          → "CIGARRILLO MUSTANG X1" + "0" → "X10"
+        //       Single-digit item numbers always start a NEW block (not mid-description),
+        //       so a lone digit here is always a description suffix, not an item number.
+        const isSingleDigit = line.length === 1;
+        if (/[A-Za-záéíóúüñÁÉÍÓÚÜÑ]$/.test(current.trimEnd()) || isSingleDigit) {
           current += line;
         } else {
           rows.push(current);
