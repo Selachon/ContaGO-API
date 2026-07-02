@@ -1,5 +1,5 @@
 import ExcelJS from "exceljs";
-import type { InvoiceData } from "../types/dianExcel.js";
+import type { InvoiceData, TaxDetail } from "../types/dianExcel.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -281,41 +281,82 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
   let rowNum = 5;
   for (const inv of invoices) {
     const invDocNumber = (inv.docNumber || inv.trackId || "").trim();
+
+    // Build common invoice fields shared by every row of this invoice
+    const invCommon = (itemIdx: number, concepto: string) => [
+      itemIdx,                                           // A  Item (sequential)
+      invDocNumber,                                      // B  Número Factura
+      inv.documentType || "",                            // C  Tipo documento
+      inv.issuerNit || "",                               // D  NIT Emisor
+      uppercaseBusinessName(inv.issuerName),             // E  Razón Social Emisor
+      inv.receiverNit || "",                             // F  NIT Receptor
+      uppercaseBusinessName(inv.receiverName),           // G  Razón Social Receptor
+      parseExcelDate(inv.issueDate, inv.issueDateISO),  // H  Fecha
+      concepto,                                          // I  Concepto
+    ];
+
+    const buildTaxCols = (td: Record<string, TaxDetail>) => [
+      td["IVA"]?.amount ?? 0,                     // N
+      (td["IVA"]?.percent ?? 0) / 100,            // O
+      td["INC"]?.amount ?? 0,                     // P
+      (td["INC"]?.percent ?? 0) / 100,            // Q
+      td["Bolsas"]?.amount ?? 0,                  // R
+      (td["Bolsas"]?.percent ?? 0) / 100,         // S
+      td["ICUI"]?.amount ?? 0,                    // T
+      (td["ICUI"]?.percent ?? 0) / 100,           // U
+      td["IC"]?.amount ?? 0,                      // V
+      td["IC Porcentual"]?.amount ?? 0,           // W
+      (td["IC Porcentual"]?.percent ?? 0) / 100,  // X
+      td["ICL"]?.amount ?? 0,                     // Y
+      td["IBUA"]?.amount ?? 0,                    // Z
+      (td["IBUA"]?.percent ?? 0) / 100,           // AA
+      td["ADV"]?.amount ?? 0,                     // AB
+    ];
+
+    // Track which tax names are already covered by line items
+    const lineItemTaxNames = new Set<string>();
+    for (const li of inv.lineItems || []) {
+      for (const tx of li.taxes || []) if (tx.amount > 0) lineItemTaxNames.add(tx.taxName);
+    }
+
+    let itemIdx = 1;
+
+    // ── Line items ──
     for (const li of inv.lineItems || []) {
       const td = Object.fromEntries((li.taxes || []).map((t) => [t.taxName, t]));
       const totalTax = (li.taxes || []).reduce((s, t) => s + t.amount, 0);
 
-      const rowData: (any)[] = [
-        li.lineNumber,           // A  Item
-        invDocNumber,            // B  Número Factura
-        inv.documentType || "",  // C  Tipo documento
-        inv.issuerNit || "",     // D  NIT Emisor
-        uppercaseBusinessName(inv.issuerName), // E  Razón Social Emisor
-        inv.receiverNit || "",   // F  NIT Receptor
-        uppercaseBusinessName(inv.receiverName), // G  Razón Social Receptor
-        parseExcelDate(inv.issueDate, inv.issueDateISO), // H  Fecha
-        li.description || "",    // I  Concepto
+      const rowData: any[] = [
+        ...invCommon(itemIdx++, li.description || ""),
         li.quantity,             // J  Cantidad
-        li.totalUnitPrice,                   // K  Base del impuesto
-        li.discount,                         // L  Descuento detalle
-        li.surcharge,                        // M  Recargo detalle
-        td["IVA"]?.amount ?? 0,                     // N  IVA
-        (td["IVA"]?.percent ?? 0) / 100,            // O  % IVA
-        td["INC"]?.amount ?? 0,                     // P  INC
-        (td["INC"]?.percent ?? 0) / 100,            // Q  % INC
-        td["Bolsas"]?.amount ?? 0,                  // R  Bolsas
-        (td["Bolsas"]?.percent ?? 0) / 100,         // S  % Bolsas
-        td["ICUI"]?.amount ?? 0,                    // T  ICUI
-        (td["ICUI"]?.percent ?? 0) / 100,           // U  % ICUI
-        td["IC"]?.amount ?? 0,                      // V  IC
-        td["IC Porcentual"]?.amount ?? 0,           // W  IC Porcentual
-        (td["IC Porcentual"]?.percent ?? 0) / 100,  // X  % IC Porcentual
-        td["ICL"]?.amount ?? 0,                     // Y  ICL
-        td["IBUA"]?.amount ?? 0,                    // Z  IBUA
-        (td["IBUA"]?.percent ?? 0) / 100,           // AA % IBUA
-        td["ADV"]?.amount ?? 0,                     // AB ADV
-        li.totalUnitPrice + totalTax,        // AC Precio unitario
-        inv.cufe || "",                      // AD CUFE
+        li.totalUnitPrice,       // K  Base del impuesto
+        li.discount,             // L  Descuento detalle
+        li.surcharge,            // M  Recargo detalle
+        ...buildTaxCols(td),
+        li.totalUnitPrice + totalTax, // AC Precio unitario
+        inv.cufe || "",               // AD CUFE
+      ];
+
+      const row = ws.getRow(rowNum);
+      row.values = rowData;
+      applyFormats(row, currencyCols, percentCols, dateCols);
+      rowNum++;
+    }
+
+    // ── Global taxes (invoice-level, not attributed to any specific line item) ──
+    for (const tax of inv.taxes || []) {
+      if (tax.amount <= 0 || lineItemTaxNames.has(tax.taxName)) continue;
+      const td: Record<string, TaxDetail> = { [tax.taxName]: tax };
+
+      const rowData: any[] = [
+        ...invCommon(itemIdx++, tax.taxName),
+        0,   // J  Cantidad
+        0,   // K  Base del impuesto
+        0,   // L  Descuento
+        0,   // M  Recargo
+        ...buildTaxCols(td),
+        tax.amount, // AC Precio unitario = monto del impuesto
+        inv.cufe || "",
       ];
 
       const row = ws.getRow(rowNum);
