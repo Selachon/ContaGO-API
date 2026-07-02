@@ -328,17 +328,27 @@ router.post("/to-excel", requireAuth, upload.array("pdfs", 600), async (req: Req
     return;
   }
 
-  const invoices: InvoiceData[] = [];
+  const rawInvoices: InvoiceData[] = [];
   const errors: string[] = [];
 
   for (const file of files) {
     try {
       const parsed = await pdfParse(file.buffer);
-      invoices.push(parsePdfText(parsed.text, file.originalname));
+      rawInvoices.push(parsePdfText(parsed.text, file.originalname));
     } catch (e) {
       errors.push(`${file.originalname}: ${(e as Error).message}`);
     }
   }
+
+  // Deduplicate by CUFE: when a race condition caused a PDF to be saved under the
+  // wrong filename, both the mis-named file and the correct file parse to the same
+  // CUFE. Keep only the last occurrence (the correctly-named file arrives last).
+  const seen = new Map<string, InvoiceData>();
+  for (const inv of rawInvoices) {
+    const key = inv.cufe || inv.docNumber || inv.zipFilename;
+    seen.set(key, inv);
+  }
+  const invoices = [...seen.values()];
 
   if (!invoices.length) {
     res.status(422).json({ error: "No se pudo extraer datos de ningún PDF.", errors });
