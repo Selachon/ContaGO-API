@@ -234,27 +234,32 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   const subtotalMatches = [...t.matchAll(/Subtotal([\d.,]+)/g)];
   const lastSubtotalMatch = subtotalMatches[subtotalMatches.length - 1];
 
-  let subtotal = 0, iva = 0, inc = 0, bolsas = 0, icui = 0, discount = 0, surcharge = 0, total = 0;
+  let subtotal = 0, iva = 0, inc = 0, bolsas = 0, icui = 0, ibua = 0, discount = 0, surcharge = 0, total = 0;
 
   if (lastSubtotalMatch) {
     const tb = t.slice(lastSubtotalMatch.index!);
     subtotal  = parseCOP(lastSubtotalMatch[1]);
-    discount  = parseCOP(tb.match(/Descuento detalle([\d.,]+)/i)?.[1]);
-    surcharge = parseCOP(tb.match(/Recargo detalle([\d.,]+)/i)?.[1]);
-    // "IVA" can appear as "IV A" due to font kerning — use flexible spacing
+    // Font kerning can insert spaces mid-word ("De scue nt o") — use flexible patterns
+    discount  = parseCOP(tb.match(/D\s*e\s*s\s*c\s*u\s*e\s*n\s*t\s*o\s+d\s*e\s+t\s*a\s*l\s*l\s*e\s*([\d.,]+)/i)?.[1]
+                      ?? tb.match(/Descuento detalle([\d.,]+)/i)?.[1]);
+    surcharge = parseCOP(tb.match(/R\s*e\s*c\s*a\s*r\s*g\s*o\s+d\s*e\s+t\s*a\s*l\s*l\s*e\s*([\d.,]+)/i)?.[1]
+                      ?? tb.match(/Recargo detalle([\d.,]+)/i)?.[1]);
+    // "IVA" can appear as "IV A" due to font kerning — flexible spacing
     iva       = parseCOP(tb.match(/\nI\s*V\s*A\s*([\d.,]+)/i)?.[1]);
-    inc       = parseCOP(tb.match(/\nINC([\d.,]+)/i)?.[1]);
-    bolsas    = parseCOP(tb.match(/Bolsas([\d.,]+)/i)?.[1]);
-    icui      = parseCOP(tb.match(/ICUI([\d.,]+)/i)?.[1]);
+    inc       = parseCOP(tb.match(/\nINC\s*([\d.,]+)/i)?.[1]);
+    bolsas    = parseCOP(tb.match(/Bolsas\s*([\d.,]+)/i)?.[1]);
+    icui      = parseCOP(tb.match(/ICUI\s*([\d.,]+)/i)?.[1]);
+    ibua      = parseCOP(tb.match(/IBUA\s*([\d.,]+)/i)?.[1]);
     total     = parseCOP(tb.match(/Total factura\s*\(=\)[^\n]*COP\s*\$([\d.,]+)/i)?.[1]);
   }
 
   // ── Taxes array ───────────────────────────────────────────────────────────────
   const taxes: TaxDetail[] = [];
-  if (iva > 0)    taxes.push({ taxId: "01", taxName: "IVA",    amount: iva,    percent: subtotal > 0 ? Math.round(iva    / subtotal * 100) : 0 });
+  if (iva > 0)    taxes.push({ taxId: "01", taxName: "IVA",    amount: iva,    percent: subtotal > 0 ? Math.round(iva / subtotal * 100) : 0 });
   if (inc > 0)    taxes.push({ taxId: "04", taxName: "INC",    amount: inc,    percent: 0 });
   if (bolsas > 0) taxes.push({ taxId: "22", taxName: "Bolsas", amount: bolsas, percent: 0 });
   if (icui > 0)   taxes.push({ taxId: "35", taxName: "ICUI",   amount: icui,   percent: 0 });
+  if (ibua > 0)   taxes.push({ taxId: "54", taxName: "IBUA",   amount: ibua,   percent: 0 });
 
   // ── Line items: extract "Detalles de Productos" section ─────────────────────
   // Section ends at "Notas Finales", "Valores informativos", or the second
