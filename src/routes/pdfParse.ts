@@ -73,9 +73,15 @@ function parseLineItems(sectionText: string): InvoiceLineItem[] {
         rows.push(current);
         current = null;
       } else if (pN) {
-        // Pure digits = new Nro starting a new multi-line item
-        rows.push(current);
-        current = line;
+        // Pure digits: new item OR fragment of the previous description line
+        // e.g. "CIGARRILLOS MALBORO X" + "10" → the "10" is part of "X10", not a new Nro.
+        // If the accumulated text ends with a letter, append as description continuation.
+        if (/[A-Za-záéíóúüñÁÉÍÓÚÜÑ]$/.test(current.trimEnd())) {
+          current += line;
+        } else {
+          rows.push(current);
+          current = line;
+        }
       } else {
         // Description continuation
         current += " " + line;
@@ -185,9 +191,10 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   // Normalize: remove $$$$$ aesthetic artifacts (2+ consecutive $), keep single $ (e.g. "COP $34.111,00")
   const t = rawText.replace(/\$\$+/g, " ").replace(/\r/g, "\n");
 
-  // ── CUFE from filename (our downloader saves <cufe>.pdf) ─────────────────────
-  const cufe = filename.replace(/\.pdf$/i, "").trim() ||
-    t.match(/Código Único de Factura[\s\S]{0,30}CUFE\s*:?\s*\n?\s*([a-f0-9A-F]{80,})/i)?.[1]?.trim() || "";
+  // ── CUFE: prefer the value embedded in the PDF text (authoritative even if the file was
+  //    mis-named due to a concurrent-download race), fall back to filename.
+  const cufeFromText = t.match(/(?:CUFE|CUDE)\s*:?\s*\n?\s*([a-f0-9A-F]{80,})/i)?.[1]?.trim();
+  const cufe = cufeFromText || filename.replace(/\.pdf$/i, "").trim();
 
   // ── Document type ─────────────────────────────────────────────────────────────
   let documentType = "Factura electrónica";
