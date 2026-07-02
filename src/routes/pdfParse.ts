@@ -26,7 +26,7 @@ function toISO(ddMMyyyy: string): string {
 }
 
 // Common U/M (unit of measure) codes used in Colombian e-invoices
-const UM_CODES = "NIU|EA|UND|UNI|KGM|GLO|PK|PAR|C62|BX|PAC|SET|ACT|SRV|HUR|DAY|MON|ANO|LTR|MLT|GRM|MTR|CMT|HLT|TNE|DZN|PCK|CAR|BOX|ZZ|NAR|XUN|CCT|MMT|MGM|CGM";
+const UM_CODES = "NIU|EA|UND|UNI|KGM|GLO|PK|PAR|C62|BX|PAC|SET|ACT|SRV|HUR|DAY|MON|ANO|LTR|MLT|GRM|MTR|CMT|HLT|TNE|DZN|PCK|CAR|BOX|ZZ|NAR|XUN|CCT|MMT|MGM|CGM|BO|BG|BJ|ST|PR|CJ|UN";
 // Match U/M code immediately followed by a digit or comma (start of Cantidad)
 // Cannot use \b because the code is glued to description (no word boundary before it)
 const UM_RE = new RegExp(`(${UM_CODES})(?=\\d|,)`);
@@ -206,9 +206,11 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   const paymentMethod = t.match(/Forma de pago:\s*([^\n]+?)(?:\s{2,}|\n|Fecha|$)/i)?.[1]?.trim() || "";
 
   // ── Emisor / Receptor sections ────────────────────────────────────────────────
-  const emisorStart  = t.indexOf("Datos del Emisor");
-  const receptorStart = t.indexOf("Datos del Adquiriente");
-  const detallesStart = t.indexOf("Detalles de Productos");
+  // Note: Notas Crédito use lowercase "emisor / vendedor"; use case-insensitive search
+  const tl = t.toLowerCase();
+  const emisorStart   = tl.indexOf("datos del emisor");
+  const receptorStart = tl.indexOf("datos del adquiriente");
+  const detallesStart = tl.indexOf("detalles de productos");
 
   const emisorBlock   = emisorStart >= 0
     ? t.slice(emisorStart, receptorStart > emisorStart ? receptorStart : undefined)
@@ -259,8 +261,10 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   // "Datos Totales" block (whichever comes first after detallesStart).
   let lineItems: InvoiceLineItem[] = [];
   if (detallesStart >= 0) {
+    // "Hoja X de Y" can appear immediately after the header (multi-page PDFs) or after the items —
+    // it is NOT a reliable end-of-section marker. Only "Notas Finales" and "Datos Totales" mark the end.
     const sectionEnd = Math.min(
-      ...[t.indexOf("Notas Finales", detallesStart), t.indexOf("Datos Totales", detallesStart), t.indexOf("Hoja 1 de", detallesStart)]
+      ...[tl.indexOf("notas finales", detallesStart), tl.indexOf("datos totales", detallesStart)]
         .filter((i) => i > detallesStart)
     );
     const itemsSection = t.slice(
