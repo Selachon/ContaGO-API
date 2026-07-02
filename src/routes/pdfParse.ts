@@ -234,7 +234,7 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   const subtotalMatches = [...t.matchAll(/Subtotal([\d.,]+)/g)];
   const lastSubtotalMatch = subtotalMatches[subtotalMatches.length - 1];
 
-  let subtotal = 0, iva = 0, inc = 0, bolsas = 0, icui = 0, ibua = 0, discount = 0, surcharge = 0, total = 0;
+  let subtotal = 0, iva = 0, inc = 0, bolsas = 0, icui = 0, ibua = 0, icl = 0, adv = 0, icOtros = 0, discount = 0, surcharge = 0, total = 0;
 
   if (lastSubtotalMatch) {
     const tb = t.slice(lastSubtotalMatch.index!);
@@ -250,6 +250,10 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
     bolsas    = parseCOP(tb.match(/Bolsas\s*([\d.,]+)/i)?.[1]);
     icui      = parseCOP(tb.match(/ICUI\s*([\d.,]+)/i)?.[1]);
     ibua      = parseCOP(tb.match(/IBUA\s*([\d.,]+)/i)?.[1]);
+    icl       = parseCOP(tb.match(/\nICL\s*([\d.,]+)/i)?.[1]);
+    adv       = parseCOP(tb.match(/\nADV\s*([\d.,]+)/i)?.[1]);
+    // IC aparece bajo el rótulo "Otros impuestos" en el PDF de la Solución Gratuita DIAN
+    icOtros   = parseCOP(tb.match(/Otros impuestos\s*([\d.,]+)/i)?.[1]);
     total     = parseCOP(tb.match(/Total factura\s*\(=\)[^\n]*COP\s*\$([\d.,]+)/i)?.[1]);
   }
 
@@ -258,8 +262,11 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   if (iva > 0)    taxes.push({ taxId: "01", taxName: "IVA",    amount: iva,    percent: subtotal > 0 ? Math.round(iva / subtotal * 100) : 0 });
   if (inc > 0)    taxes.push({ taxId: "04", taxName: "INC",    amount: inc,    percent: 0 });
   if (bolsas > 0) taxes.push({ taxId: "22", taxName: "Bolsas", amount: bolsas, percent: 0 });
-  if (icui > 0)   taxes.push({ taxId: "35", taxName: "ICUI",   amount: icui,   percent: 0 });
-  if (ibua > 0)   taxes.push({ taxId: "54", taxName: "IBUA",   amount: ibua,   percent: 0 });
+  if (icui > 0)    taxes.push({ taxId: "35", taxName: "ICUI",   amount: icui,    percent: 0 });
+  if (ibua > 0)    taxes.push({ taxId: "54", taxName: "IBUA",   amount: ibua,    percent: 0 });
+  if (icl > 0)     taxes.push({ taxId: "08", taxName: "ICL",    amount: icl,     percent: 0 });
+  if (adv > 0)     taxes.push({ taxId: "10", taxName: "ADV",    amount: adv,     percent: 0 });
+  if (icOtros > 0) taxes.push({ taxId: "03", taxName: "IC",     amount: icOtros, percent: 0 });
 
   // ── Line items: extract "Detalles de Productos" section ─────────────────────
   // Section ends at "Notas Finales", "Valores informativos", or the second
