@@ -42,8 +42,13 @@ function parsePct(s: string): number {
 }
 
 function parseLineItems(sectionText: string): InvoiceLineItem[] {
-  const t = collapseNumericSpaces(sectionText);
-  const lines = t.split("\n").map((l) => l.trim()).filter(Boolean);
+  // Repair split data lines: some PDFs put the DIAN double-space separator and
+  // the unit price on their own lines instead of inline.
+  // e.g.  "EA4,00\n15.564,71…1719.00\n  \n62.258,82"
+  //    →  "EA4,00\n15.564,71…1719.00  62.258,82"
+  const repaired = collapseNumericSpaces(sectionText)
+    .replace(/\n {2,}\n(\d[\d.,]*)/g, "  $1");
+  const lines = repaired.split("\n").map((l) => l.trim()).filter(Boolean);
   const rows: string[] = [];
   let current: string | null = null;
 
@@ -67,8 +72,10 @@ function parseLineItems(sectionText: string): InvoiceLineItem[] {
         rows.push(current);
         rows.push(line);
         current = null;
-      } else if (hasUM || hasDbl) {
-        // Completion/data line for the current multi-line item
+      } else if (hasDbl || (hasUM && hasDbl)) {
+        // Completion/data line: must have double-space (separator before unit price).
+        // A line with only hasUM (e.g. "EA4,00") but no double-space means the price
+        // data follows on the next line — treat as description continuation instead.
         current += line;
         rows.push(current);
         current = null;
