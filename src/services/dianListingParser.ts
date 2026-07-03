@@ -18,6 +18,14 @@ export type DianTaxRow = {
   reteIva: number;
   reteRenta: number;
   reteIca: number;
+  // Metadata columns (for Drive upload naming and folder structure)
+  nitEmisor: string;
+  nombreEmisor: string;
+  nitReceptor: string;
+  nombreReceptor: string;
+  folio: string;
+  fechaEmision: string;
+  grupo: string; // "Recibidas" | "Emitidas"
 };
 
 // Si el buffer es un ZIP que contiene un .xlsx adentro, lo extrae y devuelve ese buffer.
@@ -73,6 +81,14 @@ export async function parseDianListing(buffer: Buffer): Promise<Map<string, Dian
     reteIva: idx("Rete IVA"),
     reteRenta: idx("Rete Renta"),
     reteIca: idx("Rete ICA"),
+    // Metadata
+    nitEmisor: idx("NIT Emisor"),
+    nombreEmisor: idx("Nombre Emisor"),
+    nitReceptor: idx("NIT Receptor"),
+    nombreReceptor: idx("Nombre Receptor"),
+    folio: idx("Folio"),
+    fechaEmision: headers.findIndex((h) => String(h).replace(/ó/g, "o").toLowerCase().includes("fecha") && String(h).toLowerCase().includes("emis")),
+    grupo: idx("Grupo"),
   };
 
   const map = new Map<string, DianTaxRow>();
@@ -82,6 +98,7 @@ export async function parseDianListing(buffer: Buffer): Promise<Map<string, Dian
     if (!cufe || cufe.length < 64) continue;
 
     const n = (col: number) => (col >= 0 ? Number(row[col]) || 0 : 0);
+    const s = (col: number) => (col >= 0 ? String(row[col] || "").trim() : "");
     map.set(cufe, {
       iva: n(colMap.iva),
       ica: n(colMap.ica),
@@ -99,6 +116,13 @@ export async function parseDianListing(buffer: Buffer): Promise<Map<string, Dian
       reteIva: n(colMap.reteIva),
       reteRenta: n(colMap.reteRenta),
       reteIca: n(colMap.reteIca),
+      nitEmisor: s(colMap.nitEmisor),
+      nombreEmisor: s(colMap.nombreEmisor),
+      nitReceptor: s(colMap.nitReceptor),
+      nombreReceptor: s(colMap.nombreReceptor),
+      folio: s(colMap.folio),
+      fechaEmision: s(colMap.fechaEmision),
+      grupo: s(colMap.grupo),
     });
   }
   return map;

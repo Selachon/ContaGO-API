@@ -391,6 +391,11 @@ const EXTRA_TAX_PRIORITY = ["ICA", "INC", "IC", "Otros Impuestos", "IC Porcentua
 function collectExtraTaxNames(invoices: InvoiceData[]): string[] {
   const seen = new Set<string>();
   for (const inv of invoices) {
+    // Invoice-level taxes (from DIAN listing merge — authoritative source)
+    for (const tax of inv.taxes || []) {
+      if (!IVA_EXCLUDED_TAXES.has(tax.taxName)) seen.add(tax.taxName);
+    }
+    // Line-item taxes (from PDF extraction — fallback / complement)
     for (const li of inv.lineItems || []) {
       for (const tax of li.taxes || []) {
         if (!IVA_EXCLUDED_TAXES.has(tax.taxName)) seen.add(tax.taxName);
@@ -473,10 +478,18 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
         }
       }
 
+      // Accumulate extra taxes from line items (fallback — invoice-level takes priority below)
       for (const tax of li.taxes || []) {
         if (extraTaxTotals.has(tax.taxName)) {
           extraTaxTotals.set(tax.taxName, (extraTaxTotals.get(tax.taxName) || 0) + (tax.amount || 0));
         }
+      }
+    }
+
+    // Invoice-level taxes (from DIAN listing) override line-item sums for any matching name
+    for (const tax of inv.taxes || []) {
+      if (extraTaxTotals.has(tax.taxName) && (tax.amount || 0) > 0) {
+        extraTaxTotals.set(tax.taxName, tax.amount || 0);
       }
     }
 
