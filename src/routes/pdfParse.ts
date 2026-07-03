@@ -434,7 +434,7 @@ router.post(
     upload.fields([{ name: "pdfs", maxCount: 600 }, { name: "listado", maxCount: 1 }])(req, res, (err: any) => {
       if (err) {
         console.error("[/api/pdf-parse/to-excel] Multer error:", err);
-        return res.status(400).json({ error: "Error procesando archivos", detail: err.message });
+        return res.status(400).json({ error: `Error procesando archivos: ${err.message || err.code || err}` });
       }
       next();
     });
