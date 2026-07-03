@@ -524,16 +524,21 @@ router.post(
       for (const inv of invoices) {
         try {
           const lt = listadoMap?.get(inv.cufe);
-          const isReceived = lt ? /recibida/i.test(lt.grupo) : true;
+          // Treat anything that is NOT explicitly "Emitidas" as received (safe default)
+          const isReceived = lt ? !/emitid/i.test(lt.grupo) : true;
           const direction = isReceived ? "received" : "sent";
 
-          // Always use the batch-level company NIT/name for the Drive folder so all
-          // invoices land under the same company root regardless of per-invoice parsing.
-          const ownNit  = companyNit  || inv.receiverNit || "SinNIT";
-          const ownName = companyName || inv.receiverName || "";
-
+          // Folder = own company (receptor for received, emisor for emitted)
           // Third-party NIT goes in the filename for easy identification
-          const thirdPartyNit = isReceived ? (lt?.nitEmisor || inv.issuerNit || "SinNIT") : (lt?.nitReceptor || inv.receiverNit || "SinNIT");
+          const ownNit  = isReceived
+            ? (lt?.nitReceptor  || companyNit  || inv.receiverNit || "SinNIT")
+            : (lt?.nitEmisor    || inv.issuerNit || "SinNIT");
+          const ownName = isReceived
+            ? (lt?.nombreReceptor || companyName || inv.receiverName || "")
+            : (lt?.nombreEmisor   || inv.issuerName || "");
+          const thirdPartyNit = isReceived
+            ? (lt?.nitEmisor   || inv.issuerNit  || "SinNIT")
+            : (lt?.nitReceptor || inv.receiverNit || "SinNIT");
           const folio         = lt?.folio || inv.docNumber || inv.cufe.slice(0, 12);
           const safeStr       = (s: string) => s.replace(/[\\/:*?"<>|]/g, "").trim();
           const docNumber     = safeStr(`${thirdPartyNit} - ${folio}`);
