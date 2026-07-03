@@ -16,7 +16,7 @@ import { encryptToken } from "../utils/encryption.js";
 const router = Router();
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024, files: 601 },
+  limits: { fileSize: 50 * 1024 * 1024, files: 5001 },
 });
 
 function parseCOP(s: string | null | undefined): number {
@@ -431,10 +431,10 @@ router.post(
   "/to-excel",
   requireAuth,
   (req: Request, res: Response, next: Function) => {
-    upload.fields([{ name: "pdfs", maxCount: 600 }, { name: "listado", maxCount: 1 }])(req, res, (err: any) => {
+    upload.fields([{ name: "pdfs", maxCount: 5000 }, { name: "listado", maxCount: 1 }])(req, res, (err: any) => {
       if (err) {
         console.error("[/api/pdf-parse/to-excel] Multer error:", err);
-        return res.status(400).json({ error: `Error multer [${err.code || "?"}] campo="${err.field || "?"}" msg="${err.message}"` });
+        return res.status(400).json({ error: `Error procesando archivos: ${err.message || err.code}` });
       }
       next();
     });
