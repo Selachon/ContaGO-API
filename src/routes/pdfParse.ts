@@ -238,14 +238,41 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
     ? t.slice(receptorStart, detallesStart > receptorStart ? detallesStart : undefined)
     : "";
 
+  // Stop pattern: any known DIAN label (right- or left-column) or end-of-line.
+  // Using a lookahead instead of consuming the next label avoids the i-flag bug
+  // where [a-z]+ with /i also matches uppercase letters and stops too early.
+  const STOP = `(?=País:|Departamento:|Municipio|Dirección:|Teléfono|Correo:|Nit del|Nombre Comercial:|Tipo de|Régimen|Responsabilidad|Actividad|Número|\\n|$)`;
+  const field = (block: string, label: string) =>
+    block.match(new RegExp(`${label}\\s*(.+?)${STOP}`, "i"))?.[1]?.trim() || "";
+
   // Razón Social can run into "Nombre Comercial:" on the same line
   const issuerName = (
     emisorBlock.match(/Razón Social:\s*([^\n]+?)(?:Nombre Comercial:|\n|$)/i)?.[1]?.trim() || ""
   );
-  const issuerNit  = emisorBlock.match(/Nit del Emisor:\s*([\d-]+)/i)?.[1]?.trim() || "";
+  const issuerNit                = field(emisorBlock,    "Nit del Emisor:");
+  const issuerCommercialName     = field(emisorBlock,    "Nombre Comercial:");
+  const issuerTaxpayerType       = field(emisorBlock,    "Tipo de Contribuyente:");
+  const issuerFiscalRegime       = field(emisorBlock,    "Régimen Fiscal:");
+  const issuerTaxResponsibility  = field(emisorBlock,    "Responsabilidad tributaria:");
+  const issuerEconomicActivity   = field(emisorBlock,    "Actividad Económica:");
+  const issuerCountry            = field(emisorBlock,    "País:");
+  const issuerDepartment         = field(emisorBlock,    "Departamento:");
+  const issuerCity               = field(emisorBlock,    "Municipio / Ciudad:");
+  const issuerAddress            = field(emisorBlock,    "Dirección:");
+  const issuerPhone              = field(emisorBlock,    "Teléfono / Móvil:");
+  const issuerEmail              = field(emisorBlock,    "Correo:");
 
-  const receiverName = receptorBlock.match(/Nombre o Razón Social:\s*([^\n]+)/i)?.[1]?.trim() || "";
-  const receiverNit  = receptorBlock.match(/Número Documento:\s*([\d-]+)/i)?.[1]?.trim() || "";
+  const receiverName             = receptorBlock.match(/Nombre o Razón Social:\s*([^\n]+)/i)?.[1]?.trim() || "";
+  const receiverNit              = field(receptorBlock,  "Número Documento:");
+  const receiverTaxpayerType     = field(receptorBlock,  "Tipo de Contribuyente:");
+  const receiverFiscalRegime     = field(receptorBlock,  "Régimen [Ff]iscal:");
+  const receiverTaxResponsibility= field(receptorBlock,  "Responsabilidad tributaria:");
+  const receiverCountry          = field(receptorBlock,  "País:");
+  const receiverDepartment       = field(receptorBlock,  "Departamento:");
+  const receiverCity             = field(receptorBlock,  "Municipio / Ciudad:");
+  const receiverAddress          = field(receptorBlock,  "Dirección:");
+  const receiverPhone            = field(receptorBlock,  "Teléfono / Móvil:");
+  const receiverEmail            = field(receptorBlock,  "Correo:");
 
   // ── Totals: the PDF renders two copies of the summary table; the second (after
   // "MONEDACOP") has the actual values.  Some fonts space it as "MO NEDA CO P".
@@ -316,8 +343,28 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
     paymentMethod,
     issuerNit,
     issuerName,
+    issuerCommercialName,
+    issuerTaxpayerType,
+    issuerFiscalRegime,
+    issuerTaxResponsibility,
+    issuerEconomicActivity,
+    issuerCountry,
+    issuerDepartment,
+    issuerCity,
+    issuerAddress,
+    issuerPhone,
+    issuerEmail,
     receiverNit,
     receiverName,
+    receiverTaxpayerType,
+    receiverFiscalRegime,
+    receiverTaxResponsibility,
+    receiverCountry,
+    receiverDepartment,
+    receiverCity,
+    receiverAddress,
+    receiverPhone,
+    receiverEmail,
     subtotal,
     discount,
     surcharge,
