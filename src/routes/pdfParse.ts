@@ -527,9 +527,10 @@ router.post(
           const isReceived = lt ? /recibida/i.test(lt.grupo) : true;
           const direction = isReceived ? "received" : "sent";
 
-          // Own company: receptor for received, emisor for emitted
-          const ownNit  = isReceived ? (lt?.nitReceptor  || inv.receiverNit || companyNit) : (lt?.nitEmisor  || inv.issuerNit || companyNit);
-          const ownName = isReceived ? (lt?.nombreReceptor || inv.receiverName || companyName) : (lt?.nombreEmisor || inv.issuerName || companyName);
+          // Always use the batch-level company NIT/name for the Drive folder so all
+          // invoices land under the same company root regardless of per-invoice parsing.
+          const ownNit  = companyNit  || inv.receiverNit || "SinNIT";
+          const ownName = companyName || inv.receiverName || "";
 
           // Third-party NIT goes in the filename for easy identification
           const thirdPartyNit = isReceived ? (lt?.nitEmisor || inv.issuerNit || "SinNIT") : (lt?.nitReceptor || inv.receiverNit || "SinNIT");
