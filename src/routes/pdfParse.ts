@@ -566,7 +566,7 @@ router.post(
 
             await uploadInvoiceFilesToDrive(
               pdfBuffer, null, docNumber, ownNit, issueDate,
-              driveConfig, userId, onTokenRefresh, direction, ownName
+              driveConfig, userId, onTokenRefresh, direction
             );
             uploaded++;
           } catch (e) {
