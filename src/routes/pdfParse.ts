@@ -430,7 +430,15 @@ function mergeDianListingTaxes(inv: InvoiceData, lt: DianTaxRow): void {
 router.post(
   "/to-excel",
   requireAuth,
-  upload.fields([{ name: "pdfs", maxCount: 600 }, { name: "listado", maxCount: 1 }]),
+  (req: Request, res: Response, next: Function) => {
+    upload.fields([{ name: "pdfs", maxCount: 600 }, { name: "listado", maxCount: 1 }])(req, res, (err: any) => {
+      if (err) {
+        console.error("[/api/pdf-parse/to-excel] Multer error:", err);
+        return res.status(400).json({ error: "Error procesando archivos", detail: err.message });
+      }
+      next();
+    });
+  },
   async (req: Request, res: Response) => {
   try {
   const fieldFiles = req.files as Record<string, Express.Multer.File[]> | undefined;
