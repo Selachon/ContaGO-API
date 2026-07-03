@@ -582,7 +582,7 @@ router.post(
   } catch (err) {
     console.error("[/api/pdf-parse/to-excel] Unhandled error:", err);
     if (!res.headersSent) {
-      res.status(500).json({ error: "Error interno generando Excel", detail: (err as Error).message });
+      res.status(500).json({ error: `Error interno: ${(err as Error).message || err}` });
     }
   }
 });
