@@ -14,6 +14,24 @@ import { getUserGoogleDriveById, updateUserDriveTokens } from "../services/datab
 import { encryptToken } from "../utils/encryption.js";
 
 const router = Router();
+
+// ── Drive upload progress tracking ───────────────────────────────────────────
+interface DriveJobProgress { done: number; total: number; finished: boolean; }
+const driveJobs = new Map<string, DriveJobProgress>();
+function createDriveJob(total: number): string {
+  const jobId = `drv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  driveJobs.set(jobId, { done: 0, total, finished: false });
+  // Auto-cleanup after 30 minutes
+  setTimeout(() => driveJobs.delete(jobId), 30 * 60 * 1000);
+  return jobId;
+}
+
+router.get("/drive-progress/:jobId", requireAuth, (req: Request, res: Response) => {
+  const job = driveJobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: "Job no encontrado" });
+  res.json(job);
+});
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024, files: 5001 },
@@ -509,6 +527,7 @@ router.post(
   const companyName = invoices.find((i) => i.receiverNit === companyNit)?.receiverName || "";
 
   const driveConnectionId = typeof req.body?.driveConnectionId === "string" ? req.body.driveConnectionId.trim() : "";
+  const driveJobId = driveConnectionId ? createDriveJob(invoices.length) : null;
 
   // ── Generate and send Excel immediately ─────────────────────────────────────
   const tmpPath = path.join(os.tmpdir(), `contago-pdf-excel-${Date.now()}.xlsx`);
@@ -524,7 +543,10 @@ router.post(
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(xlsxName)}"`);
     if (errors.length) res.setHeader("X-Parse-Errors", errors.join(" | "));
     if (listadoMap) res.setHeader("X-Listado-Matched", String([...listadoMap.keys()].filter(k => rawInvoices.some(i => i.cufe === k)).length));
-    if (driveConnectionId) res.setHeader("X-Drive-Uploading", "true");
+    if (driveJobId) {
+      res.setHeader("X-Drive-Uploading", "true");
+      res.setHeader("X-Drive-Job-Id", driveJobId);
+    }
     res.send(buf);
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
@@ -538,18 +560,17 @@ router.post(
       const onTokenRefresh = async (newToken: string, expiry: number) => {
         await updateUserDriveTokens(userId, encryptToken(newToken), new Date(expiry).toISOString(), driveConnectionId);
       };
+      const jobId = driveJobId!;
       // Fire-and-forget: runs after response is already sent
       (async () => {
-        let uploaded = 0;
+        const job = driveJobs.get(jobId)!;
         for (const inv of invoices) {
           try {
             const lt = listadoMap?.get(inv.cufe);
             const isReceived = lt ? !/emitid/i.test(lt.grupo) : true;
             const direction = isReceived ? "received" : "sent";
 
-            // Use batch-level companyNit/companyName for folder (consistent across all invoices)
             const ownNit  = isReceived ? (companyNit || inv.receiverNit || "SinNIT") : (lt?.nitEmisor || inv.issuerNit || "SinNIT");
-            const ownName = isReceived ? (companyName || inv.receiverName || "") : (lt?.nombreEmisor || inv.issuerName || "");
             const thirdPartyNit = isReceived
               ? (lt?.nitEmisor   || inv.issuerNit  || "SinNIT")
               : (lt?.nitReceptor || inv.receiverNit || "SinNIT");
@@ -568,13 +589,18 @@ router.post(
               pdfBuffer, null, docNumber, ownNit, issueDate,
               driveConfig, userId, onTokenRefresh, direction
             );
-            uploaded++;
           } catch (e) {
             // Non-fatal: log and continue
           }
+          job.done++;
         }
-        console.log(`[Drive] Background upload complete: ${uploaded}/${invoices.length}`);
-      })().catch(e => console.error("[Drive] Background upload error:", e));
+        job.finished = true;
+        console.log(`[Drive] Background upload complete: ${job.done}/${job.total}`);
+      })().catch(e => {
+        const job = driveJobs.get(jobId);
+        if (job) job.finished = true;
+        console.error("[Drive] Background upload error:", e);
+      });
     }
   }
   } catch (err) {
