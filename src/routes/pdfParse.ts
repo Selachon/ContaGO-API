@@ -508,68 +508,12 @@ router.post(
   const companyNit = [...nitCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "";
   const companyName = invoices.find((i) => i.receiverNit === companyNit)?.receiverName || "";
 
-  // ── Optional Drive upload ────────────────────────────────────────────────────
   const driveConnectionId = typeof req.body?.driveConnectionId === "string" ? req.body.driveConnectionId.trim() : "";
-  const includeDriveLinks = req.body?.includeDriveLinks === "true" || req.body?.includeDriveLinks === true;
-  let driveUploaded = 0;
 
-  if (driveConnectionId) {
-    const userId = req.user!.userId;
-    const driveConfig = await getUserGoogleDriveById(userId, driveConnectionId).catch(() => null);
-    if (driveConfig) {
-      const onTokenRefresh = async (newToken: string, expiry: number) => {
-        await updateUserDriveTokens(userId, encryptToken(newToken), new Date(expiry).toISOString(), driveConnectionId);
-      };
-
-      for (const inv of invoices) {
-        try {
-          const lt = listadoMap?.get(inv.cufe);
-          // Treat anything that is NOT explicitly "Emitidas" as received (safe default)
-          const isReceived = lt ? !/emitid/i.test(lt.grupo) : true;
-          const direction = isReceived ? "received" : "sent";
-
-          // Folder = own company (receptor for received, emisor for emitted)
-          // Third-party NIT goes in the filename for easy identification
-          const ownNit  = isReceived
-            ? (lt?.nitReceptor  || companyNit  || inv.receiverNit || "SinNIT")
-            : (lt?.nitEmisor    || inv.issuerNit || "SinNIT");
-          const ownName = isReceived
-            ? (lt?.nombreReceptor || companyName || inv.receiverName || "")
-            : (lt?.nombreEmisor   || inv.issuerName || "");
-          const thirdPartyNit = isReceived
-            ? (lt?.nitEmisor   || inv.issuerNit  || "SinNIT")
-            : (lt?.nitReceptor || inv.receiverNit || "SinNIT");
-          const folio         = lt?.folio || inv.docNumber || inv.cufe.slice(0, 12);
-          const safeStr       = (s: string) => s.replace(/[\\/:*?"<>|]/g, "").trim();
-          const docNumber     = safeStr(`${thirdPartyNit} - ${folio}`);
-
-          const issueDate = lt?.fechaEmision || inv.issueDate || new Date().toISOString().slice(0, 10);
-
-          // Find the PDF buffer for this invoice (match by original filename or cufe)
-          const pdfFile = pdfFiles.find((f) => {
-            const stem = f.originalname.replace(/\.pdf$/i, "");
-            return stem === inv.cufe || stem === inv.zipFilename || stem === inv.docNumber;
-          });
-          const pdfBuffer = pdfFile?.buffer ?? null;
-
-          const result = await uploadInvoiceFilesToDrive(
-            pdfBuffer, null, docNumber, ownNit, issueDate,
-            driveConfig, userId, onTokenRefresh, direction, ownName
-          );
-          if (result.pdfUrl) {
-            inv.driveUrl = result.pdfUrl;
-            driveUploaded++;
-          }
-        } catch (e) {
-          // Non-fatal: Drive upload failure doesn't block Excel generation
-        }
-      }
-    }
-  }
-
+  // ── Generate and send Excel immediately ─────────────────────────────────────
   const tmpPath = path.join(os.tmpdir(), `contago-pdf-excel-${Date.now()}.xlsx`);
   try {
-    await generateExcelFile(invoices, tmpPath, includeDriveLinks && driveUploaded > 0, false, companyName, companyNit);
+    await generateExcelFile(invoices, tmpPath, false, false, companyName, companyNit);
     const buf = fs.readFileSync(tmpPath);
     const dateStr = new Date().toISOString().slice(0, 10);
     const cleanName = (s: string) => s.replace(/[^a-zA-Z0-9À-ÿ\s.\-]/g, "").trim().slice(0, 60);
@@ -580,10 +524,58 @@ router.post(
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(xlsxName)}"`);
     if (errors.length) res.setHeader("X-Parse-Errors", errors.join(" | "));
     if (listadoMap) res.setHeader("X-Listado-Matched", String([...listadoMap.keys()].filter(k => rawInvoices.some(i => i.cufe === k)).length));
-    if (driveConnectionId) res.setHeader("X-Drive-Uploaded", String(driveUploaded));
+    if (driveConnectionId) res.setHeader("X-Drive-Uploading", "true");
     res.send(buf);
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
+  }
+
+  // ── Drive upload in background (after response sent) ────────────────────────
+  if (driveConnectionId) {
+    const userId = req.user!.userId;
+    const driveConfig = await getUserGoogleDriveById(userId, driveConnectionId).catch(() => null);
+    if (driveConfig) {
+      const onTokenRefresh = async (newToken: string, expiry: number) => {
+        await updateUserDriveTokens(userId, encryptToken(newToken), new Date(expiry).toISOString(), driveConnectionId);
+      };
+      // Fire-and-forget: runs after response is already sent
+      (async () => {
+        let uploaded = 0;
+        for (const inv of invoices) {
+          try {
+            const lt = listadoMap?.get(inv.cufe);
+            const isReceived = lt ? !/emitid/i.test(lt.grupo) : true;
+            const direction = isReceived ? "received" : "sent";
+
+            // Use batch-level companyNit/companyName for folder (consistent across all invoices)
+            const ownNit  = isReceived ? (companyNit || inv.receiverNit || "SinNIT") : (lt?.nitEmisor || inv.issuerNit || "SinNIT");
+            const ownName = isReceived ? (companyName || inv.receiverName || "") : (lt?.nombreEmisor || inv.issuerName || "");
+            const thirdPartyNit = isReceived
+              ? (lt?.nitEmisor   || inv.issuerNit  || "SinNIT")
+              : (lt?.nitReceptor || inv.receiverNit || "SinNIT");
+            const folio     = lt?.folio || inv.docNumber || inv.cufe.slice(0, 12);
+            const safeStr   = (s: string) => s.replace(/[\\/:*?"<>|]/g, "").trim();
+            const docNumber = safeStr(`${thirdPartyNit} - ${folio}`);
+            const issueDate = lt?.fechaEmision || inv.issueDate || new Date().toISOString().slice(0, 10);
+
+            const pdfFile = pdfFiles.find((f) => {
+              const stem = f.originalname.replace(/\.pdf$/i, "");
+              return stem === inv.cufe || stem === inv.zipFilename || stem === inv.docNumber;
+            });
+            const pdfBuffer = pdfFile?.buffer ?? null;
+
+            await uploadInvoiceFilesToDrive(
+              pdfBuffer, null, docNumber, ownNit, issueDate,
+              driveConfig, userId, onTokenRefresh, direction, ownName
+            );
+            uploaded++;
+          } catch (e) {
+            // Non-fatal: log and continue
+          }
+        }
+        console.log(`[Drive] Background upload complete: ${uploaded}/${invoices.length}`);
+      })().catch(e => console.error("[Drive] Background upload error:", e));
+    }
   }
   } catch (err) {
     console.error("[/api/pdf-parse/to-excel] Unhandled error:", err);
