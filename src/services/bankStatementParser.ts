@@ -116,6 +116,10 @@ function detectBank(pages: string[][]): string {
   // "PAGO ACH BANCOLOMBIA" que dispararían la detección incorrecta si se verificara primero.
   // La frase "banco de occidente" es suficientemente específica para buscarse en todo el texto.
   if (allText.includes("banco de occidente")) return "occidente";
+  // Portal Empresarial Bancolombia: "PARALELO 108" aparece en la columna SUCURSAL/CANAL
+  // de prácticamente todas las filas. Distingimos antes de bancolombia.com porque el
+  // portal empresarial NO incluye el dominio en el PDF.
+  if (/paralelo\s+\d{3}/i.test(allText)) return "bancolombia";
   // Bancolombia se detecta por el dominio "bancolombia.com" (pie DCF del extracto) o
   // por la cabecera "Sucursal Virtual Personas" del reporte de movimientos online.
   if (allText.includes("bancolombia.com") || /sucursal\s+virtual\s+personas/i.test(allText)) return "bancolombia";
@@ -181,6 +185,46 @@ function parseBancolombiaVirtual(pages: string[][]): { raws: RawMov[]; opening: 
     const date = `${yyyy}-${mm}-${dd.padStart(2, "0")}`;
 
     if (isDebit) runBal -= value; else runBal += value;
+    raws.push({ date, description: desc, value, balance: Math.round(runBal * 100) / 100 });
+  }
+
+  return { raws, opening: 0, declared: { credits: null, debits: null }, closing: null };
+}
+
+// ─── Bancolombia Portal Empresarial: "YYYY/MM/DD DESCRIPCIÓN CANAL  ±VALOR" ─
+// Reporte descargado desde el portal empresarial Bancolombia. Columnas:
+// FECHA | DESCRIPCIÓN | SUCURSAL/CANAL | REFERENCIA 1 | REFERENCIA 2 | DOCUMENTO | VALOR
+// El canal más frecuente es "PARALELO 108" (sucursal empresarial). El valor
+// usa formato US (coma=miles, punto=decimal) y viene con signo: negativo = egreso.
+// No hay saldo corriente por fila ni saldo de apertura; la dirección se infiere del signo.
+function parseBancolombiaPortalEmpresarial(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
+  const all = pages.flat();
+  const numUS = (s: string) => parseFloat(s.replace(/,/g, ""));
+  const rowRx = /^(\d{4}\/\d{2}\/\d{2})\s+(.+?)\s+(-?[\d,]+\.\d{2})$/;
+  const skipRx = /^P[aá]gina\s+\d+/i;
+
+  let runBal = 0;
+  const raws: RawMov[] = [];
+
+  for (const line of all) {
+    if (skipRx.test(line)) continue;
+    const m = line.match(rowRx);
+    if (!m) continue;
+
+    const [, dateStr, descRaw, valueStr] = m;
+    const signed = numUS(valueStr);
+    const value = Math.abs(signed);
+
+    let desc = descRaw
+      .replace(/\s+PARALELO\s+\d+\b.*/i, "")
+      .replace(/\s+TDC\s+MASTER\s+CARD\b.*/i, "")
+      .replace(/\s+EST\.\s+AFILIADOS\b.*/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const date = dateStr.replace(/\//g, "-");
+
+    if (signed < 0) runBal -= value; else runBal += value;
     raws.push({ date, description: desc, value, balance: Math.round(runBal * 100) / 100 });
   }
 
@@ -494,9 +538,12 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
       "bank_unsupported"
     );
   }
-  const isSucursalVirtual = /sucursal\s+virtual\s+personas/i.test(pages.flat().join(" "));
+  const allFlat = pages.flat().join(" ");
+  const isPortalEmpresarial = /paralelo\s+\d{3}/i.test(allFlat);
+  const isSucursalVirtual   = /sucursal\s+virtual\s+personas/i.test(allFlat);
   const parsed =
-    bank === "bancolombia" && isSucursalVirtual ? parseBancolombiaVirtual(pages)
+    bank === "bancolombia" && isPortalEmpresarial ? parseBancolombiaPortalEmpresarial(pages)
+    : bank === "bancolombia" && isSucursalVirtual ? parseBancolombiaVirtual(pages)
     : bank === "bancolombia" ? parseBancolombia(pages)
     : bank === "occidente" ? parseOccidente(pages)
     : bank === "bancobogota" ? parseBancoBogota(pages)
