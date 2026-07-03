@@ -335,7 +335,7 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   if (ibua > 0)    taxes.push({ taxId: "54", taxName: "IBUA",   amount: ibua,    percent: 0 });
   if (icl > 0)     taxes.push({ taxId: "08", taxName: "ICL",    amount: icl,     percent: 0 });
   if (adv > 0)     taxes.push({ taxId: "10", taxName: "ADV",    amount: adv,     percent: 0 });
-  if (icOtros > 0) taxes.push({ taxId: "03", taxName: "IC",     amount: icOtros, percent: 0 });
+  if (icOtros > 0) taxes.push({ taxId: "03", taxName: "Otros Impuestos", amount: icOtros, percent: 0 });
 
   // ── Line items: extract "Detalles de Productos" section ─────────────────────
   // Section ends at "Notas Finales", "Valores informativos", or the second

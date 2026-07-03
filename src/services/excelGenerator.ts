@@ -61,7 +61,7 @@ const DATE_FMT = "yyyy-mm-dd";
 const CURRENCY_HEADERS = new Set([
   "Subtotal", "Descuento", "Recargo",
   "IVA", "% IVA", "INC", "% INC", "Bolsas", "% Bolsas",
-  "ICUI", "% ICUI", "IC", "IC Porcentual", "% IC Porcentual",
+  "ICUI", "% ICUI", "IC", "Otros Impuestos", "IC Porcentual", "% IC Porcentual",
   "ICL", "IBUA", "% IBUA", "ADV",
   "Total",
   "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle", "Precio unitario (incluye impuestos)",
@@ -191,7 +191,7 @@ function buildSheet1(
     "NIT Receptor", "Razón Social Receptor",
     "Fecha", "Concepto", "Forma de pago",
     "Subtotal", "Descuento", "Recargo",
-    "IVA", "INC", "Bolsas", "ICUI", "IC", "ICL", "IC Porcentual", "IBUA", "ADV",
+    "IVA", "INC", "Bolsas", "ICUI", "IC", "Otros Impuestos", "ICL", "IC Porcentual", "IBUA", "ADV",
     "Total", "Observaciones",
   ];
   if (includeDriveColumn) baseHeaders.push("Enlace Drive");
@@ -227,6 +227,7 @@ function buildSheet1(
       td["Bolsas"]?.amount ?? 0,
       td["ICUI"]?.amount ?? 0,
       td["IC"]?.amount ?? 0,
+      td["Otros Impuestos"]?.amount ?? 0,
       td["ICL"]?.amount ?? 0,
       td["IC Porcentual"]?.amount ?? 0,
       td["IBUA"]?.amount ?? 0,
@@ -262,7 +263,7 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
     "Concepto",
     "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle",
     "IVA", "% IVA", "INC", "% INC", "Bolsas", "% Bolsas",
-    "ICUI", "% ICUI", "IC",
+    "ICUI", "% ICUI", "IC", "Otros Impuestos",
     "IC Porcentual", "% IC Porcentual",
     "ICL",
     "IBUA", "% IBUA",
@@ -305,12 +306,13 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
       td["ICUI"]?.amount ?? 0,                    // T
       (td["ICUI"]?.percent ?? 0) / 100,           // U
       td["IC"]?.amount ?? 0,                      // V
-      td["IC Porcentual"]?.amount ?? 0,           // W
-      (td["IC Porcentual"]?.percent ?? 0) / 100,  // X
-      td["ICL"]?.amount ?? 0,                     // Y
-      td["IBUA"]?.amount ?? 0,                    // Z
-      (td["IBUA"]?.percent ?? 0) / 100,           // AA
-      td["ADV"]?.amount ?? 0,                     // AB
+      td["Otros Impuestos"]?.amount ?? 0,         // W
+      td["IC Porcentual"]?.amount ?? 0,           // X
+      (td["IC Porcentual"]?.percent ?? 0) / 100,  // Y
+      td["ICL"]?.amount ?? 0,                     // AA
+      td["IBUA"]?.amount ?? 0,                    // AB
+      (td["IBUA"]?.percent ?? 0) / 100,           // AC
+      td["ADV"]?.amount ?? 0,                     // AD
     ];
 
     // Track which tax names are already covered by line items
@@ -382,7 +384,7 @@ function colLetter(n: number): string {
   return s;
 }
 
-const EXTRA_TAX_PRIORITY = ["INC", "IC", "IC Porcentual", "Bolsas", "ICUI", "ICL", "IBUA", "ADV"];
+const EXTRA_TAX_PRIORITY = ["INC", "IC", "Otros Impuestos", "IC Porcentual", "Bolsas", "ICUI", "ICL", "IBUA", "ADV"];
 
 function collectExtraTaxNames(invoices: InvoiceData[]): string[] {
   const seen = new Set<string>();
