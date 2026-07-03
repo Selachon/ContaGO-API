@@ -442,7 +442,7 @@ router.post(
   let listadoMap: Map<string, DianTaxRow> | null = null;
   if (listadoFiles.length) {
     try {
-      listadoMap = parseDianListing(listadoFiles[0].buffer);
+      listadoMap = await parseDianListing(listadoFiles[0].buffer);
     } catch (e) {
       // Non-fatal: proceed without listing
     }
