@@ -9,7 +9,7 @@ import { generateExcelFile } from "../services/excelGenerator.js";
 import type { InvoiceData, TaxDetail, InvoiceLineItem } from "../types/dianExcel.js";
 import { parseLineItemsPositional } from "../services/pdfPositionalParser.js";
 import { parseDianListing, type DianTaxRow } from "../services/dianListingParser.js";
-import { uploadInvoiceFilesToDrive, parseInvoiceDate } from "../services/googleDrive.js";
+import { uploadInvoiceFilesToDrive } from "../services/googleDrive.js";
 import { getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import { encryptToken } from "../utils/encryption.js";
 
@@ -432,6 +432,7 @@ router.post(
   requireAuth,
   upload.fields([{ name: "pdfs", maxCount: 600 }, { name: "listado", maxCount: 1 }]),
   async (req: Request, res: Response) => {
+  try {
   const fieldFiles = req.files as Record<string, Express.Multer.File[]> | undefined;
   const pdfFiles  = fieldFiles?.["pdfs"]    || [];
   const listadoFiles = fieldFiles?.["listado"] || [];
@@ -569,6 +570,12 @@ router.post(
     res.send(buf);
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}
+  }
+  } catch (err) {
+    console.error("[/api/pdf-parse/to-excel] Unhandled error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Error interno generando Excel", detail: (err as Error).message });
+    }
   }
 });
 
