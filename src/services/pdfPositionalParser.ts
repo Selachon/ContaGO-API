@@ -23,11 +23,11 @@ const X = {
   nroMax:   58,   // item number: x < 58
   codigoX:  54,   // Código starts at x ≈ 55
   descMin:  75,   // description text
-  descMax: 168,
+  descMax: 160,   // U/M column starts at x ≈ 160-163; keep below it
   umMin:   160,   // U/M column (anchor: row has U/M)
   qtyMin:  190, qtyMax: 240,
   ivaMin:  408, ivaMax: 480,  // IVA amount + % (may be merged)
-  incMin:  480, incMax: 530,  // INC amount + %
+  incMin:  480, incMax: 517,  // INC amount + %; Precio col ($) starts at x ≈ 518
   extMin:  520, extMax: 590,  // precio unitario de venta (line extension)
   rowTol:    5,   // Y tolerance to group items into same row (pt)
   descTol:  25,   // max Y distance for description overflow rows
