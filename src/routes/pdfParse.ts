@@ -8,11 +8,12 @@ import { requireAuth } from "../middleware/auth.js";
 import { generateExcelFile } from "../services/excelGenerator.js";
 import type { InvoiceData, TaxDetail, InvoiceLineItem } from "../types/dianExcel.js";
 import { parseLineItemsPositional } from "../services/pdfPositionalParser.js";
+import { parseDianListing, type DianTaxRow } from "../services/dianListingParser.js";
 
 const router = Router();
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024, files: 600 },
+  limits: { fileSize: 50 * 1024 * 1024, files: 601 },
 });
 
 function parseCOP(s: string | null | undefined): number {
@@ -400,20 +401,57 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   };
 }
 
+// Aplica los impuestos del listado DIAN a una factura, reemplazando los extraídos del PDF.
+function mergeDianListingTaxes(inv: InvoiceData, lt: DianTaxRow): void {
+  const subtotal = inv.subtotal || 0;
+  const taxes: TaxDetail[] = [];
+  if (lt.iva > 0)            taxes.push({ taxId: "01", taxName: "IVA",             amount: lt.iva,            percent: subtotal > 0 ? Math.round(lt.iva / subtotal * 100) : 0 });
+  if (lt.ica > 0)            taxes.push({ taxId: "07", taxName: "ICA",             amount: lt.ica,            percent: 0 });
+  if (lt.ic > 0)             taxes.push({ taxId: "03", taxName: "IC",              amount: lt.ic,             percent: 0 });
+  if (lt.inc > 0)            taxes.push({ taxId: "04", taxName: "INC",             amount: lt.inc,            percent: 0 });
+  if (lt.bolsas > 0)         taxes.push({ taxId: "22", taxName: "Bolsas",          amount: lt.bolsas,         percent: 0 });
+  if (lt.icui > 0)           taxes.push({ taxId: "35", taxName: "ICUI",            amount: lt.icui,           percent: 0 });
+  if (lt.icl > 0)            taxes.push({ taxId: "08", taxName: "ICL",             amount: lt.icl,            percent: 0 });
+  if (lt.ibua > 0)           taxes.push({ taxId: "54", taxName: "IBUA",            amount: lt.ibua,           percent: 0 });
+  if (lt.inCarbono > 0)      taxes.push({ taxId: "09", taxName: "IN Carbono",      amount: lt.inCarbono,      percent: 0 });
+  if (lt.inCombustibles > 0) taxes.push({ taxId: "10", taxName: "IN Combustibles", amount: lt.inCombustibles, percent: 0 });
+  if (lt.icDatos > 0)        taxes.push({ taxId: "02", taxName: "IC Datos",        amount: lt.icDatos,        percent: 0 });
+  if (lt.inpp > 0)           taxes.push({ taxId: "12", taxName: "INPP",            amount: lt.inpp,           percent: 0 });
+  if (lt.timbre > 0)         taxes.push({ taxId: "11", taxName: "Timbre",          amount: lt.timbre,         percent: 0 });
+  inv.taxes = taxes;
+}
+
 // POST /api/pdf-parse/to-excel
-// Accepts multipart/form-data with field "pdfs" (multiple PDF files)
+// Accepts multipart/form-data with field "pdfs" (multiple PDF files) and optional "listado" (DIAN listing Excel)
 // Returns an XLSX file
-router.post("/to-excel", requireAuth, upload.array("pdfs", 600), async (req: Request, res: Response) => {
-  const files = req.files as Express.Multer.File[] | undefined;
-  if (!files?.length) {
+router.post(
+  "/to-excel",
+  requireAuth,
+  upload.fields([{ name: "pdfs", maxCount: 600 }, { name: "listado", maxCount: 1 }]),
+  async (req: Request, res: Response) => {
+  const fieldFiles = req.files as Record<string, Express.Multer.File[]> | undefined;
+  const pdfFiles  = fieldFiles?.["pdfs"]    || [];
+  const listadoFiles = fieldFiles?.["listado"] || [];
+
+  if (!pdfFiles.length) {
     res.status(400).json({ error: "No se recibieron PDFs." });
     return;
+  }
+
+  // Parse DIAN listing if provided
+  let listadoMap: Map<string, DianTaxRow> | null = null;
+  if (listadoFiles.length) {
+    try {
+      listadoMap = parseDianListing(listadoFiles[0].buffer);
+    } catch (e) {
+      // Non-fatal: proceed without listing
+    }
   }
 
   const rawInvoices: InvoiceData[] = [];
   const errors: string[] = [];
 
-  for (const file of files) {
+  for (const file of pdfFiles) {
     try {
       const parsed = await pdfParse(file.buffer);
       const invoice = parsePdfText(parsed.text, file.originalname);
@@ -423,6 +461,11 @@ router.post("/to-excel", requireAuth, upload.array("pdfs", 600), async (req: Req
       } catch (e) {
         // Fallback to text-based line items on pdfjs error
         errors.push(`${file.originalname} (positional): ${(e as Error).message}`);
+      }
+      // Merge DIAN listing taxes if available
+      if (listadoMap) {
+        const lt = listadoMap.get(invoice.cufe);
+        if (lt) mergeDianListingTaxes(invoice, lt);
       }
       rawInvoices.push(invoice);
     } catch (e) {
@@ -465,6 +508,7 @@ router.post("/to-excel", requireAuth, upload.array("pdfs", 600), async (req: Req
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(xlsxName)}"`);
     if (errors.length) res.setHeader("X-Parse-Errors", errors.join(" | "));
+    if (listadoMap) res.setHeader("X-Listado-Matched", String([...listadoMap.keys()].filter(k => rawInvoices.some(i => i.cufe === k)).length));
     res.send(buf);
   } finally {
     try { fs.unlinkSync(tmpPath); } catch {}

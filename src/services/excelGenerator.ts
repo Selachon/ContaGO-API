@@ -60,7 +60,7 @@ const DATE_FMT = "yyyy-mm-dd";
 // Columnas que llevan formato numérico #,##0.00
 const CURRENCY_HEADERS = new Set([
   "Subtotal", "Descuento", "Recargo",
-  "IVA", "% IVA", "INC", "% INC", "Bolsas", "% Bolsas",
+  "IVA", "% IVA", "ICA", "INC", "% INC", "Bolsas", "% Bolsas",
   "ICUI", "% ICUI", "IC", "Otros Impuestos", "IC Porcentual", "% IC Porcentual",
   "ICL", "IBUA", "% IBUA", "ADV",
   "Total",
@@ -191,7 +191,7 @@ function buildSheet1(
     "NIT Receptor", "Razón Social Receptor",
     "Fecha", "Concepto", "Forma de pago",
     "Subtotal", "Descuento", "Recargo",
-    "IVA", "INC", "Bolsas", "ICUI", "IC", "Otros Impuestos", "ICL", "IC Porcentual", "IBUA", "ADV",
+    "IVA", "ICA", "INC", "Bolsas", "ICUI", "IC", "Otros Impuestos", "ICL", "IC Porcentual", "IBUA", "ADV",
     "Total", "Observaciones",
   ];
   if (includeDriveColumn) baseHeaders.push("Enlace Drive");
@@ -223,6 +223,7 @@ function buildSheet1(
       inv.discount || 0,
       inv.surcharge || 0,
       td["IVA"]?.amount ?? 0,
+      td["ICA"]?.amount ?? 0,
       td["INC"]?.amount ?? 0,
       td["Bolsas"]?.amount ?? 0,
       td["ICUI"]?.amount ?? 0,
@@ -262,7 +263,7 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
     "NIT Emisor", "Razón Social Emisor", "NIT Receptor", "Razón Social Receptor", "Fecha",
     "Concepto",
     "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle",
-    "IVA", "% IVA", "INC", "% INC", "Bolsas", "% Bolsas",
+    "IVA", "% IVA", "ICA", "INC", "% INC", "Bolsas", "% Bolsas",
     "ICUI", "% ICUI", "IC", "Otros Impuestos",
     "IC Porcentual", "% IC Porcentual",
     "ICL",
@@ -297,22 +298,23 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
     ];
 
     const buildTaxCols = (td: Record<string, TaxDetail>) => [
-      td["IVA"]?.amount ?? 0,                     // N
-      (td["IVA"]?.percent ?? 0) / 100,            // O
-      td["INC"]?.amount ?? 0,                     // P
-      (td["INC"]?.percent ?? 0) / 100,            // Q
-      td["Bolsas"]?.amount ?? 0,                  // R
-      (td["Bolsas"]?.percent ?? 0) / 100,         // S
-      td["ICUI"]?.amount ?? 0,                    // T
-      (td["ICUI"]?.percent ?? 0) / 100,           // U
-      td["IC"]?.amount ?? 0,                      // V
-      td["Otros Impuestos"]?.amount ?? 0,         // W
-      td["IC Porcentual"]?.amount ?? 0,           // X
-      (td["IC Porcentual"]?.percent ?? 0) / 100,  // Y
-      td["ICL"]?.amount ?? 0,                     // AA
-      td["IBUA"]?.amount ?? 0,                    // AB
-      (td["IBUA"]?.percent ?? 0) / 100,           // AC
-      td["ADV"]?.amount ?? 0,                     // AD
+      td["IVA"]?.amount ?? 0,                     // N  IVA
+      (td["IVA"]?.percent ?? 0) / 100,            // O  % IVA
+      td["ICA"]?.amount ?? 0,                     // P  ICA
+      td["INC"]?.amount ?? 0,                     // Q  INC
+      (td["INC"]?.percent ?? 0) / 100,            // R  % INC
+      td["Bolsas"]?.amount ?? 0,                  // S  Bolsas
+      (td["Bolsas"]?.percent ?? 0) / 100,         // T  % Bolsas
+      td["ICUI"]?.amount ?? 0,                    // U  ICUI
+      (td["ICUI"]?.percent ?? 0) / 100,           // V  % ICUI
+      td["IC"]?.amount ?? 0,                      // W  IC
+      td["Otros Impuestos"]?.amount ?? 0,         // X  Otros Impuestos
+      td["IC Porcentual"]?.amount ?? 0,           // Y  IC Porcentual
+      (td["IC Porcentual"]?.percent ?? 0) / 100,  // Z  % IC Porcentual
+      td["ICL"]?.amount ?? 0,                     // AA ICL
+      td["IBUA"]?.amount ?? 0,                    // AB IBUA
+      (td["IBUA"]?.percent ?? 0) / 100,           // AC % IBUA
+      td["ADV"]?.amount ?? 0,                     // AD ADV
     ];
 
     // Track which tax names are already covered by line items
@@ -384,7 +386,7 @@ function colLetter(n: number): string {
   return s;
 }
 
-const EXTRA_TAX_PRIORITY = ["INC", "IC", "Otros Impuestos", "IC Porcentual", "Bolsas", "ICUI", "ICL", "IBUA", "ADV"];
+const EXTRA_TAX_PRIORITY = ["ICA", "INC", "IC", "Otros Impuestos", "IC Porcentual", "Bolsas", "ICUI", "ICL", "IBUA", "ADV"];
 
 function collectExtraTaxNames(invoices: InvoiceData[]): string[] {
   const seen = new Set<string>();
