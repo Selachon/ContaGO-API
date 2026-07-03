@@ -213,13 +213,21 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   if (/NOTA\s*CR[ÉE]DITO/i.test(t)) documentType = "Nota Crédito";
   else if (/NOTA\s*D[ÉE]BITO/i.test(t)) documentType = "Nota Débito";
   else if (/DOCUMENTO\s*SOPORTE/i.test(t)) documentType = "Documento soporte";
+  else if (/DOCUMENTO\s+EQUIVALENTE\s+POS/i.test(t)) documentType = "Documento equivalente POS";
+
+  const isPOS = documentType === "Documento equivalente POS";
 
   // ── Invoice number — runs directly into "Forma de pago:" on same line ─────────
-  const docNumber = t.match(/Número de Factura:\s*([^\n]+?)(?:Forma de pago:|\n|$)/i)?.[1]?.trim() || "";
+  let docNumber = t.match(/Número de Factura:\s*([^\n]+?)(?:Forma de pago:|\n|$)/i)?.[1]?.trim() || "";
+  if (!docNumber) docNumber = t.match(/Número de documento:\s*([^\n]+?)(?:\n|$)/i)?.[1]?.trim() || "";
 
   // ── Issue date ────────────────────────────────────────────────────────────────
-  const issueDate = t.match(/Fecha de Emisión:\s*(\d{2}\/\d{2}\/\d{4})/i)?.[1] || "";
-  const issueDateISO = toISO(issueDate);
+  let issueDate = t.match(/Fecha de Emisión:\s*(\d{2}\/\d{2}\/\d{4})/i)?.[1] || "";
+  if (!issueDate) {
+    const posDate = t.match(/Fecha y hora de expedición:\s*(\d{4})-(\d{2})-(\d{2})/i);
+    if (posDate) issueDate = `${posDate[3]}/${posDate[2]}/${posDate[1]}`;
+  }
+  let issueDateISO = toISO(issueDate);
 
   // ── Payment method ────────────────────────────────────────────────────────────
   const paymentMethod = t.match(/Forma de pago:\s*([^\n]+?)(?:\s{2,}|\n|Fecha|$)/i)?.[1]?.trim() || "";
@@ -228,11 +236,14 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   // Note: Notas Crédito use lowercase "emisor / vendedor"; use case-insensitive search
   const tl = t.toLowerCase();
   const emisorStart   = tl.indexOf("datos del emisor");
+  const vendedorStart = tl.indexOf("datos del vendedor");
   const receptorStart = tl.indexOf("datos del adquiriente");
   const detallesStart = tl.indexOf("detalles de productos");
 
-  const emisorBlock   = emisorStart >= 0
-    ? t.slice(emisorStart, receptorStart > emisorStart ? receptorStart : undefined)
+  // POS uses "Datos del vendedor" instead of "Datos del Emisor / Vendedor"
+  const efectiveEmisorStart = emisorStart >= 0 ? emisorStart : vendedorStart;
+  let emisorBlock = efectiveEmisorStart >= 0
+    ? t.slice(efectiveEmisorStart, receptorStart > efectiveEmisorStart ? receptorStart : undefined)
     : "";
   const receptorBlock = receptorStart >= 0
     ? t.slice(receptorStart, detallesStart > receptorStart ? detallesStart : undefined)
@@ -246,10 +257,11 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
     block.match(new RegExp(`${label}\\s*(.+?)${STOP}`, "i"))?.[1]?.trim() || "";
 
   // Razón Social can run into "Nombre Comercial:" on the same line
-  const issuerName = (
-    emisorBlock.match(/Razón Social:\s*([^\n]+?)(?:Nombre Comercial:|\n|$)/i)?.[1]?.trim() || ""
+  let issuerName = (
+    emisorBlock.match(/Razón [Ss]ocial:\s*([^\n]+?)(?:Nombre Comercial:|Tipo de documento:|Número de documento:|\n|$)/i)?.[1]?.trim() || ""
   );
-  const issuerNit                = field(emisorBlock,    "Nit del Emisor:");
+  let issuerNit = field(emisorBlock, "Nit del Emisor:");
+  if (!issuerNit) issuerNit = field(emisorBlock, "Número de documento:");
   const issuerCommercialName     = field(emisorBlock,    "Nombre Comercial:");
   const issuerTaxpayerType       = field(emisorBlock,    "Tipo de Contribuyente:");
   const issuerFiscalRegime       = field(emisorBlock,    "Régimen Fiscal:");
@@ -262,8 +274,10 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   const issuerPhone              = field(emisorBlock,    "Teléfono / Móvil:");
   const issuerEmail              = field(emisorBlock,    "Correo:");
 
-  const receiverName             = receptorBlock.match(/Nombre o Razón Social:\s*([^\n]+)/i)?.[1]?.trim() || "";
-  const receiverNit              = field(receptorBlock,  "Número Documento:");
+  let receiverName = receptorBlock.match(/Nombre o Razón Social:\s*([^\n]+)/i)?.[1]?.trim() || "";
+  if (!receiverName) receiverName = receptorBlock.match(/Razón social:\s*([^\n]+?)(?:NIT del|Tipo de|\n|$)/i)?.[1]?.trim() || "";
+  let receiverNit = field(receptorBlock, "Número Documento:");
+  if (!receiverNit) receiverNit = receptorBlock.match(/NIT del adquiriente:\s*([^\n]+?)(?:\n|$)/i)?.[1]?.trim() || "";
   const receiverTaxpayerType     = field(receptorBlock,  "Tipo de Contribuyente:");
   const receiverFiscalRegime     = field(receptorBlock,  "Régimen [Ff]iscal:");
   const receiverTaxResponsibility= field(receptorBlock,  "Responsabilidad tributaria:");
@@ -290,17 +304,26 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
                       ?? tb.match(/Descuento detalle([\d.,]+)/i)?.[1]);
     surcharge = parseCOP(tb.match(/R\s*e\s*c\s*a\s*r\s*g\s*o\s+d\s*e\s+t\s*a\s*l\s*l\s*e\s*([\d.,]+)/i)?.[1]
                       ?? tb.match(/Recargo detalle([\d.,]+)/i)?.[1]);
-    // "IVA" can appear as "IV A" due to font kerning — flexible spacing
-    iva       = parseCOP(tb.match(/\nI\s*V\s*A\s*([\d.,]+)/i)?.[1]);
-    inc       = parseCOP(tb.match(/\nINC\s*([\d.,]+)/i)?.[1]);
-    bolsas    = parseCOP(tb.match(/Bolsas\s*([\d.,]+)/i)?.[1]);
-    icui      = parseCOP(tb.match(/ICUI\s*([\d.,]+)/i)?.[1]);
-    ibua      = parseCOP(tb.match(/IBUA\s*([\d.,]+)/i)?.[1]);
-    icl       = parseCOP(tb.match(/\nICL\s*([\d.,]+)/i)?.[1]);
-    adv       = parseCOP(tb.match(/\nADV\s*([\d.,]+)/i)?.[1]);
-    // IC aparece bajo el rótulo "Otros impuestos" en el PDF de la Solución Gratuita DIAN
-    icOtros   = parseCOP(tb.match(/Otros impuestos\s*([\d.,]+)/i)?.[1]);
-    total     = parseCOP(tb.match(/Total factura\s*\(=\)[^\n]*COP\s*\$([\d.,]+)/i)?.[1]);
+    if (isPOS) {
+      // POS IVA uses US format (comma=thousands, dot=decimal): "28,739.50"
+      const posIvaStr = tb.match(/Total\s+IVA\s*([\d,]+\.\d{2})/i)?.[1];
+      if (posIvaStr) iva = parseFloat(posIvaStr.replace(/,/g, "")) || 0;
+      // "Total documento" spans multiple lines in POS PDFs
+      const posTotalStr = tb.match(/Total\s+documento[\s\S]{1,30}COP\s*\$([\d.,]+)/i)?.[1];
+      if (posTotalStr) total = parseCOP(posTotalStr);
+    } else {
+      // "IVA" can appear as "IV A" due to font kerning — flexible spacing
+      iva     = parseCOP(tb.match(/\nI\s*V\s*A\s*([\d.,]+)/i)?.[1]);
+      inc     = parseCOP(tb.match(/\nINC\s*([\d.,]+)/i)?.[1]);
+      bolsas  = parseCOP(tb.match(/Bolsas\s*([\d.,]+)/i)?.[1]);
+      icui    = parseCOP(tb.match(/ICUI\s*([\d.,]+)/i)?.[1]);
+      ibua    = parseCOP(tb.match(/IBUA\s*([\d.,]+)/i)?.[1]);
+      icl     = parseCOP(tb.match(/\nICL\s*([\d.,]+)/i)?.[1]);
+      adv     = parseCOP(tb.match(/\nADV\s*([\d.,]+)/i)?.[1]);
+      // IC aparece bajo el rótulo "Otros impuestos" en el PDF de la Solución Gratuita DIAN
+      icOtros = parseCOP(tb.match(/Otros impuestos\s*([\d.,]+)/i)?.[1]);
+      total   = parseCOP(tb.match(/Total factura\s*\(=\)[^\n]*COP\s*\$([\d.,]+)/i)?.[1]);
+    }
   }
 
   // ── Taxes array ───────────────────────────────────────────────────────────────

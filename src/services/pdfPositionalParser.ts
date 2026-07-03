@@ -18,7 +18,7 @@ async function getPdfjs() {
   return _pdfjs;
 }
 
-// ── Column boundaries (DIAN fixed layout) ────────────────────────────────────
+// ── Column boundaries (DIAN "Solución Gratuita" fixed layout) ────────────────
 const X = {
   nroMax:   58,   // item number: x < 58
   codigoX:  54,   // Código starts at x ≈ 55
@@ -31,6 +31,22 @@ const X = {
   extMin:  520, extMax: 590,  // precio unitario de venta (line extension)
   rowTol:    5,   // Y tolerance to group items into same row (pt)
   descTol:  25,   // max Y distance for description overflow rows
+};
+
+// ── Column boundaries for DOCUMENTO EQUIVALENTE POS ──────────────────────────
+// POS PDFs have wider left columns and US-format numbers (period=decimal, comma=thousands).
+// Items are only ~29pt apart so overflow rows can be closer to the NEXT item's Y; we use
+// "preceding data row" assignment (not nearest) and a larger descTol to handle this.
+const XP = {
+  nroMax:   70,
+  descMin: 138, descMax: 191,  // desc at x ≈ 140-165; U/M overflows at x ≥ 192 are excluded
+  umMin:   188,
+  qtyMin:  248, qtyMax: 298,   // Cantidad: x ≈ 260
+  ivaMin:  358, ivaMax: 428,   // IVA amount: x ≈ 368-380
+  pctMin:  428, pctMax: 455,   // % IVA: x ≈ 425-436
+  extMin:  453, extMax: 515,   // Valor de venta: x ≈ 464-468
+  rowTol:    5,
+  descTol:  45,  // larger than regular (25) to cover 4-5 overflow lines at ~9pt each
 };
 
 type PosItem = { text: string; x: number; y: number };
@@ -48,6 +64,11 @@ function parseCOPs(s: string): number[] {
 function parsePCTs(s: string): number[] {
   const withoutCOP = s.replace(new RegExp(COP_RE.source, "g"), " ");
   return [...withoutCOP.matchAll(PCT_RE)].map((m) => parseFloat(m[0]));
+}
+
+// US format: comma=thousands, period=decimal — "1,069.75" → 1069.75
+function parseUSNum(s: string): number {
+  return parseFloat(s.replace(/,/g, "")) || 0;
 }
 
 // ── pdfjs-dist: extract text items with (x, y) coordinates ──────────────────
@@ -107,9 +128,110 @@ function isDataRow(row: Row): boolean {
   );
 }
 
+function isDataRowPOS(row: Row): boolean {
+  return (
+    row.items.some((it) => it.x < XP.nroMax && /^\d+$/.test(it.text)) &&
+    row.items.some((it) => it.x >= XP.qtyMin && it.x < XP.qtyMax)
+  );
+}
+
+function parseRowsPOS(rows: Row[]): InvoiceLineItem[] {
+  const dataIdxs = rows.map((r, i) => (isDataRowPOS(r) ? i : -1)).filter((i) => i >= 0);
+
+  const assigned = new Map<number, number>();
+  for (let i = 0; i < rows.length; i++) {
+    if (isDataRowPOS(rows[i])) continue;
+    const t = inRange(rows[i], XP.descMin, XP.descMax);
+    if (!t) continue;
+    if (/descripci[oó]n/i.test(t)) continue;
+    // POS items are ~29pt apart so "nearest" would assign overflow rows to the NEXT item.
+    // Use the most recent PRECEDING data row instead.
+    let preceding = -1;
+    for (const di of dataIdxs) {
+      if (di < i && di > preceding) preceding = di;
+    }
+    if (preceding >= 0 && Math.abs(rows[i].y - rows[preceding].y) <= XP.descTol) {
+      assigned.set(i, preceding);
+    }
+  }
+
+  const result: InvoiceLineItem[] = [];
+  let lineNum = 1;
+
+  for (const di of dataIdxs) {
+    const row = rows[di];
+
+    type DescFrag = { y: number; t: string };
+    const beforeFrags: DescFrag[] = [];
+    const afterFrags:  DescFrag[] = [];
+    for (const [rowIdx, dataIdx] of assigned) {
+      if (dataIdx !== di) continue;
+      const frag = inRange(rows[rowIdx], XP.descMin, XP.descMax);
+      if (!frag) continue;
+      if (rows[rowIdx].y < row.y) beforeFrags.push({ y: rows[rowIdx].y, t: frag });
+      else                         afterFrags.push({ y: rows[rowIdx].y, t: frag });
+    }
+    beforeFrags.sort((a, b) => a.y - b.y);
+    afterFrags.sort((a, b)  => a.y - b.y);
+
+    const inRowDesc = inRange(row, XP.descMin, XP.descMax);
+
+    const parts = [...beforeFrags.map((p) => p.t), inRowDesc, ...afterFrags.map((p) => p.t)]
+      .filter(Boolean);
+    let description = "";
+    for (const part of parts) {
+      if (!description) { description = part; continue; }
+      const digitSeam = /\d$/.test(description) && /^\d/.test(part);
+      description = digitSeam
+        ? description + part
+        : (description.trimEnd() + " " + part.trimStart()).trim();
+    }
+    description = description.trim();
+    if (!description) continue;
+
+    // POS numeric columns — US format (period=decimal, comma=thousands)
+    const qtyText = inRange(row, XP.qtyMin, XP.qtyMax);
+    const ivaText = inRange(row, XP.ivaMin, XP.ivaMax);
+    const pctText = inRange(row, XP.pctMin, XP.pctMax);
+    const extText = inRange(row, XP.extMin, XP.extMax);
+
+    const cantidad       = parseUSNum(qtyText);
+    if (cantidad <= 0) continue;
+    const ivaAmount      = parseUSNum(ivaText);
+    const ivaPercent     = parseUSNum(pctText);
+    const totalUnitPrice = parseUSNum(extText);
+    const unitPrice      = cantidad > 0 ? totalUnitPrice / cantidad : totalUnitPrice;
+
+    const taxes: TaxDetail[] = [];
+    if (ivaPercent > 0 || ivaAmount > 0) {
+      taxes.push({ taxId: "01", taxName: "IVA", amount: ivaAmount, percent: ivaPercent });
+    }
+
+    result.push({
+      lineNumber:    lineNum++,
+      description,
+      quantity:      cantidad,
+      unitPrice,
+      discount:      0,
+      surcharge:     0,
+      taxes,
+      ivaAmount,
+      ivaPercent,
+      incAmount:     0,
+      incPercent:    0,
+      totalUnitPrice,
+      taxableBase:   totalUnitPrice,
+    });
+  }
+
+  return result;
+}
+
 // ── Public: parse line items from a PDF buffer ────────────────────────────────
 export async function parseLineItemsPositional(buffer: Buffer): Promise<InvoiceLineItem[]> {
   const posItems = await extractPositionedItems(buffer);
+
+  const isPOS = posItems.some((it) => /DOCUMENTO EQUIVALENTE POS/i.test(it.text));
 
   // Restrict to the "Detalles de Productos" table area
   const detalles = posItems.find((it) =>
@@ -128,7 +250,7 @@ export async function parseLineItemsPositional(buffer: Buffer): Promise<InvoiceL
     : posItems;
 
   const rows = groupRows(tableItems);
-  return parseRows(rows);
+  return isPOS ? parseRowsPOS(rows) : parseRows(rows);
 }
 
 // ── Core row parser ───────────────────────────────────────────────────────────
