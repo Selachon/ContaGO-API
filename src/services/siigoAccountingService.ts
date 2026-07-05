@@ -1,5 +1,6 @@
 import JSZip from "jszip";
 import { extractInvoiceDataFromXml } from "./xmlParser.js";
+import { parsePdfInvoice } from "../routes/pdfParse.js";
 import {
   createPurchase,
   createPurchaseSupportDocument,
@@ -10,7 +11,7 @@ import {
   getDocumentType,
   SiigoError,
 } from "./siigoService.js";
-import { getSupplierProfile, type SupplierProfile } from "./siigoSuggestionsService.js";
+import { getSupplierProfile, listLocalSupplierIndex, type SupplierProfile } from "./siigoSuggestionsService.js";
 
 /** Impuesto extra (ICL, IBUA, IC, Bolsas…) de una línea del XML. */
 export interface XmlExtraTax {
@@ -158,6 +159,16 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
     );
   }
 
+  return invoiceDataToCausacion(xmlData);
+}
+
+/**
+ * Mapea un InvoiceData (proveniente de un XML o de un PDF parseado) a los ítems y
+ * totales de causación: base neta de descuentos, obsequios, recargo a nivel documento
+ * e impuestos extra. Compartido por el flujo de XML y el de PDF.
+ */
+export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean } = {}): XmlCausacionData {
+  const lineItems: any[] = Array.isArray(xmlData.lineItems) ? xmlData.lineItems : [];
   const { prefix, number } = splitDocNumber(xmlData.docNumber);
   const isCreditNote = /cr[eé]dito/i.test(String(xmlData.documentType || ""));
   const validDate =
@@ -167,7 +178,8 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
   const IVA_LIKE = new Set(["IVA", "Retefuente", "ReteICA", "ReteIVA"]);
   // Nombre del "impuesto extra" bajo el cual se causa el IVA de obsequios (cuenta PUC parametrizable).
   const GIFT_TAX_NAME = "IVA Obsequio";
-  const items: XmlCausacionItem[] = lineItems.map((li) => {
+  const r2 = (n: number) => Math.round(n * 100) / 100;
+  const items: XmlCausacionItem[] = lineItems.flatMap((li) => {
     const lineExt = Number(li.totalUnitPrice) || 0;
     const ivaAmt = Number(li.ivaAmount) || 0;
     const incAmt = Number(li.incAmount) || 0;
@@ -187,14 +199,46 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
     // Base = base gravable del IVA (TaxableAmount), que ya viene neta de descuentos de
     // línea. Si el XML no la trae, se cae a LineExtensionAmount o cantidad×precio.
     const taxBase = Number(li.taxableBase) || 0;
-    return {
+    const grossBase = isGift ? 0 : (taxBase > 0 ? taxBase : (lineExt || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0)));
+    let base = grossBase;
+    let effIvaPct = Number(li.ivaPercent) || 0;
+    const parserGaveRate = effIvaPct > 0;
+    let exemptRemainder = 0; // porción no gravada del costo (base gravable especial, p. ej. licores)
+    // PDF: algunos formatos traen el IVA por línea en MONTO pero con porcentaje = 0 (o mezclan
+    // tasas 5%/19% en la misma factura). El IVA cobrado es el real, así que se deriva:
+    //  1) la TASA desde IVA/base bruta (snap a 5% o 19%);
+    //  2) la BASE neta = IVA / tasa. Si el parser dio la tasa, el faltante es un descuento de
+    //     línea (no se causa). Si la tasa se derivó (snap), el faltante es la porción excluida
+    //     del costo (base gravable especial) → se causa como ítem aparte al 0%.
+    // En XML no aplica (tasa y base vienen exactas).
+    if (opts.reconcile && !isGift && ivaAmt > 0 && base > 0) {
+      if (effIvaPct === 0) {
+        const raw = (ivaAmt / base) * 100;
+        effIvaPct = raw <= 5.5 ? 5 : 19; // tasas de IVA en Colombia: 5% o 19%
+      }
+      const derived = r2(ivaAmt / (effIvaPct / 100));
+      if (derived > 0 && derived < base - 1) {
+        if (parserGaveRate) {
+          base = derived; // descuento de línea: el resto no se causa
+        } else {
+          base = derived;
+          exemptRemainder = r2(grossBase - derived); // resto del costo, no gravado
+        }
+      }
+    }
+
+    const mainItem: XmlCausacionItem = {
       description: li.description || "",
-      base: isGift ? 0 : (taxBase > 0 ? taxBase : (lineExt || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0))),
-      ivaPercent: isGift ? 0 : (ivaAmt > 0 ? (Number(li.ivaPercent) || 0) : 0),
+      base,
+      ivaPercent: isGift ? 0 : (ivaAmt > 0 ? effIvaPct : 0),
       incPercent: isGift ? 0 : (incAmt > 0 ? (Number(li.incPercent) || 0) : 0),
       extraTaxes: extraTaxes.length ? extraTaxes : undefined,
       isGift: isGift || undefined,
     };
+    if (exemptRemainder > 0) {
+      return [mainItem, { description: `${li.description || ""} (base excluida)`, base: exemptRemainder, ivaPercent: 0, incPercent: 0 }];
+    }
+    return [mainItem];
   });
 
   // Recargo a nivel documento (ChargeTotalAmount): se aplica después del total, sin IVA.
@@ -211,8 +255,52 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
     });
   }
 
+  // Reconciliación contra el total del documento. Se usa para PDF (descarga masiva sin
+  // XML): las líneas del PDF vienen en bruto y descuento/recargo no siempre por línea,
+  // pero el TOTAL del documento es confiable. En XML no aplica (ya cuadra por TaxableAmount).
+  if (opts.reconcile) {
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+    const docTotal = Number(xmlData.total) || 0;
+    // Las bases ya vienen netas (derivadas del IVA real por línea). El residual captura
+    // lo que falte para llegar al total del documento: recargo (positivo) no rotulado.
+    if (docTotal > 0) {
+      const computed = items.reduce(
+        (s, it) =>
+          s +
+          it.base * (1 + (it.ivaPercent || 0) / 100 + (it.incPercent || 0) / 100) +
+          (it.extraTaxes || []).reduce((a, e) => a + e.amount, 0),
+        0
+      );
+      const residual = r2(docTotal - computed);
+      // Tolerancia por acumulación de redondeo al derivar bases por línea (≈ ½ peso/línea).
+      // Un recargo real es de cientos+; residuos de pocos pesos los absorbe el reintento
+      // de invalid_total_payments al enviar a Siigo.
+      const tol = Math.max(5, items.length);
+      if (residual > tol) {
+        items.push({
+          description: "RECARGO",
+          base: 0,
+          ivaPercent: 0,
+          incPercent: 0,
+          extraTaxes: [{ taxName: "Recargo", amount: residual, percent: 0 }],
+          isSurcharge: true,
+        });
+      } else if (residual < -tol) {
+        // Descuento a nivel documento (post-IVA): ítem negativo hacia una cuenta PUC parametrizable.
+        items.push({
+          description: "DESCUENTO",
+          base: 0,
+          ivaPercent: 0,
+          incPercent: 0,
+          extraTaxes: [{ taxName: "Descuento", amount: residual, percent: 0 }], // negativo
+          isSurcharge: true,
+        });
+      }
+    }
+  }
+
   console.log(
-    `[SiigoAccounting] XML ${xmlData.docNumber || "?"} — NIT ${xmlData.issuerNit}, ${items.length} ítem(s)` +
+    `[SiigoAccounting] ${opts.reconcile ? "PDF" : "XML"} ${xmlData.docNumber || "?"} — NIT ${xmlData.issuerNit}, ${items.length} ítem(s)` +
       (surcharge > 0 ? ` (incluye recargo ${surcharge})` : "")
   );
 
@@ -234,6 +322,20 @@ export async function processXmlForAccounting(xmlBuffer: Buffer): Promise<XmlCau
     },
     supplierDraft: buildSupplierDraft(xmlData),
   };
+}
+
+/**
+ * Procesa un PDF de factura DIAN (descarga masiva sin XML) a los datos de causación,
+ * reutilizando el parser de PDF de la exportación a Excel y el mismo mapeo que el XML.
+ */
+export async function processPdfForAccounting(pdfBuffer: Buffer, filename: string): Promise<XmlCausacionData> {
+  console.log(`[SiigoAccounting] Procesando PDF (${pdfBuffer.length} bytes) — ${filename}`);
+  const inv = (await parsePdfInvoice(pdfBuffer, filename)) as any;
+  const lineItems: any[] = Array.isArray(inv.lineItems) ? inv.lineItems : [];
+  if (!inv.issuerNit && lineItems.length === 0) {
+    throw new Error("No se pudo extraer datos del PDF (sin NIT del emisor ni líneas).");
+  }
+  return invoiceDataToCausacion(inv, { reconcile: true });
 }
 
 // ─── Procesamiento por lote (varios XML o un ZIP) ────────────────────
@@ -342,6 +444,7 @@ export async function processXmlBatch(
   };
 
   const results: BatchItem[] = [];
+  const usedPdf = new Set<string>();
   for (const xf of xmlFiles) {
     try {
       const xml = await processXmlForAccounting(xf.buffer);
@@ -352,6 +455,7 @@ export async function processXmlBatch(
         /* sin perfil disponible */
       }
       const pdf = findPdf(xf.name, xml);
+      if (pdf) usedPdf.add(pdf.name);
       results.push({
         fileName: xf.name,
         ok: true,
@@ -371,6 +475,34 @@ export async function processXmlBatch(
           message: e instanceof Error ? e.message : "Error procesando el XML",
         });
       }
+    }
+  }
+
+  // PDFs sin XML asociado: se causan desde el propio PDF (descarga masiva DIAN sin XML).
+  for (const pdf of pdfMap.values()) {
+    if (usedPdf.has(pdf.name)) continue;
+    try {
+      const xml = await processPdfForAccounting(pdf.buffer, pdf.name);
+      let profile: SupplierProfile | null = null;
+      try {
+        profile = await getSupplierProfile(xml.supplierNit);
+      } catch {
+        /* sin perfil disponible */
+      }
+      results.push({
+        fileName: pdf.name,
+        ok: true,
+        xml,
+        profile,
+        pdfBase64: pdf.buffer.toString("base64"),
+        pdfName: pdf.name,
+      });
+    } catch (e) {
+      results.push({
+        fileName: pdf.name,
+        ok: false,
+        message: e instanceof Error ? e.message : "Error procesando el PDF",
+      });
     }
   }
 
@@ -420,6 +552,13 @@ export async function getCustomersIndex(): Promise<CustomerIndexEntry[]> {
     }
     const total = Number(resp?.pagination?.total_results) || 0;
     if (results.length < 100 || (total && out.length >= total)) break;
+  }
+  // Si Siigo no devuelve resultados (restricción del plan de la cuenta),
+  // usamos los perfiles locales como fallback para que el autocompletado funcione.
+  if (out.length === 0) {
+    const local = await listLocalSupplierIndex();
+    customerIndexCache.set(key, { at: Date.now(), data: local });
+    return local;
   }
   customerIndexCache.set(key, { at: Date.now(), data: out });
   return out;

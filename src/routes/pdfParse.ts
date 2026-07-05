@@ -422,6 +422,22 @@ function parsePdfText(rawText: string, filename: string): InvoiceData {
   };
 }
 
+/**
+ * Parsea un PDF de factura DIAN (descarga masiva sin XML) a InvoiceData, con el mismo
+ * parser que la exportación a Excel: texto + líneas posicionales. Reutilizado por la
+ * herramienta "Contabilizar Gastos Siigo" para causar desde PDF cuando no hay XML.
+ */
+export async function parsePdfInvoice(buffer: Buffer, filename: string): Promise<InvoiceData> {
+  const parsed = await pdfParse(buffer);
+  const invoice = parsePdfText(parsed.text, filename);
+  try {
+    invoice.lineItems = await parseLineItemsPositional(buffer);
+  } catch {
+    // Si el parser posicional falla, se conservan las líneas del flujo de texto.
+  }
+  return invoice;
+}
+
 // Aplica los impuestos del listado DIAN a una factura, reemplazando los extraídos del PDF.
 function mergeDianListingTaxes(inv: InvoiceData, lt: DianTaxRow): void {
   const subtotal = inv.subtotal || 0;

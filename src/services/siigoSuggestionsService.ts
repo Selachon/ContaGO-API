@@ -399,6 +399,39 @@ export async function getAccountsCatalog(): Promise<AccountCatalogEntry[]> {
   return (bal?.accounts as AccountCatalogEntry[]) || [];
 }
 
+/**
+ * Índice local de terceros como fallback cuando Siigo no devuelve resultados.
+ * Fusiona: siigoSupplierProfiles (causación) + siigoEgresoMovs (egresos con nombre).
+ */
+export async function listLocalSupplierIndex(): Promise<{ id: string; identification: string; name: string; branch_office: number }[]> {
+  const cid = currentCompany();
+  const db = getDb();
+
+  // 1. Perfiles de proveedor (causación de gastos)
+  const profiles = await db.collection<any>(PROFILES)
+    .find({ companyId: cid }, { projection: { nit: 1, name: 1 } }).toArray();
+
+  const byNit = new Map<string, string>();
+  for (const p of profiles) {
+    if (p.nit && p.name) byNit.set(String(p.nit), String(p.name));
+  }
+
+  // 2. Movimientos de egresos que tengan NIT + nombre guardado
+  const movs = await db.collection<any>("siigoEgresoMovs")
+    .find({ companyId: cid, nit: { $exists: true, $ne: "" }, supplierName: { $exists: true, $ne: "" } },
+          { projection: { nit: 1, supplierName: 1 } })
+    .toArray();
+  for (const m of movs) {
+    if (m.nit && m.supplierName && !byNit.has(String(m.nit))) {
+      byNit.set(String(m.nit), String(m.supplierName));
+    }
+  }
+
+  return Array.from(byNit.entries()).map(([nit, name]) => ({
+    id: "", identification: nit, name, branch_office: 0,
+  }));
+}
+
 export async function getSupplierProfile(nit: string): Promise<SupplierProfile | null> {
   const key = normNit(nit);
   if (!key) return null;
