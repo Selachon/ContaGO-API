@@ -298,10 +298,12 @@ function parseRows(rows: Row[]): InvoiceLineItem[] {
 
     // In-row description (x 80-168, after código)
     let inRowDesc = inRange(row, 80, X.descMax);
-    // Handle Código+Descripción merged in one text item at x≈55
+    // Handle Código+Descripción merged in one text item at x≈50-58.
+    // Different PT providers render this cell 1-5 pt to the left of X.codigoX,
+    // so use a fixed lower bound of 50 instead of X.codigoX (54).
     // e.g. "0010127 CERVEZA PILSEN EN LATA"
     if (!inRowDesc) {
-      const codigoCell = inRange(row, X.codigoX, 80);
+      const codigoCell = inRange(row, 50, 80);
       const merged = codigoCell.match(/^\d{5,8}\s+(.+)$/);
       if (merged) inRowDesc = merged[1];
     }
