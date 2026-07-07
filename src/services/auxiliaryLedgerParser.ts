@@ -136,13 +136,24 @@ function findHeader(rows: unknown[][]): { headerRow: number; map: ColMap } {
         secuencia: find("secuencia"),
         fecha: find("fecha elaboracion", "fecha"),
         identificacion: find("identificacion", "nit"),
-        tercero: find("nombre del tercero", "tercero"),
+        tercero: find("nombre del tercero", "tercero", "nombre"),
         descripcion: find("descripcion"),
         detalle: find("detalle"),
         saldoInicial: find("saldo inicial"),
         debito: hasDebito,
         credito: hasCredito,
       };
+      // En el formato "MOVIMIENTO CUENTAS - GENERAL" hay dos columnas DESCRIPCION:
+      // la primera es el nombre de cuenta (col 2) y la segunda es la descripción
+      // del movimiento (col 8, después de COMPROBANTE). Usamos la segunda.
+      const allDescr = cells.reduce<number[]>((a, c, i) => {
+        if (c === "descripcion") a.push(i);
+        return a;
+      }, []);
+      if (allDescr.length > 1 && map.comprobante != null) {
+        const afterComp = allDescr.find((i) => i > map.comprobante!);
+        if (afterComp != null) map.descripcion = afterComp;
+      }
       // Limpia índices -1.
       for (const k of Object.keys(map) as (keyof ColMap)[]) {
         if (map[k] != null && map[k]! < 0) delete map[k];
@@ -180,7 +191,8 @@ export async function parseAuxiliaryLedger(buffer: Buffer): Promise<ParsedLedger
   // venir repetido en todas las columnas por celdas combinadas → tomamos el
   // valor único de la primera celda de cada fila.
   const headLines = rows.slice(0, 12).map((r) => str(r.find((c) => str(c)) ?? ""));
-  const period = headLines.find((l) => /^de\s+\w+.*\d{4}/i.test(l)) || "";
+  // "De: JUN 1/2026 A: JUN 30/2026" o "De JUN 1/2026 A JUN 30/2026"
+  const period = headLines.find((l) => /^de[:\s]+\w+.*\d{4}/i.test(l)) || "";
 
   const { headerRow, map } = findHeader(rows);
 
@@ -231,7 +243,18 @@ export async function parseAuxiliaryLedger(buffer: Buffer): Promise<ParsedLedger
     if (debit === 0 && credit === 0) continue;
 
     if (!accountCode && /^\d{4,}$/.test(codigoCell)) accountCode = codigoCell;
+    if (!accountCode && cuentaCell) {
+      // Formato "MOVIMIENTO CUENTAS - GENERAL": primera col = "11100505   BCO OCCIDENTE..."
+      const mc = cuentaCell.match(/^(\d{5,})\s+(.+)/);
+      if (mc) { accountCode = mc[1]; accountName = mc[2].trim(); }
+    }
     if (!accountName && cuentaCell) accountName = cuentaCell;
+    // En el formato "MOVIMIENTO CUENTAS - GENERAL" el saldo inicial se repite
+    // en cada fila de movimiento — lo tomamos de la primera fila de datos.
+    if (opening == null && map.saldoInicial != null) {
+      const si = num(get(row, map.saldoInicial));
+      if (si !== 0) opening = si;
+    }
 
     const direction: "in" | "out" = debit > 0 ? "in" : "out";
     entries.push({
