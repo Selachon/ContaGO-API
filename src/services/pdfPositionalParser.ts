@@ -340,12 +340,23 @@ function parseRows(rows: Row[]): InvoiceLineItem[] {
     const cantidad       = qtyCOPs[0] || 0;
     if (cantidad <= 0) continue;
 
-    const ivaAmount      = ivaCOPs[0] || 0;
-    const ivaPercent     = ivaPCTs[0] || 0;  // e.g. 19.00 (not 0.19), matches excelGenerator convention
-    const incAmount      = incCOPs[0] || 0;
-    const incPercent     = incPCTs[0] || 0;
+    let ivaAmount      = ivaCOPs[0] || 0;
+    let ivaPercent     = ivaPCTs[0] || 0;  // e.g. 19.00 (not 0.19), matches excelGenerator convention
+    let incAmount      = incCOPs[0] || 0;
+    let incPercent     = incPCTs[0] || 0;
     const totalUnitPrice = extCOPs.at(-1) || 0;  // precio unitario de venta = line extension
     const unitPrice      = cantidad > 0 ? totalUnitPrice / cantidad : totalUnitPrice;
+
+    // Tasas válidas de IVA en Colombia: 0%, 5%, 19%.
+    // Si el PDF coloca un impuesto en la columna IVA pero con una tasa diferente
+    // (e.g. 8% de restaurantes), en realidad es INC. Lo reclasificamos.
+    const VALID_IVA_RATES = new Set([0, 5, 19]);
+    if (ivaAmount > 0 && !VALID_IVA_RATES.has(ivaPercent)) {
+      incAmount  += ivaAmount;
+      incPercent  = incPercent || ivaPercent;
+      ivaAmount   = 0;
+      ivaPercent  = 0;
+    }
 
     const taxes: TaxDetail[] = [];
     if (ivaPercent > 0 || ivaAmount > 0) {
