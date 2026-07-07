@@ -132,6 +132,17 @@ publicCajaRouter.get("/public/:token/report", async (req, res) => {
   }});
 });
 
+publicCajaRouter.get("/public/:token/flujo", async (req, res) => {
+  const companyId = await resolveCompanyByToken(req.params.token);
+  if (!companyId) return res.status(404).json({ ok: false, message: "Token inválido." });
+  const meses = Math.min(12, Math.max(1, Number(req.query.meses) || 6));
+  const [flujo, config] = await Promise.all([
+    computeFlujoEditable(companyId, meses),
+    getCajaConfig(companyId),
+  ]);
+  res.json({ ok: true, data: { flujo, config } });
+});
+
 publicCajaRouter.get("/public/:token/excel", async (req, res) => {
   const companyId = await resolveCompanyByToken(req.params.token);
   if (!companyId) return res.status(404).json({ ok: false, message: "Token inválido." });
@@ -143,36 +154,53 @@ publicCajaRouter.get("/public/:token/excel", async (req, res) => {
   const HEAD_FILL = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FF" + BLUE } };
   const ALT_FILL  = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FFF5F5F5" } };
 
-  // Hoja "Todos los movimientos"
-  const wsTodos = wb.addWorksheet("Todos los movimientos");
-  const hRow = wsTodos.addRow(["Fecha", "Mes", "Proyecto", "Descripción", "Categoría", "Valor"]);
-  hRow.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
-  const allItems: any[] = [];
-  for (const r of rows) for (const it of r.items || []) allItems.push({ ...it, proyNombre: r.proyecto.nombre });
-  allItems.sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
-  let ri = 2;
-  for (const it of allItems) {
-    const val = round(it.valor) * (it.direction === "in" ? 1 : -1);
-    const dRow = wsTodos.addRow([it.fecha, String(it.fecha || "").slice(0, 7), it.proyNombre, it.descripcion, it.categoria || it.origen || "", val]);
-    dRow.getCell(6).numFmt = "#,##0";
-    dRow.getCell(6).font = { color: { argb: val >= 0 ? "FF1B5E20" : "FFB71C1C" } };
-    if (ri % 2 === 0) dRow.eachCell((c) => { c.fill = ALT_FILL; });
-    ri++;
+  const { proyectoId } = req.query as { proyectoId?: string };
+
+  function addMovSheet(ws: ExcelJS.Worksheet, items: any[], proyNombre: string) {
+    const hRow = ws.addRow(["Fecha", "Mes", "Proyecto", "Descripción", "Categoría", "Valor"]);
+    hRow.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
+    const sorted = [...items].sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
+    let ri = 2;
+    for (const it of sorted) {
+      const val = round(it.valor) * (it.direction === "in" ? 1 : -1);
+      const dRow = ws.addRow([it.fecha, String(it.fecha || "").slice(0, 7), proyNombre, it.descripcion, it.categoria || it.origen || "", val]);
+      dRow.getCell(6).numFmt = "#,##0";
+      dRow.getCell(6).font = { color: { argb: val >= 0 ? "FF1B5E20" : "FFB71C1C" } };
+      if (ri % 2 === 0) dRow.eachCell((c) => { c.fill = ALT_FILL; });
+      ri++;
+    }
+    ws.columns = [{ width: 12 }, { width: 10 }, { width: 28 }, { width: 50 }, { width: 26 }, { width: 18 }];
+    ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: 6 } };
+    ws.views = [{ state: "frozen", ySplit: 1 }];
   }
-  wsTodos.columns = [{ width: 12 }, { width: 10 }, { width: 28 }, { width: 50 }, { width: 26 }, { width: 18 }];
-  wsTodos.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: 6 } };
-  wsTodos.views = [{ state: "frozen", ySplit: 1 }];
 
-  // Hoja resumen
-  const wsRes = wb.addWorksheet("Resumen");
-  const rh = wsRes.addRow(["Proyecto", "Saldo inicial", "Ingresos", "Egresos", "Saldo"]);
-  rh.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
-  for (const r of rows.slice().sort((a, b) => b.saldo - a.saldo))
-    wsRes.addRow([r.proyecto.nombre, round(r.proyecto.saldoInicial || 0), round(r.ingresos), round(r.egresos), round(r.saldo)]);
-  wsRes.addRow(["TOTAL CAJA", "", "", "", round(totalCaja)]).font = { bold: true };
-  wsRes.columns = [{ width: 32 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 16 }];
+  let fname: string;
 
-  const fname = `caja_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  if (proyectoId) {
+    // Descarga de un solo proyecto
+    const row = rows.find((r) => r.proyecto.id === proyectoId);
+    if (!row) return res.status(404).json({ ok: false, message: "Proyecto no encontrado." });
+    const ws = wb.addWorksheet(row.proyecto.nombre.slice(0, 31));
+    addMovSheet(ws, row.items || [], row.proyecto.nombre);
+    fname = `caja_${row.proyecto.nombre.replace(/\s+/g, "_").slice(0, 30)}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  } else {
+    // Descarga consolidada (todos)
+    const wsTodos = wb.addWorksheet("Todos los movimientos");
+    const allItems: any[] = [];
+    for (const r of rows) for (const it of r.items || []) allItems.push({ ...it, proyNombre: r.proyecto.nombre });
+    addMovSheet(wsTodos, allItems.map((it) => ({ ...it, descripcion: it.descripcion })), "");
+    // Overwrite column 3 with proyNombre per row already included via the addMovSheet loop
+    // Hoja resumen
+    const wsRes = wb.addWorksheet("Resumen");
+    const rh = wsRes.addRow(["Proyecto", "Saldo inicial", "Ingresos", "Egresos", "Saldo"]);
+    rh.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
+    for (const r of rows.slice().sort((a, b) => b.saldo - a.saldo))
+      wsRes.addRow([r.proyecto.nombre, round(r.proyecto.saldoInicial || 0), round(r.ingresos), round(r.egresos), round(r.saldo)]);
+    wsRes.addRow(["TOTAL CAJA", "", "", "", round(totalCaja)]).font = { bold: true };
+    wsRes.columns = [{ width: 32 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 16 }];
+    fname = `caja_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  }
+
   res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
   await wb.xlsx.write(res); res.end();
@@ -669,6 +697,7 @@ async function buildCajaData(companyId: string) {
   const ensure = (pid: string) => { if (!byProj.has(pid)) byProj.set(pid, { items: [], in: 0, out: 0 }); return byProj.get(pid)!; };
   for (const m of movs as any[]) {
     const pid = (tagsMap as any)[m.id]; if (!pid) continue;
+    if (m.cajaEntryId) continue; // ya representado como entry manual — evitar doble conteo
     const e = ensure(pid); const v = Number(m.value) || 0;
     if (m.direction === "in") e.in += v; else e.out += v;
     e.items.push({ fecha: m.date, descripcion: m.description, valor: v, direction: m.direction, origen: "Banco" });
@@ -1116,9 +1145,10 @@ router.post("/plan/ingresos", async (req: Request, res: Response) => {
   const companyId = req.headers["x-siigo-company"] as string;
   if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
     return res.status(403).json({ ok: false, message: "Sin acceso." });
-  const { concepto, tipo, pagos } = req.body;
+  const { concepto, tipo, pagos, notaDescarte, montoEstimado } = req.body;
   if (!concepto) return res.status(400).json({ ok: false, message: "concepto requerido." });
-  const item = await upsertPlanIngreso(companyId, { concepto, tipo: tipo === "probable" ? "probable" : "confirmado", pagos: pagos || [] });
+  const tipoVal = tipo === "probable" ? "probable" : tipo === "descartado" ? "descartado" : "confirmado";
+  const item = await upsertPlanIngreso(companyId, { concepto, tipo: tipoVal, pagos: pagos || [], notaDescarte, montoEstimado: montoEstimado ? Number(montoEstimado) : undefined });
   res.json({ ok: true, item });
 });
 
@@ -1126,8 +1156,9 @@ router.patch("/plan/ingresos/:id", async (req: Request, res: Response) => {
   const companyId = req.headers["x-siigo-company"] as string;
   if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
     return res.status(403).json({ ok: false, message: "Sin acceso." });
-  const { concepto, tipo, pagos } = req.body;
-  const item = await upsertPlanIngreso(companyId, { id: req.params.id, concepto, tipo: tipo === "probable" ? "probable" : "confirmado", pagos: pagos || [] });
+  const { concepto, tipo, pagos, notaDescarte, montoEstimado } = req.body;
+  const tipoVal = tipo === "probable" ? "probable" : tipo === "descartado" ? "descartado" : "confirmado";
+  const item = await upsertPlanIngreso(companyId, { id: req.params.id, concepto, tipo: tipoVal, pagos: pagos || [], notaDescarte, montoEstimado: montoEstimado ? Number(montoEstimado) : undefined });
   res.json({ ok: true, item });
 });
 
@@ -1192,10 +1223,12 @@ router.patch("/plan/config", async (req: Request, res: Response) => {
   const companyId = req.headers["x-siigo-company"] as string;
   if (!companyId || !(await userCanAccessCompany(companyId, req.user!.userId)))
     return res.status(403).json({ ok: false, message: "Sin acceso." });
-  const { saldoInicial, tarifaIca } = req.body;
+  const { saldoInicial, tarifaIca, saldoBancos, adeudadoProyectos } = req.body;
   const config = await updateCajaConfig(companyId, {
-    ...(saldoInicial !== undefined ? { saldoInicial: Number(saldoInicial) } : {}),
-    ...(tarifaIca    !== undefined ? { tarifaIca:    Number(tarifaIca)    } : {}),
+    ...(saldoInicial        !== undefined ? { saldoInicial:        Number(saldoInicial) }        : {}),
+    ...(tarifaIca           !== undefined ? { tarifaIca:           Number(tarifaIca) }            : {}),
+    ...(saldoBancos         !== undefined ? { saldoBancos:         Number(saldoBancos) }          : {}),
+    ...(adeudadoProyectos   !== undefined ? { adeudadoProyectos }                                 : {}),
   });
   res.json({ ok: true, config });
 });
