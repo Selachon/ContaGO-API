@@ -1009,19 +1009,25 @@ export interface PlanIngreso {
   id: string;
   companyId: string;
   concepto: string;
-  tipo: "confirmado" | "probable";
+  tipo: "confirmado" | "probable" | "descartado";
   pagos: { mes: string; monto: number }[];
+  montoEstimado?: number;
+  notaDescarte?: string;
   createdAt: string;
   updatedAt: string;
 }
 
 function mapPlanIngreso(d: any): PlanIngreso {
+  const tipo: PlanIngreso["tipo"] =
+    d.tipo === "probable" ? "probable" : d.tipo === "descartado" ? "descartado" : "confirmado";
   return {
     id: d._id.toString(),
     companyId: d.companyId || "",
     concepto: d.concepto || "",
-    tipo: d.tipo === "probable" ? "probable" : "confirmado",
+    tipo,
     pagos: (d.pagos || []).filter((p: any) => p?.mes && Number(p.monto) > 0),
+    montoEstimado: d.montoEstimado ? Number(d.montoEstimado) : undefined,
+    notaDescarte: d.notaDescarte || undefined,
     createdAt: d.createdAt || "",
     updatedAt: d.updatedAt || "",
   };
@@ -1039,20 +1045,36 @@ export async function listPlanIngresos(companyId: string): Promise<PlanIngreso[]
 
 export async function upsertPlanIngreso(
   companyId: string,
-  data: { id?: string; concepto: string; tipo: "confirmado" | "probable"; pagos: { mes: string; monto: number }[] },
+  data: {
+    id?: string;
+    concepto: string;
+    tipo: "confirmado" | "probable" | "descartado";
+    pagos: { mes: string; monto: number }[];
+    montoEstimado?: number;
+    notaDescarte?: string;
+  },
 ): Promise<PlanIngreso> {
   const ts = now();
+  const tipo: PlanIngreso["tipo"] =
+    data.tipo === "probable" ? "probable" : data.tipo === "descartado" ? "descartado" : "confirmado";
+  const setDoc: any = { concepto: data.concepto, tipo, pagos: data.pagos, updatedAt: ts, montoEstimado: data.montoEstimado ?? null };
+  // Persist notaDescarte only for descartados; clear it when moving to another state
+  if (tipo === "descartado") {
+    setDoc.notaDescarte = data.notaDescarte ?? "";
+  } else {
+    setDoc.notaDescarte = null;
+  }
   if (data.id && ObjectId.isValid(data.id)) {
     const r = await getDb()
       .collection<any>(PLAN_INGRESOS)
       .findOneAndUpdate(
         { _id: new ObjectId(data.id), companyId },
-        { $set: { concepto: data.concepto, tipo: data.tipo, pagos: data.pagos, updatedAt: ts } },
+        { $set: setDoc },
         { returnDocument: "after" },
       );
     return mapPlanIngreso(r);
   }
-  const doc = { companyId, concepto: data.concepto, tipo: data.tipo, pagos: data.pagos, createdAt: ts, updatedAt: ts };
+  const doc = { companyId, ...setDoc, createdAt: ts };
   const r = await getDb().collection<any>(PLAN_INGRESOS).insertOne(doc);
   return mapPlanIngreso({ _id: r.insertedId, ...doc });
 }
@@ -1068,28 +1090,51 @@ export async function deletePlanIngreso(companyId: string, id: string): Promise<
 const CAJA_CONFIG    = "cajaErpConfig";
 const PROV_DINAMICA  = "cajaErpProvDinamica";
 
+export interface AdeudadoProyecto {
+  nombre: string;
+  monto: number;
+}
+
 export interface CajaConfig {
   companyId: string;
-  saldoInicial: number;   // saldo real de caja hoy
-  tarifaIca: number;      // ej. 0.00966 para Bogotá servicios profesionales
+  saldoInicial: number;          // = saldoBancos - sum(adeudadoProyectos) — punto de partida del flujo
+  saldoBancos?: number;          // saldo real en cuentas bancarias hoy
+  adeudadoProyectos?: AdeudadoProyecto[];  // lo que la oficina le debe a cada proyecto
+  tarifaIca: number;
 }
 
 export async function getCajaConfig(companyId: string): Promise<CajaConfig> {
   const doc = await getDb().collection<any>(CAJA_CONFIG).findOne({ companyId });
+  const saldoBancos  = doc?.saldoBancos != null ? Number(doc.saldoBancos) : undefined;
+  const adeudadoProyectos: AdeudadoProyecto[] = Array.isArray(doc?.adeudadoProyectos)
+    ? doc.adeudadoProyectos.map((p: any) => ({ nombre: String(p.nombre ?? ""), monto: Number(p.monto) || 0 }))
+    : [];
+  // saldoInicial = bancos − adeudado (o el valor legado si no se han ingresado bancos)
+  const saldoInicial = saldoBancos != null
+    ? saldoBancos - adeudadoProyectos.reduce((s, p) => s + p.monto, 0)
+    : Number(doc?.saldoInicial || 0);
   return {
     companyId,
-    saldoInicial: Number(doc?.saldoInicial || 0),
+    saldoInicial,
+    saldoBancos,
+    adeudadoProyectos,
     tarifaIca: Number(doc?.tarifaIca ?? 0.00966),
   };
 }
 
 export async function updateCajaConfig(
   companyId: string,
-  data: Partial<Pick<CajaConfig, "saldoInicial" | "tarifaIca">>,
+  data: Partial<Pick<CajaConfig, "saldoInicial" | "saldoBancos" | "adeudadoProyectos" | "tarifaIca">>,
 ): Promise<CajaConfig> {
+  const patch: Record<string, unknown> = { companyId, updatedAt: now() };
+  if (data.tarifaIca      != null) patch.tarifaIca          = data.tarifaIca;
+  if (data.saldoBancos    != null) patch.saldoBancos         = Number(data.saldoBancos);
+  if (data.adeudadoProyectos != null) patch.adeudadoProyectos = data.adeudadoProyectos;
+  // saldoInicial legado (cuando no se usa el desglose)
+  if (data.saldoInicial   != null && data.saldoBancos == null) patch.saldoInicial = Number(data.saldoInicial);
   await getDb()
     .collection<any>(CAJA_CONFIG)
-    .updateOne({ companyId }, { $set: { ...data, companyId, updatedAt: now() } }, { upsert: true });
+    .updateOne({ companyId }, { $set: patch }, { upsert: true });
   return getCajaConfig(companyId);
 }
 
@@ -1237,8 +1282,9 @@ export async function computeFlujoEditable(companyId: string, numMeses: number):
     // Total gastos = fijos + provisión IVA del mes + provisión ICA del mes
     const totalGastos = totalGastosFijos + ivaNeto + icaProvision;
 
-    // Ingresos planificados
+    // Ingresos planificados (descartados no contribuyen a la proyección)
     const ingresos = planIngresos.flatMap((ing) => {
+      if (ing.tipo === "descartado") return [];
       const pago = ing.pagos.find((p) => p.mes === mes);
       if (!pago || pago.monto === 0) return [];
       return [{ id: ing.id, concepto: ing.concepto, tipo: ing.tipo, monto: pago.monto }];
