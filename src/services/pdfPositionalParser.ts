@@ -26,8 +26,8 @@ const X = {
   descMax: 160,   // U/M column starts at x ≈ 160-163; keep below it
   umMin:   160,   // U/M column (anchor: row has U/M)
   qtyMin:  190, qtyMax: 240,
-  ivaMin:  408, ivaMax: 480,  // IVA amount + % (may be merged)
-  incMin:  480, incMax: 517,  // INC amount + %; Precio col ($) starts at x ≈ 518
+  ivaMin:  408, ivaMax: 462,  // IVA amount + %: right edge ~x453 (before INC $ at x≈468)
+  incMin:  462, incMax: 517,  // INC amount + % (right-aligned, can start at x≈468); Precio ($) at x≈518
   extMin:  520, extMax: 590,  // precio unitario de venta (line extension)
   rowTol:    5,   // Y tolerance to group items into same row (pt)
   descTol:  25,   // max Y distance for description overflow rows
@@ -340,23 +340,12 @@ function parseRows(rows: Row[]): InvoiceLineItem[] {
     const cantidad       = qtyCOPs[0] || 0;
     if (cantidad <= 0) continue;
 
-    let ivaAmount      = ivaCOPs[0] || 0;
-    let ivaPercent     = ivaPCTs[0] || 0;  // e.g. 19.00 (not 0.19), matches excelGenerator convention
-    let incAmount      = incCOPs[0] || 0;
-    let incPercent     = incPCTs[0] || 0;
+    const ivaAmount      = ivaCOPs[0] || 0;
+    const ivaPercent     = ivaPCTs[0] || 0;  // e.g. 19.00 (not 0.19), matches excelGenerator convention
+    const incAmount      = incCOPs[0] || 0;
+    const incPercent     = incPCTs[0] || 0;
     const totalUnitPrice = extCOPs.at(-1) || 0;  // precio unitario de venta = line extension
     const unitPrice      = cantidad > 0 ? totalUnitPrice / cantidad : totalUnitPrice;
-
-    // Tasas válidas de IVA en Colombia: 0%, 5%, 19%.
-    // Si el PDF coloca un impuesto en la columna IVA pero con una tasa diferente
-    // (e.g. 8% de restaurantes), en realidad es INC. Lo reclasificamos.
-    const VALID_IVA_RATES = new Set([0, 5, 19]);
-    if (ivaAmount > 0 && !VALID_IVA_RATES.has(ivaPercent)) {
-      incAmount  += ivaAmount;
-      incPercent  = incPercent || ivaPercent;
-      ivaAmount   = 0;
-      ivaPercent  = 0;
-    }
 
     const taxes: TaxDetail[] = [];
     if (ivaPercent > 0 || ivaAmount > 0) {
