@@ -350,11 +350,18 @@ function parseSheetRowsPuc(xml: string, sharedStrings: string[]): string[][] {
   for (const rowXml of rowMatches) {
     const cells = Array.from(rowXml.matchAll(/<(?:\w+:)?c([^>]*)>([\s\S]*?)<\/(?:\w+:)?c>/g));
     const rowValues: string[] = [];
+    let autoColIndex = 0;
     for (const cellMatch of cells) {
       const attrs = cellMatch[1];
       const body = cellMatch[2];
-      const ref = (attrs.match(/r="([A-Z]+)\d+"/) || [])[1] || "A";
-      const colIndex = colLettersToIndexPuc(ref);
+      const refMatch = attrs.match(/r="([A-Z]+)\d+"/);
+      let colIndex: number;
+      if (refMatch) {
+        colIndex = colLettersToIndexPuc(refMatch[1]);
+        autoColIndex = colIndex;
+      } else {
+        colIndex = ++autoColIndex;
+      }
       while (rowValues.length < colIndex) rowValues.push("");
       const type = (attrs.match(/t="([^"]+)"/) || [])[1] || "";
       const valueMatch = body.match(/<(?:\w+:)?v>([\s\S]*?)<\/(?:\w+:)?v>/);
