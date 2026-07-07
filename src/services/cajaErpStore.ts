@@ -1185,7 +1185,7 @@ const IVA_PAGO_MESES = new Set([1, 5, 8]);
 export interface MesFlujo {
   mes: string;
   label: string;
-  gastos: { id: string; nombre: string; monto: number; esDefault: boolean }[];
+  gastos: { id: string; nombre: string; monto: number; esDefault: boolean; frecuenciaMeses: number }[];
   totalGastosFijos: number;
   // Provisiones dinámicas
   ivaGenerado: number;
@@ -1258,7 +1258,7 @@ export async function computeFlujoEditable(companyId: string, numMeses: number):
     const gastos = activos.map((g) => {
       const def = Math.round(g.monto / (g.frecuenciaMeses || 1));
       const esDefault = !(g.id in mesOv);
-      return { id: g.id, nombre: g.nombre, monto: esDefault ? def : mesOv[g.id], esDefault };
+      return { id: g.id, nombre: g.nombre, monto: esDefault ? def : mesOv[g.id], esDefault, frecuenciaMeses: g.frecuenciaMeses || 1 };
     });
     const totalGastosFijos = gastos.reduce((s, g) => s + g.monto, 0);
 
