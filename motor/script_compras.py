@@ -593,9 +593,18 @@ def dividir_salida_en_partes_por_comprobante(df_salida, max_lineas=500):
     return partes
 
 
+# Excluir líneas cuyo Concepto sea literalmente "IVA": algunos proveedores
+# (ej. ULIFE) codifican el IVA como línea de detalle separada con base=0,
+# lo que el motor confundiría con un obsequio.
+_concepto_es_iva = (
+    detalle["Concepto"].astype(str).str.strip().str.upper() == "IVA"
+    if "Concepto" in detalle.columns
+    else pd.Series(False, index=detalle.index)
+)
 detalle["Es_Obsequio"] = (
     (detalle[col_base_detalle] == 0)
     & (detalle["IVA"] > 0)
+    & (~_concepto_es_iva)
 )
 
 iva_obsequios = (
