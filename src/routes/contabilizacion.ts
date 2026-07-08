@@ -39,6 +39,8 @@ import {
 import {
   createEmpresa,
   dataRoot,
+  detectarConsecutivosDesdeAuxiliar,
+  getComprobantesEmpresa,
   getPuc,
   getTabla,
   guardarConsecutivos,
@@ -508,6 +510,20 @@ router.post("/ventas", upload.array("dian"), async (req: Request, res: Response)
       resumen: result.resumen,
       archivos: archivosResponse(jobId, result.archivos),
     });
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
+router.post("/compras/consecutivos/detectar", upload.single("auxiliar"), async (req: Request, res: Response) => {
+  try {
+    const empresaId = await resolverEmpresaId(req);
+    const f = req.file as Express.Multer.File | undefined;
+    if (!f) throw new MotorError("sin_archivos", "Debe subir el movimiento auxiliar.", [], 400);
+    const comprobantes = await getComprobantesEmpresa(empresaId);
+    const tipos = [comprobantes.tipoCompras, comprobantes.tipoComprasNc].filter(Boolean);
+    const consecutivos = await detectarConsecutivosDesdeAuxiliar(f.buffer, tipos);
+    res.json({ ok: true, consecutivos });
   } catch (err) {
     enviarError(res, err);
   }

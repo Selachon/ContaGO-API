@@ -481,6 +481,41 @@ export async function importarPuc(empresaId: string, buffer: Buffer, filename = 
   return cuentas;
 }
 
+export async function getComprobantesEmpresa(empresaId: string): Promise<Comprobantes> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { comprobantes: 1 } });
+  if (!doc) throw new Error("Empresa no encontrada.");
+  return normComprobantes(doc.comprobantes);
+}
+
+/**
+ * Lee un movimiento auxiliar de SIIGO (.xlsx) y devuelve el siguiente consecutivo
+ * para cada tipo de comprobante indicado. Busca entradas "CC-{tipo}-{n}" en la
+ * columna "Comprobante" y retorna max(n) + 1 (o 1 si no hay ninguna).
+ */
+export async function detectarConsecutivosDesdeAuxiliar(
+  buffer: Buffer,
+  tipos: string[]
+): Promise<Record<string, number>> {
+  const tiposValidos = tipos.filter(Boolean);
+  if (!tiposValidos.length) return {};
+  const tabla = await leerHojaConEncabezadoDinamico(buffer, (cols) =>
+    cols.some((c) => normalizarCol(c) === "comprobante")
+  );
+  const compCol = tabla.columns.find((c) => normalizarCol(c) === "comprobante");
+  if (!compCol) return Object.fromEntries(tiposValidos.map((t) => [t, 1]));
+  const maxPorTipo: Record<string, number> = Object.fromEntries(tiposValidos.map((t) => [t, 0]));
+  for (const row of tabla.rows) {
+    const val = String(row[compCol] ?? "").trim();
+    const m = /^CC-(\w+)-(\d+)$/i.exec(val);
+    if (m && m[1] in maxPorTipo) {
+      maxPorTipo[m[1]] = Math.max(maxPorTipo[m[1]], parseInt(m[2], 10));
+    }
+  }
+  return Object.fromEntries(tiposValidos.map((t) => [t, (maxPorTipo[t] || 0) + 1]));
+}
+
 export async function getPuc(empresaId: string): Promise<CuentaPuc[]> {
   const oid = toObjectId(empresaId);
   if (!oid) throw new Error("Empresa inválida.");
