@@ -249,12 +249,23 @@ export async function parseLineItemsPositional(buffer: Buffer): Promise<InvoiceL
       )
     : posItems;
 
+  // Detect IVA column header position to handle PDFs where the layout is
+  // shifted left vs the standard DIAN "Solución Gratuita" template.
+  // The IVA "$" and amount appear ~16-18pt to the left of the header label.
+  const ivaHeader = tableItems.find(
+    (it) => it.text === "IVA" && it.y < (detalles ? detalles.y + 40 : Infinity)
+  );
+  const dynamicX = ivaHeader
+    ? { ...X, ivaMin: Math.max(360, ivaHeader.x - 18) }
+    : X;
+
   const rows = groupRows(tableItems);
-  return isPOS ? parseRowsPOS(rows) : parseRows(rows);
+  return isPOS ? parseRowsPOS(rows) : parseRows(rows, dynamicX);
 }
 
 // ── Core row parser ───────────────────────────────────────────────────────────
-function parseRows(rows: Row[]): InvoiceLineItem[] {
+function parseRows(rows: Row[], Xb: typeof X = X): InvoiceLineItem[] {
+  const X = Xb;
   // Step 1: find all data row indices
   const dataIdxs = rows.map((r, i) => (isDataRow(r) ? i : -1)).filter((i) => i >= 0);
 
