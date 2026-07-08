@@ -649,6 +649,31 @@ iva_5 = (
 )
 iva_5.rename(columns={"IVA": "IVA_5"}, inplace=True)
 
+# Líneas con IVA positivo pero %IVA=0 (ej. Colanta). Infiere la tasa del cociente.
+_lineas_iva_inf = detalle_sin_obsequios[
+    (detalle_sin_obsequios["% IVA"].round(4) == 0)
+    & (detalle_sin_obsequios["IVA"] > 0)
+    & (detalle_sin_obsequios[col_base_detalle] > 0)
+].copy()
+
+if len(_lineas_iva_inf) > 0:
+    _lineas_iva_inf["_tasa"] = (
+        (_lineas_iva_inf["IVA"] / _lineas_iva_inf[col_base_detalle] * 100).round(0).astype(int)
+    )
+    _iva_inf_19 = (
+        _lineas_iva_inf[_lineas_iva_inf["_tasa"] == 19]
+        .groupby(col_factura)["IVA"].sum().reset_index()
+    )
+    _iva_inf_19.rename(columns={"IVA": "IVA_INF_19"}, inplace=True)
+    _iva_inf_5 = (
+        _lineas_iva_inf[_lineas_iva_inf["_tasa"] == 5]
+        .groupby(col_factura)["IVA"].sum().reset_index()
+    )
+    _iva_inf_5.rename(columns={"IVA": "IVA_INF_5"}, inplace=True)
+else:
+    _iva_inf_19 = pd.DataFrame(columns=[col_factura, "IVA_INF_19"])
+    _iva_inf_5 = pd.DataFrame(columns=[col_factura, "IVA_INF_5"])
+
 inc = (
     detalle_sin_obsequios
     .groupby(col_factura)["INC"]
@@ -675,6 +700,8 @@ df = df.merge(iva_obsequios, on=col_factura, how="left")
 df = df.merge(iva_obsequios_19, on=col_factura, how="left")
 df = df.merge(iva_obsequios_5, on=col_factura, how="left")
 df = df.merge(param, on=col_nit, how="left")
+df = df.merge(_iva_inf_19, on=col_factura, how="left")
+df = df.merge(_iva_inf_5, on=col_factura, how="left")
 
 for col in df.columns:
     if pd.api.types.is_numeric_dtype(df[col]):
@@ -742,10 +769,11 @@ for _, row in df.iterrows():
     tipo_doc = row[col_tipo_documento]
     tipo_doc_abreviado = abreviar_tipo_documento(tipo_doc)
 
-    base_gasto = row[col_subtotal_facturas]
+    descuento_header = redondear(row[col_descuento])
+    base_gasto = redondear(row[col_subtotal_facturas]) - descuento_header
 
-    iva_19_valor = row["IVA_19"]
-    iva_5_valor = row["IVA_5"]
+    iva_19_valor = row["IVA_19"] + row["IVA_INF_19"]
+    iva_5_valor = row["IVA_5"] + row["IVA_INF_5"]
     inc_valor = row.get("INC_DET", 0)
     otros_valor = row["Otros"]
 
