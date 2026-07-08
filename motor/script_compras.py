@@ -671,8 +671,8 @@ if len(_lineas_iva_inf) > 0:
     )
     _iva_inf_5.rename(columns={"IVA": "IVA_INF_5"}, inplace=True)
 else:
-    _iva_inf_19 = pd.DataFrame(columns=[col_factura, "IVA_INF_19"])
-    _iva_inf_5 = pd.DataFrame(columns=[col_factura, "IVA_INF_5"])
+    _iva_inf_19 = pd.DataFrame(columns=[col_factura, "IVA_INF_19"]).astype({"IVA_INF_19": float})
+    _iva_inf_5 = pd.DataFrame(columns=[col_factura, "IVA_INF_5"]).astype({"IVA_INF_5": float})
 
 inc = (
     detalle_sin_obsequios
