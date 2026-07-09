@@ -1254,12 +1254,13 @@ export async function computeFlujoEditable(companyId: string, numMeses: number):
     const mesOv = overrides[mes] || {};
     const prov  = provMap.get(mes);
 
-    // Gastos fijos con overrides
-    const gastos = activos.map((g) => {
-      const def = Math.round(g.monto / (g.frecuenciaMeses || 1));
-      const esDefault = !(g.id in mesOv);
-      return { id: g.id, nombre: g.nombre, monto: esDefault ? def : mesOv[g.id], esDefault, frecuenciaMeses: g.frecuenciaMeses || 1 };
-    });
+    // Gastos fijos con overrides — solo mensuales (frecuenciaMeses === 1)
+    const gastos = activos
+      .filter((g) => (g.frecuenciaMeses || 1) === 1)
+      .map((g) => {
+        const esDefault = !(g.id in mesOv);
+        return { id: g.id, nombre: g.nombre, monto: esDefault ? g.monto : mesOv[g.id], esDefault, frecuenciaMeses: 1 };
+      });
     const totalGastosFijos = gastos.reduce((s, g) => s + g.monto, 0);
 
     // IVA dinámico
