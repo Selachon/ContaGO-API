@@ -26,6 +26,10 @@ export interface XmlCausacionItem {
   base: number;
   ivaPercent: number;
   incPercent: number;
+  /** Cantidad real del ítem (del XML/PDF). Cuando está presente, unitPrice × quantity = base. */
+  quantity?: number;
+  /** Precio unitario derivado: base / quantity. Garantiza que qty × price = base exacto. */
+  unitPrice?: number;
   /** Impuestos adicionales distintos de IVA/Retefte que generan líneas separadas. */
   extraTaxes?: XmlExtraTax[];
   /**
@@ -227,6 +231,13 @@ export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean
       }
     }
 
+    // Cantidad real del ítem (≥1). Solo aplica a ítems normales; obsequios y recarros
+    // no tienen cantidad significativa y siempre van con quantity=1 en la UI.
+    const rawQty = !isGift ? (Number(li.quantity) || 0) : 0;
+    const itemQty = rawQty >= 1 ? rawQty : undefined;
+    // Precio unitario derivado: base / qty. Garantiza qty × price = base sin redondeos acumulados.
+    const itemUnitPrice = itemQty && itemQty > 1 && base > 0 ? r2(base / itemQty) : undefined;
+
     const mainItem: XmlCausacionItem = {
       description: li.description || "",
       base,
@@ -234,6 +245,8 @@ export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean
       incPercent: isGift ? 0 : (incAmt > 0 ? (Number(li.incPercent) || 0) : 0),
       extraTaxes: extraTaxes.length ? extraTaxes : undefined,
       isGift: isGift || undefined,
+      quantity: itemQty,
+      unitPrice: itemUnitPrice,
     };
     if (exemptRemainder > 0) {
       return [mainItem, { description: `${li.description || ""} (base excluida)`, base: exemptRemainder, ivaPercent: 0, incPercent: 0 }];
