@@ -595,6 +595,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       res.status(403).json({ ok: false, code: "forbidden", message: "Solo administradores pueden compartir empresas." });
       return false;
     }
+    if (req.user.isAdmin) return true; // admin puede gestionar cualquier empresa
     const owns = await userOwnsCompany(companyId, req.user.userId);
     if (!owns) {
       res.status(403).json({ ok: false, code: "forbidden", message: "Solo el dueño puede compartir esta empresa." });
