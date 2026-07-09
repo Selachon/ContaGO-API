@@ -18,6 +18,7 @@ import {
   getSiigoIntegrationHealth,
   listCustomers,
   createCustomer,
+  listCityCodes,
   listDocumentTypes,
   listInvoices,
   listPaymentReceipts,
@@ -1422,6 +1423,15 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   } catch (error) {
     return handleSiigoError(res, error);
   }
+  });
+
+  router.get("/city-codes", async (req: Request, res: Response) => {
+    try {
+      const data = await listCityCodes(req.query as Record<string, unknown>);
+      return res.json({ ok: true, source: "siigo", data });
+    } catch (error) {
+      return handleSiigoError(res, error);
+    }
   });
 
   router.post("/customers", async (req: Request, res: Response) => {

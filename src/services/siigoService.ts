@@ -596,3 +596,7 @@ export async function listAccounts(query: Record<string, unknown> = {}): Promise
 export async function createCustomer(body: unknown): Promise<unknown> {
   return request("/v1/customers", { method: "POST", body });
 }
+
+export async function listCityCodes(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/city-codes", { query });
+}
