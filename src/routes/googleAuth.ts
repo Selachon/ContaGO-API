@@ -197,6 +197,39 @@ router.get("/callback", async (req: Request, res: Response) => {
     // Recupera el userId y purpose enviados al iniciar OAuth.
     const stateData = JSON.parse(Buffer.from(state, "base64").toString("utf8"));
 
+    // ── Castro Portal: autenticación de empleados con Google ─────────────────
+    if (stateData.purpose === "castro-portal") {
+      const { accessToken } = await exchangeCodeForTokens(code);
+      const userEmail = (await getGoogleUserEmail(accessToken)).toLowerCase();
+
+      const { getConfig } = await import("../services/castroFacturasService.js");
+      const config = await getConfig();
+      const allowed = [...(config.empleados || []), ...(config.socios || [])].map((e) => e.toLowerCase());
+
+      if (!allowed.includes(userEmail)) {
+        return sendResponse(false, `El correo ${userEmail} no tiene acceso al portal. Contacta al administrador.`);
+      }
+
+      const token = (await import("jsonwebtoken")).default.sign(
+        { email: userEmail, purpose: "castro-portal" },
+        process.env.JWT_SECRET!,
+        { expiresIn: "8h" }
+      );
+
+      const returnUrl = stateData.returnUrl || "";
+      const allowed_origins = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim());
+      let redirectTo: URL;
+      try {
+        redirectTo = new URL(returnUrl);
+        if (!allowed_origins.some((o) => returnUrl.startsWith(o))) throw new Error("origen no permitido");
+      } catch {
+        redirectTo = new URL("https://contago.com.co/public/facturas-mob");
+      }
+      redirectTo.searchParams.set("portal_token", token);
+      console.log(`[Castro Portal] Acceso concedido: ${userEmail}`);
+      return res.redirect(302, redirectTo.toString());
+    }
+
     // ── Castro Arroyave: conexión específica para Drive + Sheets ─────────────
     if (stateData.purpose === "castro") {
       const { accessToken, refreshToken, expiryDate } = await exchangeCodeForTokens(code);

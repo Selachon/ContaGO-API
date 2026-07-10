@@ -1,7 +1,8 @@
-import { Router, type Request, type Response } from "express";
+import { Router, type Request, type Response, type NextFunction } from "express";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
+import jwt from "jsonwebtoken";
 import { requireAuth } from "../middleware/auth.js";
 import { getDb } from "../services/database.js";
 import { getAuthUrl } from "../services/googleDrive.js";
@@ -28,6 +29,39 @@ const router = Router();
 const PDF_DIR = path.resolve("data/castro-pdfs");
 fs.mkdirSync(PDF_DIR, { recursive: true });
 ensureIndexes().catch((e) => console.error("[castro] index error:", e));
+
+// ── Middleware: autenticación de portal ───────────────────────────────────────
+
+function portalAuth(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ")
+    ? authHeader.slice(7)
+    : (req.query.token as string | undefined);
+
+  if (!token) { res.status(401).json({ error: "No autenticado." }); return; }
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as { email: string; purpose: string };
+    if (payload.purpose !== "castro-portal") throw new Error();
+    (req as Request & { portalEmail: string }).portalEmail = payload.email;
+    next();
+  } catch {
+    res.status(401).json({ error: "Sesión expirada. Vuelve a iniciar sesión." });
+  }
+}
+
+// ── Portal: iniciar login con Google ─────────────────────────────────────────
+
+router.get("/auth/portal/login", (req: Request, res: Response) => {
+  const returnUrl = String(req.query.returnUrl || "https://contago.com.co/public/facturas-mob");
+  const PORTAL_SCOPES = [
+    "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
+  ];
+  const state = Buffer.from(JSON.stringify({ purpose: "castro-portal", returnUrl })).toString("base64");
+  const authUrl = getAuthUrl(state, PORTAL_SCOPES);
+  res.redirect(302, authUrl);
+});
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -180,7 +214,7 @@ router.put("/config", requireAuth, async (req: Request, res: Response) => {
 
 // ── Public: list facturas ─────────────────────────────────────────────────────
 
-router.get("/public/facturas", async (_req: Request, res: Response) => {
+router.get("/public/facturas", portalAuth, async (_req: Request, res: Response) => {
   const facturas = await listFacturas();
   const safe = facturas.map(({ pdfPath: _p, ...rest }) => rest);
   res.json({ facturas: safe });
@@ -188,14 +222,14 @@ router.get("/public/facturas", async (_req: Request, res: Response) => {
 
 // ── Public: employee list ─────────────────────────────────────────────────────
 
-router.get("/public/config", async (_req: Request, res: Response) => {
+router.get("/public/config", portalAuth, async (_req: Request, res: Response) => {
   const config = await getConfig();
   res.json({ empleados: config.empleados, socios: config.socios || [] });
 });
 
 // ── Public: serve PDF ─────────────────────────────────────────────────────────
 
-router.get("/public/pdf/:cufe", async (req: Request, res: Response) => {
+router.get("/public/pdf/:cufe", portalAuth, async (req: Request, res: Response) => {
   const cufe = req.params.cufe.replace(/[^a-f0-9A-F]/g, "").slice(0, 200);
   const factura = await getFactura(cufe);
   if (!factura) { res.status(404).json({ error: "Factura no encontrada." }); return; }
@@ -220,7 +254,7 @@ router.get("/public/pdf/:cufe", async (req: Request, res: Response) => {
 
 // ── Public: claim a factura ───────────────────────────────────────────────────
 
-router.post("/public/reclamar/:cufe", uploadAnexos.array("anexos", 5), async (req: Request, res: Response) => {
+router.post("/public/reclamar/:cufe", portalAuth, uploadAnexos.array("anexos", 5), async (req: Request, res: Response) => {
   const { cufe } = req.params;
   const { correo, concepto, proyecto, formaPago, detalleFormaPago, esSocio } = req.body;
 
@@ -286,7 +320,7 @@ router.post("/public/reclamar/:cufe", uploadAnexos.array("anexos", 5), async (re
 
 // ── Public: rechazar una factura ──────────────────────────────────────────────
 
-router.post("/public/rechazar/:cufe", async (req: Request, res: Response) => {
+router.post("/public/rechazar/:cufe", portalAuth, async (req: Request, res: Response) => {
   const { cufe } = req.params;
   const { correo, motivo } = req.body;
 
