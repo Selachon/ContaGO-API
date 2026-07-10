@@ -9,6 +9,7 @@ import type { Collection } from "mongodb";
 
 export interface CastroFactura {
   cufe: string;
+  documentType: string;
   docNumber: string;
   issuerName: string;
   issuerNit: string;
@@ -86,6 +87,7 @@ export async function upsertFactura(
     {
       $setOnInsert: { estado: "pendiente" as const, claim: null, rechazo: null, uploadedAt: new Date(), pdfDriveLink: null },
       $set: {
+        documentType: f.documentType || "Factura electrónica",
         docNumber: f.docNumber,
         issuerName: f.issuerName,
         issuerNit: f.issuerNit,

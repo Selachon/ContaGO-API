@@ -149,6 +149,7 @@ router.post(
 
         await upsertFactura({
           cufe,
+          documentType: invoice.documentType || "Factura electrónica",
           docNumber: invoice.docNumber || "",
           issuerName: invoice.issuerName || invoice.issuerCommercialName || "Proveedor sin nombre",
           issuerNit: invoice.issuerNit || "",
