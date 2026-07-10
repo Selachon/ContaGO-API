@@ -199,11 +199,23 @@ router.get("/public/pdf/:cufe", async (req: Request, res: Response) => {
   const cufe = req.params.cufe.replace(/[^a-f0-9A-F]/g, "").slice(0, 200);
   const factura = await getFactura(cufe);
   if (!factura) { res.status(404).json({ error: "Factura no encontrada." }); return; }
+
+  // Servir desde disco local si existe (dev)
   const pdfPath = path.join(PDF_DIR, `${cufe}.pdf`);
-  if (!fs.existsSync(pdfPath)) { res.status(404).json({ error: "PDF no disponible." }); return; }
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `inline; filename="${factura.pdfFilename}"`);
-  fs.createReadStream(pdfPath).pipe(res);
+  if (fs.existsSync(pdfPath)) {
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${factura.pdfFilename}"`);
+    fs.createReadStream(pdfPath).pipe(res);
+    return;
+  }
+
+  // En producción el disco es efímero: redirigir a Drive si está disponible
+  if (factura.pdfDriveLink) {
+    res.redirect(302, factura.pdfDriveLink);
+    return;
+  }
+
+  res.status(404).json({ error: "PDF no disponible. Sube el archivo nuevamente." });
 });
 
 // ── Public: claim a factura ───────────────────────────────────────────────────
