@@ -122,12 +122,19 @@ router.post(
     const config = await getConfig();
     const driveConnected = Boolean(config.googleAuth?.drive_folder_id);
 
-    const results: { filename: string; cufe?: string; driveLink?: string; error?: string }[] = [];
+    const results: { filename: string; cufe?: string; driveLink?: string; error?: string; duplicado?: boolean }[] = [];
 
     for (const file of files) {
       try {
         const invoice = await parsePdfInvoice(file.buffer, file.originalname);
         const cufe = invoice.cufe || file.originalname.replace(/\.pdf$/i, "");
+
+        // Verificar duplicado por CUFE antes de procesar
+        const existente = await getFactura(cufe);
+        if (existente) {
+          results.push({ filename: file.originalname, cufe, duplicado: true });
+          continue;
+        }
 
         // Save PDF to disk
         const pdfFilename = `${cufe}.pdf`;
@@ -171,9 +178,10 @@ router.post(
       }
     }
 
-    const ok = results.filter((r) => !r.error).length;
+    const ok = results.filter((r) => !r.error && !r.duplicado).length;
+    const duplicados = results.filter((r) => r.duplicado);
     const errors = results.filter((r) => r.error);
-    res.json({ ok, total: files.length, driveConnected, errors: errors.length ? errors : undefined });
+    res.json({ ok, total: files.length, duplicados: duplicados.length, driveConnected, duplicadosList: duplicados.length ? duplicados : undefined, errors: errors.length ? errors : undefined });
   }
 );
 
