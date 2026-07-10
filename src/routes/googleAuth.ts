@@ -18,6 +18,7 @@ import {
   removeUserGoogleDriveById,
   setSelectedUserGoogleDrive,
 } from "../services/database.js";
+import { saveGoogleAuth, ensureCastroDriveFolder } from "../services/castroFacturasService.js";
 
 const router = Router();
 
@@ -165,8 +166,14 @@ router.get("/callback", async (req: Request, res: Response) => {
     <div class="icon">${icon}</div>
     <h2>${success ? "Google Drive Conectado" : "Error de Conexión"}</h2>
     <p>${safeMessage}</p>
-    <div class="note">Ya puedes cerrar esta ventana</div>
+    <div class="note">Esta ventana se cerrará automáticamente...</div>
   </div>
+  <script>
+    setTimeout(() => {
+      if (window.opener) { window.opener.postMessage({ type: 'contago-google-auth', success: ${success} }, '*'); }
+      window.close();
+    }, 1500);
+  </script>
 </body>
 </html>`);
   };
@@ -187,8 +194,36 @@ router.get("/callback", async (req: Request, res: Response) => {
   }
 
   try {
-    // Recupera el userId enviado al iniciar OAuth.
+    // Recupera el userId y purpose enviados al iniciar OAuth.
     const stateData = JSON.parse(Buffer.from(state, "base64").toString("utf8"));
+
+    // ── Castro Arroyave: conexión específica para Drive + Sheets ─────────────
+    if (stateData.purpose === "castro") {
+      const { accessToken, refreshToken, expiryDate } = await exchangeCodeForTokens(code);
+      const userEmail = await getGoogleUserEmail(accessToken);
+      const encryptedTokens = encryptDriveTokens(accessToken, refreshToken);
+
+      // Reconstruct an oauth2 client to create the Drive folder
+      const { createOAuth2Client } = await import("../services/googleDrive.js");
+      const oauth2Client = createOAuth2Client();
+      oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
+
+      const driveFolderId = await ensureCastroDriveFolder(oauth2Client);
+
+      await saveGoogleAuth({
+        encrypted_access_token: encryptedTokens.encrypted_access_token,
+        encrypted_refresh_token: encryptedTokens.encrypted_refresh_token,
+        token_expiry: new Date(expiryDate).toISOString(),
+        user_email: userEmail,
+        drive_folder_id: driveFolderId,
+        connected_at: new Date().toISOString(),
+      });
+
+      console.log(`[Castro] Google conectado: ${userEmail}, carpeta Drive: ${driveFolderId}`);
+      return sendResponse(true, `Cuenta de Google vinculada (${userEmail}). Los PDFs se guardarán en la carpeta "Castro Arroyave - Facturas ContaGO" de Drive.`);
+    }
+
+    // ── Flujo estándar: Drive por usuario ────────────────────────────────────
     const userId = stateData.userId;
 
     if (!userId) {
