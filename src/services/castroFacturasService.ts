@@ -29,6 +29,7 @@ export interface CastroFactura {
 export interface CastroClaim {
   correo: string;
   concepto: string;
+  proyecto: string;
   formaPago: string;
   detalleFormaPago: string;
   esSocio: boolean;
@@ -297,7 +298,7 @@ export async function appendToSheet(factura: CastroFactura, claim: CastroClaim):
   const marcaTemporal = now.toLocaleString("es-CO", { timeZone: "America/Bogota" });
 
   // Columns A–N of "Gastos 2026"
-  const conceptoCompleto = [claim.concepto, claim.formaPago, claim.detalleFormaPago]
+  const conceptoCompleto = [claim.concepto, claim.proyecto, claim.formaPago, claim.detalleFormaPago]
     .filter(Boolean).join(" - ");
 
   const row = [
@@ -352,7 +353,7 @@ export async function appendToPersonalesSheet(factura: CastroFactura, claim: Cas
   // Estructura real de "Gastos Personales" (fila 2 = headers):
   // A: Mes | B: ITEM | C: Fecha de emisión | D: Razón social | E: Valor antes de imp.
   // F: Valor IVA | G: Concepto | H: Adjunte factura | I: Adjunte otros anexos
-  const conceptoCompleto = [claim.concepto, claim.formaPago, claim.detalleFormaPago]
+  const conceptoCompleto = [claim.concepto, claim.proyecto, claim.formaPago, claim.detalleFormaPago]
     .filter(Boolean).join(" - ");
 
   const row = [

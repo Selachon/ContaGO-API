@@ -222,10 +222,10 @@ router.get("/public/pdf/:cufe", async (req: Request, res: Response) => {
 
 router.post("/public/reclamar/:cufe", uploadAnexos.array("anexos", 5), async (req: Request, res: Response) => {
   const { cufe } = req.params;
-  const { correo, concepto, formaPago, detalleFormaPago, esSocio } = req.body;
+  const { correo, concepto, proyecto, formaPago, detalleFormaPago, esSocio } = req.body;
 
-  if (!correo || !concepto || !formaPago) {
-    res.status(400).json({ error: "Faltan campos: correo, concepto, formaPago." });
+  if (!correo || !concepto || !proyecto || !formaPago) {
+    res.status(400).json({ error: "Faltan campos: correo, concepto, proyecto, formaPago." });
     return;
   }
 
@@ -253,6 +253,7 @@ router.post("/public/reclamar/:cufe", uploadAnexos.array("anexos", 5), async (re
   const claim = {
     correo: String(correo).trim(),
     concepto: String(concepto).trim(),
+    proyecto: String(proyecto).trim(),
     formaPago: String(formaPago).trim(),
     detalleFormaPago: String(detalleFormaPago || "").trim(),
     esSocio: esSocio === "true" || esSocio === true,
