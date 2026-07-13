@@ -602,6 +602,7 @@ router.post(
             const validDateRe = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$|^\d{4}[\/\-]\d{2}[\/\-]\d{2}/;
             const rawFecha = lt?.fechaEmision;
             const issueDate = (rawFecha && validDateRe.test(rawFecha) ? rawFecha : null) || inv.issueDate;
+            console.log(`[Drive diag] cufe=${inv.cufe?.slice(0,12)} lt=${!!lt} rawFecha=${rawFecha} invDate=${inv.issueDate} → issueDate=${issueDate}`);
             // Skip Drive upload if no valid date — avoids creating wrong-month folders
             if (!issueDate) { job.done++; continue; }
 
