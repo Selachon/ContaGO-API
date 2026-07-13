@@ -550,7 +550,13 @@ router.post(
   try {
     await generateExcelFile(invoices, tmpPath, false, false, companyName, companyNit);
     const buf = fs.readFileSync(tmpPath);
-    const dateStr = new Date().toISOString().slice(0, 10);
+    // Use actual invoice date range; fall back to today only if no dates parsed from PDFs
+    const isoDates = invoices.map(i => i.issueDateISO || toISO(i.issueDate || "")).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).sort();
+    const minDate = isoDates[0];
+    const maxDate = isoDates[isoDates.length - 1];
+    const dateStr = minDate && maxDate && minDate !== maxDate
+      ? `${minDate} - ${maxDate}`
+      : (minDate || new Date().toISOString().slice(0, 10));
     const cleanName = (s: string) => s.replace(/[^a-zA-Z0-9À-ÿ\s.\-]/g, "").trim().slice(0, 60);
     const nitTxt  = companyNit  ? `${companyNit} - `  : "";
     const nomTxt  = companyName ? `${cleanName(companyName)} - ` : "";
@@ -593,7 +599,9 @@ router.post(
             const folio     = lt?.folio || inv.docNumber || inv.cufe.slice(0, 12);
             const safeStr   = (s: string) => s.replace(/[\\/:*?"<>|]/g, "").trim();
             const docNumber = safeStr(`${thirdPartyNit} - ${folio}`);
-            const issueDate = lt?.fechaEmision || inv.issueDate || new Date().toISOString().slice(0, 10);
+            const issueDate = lt?.fechaEmision || inv.issueDate;
+            // Skip Drive upload if no date — avoids creating wrong-month folders
+            if (!issueDate) { job.done++; continue; }
 
             const pdfFile = pdfFiles.find((f) => {
               const stem = f.originalname.replace(/\.pdf$/i, "");

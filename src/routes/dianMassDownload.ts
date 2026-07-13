@@ -345,6 +345,8 @@ async function processMassDownloadJob(
     const bundle = new JSZip();
     const pdfBuffersForMerge: Buffer[] = [];
     let ownerNit = "";
+    let minInvoiceDate = "";
+    let maxInvoiceDate = "";
 
     for (const result of successful) {
       if (isJobCancelled(jobId)) return;
@@ -369,6 +371,12 @@ async function processMassDownloadJob(
             if (!ownerNit) ownerNit = (direction === "sent" && !isDS) ? issuerNit : receiverNit;
             docNumber = invoiceData.docNumber || docNumber;
             issueDate = invoiceData.issueDateISO || invoiceData.issueDate || "";
+            // Track ISO date range for output ZIP name
+            if (issueDate && /^\d{4}-\d{2}-\d{2}/.test(issueDate)) {
+              const isoDate = issueDate.slice(0, 10);
+              if (!minInvoiceDate || isoDate < minInvoiceDate) minInvoiceDate = isoDate;
+              if (!maxInvoiceDate || isoDate > maxInvoiceDate) maxInvoiceDate = isoDate;
+            }
           } catch {}
 
           const { year, monthName } = parseInvoiceDate(issueDate);
@@ -411,8 +419,18 @@ async function processMassDownloadJob(
     fs.writeFileSync(outputPath, bundleBuffer);
 
     const ES_MONTHS = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
-    const now = new Date();
-    const dateFmt = `${ES_MONTHS[now.getMonth()]} ${String(now.getDate()).padStart(2, "0")} ${now.getFullYear()}`;
+    const fmtISODate = (iso: string) => {
+      const [y, m, d] = iso.split("-");
+      return `${ES_MONTHS[parseInt(m, 10) - 1]} ${String(parseInt(d, 10)).padStart(2, "0")} ${y}`;
+    };
+    // Use actual invoice date range; fall back to today only if no dates were parsed
+    const effectiveStart = startDate || minInvoiceDate;
+    const effectiveEnd   = endDate   || maxInvoiceDate;
+    const dateFmt = effectiveStart && effectiveEnd && effectiveStart !== effectiveEnd
+      ? `${fmtISODate(effectiveStart)} - ${fmtISODate(effectiveEnd)}`
+      : (effectiveStart || effectiveEnd)
+        ? fmtISODate(effectiveStart || effectiveEnd!)
+        : (() => { const n = new Date(); return `${ES_MONTHS[n.getMonth()]} ${String(n.getDate()).padStart(2, "0")} ${n.getFullYear()}`; })();
     const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
     const nit = (ownerNit || successful[0]?.nit || "").replace(/[^a-zA-Z0-9]/g, "") || "SinNIT";
     job.outputName = `${nit} - Facturas ${dirLabel} DIAN ${dateFmt}.zip`;
