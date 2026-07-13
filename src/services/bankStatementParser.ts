@@ -112,17 +112,13 @@ function detectBank(pages: string[][]): string {
   // pero sus movimientos pueden mencionar "BANCOLOMBIA" en transferencias entrantes,
   // lo que dispararía una detección falsa si se verifica bancolombia antes.
   if (allText.includes("davivienda")) return "davivienda";
-  // Occidente antes de bancolombia: un extracto de Occidente puede tener transacciones
-  // "PAGO ACH BANCOLOMBIA" que dispararían la detección incorrecta si se verificara primero.
-  // La frase "banco de occidente" es suficientemente específica para buscarse en todo el texto.
-  if (allText.includes("banco de occidente")) return "occidente";
-  // Portal Empresarial Bancolombia: "PARALELO 108" aparece en la columna SUCURSAL/CANAL
-  // de prácticamente todas las filas. Distingimos antes de bancolombia.com porque el
-  // portal empresarial NO incluye el dominio en el PDF.
+  // Bancolombia antes de Occidente: un extracto de Bancolombia puede tener pagos PSE a
+  // "Banco de Occidente S.A." que disparan la detección de Occidente si se verificara primero.
+  // bancolombia.com aparece en el pie DCF y es un marcador inequívoco del banco emisor.
   if (/paralelo\s+\d{3}/i.test(allText)) return "bancolombia";
-  // Bancolombia se detecta por el dominio "bancolombia.com" (pie DCF del extracto) o
-  // por la cabecera "Sucursal Virtual Personas" del reporte de movimientos online.
   if (allText.includes("bancolombia.com") || /sucursal\s+virtual\s+personas/i.test(allText)) return "bancolombia";
+  // Occidente: "banco de occidente" aparece en el encabezado/pie del propio extracto.
+  if (allText.includes("banco de occidente")) return "occidente";
   const head40 = pages.flat().slice(0, 40).join(" ").toLowerCase();
   if (head40.includes("itaú") || head40.includes("itau")) return "itau";
   // Banco de Bogotá: el nombre va en el pie (URL bancodebogota.com), no en el
