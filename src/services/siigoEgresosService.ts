@@ -13,7 +13,7 @@
  * mapeo de columnas en la UI), no asume un formato concreto.
  */
 import ExcelJS from "exceljs";
-import { createPaymentReceipt, getAccountsPayable, listVouchers, listPaymentReceipts, listJournals } from "./siigoService.js";
+import { createPaymentReceipt, getAccountsPayable, listVouchers, listPaymentReceipts, listJournals, listCustomers } from "./siigoService.js";
 
 export interface BankSheet {
   name: string;
@@ -263,7 +263,7 @@ export interface EgresoPayload {
   document: { id: number };
   type: EgresoType;
   date: string;
-  supplier: { identification: string; branch_office?: number };
+  supplier: { id?: string; identification: string; branch_office?: number };
   currency?: EgresoCurrency;
   items?: EgresoItem[];
   payment?: { id: number; value: number };
@@ -358,10 +358,46 @@ export function validateEgresoPayload(p: Partial<EgresoPayload> | undefined): st
 const round2 = (n: unknown): number => Math.round((Number(n) || 0) * 100) / 100;
 
 /** Envía el recibo de pago/egreso a Siigo. POST a producción. */
+/**
+ * Intenta resolver el ID interno de Siigo de un proveedor a partir de su NIT.
+ * Busca en: (1) /v1/customers, (2) /v1/accounts-payable.
+ * Retorna null si ninguna fuente lo encuentra (Siigo puede seguir con solo el NIT).
+ */
+async function resolveSupplierSiigoId(nit: string, branchOffice = 0): Promise<string | null> {
+  // Intento 1: endpoint de clientes (puede estar caído)
+  try {
+    const resp = (await listCustomers({ identification: nit, branch_office: branchOffice, page: 1, page_size: 5 })) as any;
+    const hit = Array.isArray(resp?.results) && resp.results.find((c: any) => String(c?.identification) === nit);
+    if (hit?.id) return String(hit.id);
+  } catch { /* ignora */ }
+
+  // Intento 2: cuentas por pagar (funciona incluso cuando customers está caído)
+  try {
+    const ap = (await getAccountsPayable({})) as any;
+    const rows: any[] = Array.isArray(ap) ? ap : Array.isArray(ap?.results) ? ap.results : [];
+    for (const row of rows) {
+      if (String(row?.provider?.identification) === nit) {
+        const id = row?.provider?.id;
+        if (id) return String(id);
+      }
+    }
+  } catch { /* ignora */ }
+
+  return null;
+}
+
 export async function submitEgreso(payload: EgresoPayload): Promise<unknown> {
+  // Resolver ID interno de Siigo si no viene ya en el payload
+  let supplier = payload.supplier;
+  if (!supplier.id) {
+    const siigoId = await resolveSupplierSiigoId(supplier.identification, supplier.branch_office ?? 0);
+    if (siigoId) supplier = { ...supplier, id: siigoId };
+  }
+
   // Red de seguridad: redondea todos los valores a 2 decimales antes del POST.
   const clean: EgresoPayload = {
     ...payload,
+    supplier,
     items: payload.items?.map((it) => ({ ...it, value: round2(it.value) })),
     payment: payload.payment ? { ...payload.payment, value: round2(payload.payment.value) } : undefined,
   };

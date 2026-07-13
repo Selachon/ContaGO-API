@@ -655,7 +655,8 @@ async function processCufeDownloadJob(
               driveConfig,
               userId,
               onTokenRefresh,
-              direction === "sent" ? "sent" : "received"
+              direction === "sent" ? "sent" : "received",
+              companyName || undefined
             );
             invoiceData.driveUrl = uploadResult.pdfUrl || uploadResult.folderUrl;
           } catch (driveErr) {
@@ -831,7 +832,8 @@ async function processCufeDownloadJob(
                 driveConfig,
                 userId,
                 onTokenRefresh,
-                direction === "sent" ? "sent" : "received"
+                direction === "sent" ? "sent" : "received",
+                companyName || undefined
               );
             } catch (driveErr) {
               // Cuota agotada = fallará para TODOS los documentos: abortar de

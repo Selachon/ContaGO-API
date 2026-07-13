@@ -490,7 +490,8 @@ router.post(
             job.driveConfig,
             job.userId,
             onTokenRefresh,
-            job.direction === "sent" ? "sent" : "received"
+            job.direction === "sent" ? "sent" : "received",
+            job.companyName || undefined
           );
           invoiceData.driveUrl = result.pdfUrl || result.folderUrl;
         } catch (driveErr) {
