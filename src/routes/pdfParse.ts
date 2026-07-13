@@ -599,8 +599,10 @@ router.post(
             const folio     = lt?.folio || inv.docNumber || inv.cufe.slice(0, 12);
             const safeStr   = (s: string) => s.replace(/[\\/:*?"<>|]/g, "").trim();
             const docNumber = safeStr(`${thirdPartyNit} - ${folio}`);
-            const issueDate = lt?.fechaEmision || inv.issueDate;
-            // Skip Drive upload if no date — avoids creating wrong-month folders
+            const validDateRe = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$|^\d{4}[\/\-]\d{2}[\/\-]\d{2}/;
+            const rawFecha = lt?.fechaEmision;
+            const issueDate = (rawFecha && validDateRe.test(rawFecha) ? rawFecha : null) || inv.issueDate;
+            // Skip Drive upload if no valid date — avoids creating wrong-month folders
             if (!issueDate) { job.done++; continue; }
 
             const pdfFile = pdfFiles.find((f) => {

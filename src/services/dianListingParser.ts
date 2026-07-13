@@ -50,12 +50,38 @@ async function resolveBuffer(buffer: Buffer): Promise<Buffer> {
   return buffer;
 }
 
+function excelSerialToDateStr(serial: number): string {
+  // Excel serial: days since 1900-01-00 (with Lotus 1-2-3 leap-year bug on day 60)
+  const utcDays = serial - 25569; // offset to Unix epoch (days)
+  const ms = utcDays * 86400 * 1000;
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return "";
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const yyyy = d.getUTCFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+
+function cellToDateStr(val: unknown): string {
+  if (val == null || val === "") return "";
+  if (typeof val === "number") return excelSerialToDateStr(val);
+  if (val instanceof Date) {
+    const dd = String(val.getUTCDate()).padStart(2, "0");
+    const mm = String(val.getUTCMonth() + 1).padStart(2, "0");
+    return `${dd}/${mm}/${val.getUTCFullYear()}`;
+  }
+  const s = String(val).trim();
+  // Accept DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD
+  if (/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$/.test(s) || /^\d{4}[\/\-]\d{2}[\/\-]\d{2}/.test(s)) return s;
+  return "";
+}
+
 export async function parseDianListing(buffer: Buffer): Promise<Map<string, DianTaxRow>> {
   const xlsxBuf = await resolveBuffer(buffer);
-  const wb = XLSX.read(xlsxBuf, { type: "buffer" });
+  const wb = XLSX.read(xlsxBuf, { type: "buffer", cellDates: true });
   const ws = wb.Sheets[wb.SheetNames[0]];
   if (!ws) return new Map();
-  const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1 }) as unknown[][];
+  const rows = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, raw: true }) as unknown[][];
 
   if (!rows.length) return new Map();
 
@@ -121,7 +147,7 @@ export async function parseDianListing(buffer: Buffer): Promise<Map<string, Dian
       nitReceptor: s(colMap.nitReceptor),
       nombreReceptor: s(colMap.nombreReceptor),
       folio: s(colMap.folio),
-      fechaEmision: s(colMap.fechaEmision),
+      fechaEmision: colMap.fechaEmision >= 0 ? cellToDateStr(row[colMap.fechaEmision]) : "",
       grupo: s(colMap.grupo),
     });
   }
