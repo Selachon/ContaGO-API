@@ -138,7 +138,10 @@ const isStatementBankGroupItem = (item: RecItem): boolean =>
   item.kind === "bank_fee" || BANK_STATEMENT_GROUP_RX.test(item.description);
 
 const isLedgerBankGroupItem = (item: RecItem): boolean =>
-  BANK_LEDGER_GROUP_RX.test([item.description, item.thirdParty || "", item.voucher || ""].join(" "));
+  BANK_LEDGER_GROUP_RX.test([item.description, item.thirdParty || "", item.voucher || ""].join(" ")) ||
+  // Comprobantes de Contabilidad (CC-) son asientos de consolidación mensual de
+  // gastos bancarios e intereses; no tienen descripción canónica pero sí agrupan.
+  /^CC-/i.test(item.voucher ?? "");
 
 // ─── Normalización a items con id estable ────────────────────────────────
 function toItems(statement: RecStatementInput, ledger: RecLedgerInput): {
@@ -312,7 +315,11 @@ function matchGroups(
       }
 
       const candidates = sPool.filter((s) => s.direction === dir && isStatementBankGroupItem(s));
-      const subset = findSubset(candidates, target.value, bankGroupTol, maxSize);
+      // Intentar con el pool COMPLETO del mismo sentido primero (evita la
+      // restricción de maxSize cuando todos los gastos bancarios forman el total).
+      const fullSum = round2(candidates.reduce((a, s) => a + s.value, 0));
+      const fullMatch = candidates.length >= 1 && Math.abs(fullSum - target.value) <= bankGroupTol;
+      const subset = fullMatch ? candidates : findSubset(candidates, target.value, bankGroupTol, maxSize);
       if (!subset) continue;
       const sum = round2(subset.reduce((a, s) => a + s.value, 0));
       matches.push({
