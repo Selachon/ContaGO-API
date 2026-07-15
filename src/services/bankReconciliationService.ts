@@ -241,8 +241,14 @@ function findSubset(pool: RecItem[], target: number, tol: number, maxSize: numbe
   const suffix = new Array(n + 1).fill(0);
   for (let i = n - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + items[i].value;
 
+  // Límite de nodos explorados: evita bloquear el event loop indefinidamente
+  // cuando el pool tiene muchos ítems con valores repetidos (p.ej. 90 comisiones).
+  let nodes = 0;
+  const MAX_NODES = 2_000_000;
+
   const chosen: number[] = [];
   const dfs = (start: number, remaining: number) => {
+    if (nodes++ > MAX_NODES) return;
     if (best && Math.abs(best.residual) <= EPS) return; // ya hay exacto
     if (Math.abs(remaining) <= tol) {
       const residual = Math.abs(remaining);
@@ -255,11 +261,16 @@ function findSubset(pool: RecItem[], target: number, tol: number, maxSize: numbe
     if (start >= n) return;
     if (suffix[start] + tol < remaining) return; // ni sumando todo lo restante alcanza
     for (let i = start; i < n; i++) {
+      // Skip-duplicate: si este ítem tiene el mismo valor que el anterior
+      // al mismo nivel, ya exploramos esa rama — saltamos para evitar la
+      // explosión combinatoria con comisiones bancarias repetidas.
+      if (i > start && Math.abs(items[i].value - items[i - 1].value) < EPS) continue;
       if (items[i].value - tol > remaining) continue; // este solo ya se pasa
       chosen.push(i);
       dfs(i + 1, remaining - items[i].value);
       chosen.pop();
       if (best && Math.abs(best.residual) <= EPS) return;
+      if (nodes > MAX_NODES) return;
     }
   };
   dfs(0, target);
@@ -268,7 +279,23 @@ function findSubset(pool: RecItem[], target: number, tol: number, maxSize: numbe
   // Solo agrupamos si son ≥2 elementos (un 1:1 ya se intentó antes).
   const b = best as { idx: number[]; residual: number };
   if (b.idx.length < 2) return null;
-  return b.idx.map((i) => items[i]);
+  // Al hacer skip-duplicate, el índice encontrado apunta al primero de cada valor;
+  // pero en el resultado queremos ítems reales — mapeamos expandiendo duplicados.
+  const result: RecItem[] = [];
+  const usedIndexes = new Set(b.idx);
+  const valueCounts = new Map<number, number>();
+  for (const idx of b.idx) {
+    const val = Math.round(items[idx].value * 100);
+    valueCounts.set(val, (valueCounts.get(val) ?? 0) + 1);
+  }
+  const taken = new Map<number, number>();
+  for (let i = 0; i < n && result.length < b.idx.length; i++) {
+    const val = Math.round(items[i].value * 100);
+    const need = valueCounts.get(val) ?? 0;
+    const got = taken.get(val) ?? 0;
+    if (got < need) { result.push(items[i]); taken.set(val, got + 1); }
+  }
+  return result;
 }
 
 // ─── Fase 2: agrupación por subset-sum (comisiones desglosadas/consolidadas) ─
