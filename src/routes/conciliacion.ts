@@ -86,8 +86,14 @@ router.post(
       const password = typeof req.body?.password === "string" ? req.body.password : undefined;
       const tolerance = toNum(req.body?.tolerance, 100);
 
+      const t0 = Date.now();
       const { statement, parsed } = await parseStatement(extractoFile, password);
+      console.log(`[conciliacion] parseStatement: ${Date.now() - t0}ms  (${extractoFile.size} bytes, ${statement.movements.length} movs)`);
+
+      const t1 = Date.now();
       const aux = await parseAuxiliaryLedger(auxiliarFile.buffer);
+      console.log(`[conciliacion] parseAuxiliar:  ${Date.now() - t1}ms  (${auxiliarFile.size} bytes, ${aux.entries.length} entradas)`);
+
       const ledger: RecLedgerInput = {
         opening: aux.opening,
         closing: aux.closing,
@@ -102,7 +108,9 @@ router.post(
         })),
       };
 
+      const t2 = Date.now();
       const result = reconcile(statement, ledger, { tolerance });
+      console.log(`[conciliacion] reconcile:      ${Date.now() - t2}ms  (tol=${tolerance})`);
 
       return res.json({
         ok: true,
