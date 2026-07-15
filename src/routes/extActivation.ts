@@ -110,7 +110,7 @@ router.get("/activation", requireAuth, async (req: Request, res: Response) => {
   res.json({ ok: true, ...status });
 });
 
-// ── Generar el código (permite 1 pendiente a la vez, máx. 2 dispositivos) ───
+// ── Generar el código (permite 1 pendiente a la vez, máx. 4 dispositivos) ───
 router.post("/activation/generate", requireAuth, async (req: Request, res: Response) => {
   const result = await generateExtActivationCode(req.user!.userId);
   if (!result.ok) {
@@ -120,7 +120,7 @@ router.post("/activation/generate", requireAuth, async (req: Request, res: Respo
     return res.status(409).json({
       ok: false,
       code: "DEVICE_LIMIT",
-      message: "Ya tienes 2 dispositivos registrados (el máximo permitido). Para agregar uno nuevo, desvincula uno de los existentes o pídele a un administrador que restablezca la activación.",
+      message: "Ya tienes 4 dispositivos registrados (el máximo permitido). Para agregar uno nuevo, desvincula uno de los existentes o pídele a un administrador que restablezca la activación.",
     });
   }
   if (result.already) {
@@ -152,7 +152,7 @@ router.post("/activate", rateLimit(20, 15 * 60 * 1000), async (req: Request, res
     return res.status(403).json({
       ok: false,
       code: "DEVICE_LIMIT",
-      message: "Ya tienes 2 dispositivos registrados (el máximo permitido). Desvincula uno desde la extensión o pídele al administrador que restablezca la activación.",
+      message: "Ya tienes 4 dispositivos registrados (el máximo permitido). Desvincula uno desde la extensión o pídele al administrador que restablezca la activación.",
     });
   }
 

@@ -936,7 +936,7 @@ export async function getExtActivationStatus(userId: string): Promise<ExtActivat
       activatedAt: ext?.activatedAt,
       deviceLabel: ext?.deviceLabel,
       deviceCount,
-      maxDevices: 2,
+      maxDevices: 4,
       devices,
     };
   } catch {
@@ -945,7 +945,7 @@ export async function getExtActivationStatus(userId: string): Promise<ExtActivat
 }
 
 // Genera un código de activación. Si ya hay uno pendiente → { already: true }.
-// Si el usuario ya tiene 2 dispositivos registrados → { deviceLimit: true }.
+// Si el usuario ya tiene 4 dispositivos registrados → { deviceLimit: true }.
 export async function generateExtActivationCode(
   userId: string
 ): Promise<{ ok: boolean; already?: boolean; deviceLimit?: boolean; code?: string; status?: ExtActivationStatus }> {
@@ -954,10 +954,10 @@ export async function generateExtActivationCode(
     const record = await usersCollection().findOne({ _id: oid });
     if (!record) return { ok: false };
 
-    // Límite de 2 dispositivos (el activatedAt legacy cuenta como 1).
+    // Límite de 4 dispositivos (el activatedAt legacy cuenta como 1).
     const legacyActivated = !!(record.ext_activation?.activatedAt);
     const deviceCount = (record.ext_devices?.length || 0) + (legacyActivated ? 1 : 0);
-    if (deviceCount >= 2) return { ok: true, deviceLimit: true };
+    if (deviceCount >= 4) return { ok: true, deviceLimit: true };
 
     // Código ya pendiente (no canjeado aún): devolver sin generar otro.
     if (record.ext_activation?.code && !record.ext_activation?.activatedAt) {
@@ -987,7 +987,7 @@ export async function generateExtActivationCode(
 
 // Canjea el código: registra un nuevo dispositivo y borra el código pendiente.
 // Devuelve null si el código no existe o ya fue usado. Devuelve { deviceLimit: true }
-// si el usuario ya alcanzó el máximo de 2 dispositivos.
+// si el usuario ya alcanzó el máximo de 4 dispositivos.
 export async function activateExtensionByCode(
   code: string,
   deviceLabel?: string
@@ -1003,7 +1003,7 @@ export async function activateExtensionByCode(
 
     // Verificar límite de dispositivos.
     const deviceCount = record.ext_devices?.length || 0;
-    if (deviceCount >= 2) return { deviceLimit: true };
+    if (deviceCount >= 4) return { deviceLimit: true };
 
     // Registrar nuevo dispositivo y limpiar el código pendiente.
     const deviceId = randomBytes(16).toString("hex");
