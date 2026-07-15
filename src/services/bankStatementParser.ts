@@ -108,9 +108,12 @@ async function extractLines(buffer: Buffer, password?: string): Promise<string[]
 function detectBank(pages: string[][]): string {
   const allText = pages.flat().join(" ").toLowerCase();
   const head = allText; // reutilizamos allText para los checks de encabezado también
-  // Davivienda primero: extractos Davivienda siempre traen "davivienda.com" en el pie,
-  // pero sus movimientos pueden mencionar "BANCOLOMBIA" en transferencias entrantes,
-  // lo que dispararía una detección falsa si se verifica bancolombia antes.
+  // Banco de Bogotá primero: su pie siempre contiene "bancodebogota.com", pero sus
+  // movimientos mencionan "BANCO DAVIVIENDA" en transferencias entrantes, lo que
+  // dispararía una detección falsa si se verifica davivienda antes.
+  if (allText.includes("bancodebogota.com")) return "bancobogota";
+  // Davivienda: extractos Davivienda siempre traen "davivienda" en el pie.
+  // Sus movimientos pueden mencionar "BANCOLOMBIA" en transferencias entrantes.
   if (allText.includes("davivienda")) return "davivienda";
   // Bancolombia antes de Occidente: un extracto de Bancolombia puede tener pagos PSE a
   // "Banco de Occidente S.A." que disparan la detección de Occidente si se verificara primero.
@@ -121,9 +124,6 @@ function detectBank(pages: string[][]): string {
   if (allText.includes("banco de occidente")) return "occidente";
   const head40 = pages.flat().slice(0, 40).join(" ").toLowerCase();
   if (head40.includes("itaú") || head40.includes("itau")) return "itau";
-  // Banco de Bogotá: el nombre va en el pie (URL bancodebogota.com), no en el
-  // encabezado. Es marcador específico y los demás bancos ya se descartaron arriba.
-  if (allText.includes("bancodebogota.com")) return "bancobogota";
   return "desconocido";
 }
 
