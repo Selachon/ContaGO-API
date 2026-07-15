@@ -15,6 +15,7 @@ NOMBRE_PLANTILLA = "Subir Terceros desde Excel - Siigo Nube SF_CO.xlsm"
 HOJA_TERCEROS_DIAN = "Datos de terceros"
 HOJA_PLANTILLA = "Plantilla"
 HOJA_PAISES = "Paises"
+TABLA_PAISES_FALLBACK = os.path.join(os.path.dirname(__file__), "tabla_paises.xlsx")
 
 
 def normalizar_texto(texto):
@@ -231,7 +232,19 @@ def calcular_digito_verificacion(nit):
 
 
 def construir_diccionario_geo(path_plantilla):
-    bruto = pd.read_excel(path_plantilla, sheet_name=HOJA_PAISES, header=None)
+    xls = pd.ExcelFile(path_plantilla)
+    if HOJA_PAISES in xls.sheet_names:
+        bruto = pd.read_excel(xls, sheet_name=HOJA_PAISES, header=None)
+    elif os.path.exists(TABLA_PAISES_FALLBACK):
+        bruto = pd.read_excel(TABLA_PAISES_FALLBACK, sheet_name=0, engine="openpyxl", header=None)
+    else:
+        if WEB:
+            web_io.error(
+                "plantilla_sin_paises",
+                f"La plantilla de terceros no contiene la hoja '{HOJA_PAISES}' "
+                "y no se encontró la tabla de países de respaldo.",
+            )
+        raise ValueError(f"La plantilla no contiene la hoja '{HOJA_PAISES}'")
     fila_header = None
     for i in range(min(40, len(bruto))):
         vals = [normalizar_texto(v) for v in bruto.iloc[i].tolist() if pd.notna(v)]
