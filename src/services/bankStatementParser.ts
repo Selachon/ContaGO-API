@@ -535,7 +535,10 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
     );
   }
   const allFlat = pages.flat().join(" ");
-  const isPortalEmpresarial = /paralelo\s+\d{3}/i.test(allFlat);
+  // "SUCURSAL PARALELO 108" aparece también en extractos estándar como nombre de
+  // sucursal. El Portal Empresarial se distingue por "Saldo Efectivo Actual:" en
+  // el encabezado y fechas YYYY/MM/DD — el extracto estándar no tiene ese texto.
+  const isPortalEmpresarial = /saldo efectivo actual/i.test(allFlat);
   const isSucursalVirtual   = /sucursal\s+virtual\s+personas/i.test(allFlat);
   const parsed =
     bank === "bancolombia" && isPortalEmpresarial ? parseBancolombiaPortalEmpresarial(pages)
