@@ -16,11 +16,11 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { parseBankPdf, StatementError } from "../services/bankStatementParser.js";
 import { parseAuxiliaryLedger, LedgerError } from "../services/auxiliaryLedgerParser.js";
 import {
-  reconcile,
   type RecStatementInput,
   type RecLedgerInput,
   type RecOptions,
 } from "../services/bankReconciliationService.js";
+import { reconcileInWorker } from "../services/reconcileInWorker.js";
 import { generateReconciliationExcel, type GenMeta } from "../services/conciliacionExcelGenerator.js";
 
 export const CONCILIACION_TOOL_ID = "conciliacion-bancaria";
@@ -109,7 +109,7 @@ router.post(
       };
 
       const t2 = Date.now();
-      const result = reconcile(statement, ledger, { tolerance });
+      const result = await reconcileInWorker(statement, ledger, { tolerance });
       console.log(`[conciliacion] reconcile:      ${Date.now() - t2}ms  (tol=${tolerance})`);
 
       return res.json({
@@ -143,7 +143,7 @@ router.post("/reconcile", async (req: Request, res: Response) => {
     if (!statement?.movements || !ledger?.entries) {
       return res.status(400).json({ ok: false, message: "Faltan los datos de extracto/auxiliar." });
     }
-    const result = reconcile(statement, ledger, options ?? {});
+    const result = await reconcileInWorker(statement, ledger, options ?? {});
     return res.json({ ok: true, result });
   } catch (error) {
     return handleErr(res, error);
@@ -162,7 +162,7 @@ router.post("/export", async (req: Request, res: Response) => {
     if (!statement?.movements || !ledger?.entries) {
       return res.status(400).json({ ok: false, message: "Faltan los datos de extracto/auxiliar." });
     }
-    const result = reconcile(statement, ledger, options ?? {});
+    const result = await reconcileInWorker(statement, ledger, options ?? {});
     const buffer = await generateReconciliationExcel(
       result,
       meta ?? {},
