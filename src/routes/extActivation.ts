@@ -25,6 +25,7 @@ import {
   generateExtActivationCode,
   getExtActivationStatus,
   activateExtensionByCode,
+  removeExtDevice,
   getUserPurchases,
   getUserNits,
   getExporterPrefs,
@@ -109,17 +110,24 @@ router.get("/activation", requireAuth, async (req: Request, res: Response) => {
   res.json({ ok: true, ...status });
 });
 
-// ── Generar el código (una sola vez) ────────────────────────────────────────
+// ── Generar el código (permite 1 pendiente a la vez, máx. 2 dispositivos) ───
 router.post("/activation/generate", requireAuth, async (req: Request, res: Response) => {
   const result = await generateExtActivationCode(req.user!.userId);
   if (!result.ok) {
     return res.status(500).json({ ok: false, message: "No se pudo generar el código de activación" });
   }
+  if (result.deviceLimit) {
+    return res.status(409).json({
+      ok: false,
+      code: "DEVICE_LIMIT",
+      message: "Ya tienes 2 dispositivos registrados (el máximo permitido). Para agregar uno nuevo, desvincula uno de los existentes o pídele a un administrador que restablezca la activación.",
+    });
+  }
   if (result.already) {
     return res.status(409).json({
       ok: false,
       code: "ALREADY_GENERATED",
-      message: "Ya generaste tu código de activación. Si necesitas uno nuevo, pídele a un administrador que lo restablezca.",
+      message: "Ya tienes un código de activación pendiente. Úsalo en la extensión o pídele a un administrador que lo restablezca.",
       status: result.status,
     });
   }
@@ -140,13 +148,21 @@ router.post("/activate", rateLimit(20, 15 * 60 * 1000), async (req: Request, res
       message: "Código no válido o ya utilizado. Genera uno nuevo en el portal (o pide a un admin que lo restablezca).",
     });
   }
+  if ("deviceLimit" in result) {
+    return res.status(403).json({
+      ok: false,
+      code: "DEVICE_LIMIT",
+      message: "Ya tienes 2 dispositivos registrados (el máximo permitido). Desvincula uno desde la extensión o pídele al administrador que restablezca la activación.",
+    });
+  }
 
-  const { user } = result;
+  const { user, deviceId } = result;
   const payload: JWTPayload = {
     userId: user.id,
     email: user.email,
     isAdmin: user.is_admin,
     role: user.role || (user.is_admin ? "ADMIN" : "USER"),
+    deviceId,
   };
   const token = jwt.sign(payload, getJwtSecret(), { expiresIn: EXT_TOKEN_TTL } as jwt.SignOptions);
 
@@ -158,8 +174,29 @@ router.post("/activate", rateLimit(20, 15 * 60 * 1000), async (req: Request, res
   res.json({
     ok: true,
     token,
+    deviceId,
     user: { email: user.email, name: user.name, purchasedTools, nits },
   });
+});
+
+// ── Desvincular dispositivo (llamado desde la extensión al hacer logout) ────
+router.post("/deactivate", requireAuth, async (req: Request, res: Response) => {
+  const deviceId = req.user!.deviceId;
+  if (deviceId) {
+    await removeExtDevice(req.user!.userId, deviceId);
+  }
+  res.json({ ok: true });
+});
+
+// ── Desvincular un dispositivo específico desde el portal web ───────────────
+// Autenticado con el JWT del portal (no requiere deviceId en el token).
+router.delete("/devices/:deviceId", requireAuth, async (req: Request, res: Response) => {
+  const { deviceId } = req.params;
+  if (!deviceId || deviceId.length < 8) {
+    return res.status(400).json({ ok: false, message: "deviceId inválido." });
+  }
+  const removed = await removeExtDevice(req.user!.userId, deviceId);
+  res.json({ ok: removed });
 });
 
 // ── Preferencias del Exportador DIAN (las configura el portal, las lee la extensión) ──

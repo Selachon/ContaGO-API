@@ -85,9 +85,11 @@ interface UserRecord {
   ext_activation?: {
     code: string | null;          // código en claro; null = nunca generado / restablecido
     codeGeneratedAt?: string;     // ISO — cuándo se generó
-    activatedAt?: string;         // ISO — cuándo lo canjeó la extensión (consume el código)
-    deviceLabel?: string;         // etiqueta opcional del dispositivo que activó
+    activatedAt?: string;         // ISO — flujo legacy (un solo dispositivo, pre-multi-device)
+    deviceLabel?: string;         // etiqueta del dispositivo (flujo legacy)
   };
+  // Dispositivos registrados vía el flujo multi-device (máx. 2).
+  ext_devices?: ExtDevice[];
   // Preferencias del Exportador DIAN que se configuran en el portal y la extensión
   // lee para seguirlas tal cual (Drive sí/no, qué cuenta, incluir enlaces).
   exporter_prefs?: {
@@ -893,13 +895,22 @@ function makeExtCode(): string {
   return `CTG-${block()}-${block()}`;
 }
 
+export interface ExtDevice {
+  deviceId: string;
+  deviceLabel: string;
+  activatedAt: string;
+}
+
 export interface ExtActivationStatus {
   generated: boolean;
   activated: boolean;
-  code?: string | null;          // se devuelve solo si aún no se ha canjeado
+  code?: string | null;          // solo si hay código pendiente (aún no canjeado)
   codeGeneratedAt?: string;
   activatedAt?: string;
   deviceLabel?: string;
+  deviceCount: number;
+  maxDevices: number;
+  devices: Pick<ExtDevice, "deviceId" | "deviceLabel" | "activatedAt">[];
 }
 
 export async function getExtActivationStatus(userId: string): Promise<ExtActivationStatus | null> {
@@ -907,32 +918,53 @@ export async function getExtActivationStatus(userId: string): Promise<ExtActivat
     const record = await usersCollection().findOne({ _id: new ObjectId(userId) });
     if (!record) return null;
     const ext = record.ext_activation;
-    if (!ext || !ext.code) return { generated: false, activated: false };
+    const devices: ExtDevice[] = (record.ext_devices || []).map(d => ({
+      deviceId: d.deviceId,
+      deviceLabel: d.deviceLabel || "",
+      activatedAt: d.activatedAt,
+    }));
+    // El "activatedAt" legacy cuenta como 1 dispositivo (flujo antiguo).
+    const legacyActivated = !!(ext?.activatedAt);
+    const deviceCount = devices.length + (legacyActivated ? 1 : 0);
+    // Código pendiente = existe y no fue activado aún (flujo legacy setea activatedAt en vez de limpiar).
+    const hasPendingCode = !!(ext?.code && !ext?.activatedAt);
     return {
-      generated: true,
-      activated: !!ext.activatedAt,
-      code: ext.activatedAt ? null : ext.code, // tras canjearlo no se vuelve a mostrar
-      codeGeneratedAt: ext.codeGeneratedAt,
-      activatedAt: ext.activatedAt,
-      deviceLabel: ext.deviceLabel,
+      generated: hasPendingCode,
+      activated: deviceCount > 0,
+      code: hasPendingCode ? ext!.code : null,
+      codeGeneratedAt: ext?.codeGeneratedAt,
+      activatedAt: ext?.activatedAt,
+      deviceLabel: ext?.deviceLabel,
+      deviceCount,
+      maxDevices: 2,
+      devices,
     };
   } catch {
     return null;
   }
 }
 
-// Genera el código UNA sola vez. Si ya existe → { already: true } sin tocar nada.
+// Genera un código de activación. Si ya hay uno pendiente → { already: true }.
+// Si el usuario ya tiene 2 dispositivos registrados → { deviceLimit: true }.
 export async function generateExtActivationCode(
   userId: string
-): Promise<{ ok: boolean; already?: boolean; code?: string; status?: ExtActivationStatus }> {
+): Promise<{ ok: boolean; already?: boolean; deviceLimit?: boolean; code?: string; status?: ExtActivationStatus }> {
   try {
     const oid = new ObjectId(userId);
     const record = await usersCollection().findOne({ _id: oid });
     if (!record) return { ok: false };
-    if (record.ext_activation && record.ext_activation.code) {
+
+    // Límite de 2 dispositivos (el activatedAt legacy cuenta como 1).
+    const legacyActivated = !!(record.ext_activation?.activatedAt);
+    const deviceCount = (record.ext_devices?.length || 0) + (legacyActivated ? 1 : 0);
+    if (deviceCount >= 2) return { ok: true, deviceLimit: true };
+
+    // Código ya pendiente (no canjeado aún): devolver sin generar otro.
+    if (record.ext_activation?.code && !record.ext_activation?.activatedAt) {
       return { ok: true, already: true, status: (await getExtActivationStatus(userId)) || undefined };
     }
-    // Reintentar ante colisión del índice único (muy improbable).
+
+    // Generar código nuevo (reemplaza el objeto ext_activation completo, limpiando el activatedAt legacy).
     for (let attempt = 0; attempt < 5; attempt++) {
       const code = makeExtCode();
       try {
@@ -942,7 +974,7 @@ export async function generateExtActivationCode(
         );
         return { ok: true, code };
       } catch (e: any) {
-        if (e?.code === 11000) continue; // colisión → otro código
+        if (e?.code === 11000) continue; // colisión de índice único → otro código
         throw e;
       }
     }
@@ -953,28 +985,58 @@ export async function generateExtActivationCode(
   }
 }
 
-// Canjea el código: lo marca como activado (un solo uso) y devuelve el usuario.
+// Canjea el código: registra un nuevo dispositivo y borra el código pendiente.
+// Devuelve null si el código no existe o ya fue usado. Devuelve { deviceLimit: true }
+// si el usuario ya alcanzó el máximo de 2 dispositivos.
 export async function activateExtensionByCode(
   code: string,
   deviceLabel?: string
-): Promise<{ user: User; reactivated: boolean } | null> {
+): Promise<{ user: User; deviceId: string } | { deviceLimit: true } | null> {
   try {
     const clean = String(code || "").trim().toUpperCase();
     if (!clean) return null;
     const record = await usersCollection().findOne({ "ext_activation.code": clean });
     if (!record) return null;
     if (record.status === "suspended") return null;
-    const already = !!record.ext_activation?.activatedAt;
-    // Único uso: si ya fue activado, no se permite canjear de nuevo (pide reset admin).
-    if (already) return null;
+    // Flujo legacy: el código ya fue canjeado (activatedAt set) → un solo uso.
+    if (record.ext_activation?.activatedAt) return null;
+
+    // Verificar límite de dispositivos.
+    const deviceCount = record.ext_devices?.length || 0;
+    if (deviceCount >= 2) return { deviceLimit: true };
+
+    // Registrar nuevo dispositivo y limpiar el código pendiente.
+    const deviceId = randomBytes(16).toString("hex");
+    const device: ExtDevice = {
+      deviceId,
+      deviceLabel: (deviceLabel || "").slice(0, 120),
+      activatedAt: new Date().toISOString(),
+    };
     await usersCollection().updateOne(
       { _id: record._id },
-      { $set: { "ext_activation.activatedAt": new Date().toISOString(), "ext_activation.deviceLabel": deviceLabel || "" } }
+      {
+        $push: { ext_devices: device as any },
+        $unset: { "ext_activation.code": "", "ext_activation.codeGeneratedAt": "" },
+      }
     );
-    return { user: mapUser(record)!, reactivated: false };
+    return { user: mapUser(record)!, deviceId };
   } catch (err) {
     console.error("Error activando extensión:", err);
     return null;
+  }
+}
+
+// Elimina un dispositivo del registro (llamado desde la extensión al desvincularse).
+export async function removeExtDevice(userId: string, deviceId: string): Promise<boolean> {
+  try {
+    await usersCollection().updateOne(
+      { _id: new ObjectId(userId) },
+      { $pull: { ext_devices: { deviceId } } as any }
+    );
+    return true;
+  } catch (err) {
+    console.error("Error eliminando dispositivo:", err);
+    return false;
   }
 }
 
@@ -1010,12 +1072,12 @@ export async function setExporterPrefs(userId: string, prefs: Partial<ExporterPr
   return next;
 }
 
-// Admin: restablece la activación para que el usuario pueda generar un código nuevo.
+// Admin: restablece la activación y borra todos los dispositivos registrados.
 export async function resetExtActivation(userId: string): Promise<boolean> {
   try {
     const result = await usersCollection().updateOne(
       { _id: new ObjectId(userId) },
-      { $unset: { ext_activation: "" } }
+      { $unset: { ext_activation: "" }, $set: { ext_devices: [] } }
     );
     return result.matchedCount > 0;
   } catch (err) {

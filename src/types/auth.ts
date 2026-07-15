@@ -38,6 +38,7 @@ export interface JWTPayload {
   email: string;
   isAdmin: boolean;
   role?: UserRole;
+  deviceId?: string;
 }
 
 export interface AuthResponse {
