@@ -234,10 +234,11 @@ function parseBancolombia(pages: string[][]): { raws: RawMov[]; opening: number 
   const hasta = all.find((l) => /HASTA:/i.test(l));
   if (hasta) { const m = hasta.match(/HASTA:\s*(\d{4})/); if (m) year = m[1]; }
 
+  // Bancolombia usa "$ .00" (sin dígito antes del punto) para saldo cero.
   const findMoney = (rx: RegExp): number | null => {
     const line = all.find((l) => rx.test(l));
     if (!line) return null;
-    const m = line.match(/([\d,]+\.\d{2})/);
+    const m = line.match(/([\d,]*\.\d{2})/);
     return m ? num(m[1]) : null;
   };
   const opening = findMoney(/SALDO ANTERIOR/i);
@@ -246,7 +247,9 @@ function parseBancolombia(pages: string[][]): { raws: RawMov[]; opening: number 
   const debits = findMoney(/TOTAL CARGOS/i);
 
   const raws: RawMov[] = [];
-  const rowRx = /^(\d{1,2}\/\d{2})\s+(.+?)\s+(-?[\d,]+\.\d{2})\s+([\d,]+\.\d{2})$/;
+  // Bancolombia omite el 0 inicial en centavos/cero: ".44", ".00" en vez de "0.44", "0.00"
+  // Tanto el valor como el saldo pueden venir así → [\d,]* en ambos grupos.
+  const rowRx = /^(\d{1,2}\/\d{2})\s+(.+?)\s+(-?[\d,]*\.\d{2})\s+([\d,]*\.\d{2})$/;
   for (const line of all) {
     const m = line.match(rowRx);
     if (!m) continue;
@@ -486,7 +489,10 @@ function classifyAndReconcile(
       );
     }
     const kind: MovKind = FEE_RX.test(r.description) ? "bank_fee" : direction === "in" ? "ingreso" : "egreso";
-    if (direction === "in") credits += r.value; else debits += r.value;
+    // Redondear al acumular para evitar drift de punto flotante en extractos con
+    // muchos movimientos de centavos (ej. intereses diarios de ahorros).
+    if (direction === "in") credits = Math.round((credits + r.value) * 100) / 100;
+    else debits = Math.round((debits + r.value) * 100) / 100;
     movements.push({ date: r.date, description: r.description, value: r.value, balance: r.balance, kind, direction });
     prev = r.balance;
   });
