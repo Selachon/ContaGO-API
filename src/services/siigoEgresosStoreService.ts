@@ -134,7 +134,7 @@ export async function addMovements(companyId: string, movs: NewMovInput[]): Prom
   return docs.map((d, i) => mapDoc({ ...d, _id: result.insertedIds[i] }));
 }
 
-const EDITABLE_FIELDS = ["date", "value", "description", "nit", "kind", "direction", "balance", "status", "note", "siigoMatch", "receipt", "fingerprint", "cajaEntryId", "pdfUrl", "pdfName", "proyectoId"];
+const EDITABLE_FIELDS = ["date", "value", "description", "nit", "kind", "direction", "balance", "status", "note", "siigoMatch", "receipt", "fingerprint", "cajaEntryId", "pdfUrl", "pdfName", "proyectoId", "bankAccountId"];
 
 /** Actualiza campos permitidos de un movimiento. */
 export async function updateMovement(
