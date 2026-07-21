@@ -505,6 +505,20 @@ router.patch("/payments/:id", async (req, res) => {
   res.json({ ok: true, data: updated });
 });
 
+router.delete("/payments/:id/items/:index", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const prog = await getPayment(companyId, req.params.id);
+  if (!prog) return res.status(404).json({ ok: false, message: "Programación no encontrada." });
+  if (prog.estado !== "borrador") return res.status(409).json({ ok: false, message: "Solo se pueden quitar ítems de una programación en borrador." });
+  const idx = Number(req.params.index);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= prog.items.length)
+    return res.status(400).json({ ok: false, message: "Índice de ítem inválido." });
+  const items = prog.items.filter((_, i) => i !== idx);
+  const updated = await updatePayment(companyId, req.params.id, { items });
+  res.json({ ok: true, data: updated });
+});
+
 router.delete("/payments/:id", async (req, res) => {
   const companyId = await resolveCompany(req, res);
   if (!companyId) return;
