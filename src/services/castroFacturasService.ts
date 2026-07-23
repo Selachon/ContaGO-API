@@ -316,7 +316,8 @@ export async function appendToSheet(factura: CastroFactura, claim: CastroClaim):
     "",                              // J: Centro de Costos
     factura.pdfDriveLink || "",      // K: Adjunte factura
     claim.anexosDriveLinks?.join(", ") || "", // L: Otros anexos
-    "Factura electrónica",           // M: Tipo de documento
+    factura.documentType || "Factura electrónica", // M: Tipo de documento
+    factura.total || "",             // N: Total factura (incluye IVA + otros impuestos)
   ];
 
   // Encontrar el último renglón con dato en columna E (Fecha de emisión)
@@ -334,7 +335,7 @@ export async function appendToSheet(factura: CastroFactura, claim: CastroClaim):
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: config.spreadsheetId,
-    range: `'${sheetName}'!A${targetRow}:M${targetRow}`,
+    range: `'${sheetName}'!A${targetRow}:N${targetRow}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
@@ -366,6 +367,7 @@ export async function appendToPersonalesSheet(factura: CastroFactura, claim: Cas
     conceptoCompleto,                // G: Concepto + forma de pago + detalle
     factura.pdfDriveLink || "",      // H: Adjunte factura
     claim.anexosDriveLinks?.join(", ") || "", // I: Adjunte otros anexos
+    factura.total || "",             // J: Total factura (incluye IVA + otros impuestos)
   ];
 
   // Buscar último renglón con dato en columna D (Razón social — siempre diligenciada)
@@ -382,7 +384,7 @@ export async function appendToPersonalesSheet(factura: CastroFactura, claim: Cas
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: config.spreadsheetId,
-    range: `'${sheetName}'!C${targetRow}:I${targetRow}`,
+    range: `'${sheetName}'!C${targetRow}:J${targetRow}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
