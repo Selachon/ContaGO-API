@@ -311,13 +311,12 @@ export async function appendToSheet(factura: CastroFactura, claim: CastroClaim):
     factura.issueDateISO,            // E: Fecha de emisión
     factura.issuerName,              // F: Nombres / Razón social
     factura.subtotal || "",          // G: Valor antes de impuestos
-    factura.iva || "",               // H: Valor IVA
+    factura.total && factura.subtotal ? factura.total - factura.subtotal : (factura.iva || ""), // H: Total impuestos (IVA + otros)
     conceptoCompleto,                // I: Concepto + forma de pago + detalle
     "",                              // J: Centro de Costos
     factura.pdfDriveLink || "",      // K: Adjunte factura
     claim.anexosDriveLinks?.join(", ") || "", // L: Otros anexos
     factura.documentType || "Factura electrónica", // M: Tipo de documento
-    factura.total || "",             // N: Total factura (incluye IVA + otros impuestos)
   ];
 
   // Encontrar el último renglón con dato en columna E (Fecha de emisión)
@@ -335,7 +334,7 @@ export async function appendToSheet(factura: CastroFactura, claim: CastroClaim):
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: config.spreadsheetId,
-    range: `'${sheetName}'!A${targetRow}:N${targetRow}`,
+    range: `'${sheetName}'!A${targetRow}:M${targetRow}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
@@ -363,11 +362,10 @@ export async function appendToPersonalesSheet(factura: CastroFactura, claim: Cas
     factura.issueDateISO,            // C: Fecha de emisión
     factura.issuerName,              // D: Razón social
     factura.subtotal || "",          // E: Valor antes de impuestos
-    factura.iva || "",               // F: Valor IVA (vacío si no aplica)
+    factura.total && factura.subtotal ? factura.total - factura.subtotal : (factura.iva || ""), // F: Total impuestos (IVA + otros)
     conceptoCompleto,                // G: Concepto + forma de pago + detalle
     factura.pdfDriveLink || "",      // H: Adjunte factura
     claim.anexosDriveLinks?.join(", ") || "", // I: Adjunte otros anexos
-    factura.total || "",             // J: Total factura (incluye IVA + otros impuestos)
   ];
 
   // Buscar último renglón con dato en columna D (Razón social — siempre diligenciada)
@@ -384,7 +382,7 @@ export async function appendToPersonalesSheet(factura: CastroFactura, claim: Cas
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: config.spreadsheetId,
-    range: `'${sheetName}'!C${targetRow}:J${targetRow}`,
+    range: `'${sheetName}'!C${targetRow}:I${targetRow}`,
     valueInputOption: "USER_ENTERED",
     requestBody: { values: [row] },
   });
