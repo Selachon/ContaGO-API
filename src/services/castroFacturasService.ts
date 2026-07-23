@@ -310,8 +310,8 @@ export async function appendToSheet(factura: CastroFactura, claim: CastroClaim):
     claim.correo,                    // D: Correo electrónico
     factura.issueDateISO,            // E: Fecha de emisión
     factura.issuerName,              // F: Nombres / Razón social
-    factura.subtotal || "",          // G: Valor antes de impuestos
-    factura.total && factura.subtotal ? factura.total - factura.subtotal : (factura.iva || ""), // H: Total impuestos (IVA + otros)
+    factura.total && factura.iva ? factura.total - factura.iva : (factura.subtotal || ""), // G: Base (subtotal + otros impuestos)
+    factura.iva || "",               // H: Valor IVA
     conceptoCompleto,                // I: Concepto + forma de pago + detalle
     "",                              // J: Centro de Costos
     factura.pdfDriveLink || "",      // K: Adjunte factura
@@ -361,8 +361,8 @@ export async function appendToPersonalesSheet(factura: CastroFactura, claim: Cas
   const row = [
     factura.issueDateISO,            // C: Fecha de emisión
     factura.issuerName,              // D: Razón social
-    factura.subtotal || "",          // E: Valor antes de impuestos
-    factura.total && factura.subtotal ? factura.total - factura.subtotal : (factura.iva || ""), // F: Total impuestos (IVA + otros)
+    factura.total && factura.iva ? factura.total - factura.iva : (factura.subtotal || ""), // E: Base (subtotal + otros impuestos)
+    factura.iva || "",               // F: Valor IVA
     conceptoCompleto,                // G: Concepto + forma de pago + detalle
     factura.pdfDriveLink || "",      // H: Adjunte factura
     claim.anexosDriveLinks?.join(", ") || "", // I: Adjunte otros anexos
