@@ -526,6 +526,7 @@ export async function verifyPassword(user: User, password: string): Promise<bool
 export const TOOL_SUCCESSOR: Record<string, string> = {
   "dian-downloader": "dian-mass-download",
   "dian-excel-exporter": "dian-cufe-downloader",
+  "dian-mass-download": "dian-recibidos",
 };
 
 export async function getUserPurchases(userId: string): Promise<string[]> {
