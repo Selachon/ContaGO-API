@@ -5,7 +5,8 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
-import { acquireDianJobSlot, downloadDocumentsByCufe } from "../services/dianScraper.js";
+import { closeBrowserSafely, REAL_USER_AGENT } from "../services/dianScraper.js";
+import { authenticateAndNavigate, fetchDocumentList } from "../services/dianRecibidosScraper.js";
 import { extractThirdPartyDataFromXml } from "../services/xmlParser.js";
 import { generateThirdPartiesExcelFile } from "../services/excelGenerator.js";
 import { requireAuth } from "../middleware/auth.js";
@@ -300,7 +301,7 @@ router.post(
       message: demoLimitInfo?.message || `${downloadCufes.length} terceros únicos encontrados. Usa /dian-third-parties/job-status/${jobId} para consultar el progreso.`,
     });
 
-    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, skippedEntries, start_date, end_date, direction, req.user!.userId).catch((err) => {
+    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, allDates, skippedEntries, start_date, end_date, direction, req.user!.userId).catch((err) => {
       console.error(`[ThirdParties] Job ${jobId} error:`, err);
       const j = jobTracker.get(jobId);
       if (j) {
@@ -317,6 +318,7 @@ async function processCufeDownloadJob(
   tokenUrl: string,
   allCufes: string[],
   downloadCufes: string[],
+  allDates: string[],
   skippedEntries: Array<{cufe: string; reason: string}>,
   startDate: string | undefined,
   endDate: string | undefined,
@@ -325,16 +327,6 @@ async function processCufeDownloadJob(
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
-
-  // Cola global DIAN: por defecto 1 job a la vez (env DIAN_MAX_CONCURRENT_JOBS).
-  // Varios jobs simultaneos disparan el bloqueo anti-bot por IP y degradan a todos;
-  // serializar mantiene la precision de proceso unico. El usuario ve su turno.
-  const releaseDianJobSlot = await acquireDianJobSlot((pos) => setProgress(jobId, {
-    step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`,
-    current: 0,
-    total: 0,
-  }));
-  if (isJobCancelled(jobId)) { releaseDianJobSlot(); return; }
 
   job.status = "processing";
 
@@ -366,68 +358,138 @@ async function processCufeDownloadJob(
   let companyNit = "";
   let companyWasFromDS = false;
 
-  async function downloadAndFill(batch: string[], dir: string, phaseLabel: string): Promise<void> {
-    const { results } = await downloadDocumentsByCufe(
-      tokenUrl, batch, startDate, endDate, direction, dir,
-      (progress) => setProgress(jobId, {
-        step: `${phaseLabel}: ${progress.step || "..."}`,
-        current: progress.current ?? 0,
-        total: downloadCufes.length,
-      }),
-      () => isJobCancelled(jobId)
+  if (downloadCufes.length > 0) {
+    // ── gratis-vpfe bulk approach ────────────────────────────────────────────
+    const parseAnyDate = (raw: string): Date | null => {
+      if (!raw) return null;
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return new Date(raw);
+      const m = raw.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+      if (m) return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+      return null;
+    };
+    const fmtDdMmYyyy = (ms: number): string => {
+      const dt = new Date(ms);
+      return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
+    };
+    const isoToDdMmYyyy = (iso: string): string => {
+      const [y, m, d] = iso.split("-");
+      return `${d}/${m}/${y}`;
+    };
+
+    const fromDate = startDate ? isoToDdMmYyyy(startDate) : "01/01/2015";
+    const toDate = endDate ? isoToDdMmYyyy(endDate) : fmtDdMmYyyy(Date.now());
+
+    setProgress(jobId, { step: "Autenticando en portal DIAN...", current: 0, total: downloadCufes.length });
+
+    const { browser: gBrowser, page: gPage } = await authenticateAndNavigate(
+      tokenUrl, fromDate, toDate,
+      (p) => setProgress(jobId, { step: p.step || "Autenticando...", current: 0, total: downloadCufes.length }),
+      direction,
     );
 
-    if (isJobCancelled(jobId)) return;
-
-    const successful = results.filter((r) => r.success && r.destPath);
-    for (let i = 0; i < successful.length; i++) {
+    try {
       if (isJobCancelled(jobId)) return;
-      const result = successful[i];
-      setProgress(jobId, {
-        step: `${phaseLabel}: procesando XML ${i + 1}/${successful.length}...`,
-        current: i + 1,
-        total: successful.length,
-      });
-      try {
-        const zipBuffer = fs.readFileSync(result.destPath!);
-        const { xmlBuffer } = await extractFilesFromZip(zipBuffer);
-        if (!xmlBuffer) continue;
-        const invoiceData = await extractThirdPartyDataFromXml(xmlBuffer, {
-          id: result.trackId || result.cufe,
-          docnum: result.docnum || "",
-        });
+
+      setProgress(jobId, { step: "Obteniendo lista de documentos...", current: 0, total: downloadCufes.length });
+      const portalDocs = await fetchDocumentList(gPage, direction);
+
+      if (portalDocs.length === 0) {
+        console.warn("[ThirdParties] gratis-vpfe: sin documentos en el rango de fechas.");
+      }
+
+      const cookiesArr = await gPage.cookies();
+      const cookieHeader = cookiesArr.map((c: any) => `${c.name}=${c.value}`).join("; ");
+
+      const cufeSetLower = new Set(downloadCufes.map((c) => c.toLowerCase()));
+      const cufeOriginalMap = new Map(downloadCufes.map((c) => [c.toLowerCase(), c]));
+
+      const CONCURRENCY = 4;
+      let dlSlots = CONCURRENCY;
+      const dlWaitQueue: Array<() => void> = [];
+      const acquireDl = (): Promise<void> =>
+        dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((r) => dlWaitQueue.push(r));
+      const releaseDl = () => { const n = dlWaitQueue.shift(); if (n) n(); else dlSlots++; };
+
+      const RATE_MS = 60000 / 50; // 50 facturas/min = 1 descarga cada 1200ms
+      let nextAllowedMs = Date.now();
+      const rateAcquire = async (): Promise<void> => {
+        const wait = nextAllowedMs - Date.now();
+        nextAllowedMs = Math.max(nextAllowedMs, Date.now()) + RATE_MS;
+        if (wait > 0) await new Promise<void>((r) => setTimeout(r, wait));
+      };
+
+      let dlOk = 0;
+      const failedDocs: Array<{ txId: string; docNumber: string }> = [];
+
+      const processXml = async (xmlBuf: Buffer, txId: string, docNumber: string): Promise<void> => {
+          // El transactionId de gratis-vpfe ES el CUFE (96-char hex SHA-384)
+          const cufeLower = txId.toLowerCase();
+          if (!cufeSetLower.has(cufeLower)) return;
+
+          const originalCufe = cufeOriginalMap.get(cufeLower)!;
+        const invoiceData = await extractThirdPartyDataFromXml(xmlBuf, { id: txId, docnum: docNumber });
 
         const isDS = !!invoiceData.isDocumentoSoporte;
-        const currentOwnName = (direction === "received") 
-          ? invoiceData.receiverName 
-          : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
-        const currentOwnNit = (direction === "received")
-          ? invoiceData.receiverNit
-          : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
-
-        if (!companyName || companyName === "N/A" || (companyWasFromDS && !isDS)) {
-          if (currentOwnName && currentOwnName !== "N/A") {
-            companyName = currentOwnName;
-            companyNit = (currentOwnNit && currentOwnNit !== "N/A") ? currentOwnNit : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
+        const ownName = direction === "received" ? invoiceData.receiverName : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
+        const ownNit = direction === "received" ? invoiceData.receiverNit : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
+        if ((!companyName || companyName === "N/A") || (companyWasFromDS && !isDS)) {
+          if (ownName && ownName !== "N/A") {
+            companyName = ownName;
+            companyNit = (ownNit && ownNit !== "N/A") ? ownNit : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
             companyWasFromDS = isDS;
           }
         }
 
-        invoiceMap.set(result.cufe, invoiceData);
-      } catch {}
+        invoiceMap.set(originalCufe, invoiceData);
+        dlOk++;
+        setProgress(jobId, { step: `Descargando ${dlOk}/${downloadCufes.length}...`, current: dlOk, total: downloadCufes.length });
+      };
+
+      setProgress(jobId, { step: `Descargando documentos...`, current: 0, total: downloadCufes.length });
+
+      const dlPromises = portalDocs.map(async (doc) => {
+        await acquireDl();
+        await rateAcquire();
+        try {
+          const xmlUrl = `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${doc.transactionId}&type=2`;
+          const xmlResp = await fetch(xmlUrl, { headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader } });
+          if (!xmlResp.ok) { failedDocs.push({ txId: doc.transactionId, docNumber: doc.docNumber }); return; }
+          const xmlBuf = Buffer.from(await xmlResp.arrayBuffer());
+          await processXml(xmlBuf, doc.transactionId, doc.docNumber);
+        } catch (err) {
+          console.warn(`[ThirdParties] Error doc ${doc.transactionId}:`, err instanceof Error ? err.message : err);
+          failedDocs.push({ txId: doc.transactionId, docNumber: doc.docNumber });
+        } finally {
+          releaseDl();
+        }
+      });
+      await Promise.all(dlPromises);
+
+      if (isJobCancelled(jobId)) return;
+
+      if (failedDocs.length > 0) {
+        console.log(`[ThirdParties] Reintentando ${failedDocs.length} descarga(s) fallida(s)...`);
+        const freshCookies = await gPage.cookies();
+        const freshHdr = freshCookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+        for (const f of failedDocs) {
+          if (isJobCancelled(jobId)) break;
+          try {
+            const xmlResp = await fetch(
+              `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${f.txId}&type=2`,
+              { headers: { "User-Agent": REAL_USER_AGENT, Cookie: freshHdr } },
+            );
+            if (!xmlResp.ok) continue;
+            const xmlBuf = Buffer.from(await xmlResp.arrayBuffer());
+            await processXml(xmlBuf, f.txId, f.docNumber);
+          } catch (err) {
+            console.warn(`[ThirdParties] Reintento fallido ${f.txId}:`, err instanceof Error ? err.message : err);
+          }
+        }
+      }
+    } finally {
+      await closeBrowserSafely(gBrowser).catch(() => {});
     }
   }
-
-    if (isJobCancelled(jobId)) return;
-    await downloadAndFill(downloadCufes, tempDir, "Descarga");
-    if (isJobCancelled(jobId)) return;
-
-    const pendingCufes = downloadCufes.filter((c) => !invoiceMap.get(c)?.issuerNit);
-    if (pendingCufes.length > 0) {
-      const tempDir2 = path.join(DOWNLOADS_DIR, `${sessionId}_retry`);
-      fs.mkdirSync(tempDir2, { recursive: true });
-      try { await downloadAndFill(pendingCufes, tempDir2, "Reintento"); } finally { fs.rmSync(tempDir2, { recursive: true, force: true }); }
-    }
 
     if (isJobCancelled(jobId)) return;
     setProgress(jobId, { step: "Generando Excel de Terceros...", current: downloadCufes.length, total: downloadCufes.length });
@@ -442,7 +504,6 @@ async function processCufeDownloadJob(
     job.status = "error"; job.error = (err as Error).message;
     setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: job.error });
   } finally {
-    releaseDianJobSlot();
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
 }

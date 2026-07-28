@@ -95,6 +95,9 @@ export interface PortalStatusConfig {
     disableLogin: boolean;
     linkLabel?: string;
     linkUrl?: string;
+    features?: {
+      extensionEnabled?: boolean;
+    };
   };
   tools: PortalToolStatus[];
   updatedAt?: string;
@@ -200,6 +203,7 @@ function defaultPortalStatus(): PortalStatusConfig {
       disableLogin: false,
       linkLabel: "",
       linkUrl: "",
+      features: { extensionEnabled: true },
     },
     tools: [],
     updatedAt: undefined,
@@ -569,6 +573,9 @@ export async function updatePortalStatusConfig(
       disableLogin: !!config.global?.disableLogin,
       linkLabel: (config.global?.linkLabel || "").trim(),
       linkUrl: (config.global?.linkUrl || "").trim(),
+      features: {
+        extensionEnabled: config.global?.features?.extensionEnabled !== false,
+      },
     },
     tools: (config.tools || []).map((tool) => ({
       toolId: String(tool.toolId || "").trim(),

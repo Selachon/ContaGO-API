@@ -5,7 +5,8 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
-import { acquireDianJobSlot, extractDocumentIdsByCufe, fetchZipToFile, downloadZipInPage, REAL_USER_AGENT, type ListingRecord } from "../services/dianScraper.js";
+import { closeBrowserSafely, REAL_USER_AGENT, type ListingRecord } from "../services/dianScraper.js";
+import { authenticateAndNavigate } from "../services/dianRecibidosScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile } from "../services/excelGenerator.js";
 import {
@@ -255,7 +256,6 @@ router.post(
     let allDates: string[];
     let skippedEntries: Array<{cufe: string; reason: string}>;
     let direction: DocumentDirection;
-    let listingRecords: ListingRecord[] = [];
     try {
       const excelBuffer = await resolveExcelBuffer(file);
       const result = await extractCufesFromExcel(excelBuffer);
@@ -270,7 +270,6 @@ router.post(
       allDates = result.dates;
       skippedEntries = result.skippedEntries;
       direction = result.detectedDirection;
-      listingRecords = result.listingRecords;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return res.status(400).json({ status: "error", detalle: `Error leyendo archivo: ${msg}` });
@@ -323,7 +322,7 @@ router.post(
       message: demoLimitInfo?.message || `${allCufes.length} CUFEs encontrados. Usa /dian-cufe/job-status/${jobId} para consultar el progreso.`,
     });
 
-    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, skippedEntries, start_date, end_date, direction, req.user!.userId, drive_connection_id, parseBoolParam(include_drive_links, false), parseBoolParam(upload_to_drive, true), listingRecords).catch((err) => {
+    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, allDates, skippedEntries, start_date, end_date, direction, req.user!.userId, drive_connection_id, parseBoolParam(include_drive_links, false), parseBoolParam(upload_to_drive, true)).catch((err) => {
       console.error(`[CUFE DL] Job ${jobId} error:`, err);
       const j = jobTracker.get(jobId);
       if (j) {
@@ -338,8 +337,9 @@ router.post(
 async function processCufeDownloadJob(
   jobId: string,
   tokenUrl: string,
-  allCufes: string[],       // all CUFEs in original order — drives Excel output
-  downloadCufes: string[],  // subset to actually scrape/download
+  allCufes: string[],
+  downloadCufes: string[],
+  allDates: string[],
   skippedEntries: Array<{cufe: string; reason: string}>,
   startDate: string | undefined,
   endDate: string | undefined,
@@ -348,22 +348,11 @@ async function processCufeDownloadJob(
   driveConnectionId: string | undefined,
   includeDriveLinks: boolean,
   uploadToDrive: boolean,
-  listingRecords: ListingRecord[] = []
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
 
   job.status = "processing";
-
-  // Cola global DIAN: por defecto 1 job a la vez (env DIAN_MAX_CONCURRENT_JOBS).
-  // Varios jobs simultaneos disparan el bloqueo anti-bot por IP y degradan a todos;
-  // serializar mantiene la precision de proceso unico. El usuario ve su turno.
-  const releaseDianJobSlot = await acquireDianJobSlot((pos) => setProgress(jobId, {
-    step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`,
-    current: 0,
-    total: 0,
-  }));
-  if (isJobCancelled(jobId)) { releaseDianJobSlot(); return; }
 
   const sessionId = uuidv4();
   const tempDir = path.join(DOWNLOADS_DIR, sessionId);
@@ -424,359 +413,187 @@ async function processCufeDownloadJob(
 
     if (isJobCancelled(jobId)) return;
 
-    // Semáforo de descargas por job. 5 equilibra velocidad (~18-22/min) y presión
-    // sobre DIAN: a mayor concurrencia el bloqueo transitorio se vuelve más intenso y
-    // sostenido (visto en prod), dejando más faltantes para el barrido. throttledDianDownload
-    // recupera con reintentos cortos, y el barrido con reingreso al token + cooldown
-    // garantiza completitud. Tunable por env según tolere la IP del servidor.
-    const MAX_DL = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 5), 12));
-    let dlSlots = MAX_DL;
-    const dlQueue: Array<() => void> = [];
-    const acquireDl = (): Promise<void> =>
-      dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((res) => dlQueue.push(res));
-    const releaseDl = () => {
-      const next = dlQueue.shift();
-      if (next) next(); else dlSlots++;
-    };
+    if (downloadCufes.length > 0) {
+      // ── gratis-vpfe bulk approach ────────────────────────────────────────────
+      // Descarga directa por CUFE: transactionId = CUFE (SHA-384 hex), no se necesita listing
+      const fmtDdMmYyyy = (ms: number): string => {
+        const dt = new Date(ms);
+        return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
+      };
 
-    // Download results keyed by cufe
-    const dlResults = new Map<string, { destPath: string | null; trackId: string; docnum: string; nit: string; error?: string }>();
-    let dlDone = 0;   // intentos terminados (éxito o fallo)
-    let dlOk = 0;     // descargas REALMENTE exitosas (las que avanzan la barra)
-    // Descargas disparadas en segundo plano; se esperan todas al final.
-    const downloadPromises: Promise<void>[] = [];
+      setProgress(jobId, { step: "Autenticando en portal DIAN...", current: 0, total: downloadCufes.length });
 
-    // Descarga el ZIP de un documento y registra el resultado en dlResults.
-    // Reutilizado por el flujo principal y por el reintento de fallidos.
-    const downloadDoc = async (
-      doc: { id: string; docnum: string; nit?: string; cufe?: string; docType?: string },
-      cookies: Record<string, string>,
-      page?: import("puppeteer").Page,
-    ): Promise<void> => {
-      const isEquivalente = doc.docType?.toLowerCase().includes("equivalente") ?? false;
-      const baseUrl = isEquivalente
-        ? "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFilesEquivalente?trackId="
-        : "https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=";
-      const safeNit = (doc.nit || "SinNIT").replace(/[^a-zA-Z0-9_\-]/g, "_");
-      const safeDoc = (doc.docnum || doc.id.slice(0, 12)).replace(/[^a-zA-Z0-9_\-]/g, "_");
-      const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
-      const isEquiv = doc.docType?.toLowerCase().includes("equivalente") ?? false;
-      const key = doc.cufe || doc.id;
+      // Usar cualquier fecha: solo necesitamos la sesión autenticada, no el listing
+      const { browser: gBrowser, page: gPage } = await authenticateAndNavigate(
+        tokenUrl, "01/01/2024", fmtDdMmYyyy(Date.now()),
+        (p) => setProgress(jobId, { step: p.step || "Autenticando...", current: 0, total: downloadCufes.length }),
+        direction,
+      );
+
       try {
-        // Descarga disparando el botón del portal (corre el reCAPTCHA) y captura el
-        // ZIP. Fallback a fetch de Node si no hay página.
-        if (page) {
-          const dlDir = path.join(tempDir, `_dl_${(doc.id || "x").slice(0, 16)}`);
-          const buf = await downloadZipInPage(page, doc.id, isEquiv, dlDir);
-          fs.writeFileSync(destPath, buf);
-          try { fs.rmSync(dlDir, { recursive: true, force: true }); } catch { /* noop */ }
-        } else {
-          const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-          await fetchZipToFile(`${baseUrl}${doc.id}`, destPath, cookieHeader);
-        }
-        dlResults.set(key, { destPath, trackId: doc.id, docnum: doc.docnum, nit: doc.nit || "" });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[CUFE DL] Error descarga ${key.slice(0, 16)}: ${msg}`);
-        dlResults.set(key, { destPath: null, trackId: doc.id, docnum: doc.docnum, nit: doc.nit || "", error: msg });
-      }
-    };
+        if (isJobCancelled(jobId)) return;
 
-    setProgress(jobId, { step: "Buscando y descargando documentos...", current: 0, total: downloadCufes.length });
+        const getCookieHeader = async () => {
+          const c = await gPage.cookies();
+          return c.map((c: any) => `${c.name}=${c.value}`).join("; ");
+        };
 
-    // Solo se buscan/descargan los CUFE PROCESABLES. Los omitidos (Application
-    // Response, Nómina) ya tienen su fila-nota en invoiceMap y NO son ZIPs
-    // descargables: incluirlos en la búsqueda desperdiciaba tiempo (cada uno fallaba
-    // y agotaba los reintentos, y volvía a intentarse en el barrido). Filtrarlos aquí
-    // es el mayor ahorro de tiempo sin perder ninguna factura real.
-    const downloadSet = new Set(downloadCufes.map((c) => c.toLowerCase()));
-    const processableRecords = listingRecords.filter((r) => downloadSet.has((r.cufe || "").toLowerCase()));
+        const cufeOriginalMap = new Map(downloadCufes.map((c) => [c.toLowerCase(), c]));
 
-    // Búsqueda serial (1 worker → sin race) + descargas en paralelo con contrapresión.
-    // El callback espera SOLO a que haya cupo de descarga libre, dispara la descarga
-    // en segundo plano y devuelve el control para que la búsqueda del siguiente CUFE
-    // se solape con la descarga en curso. Así el tiempo de búsqueda (~0.7s) se esconde
-    // bajo el de descarga (~1.9s, el cuello de botella real de DIAN).
-    const { documents } = await extractDocumentIdsByCufe(
-      tokenUrl,
-      startDate,
-      endDate,
-      jobId,
-      direction,
-      (p) => setProgress(jobId, {
-        step: `Descargando ${dlOk}/${downloadCufes.length}...`,
-        current: dlOk,
-        total: downloadCufes.length,
-      }),
-      async ({ doc, cookies, page }) => {
-        // Con descarga EN-navegador (Cloudflare) hay que serializar sobre la página
-        // del worker: se espera la descarga antes de la siguiente búsqueda. Sin
-        // página (sin Cloudflare) se mantiene el pipeline en paralelo con contrapresión.
-        if (page) {
-          let ok = false;
-          try {
-            await downloadDoc(doc, cookies, page);
-            ok = !!dlResults.get(doc.cufe || doc.id)?.destPath;
-          } finally {
-            dlDone++;
-            if (ok) dlOk++;
-            const pend = dlDone - dlOk;
-            setProgress(jobId, {
-              step: pend > 0
-                ? `Descargando ${dlOk}/${downloadCufes.length} (${pend} por reintentar)...`
-                : `Descargando ${dlOk}/${downloadCufes.length}...`,
-              current: dlOk,
-              total: allCufes.length,
+        const CONCURRENCY = 4;
+        let dlSlots = CONCURRENCY;
+        const dlWaitQueue: Array<() => void> = [];
+        const acquireDl = (): Promise<void> =>
+          dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((r) => dlWaitQueue.push(r));
+        const releaseDl = () => { const n = dlWaitQueue.shift(); if (n) n(); else dlSlots++; };
+
+        const RATE_MS = 60000 / 50;
+        let nextAllowedMs = Date.now();
+        const rateAcquire = async (): Promise<void> => {
+          const wait = nextAllowedMs - Date.now();
+          nextAllowedMs = Math.max(nextAllowedMs, Date.now()) + RATE_MS;
+          if (wait > 0) await new Promise<void>((r) => setTimeout(r, wait));
+        };
+
+        let dlOk = 0;
+        const dlStartMs = Date.now();
+        let cookieHeader = await getCookieHeader();
+
+        const processXml = async (xmlBuf: Buffer, cufe: string): Promise<void> => {
+          const originalCufe = cufeOriginalMap.get(cufe.toLowerCase())!;
+          const invoiceData = await extractInvoiceDataFromXml(xmlBuf, { id: cufe, docnum: "" });
+
+          const isDS = !!invoiceData.isDocumentoSoporte;
+          const ownName = direction === "received" ? invoiceData.receiverName : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
+          const ownNit = direction === "received" ? invoiceData.receiverNit : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
+          if ((!companyName || companyName === "N/A") || (companyWasFromDS && !isDS)) {
+            if (ownName && ownName !== "N/A") {
+              companyName = ownName;
+              companyNit = (ownNit && ownNit !== "N/A") ? ownNit : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
+              companyWasFromDS = isDS;
+            }
+          }
+
+          const hasValidData = !!(invoiceData.issueDate && invoiceData.docNumber);
+          let pdfBuffer: Buffer | null = null;
+          if (doUploadInvoices && !isDS) {
+            try {
+              const pdfResp = await fetch(
+                `https://gratis-vpfe.dian.gov.co/IoFacturo/Print/PrintStoragePdf?transactionId=${cufe}&viewMode=attachment`,
+                { headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader } },
+              );
+              if (pdfResp.ok) {
+                const buf = Buffer.from(await pdfResp.arrayBuffer());
+                if (buf[0] === 0x25 && buf[1] === 0x50) pdfBuffer = buf;
+              }
+            } catch {}
+          }
+
+          if (useInlineDriveLinks && driveConfig && hasValidData) {
+            try {
+              const uploadResult = await uploadInvoiceFilesToDrive(
+                pdfBuffer, xmlBuf, invoiceData.docNumber!, getOwnNit(invoiceData, direction),
+                invoiceData.issueDate!, driveConfig, userId, onTokenRefresh,
+                direction === "sent" ? "sent" : "received", companyName || undefined,
+              );
+              invoiceData.driveUrl = uploadResult.pdfUrl || uploadResult.folderUrl;
+            } catch (driveErr) {
+              console.warn(`[CUFE DL] Drive upload error ${originalCufe.slice(0, 16)}:`, driveErr);
+            }
+          }
+
+          if (runDeferredDriveUpload && hasValidData) {
+            deferredUploads.push({
+              xmlBuffer: xmlBuf, pdfBuffer,
+              docnum: invoiceData.docNumber!, ownNit: getOwnNit(invoiceData, direction),
+              issueDate: invoiceData.issueDate!,
             });
           }
-          return;
-        }
-        // Contrapresión: bloquea la búsqueda solo si ya hay MAX_DL descargas en vuelo.
-        // Mantiene la cola corta → las cookies siguen frescas (sin 403 por sesión vieja).
-        await acquireDl();
-        const dl = (async () => {
-          let ok = false;
+
+          invoiceMap.set(originalCufe, invoiceData);
+          dlOk++;
+          const elapsedMin = (Date.now() - dlStartMs) / 60000;
+          const fpm = elapsedMin > 0 ? Math.round(dlOk / elapsedMin) : 0;
+          setProgress(jobId, { step: `Descargando factura ${dlOk}/${downloadCufes.length} · ${fpm} fact/min`, current: dlOk, total: downloadCufes.length });
+        };
+
+        // ── Pasada 1: descarga directa por CUFE con concurrencia ─────────────
+        setProgress(jobId, { step: `Descargando ${downloadCufes.length} facturas...`, current: 0, total: downloadCufes.length });
+
+        const failedCufes: string[] = [];
+        const p1Promises = downloadCufes.map(async (cufe) => {
+          await acquireDl();
+          await rateAcquire();
           try {
-            await downloadDoc(doc, cookies);
-            ok = !!dlResults.get(doc.cufe || doc.id)?.destPath;
+            const xmlResp = await fetch(
+              `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${cufe}&type=2`,
+              { headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader } },
+            );
+            if (!xmlResp.ok) { failedCufes.push(cufe); return; }
+            const xmlBuf = Buffer.from(await xmlResp.arrayBuffer());
+            await processXml(xmlBuf, cufe);
+          } catch (err) {
+            console.warn(`[CUFE DL] P1 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err);
+            failedCufes.push(cufe);
           } finally {
             releaseDl();
-            dlDone++;
-            if (ok) dlOk++;
-            // La barra refleja SOLO las descargas exitosas (no los intentos fallidos),
-            // para no dar una falsa sensación de avance cuando aún no se ha obtenido
-            // nada. Los fallidos se recuperan después en la fase de reintento/barrido.
-            const pend = dlDone - dlOk;
-            setProgress(jobId, {
-              step: pend > 0
-                ? `Descargando ${dlOk}/${downloadCufes.length} (${pend} por reintentar)...`
-                : `Descargando ${dlOk}/${downloadCufes.length}...`,
-              current: dlOk,
-              total: allCufes.length,
-            });
           }
-        })();
-        downloadPromises.push(dl);
-        // No esperamos la descarga: la búsqueda continúa con el siguiente CUFE.
-      },
-      processableRecords,
-    );
-
-    // Esperar a que terminen las descargas en vuelo.
-    await Promise.all(downloadPromises);
-    console.log(`[CUFE DL] ${documents.length}/${downloadCufes.length} CUFEs resueltos, ${dlDone} descargados`);
-
-    if (isJobCancelled(jobId)) return;
-
-    // Reintento de descargas fallidas (típicamente 403 transitorios de DIAN: límite
-    // de concurrencia o ventana de permiso). Se re-resuelven con sesión fresca y se
-    // descargan en serie (lote pequeño). Esto recupera los documentos sin reabrir el
-    // problema de robo por race (sigue siendo 1 worker).
-    const failedKeys = [...dlResults.entries()].filter(([, r]) => !r.destPath).map(([k]) => k);
-    if (failedKeys.length > 0) {
-      const retryTotal = failedKeys.length;
-      console.log(`[CUFE DL] Reintentando ${retryTotal} descargas fallidas...`);
-      // Barra HONESTA del reintento: escala 0→retryTotal que sube a medida que se
-      // recupera cada faltante (antes quedaba "llena" y el usuario no sabía el avance).
-      let retryOk = 0;
-      setProgress(jobId, { step: `Reintentando descargas: 0/${retryTotal} recuperadas...`, current: 0, total: retryTotal });
-      const failedSet = new Set(failedKeys.map((k) => k.toLowerCase()));
-      const retryRecords = listingRecords.filter((r) => failedSet.has((r.cufe || "").toLowerCase()));
-      try {
-        await extractDocumentIdsByCufe(
-          tokenUrl, startDate, endDate, jobId, direction,
-          () => {},
-          async ({ doc, cookies, page }) => {
-            await downloadDoc(doc, cookies, page);
-            if (dlResults.get(doc.cufe || doc.id)?.destPath) retryOk++;
-            setProgress(jobId, { step: `Reintentando descargas: ${retryOk}/${retryTotal} recuperadas...`, current: retryOk, total: retryTotal });
-          },
-          retryRecords,
-        );
-      } catch (err) {
-        console.warn(`[CUFE DL] Error en reintento de descargas:`, err instanceof Error ? err.message : err);
-      }
-      const stillFailed = [...dlResults.entries()].filter(([, r]) => !r.destPath).length;
-      console.log(`[CUFE DL] Tras reintento: ${stillFailed} descargas aún fallidas`);
-    }
-
-    if (isJobCancelled(jobId)) return;
-
-    // Process XML for each successful download
-    const successful = [...dlResults.entries()].filter(([, r]) => r.destPath);
-    for (let i = 0; i < successful.length; i++) {
-      if (isJobCancelled(jobId)) return;
-      const [cufe, result] = successful[i];
-      setProgress(jobId, { step: `Procesando XML ${i + 1}/${successful.length}...`, current: i + 1, total: successful.length });
-      try {
-        const zipBuffer = fs.readFileSync(result.destPath!);
-        const { xmlBuffer, pdfBuffer } = await extractFilesFromZip(zipBuffer);
-        if (!xmlBuffer) {
-          console.warn(`[CUFE DL] Sin XML en ZIP: ${result.destPath}`);
-          continue;
-        }
-        const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
-          id: result.trackId,
-          docnum: result.docnum || "",
         });
+        await Promise.all(p1Promises);
+        if (isJobCancelled(jobId)) return;
 
-        const isDS = !!invoiceData.isDocumentoSoporte;
-        const currentOwnName = direction === "received"
-          ? invoiceData.receiverName
-          : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
-        const currentOwnNit = direction === "received"
-          ? invoiceData.receiverNit
-          : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
-
-        const isNameEmpty = !companyName || companyName === "N/A";
-        const isCurrentlyDSIdentified = companyName && companyWasFromDS;
-
-        if (isNameEmpty || (isCurrentlyDSIdentified && !isDS)) {
-          if (currentOwnName && currentOwnName !== "N/A") {
-            companyName = currentOwnName;
-            companyNit = (currentOwnNit && currentOwnNit !== "N/A")
-              ? currentOwnNit
-              : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
-            companyWasFromDS = isDS;
+        // ── Pasada 2: reintentar fallidos con cookies frescas ────────────────
+        let missing = downloadCufes.filter((c) => !hasData(c));
+        if (missing.length > 0) {
+          console.log(`[CUFE DL] Pasada 2: ${missing.length} faltantes — cookies frescas`);
+          setProgress(jobId, { step: `Recuperando ${missing.length} facturas faltantes...`, current: dlOk, total: downloadCufes.length });
+          cookieHeader = await getCookieHeader();
+          for (const cufe of missing) {
+            if (isJobCancelled(jobId)) break;
+            await rateAcquire();
+            try {
+              const xmlResp = await fetch(
+                `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${cufe}&type=2`,
+                { headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader } },
+              );
+              if (xmlResp.ok) await processXml(Buffer.from(await xmlResp.arrayBuffer()), cufe);
+            } catch (err) {
+              console.warn(`[CUFE DL] P2 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err);
+            }
           }
         }
 
-        const hasValidData = !!(invoiceData.issueDate && invoiceData.docNumber);
-        const effectivePdf = invoiceData.isDocumentoSoporte ? null : pdfBuffer;
-
-        if (useInlineDriveLinks && driveConfig && hasValidData) {
+        // ── Pasada 3: re-autenticar y reintentar los que queden ─────────────
+        missing = downloadCufes.filter((c) => !hasData(c));
+        if (missing.length > 0 && !isJobCancelled(jobId)) {
+          console.log(`[CUFE DL] Pasada 3: ${missing.length} aún faltantes — re-autenticando`);
+          setProgress(jobId, { step: `Recuperando ${missing.length} facturas (re-autenticando)...`, current: dlOk, total: downloadCufes.length });
+          const { browser: gBrowser2, page: gPage2 } = await authenticateAndNavigate(
+            tokenUrl, "01/01/2024", fmtDdMmYyyy(Date.now()), () => {}, direction,
+          );
           try {
-            const uploadResult = await uploadInvoiceFilesToDrive(
-              effectivePdf,
-              xmlBuffer,
-              invoiceData.docNumber!,
-              getOwnNit(invoiceData, direction),
-              invoiceData.issueDate!,
-              driveConfig,
-              userId,
-              onTokenRefresh,
-              direction === "sent" ? "sent" : "received",
-              companyName || undefined
-            );
-            invoiceData.driveUrl = uploadResult.pdfUrl || uploadResult.folderUrl;
-          } catch (driveErr) {
-            console.warn(`[CUFE DL] Drive upload error ${cufe.slice(0, 16)}:`, driveErr);
+            const cookies2 = await gPage2.cookies();
+            const hdr2 = cookies2.map((c: any) => `${c.name}=${c.value}`).join("; ");
+            for (const cufe of missing) {
+              if (isJobCancelled(jobId)) break;
+              await rateAcquire();
+              try {
+                const xmlResp = await fetch(
+                  `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${cufe}&type=2`,
+                  { headers: { "User-Agent": REAL_USER_AGENT, Cookie: hdr2 } },
+                );
+                if (xmlResp.ok) await processXml(Buffer.from(await xmlResp.arrayBuffer()), cufe);
+              } catch {}
+            }
+          } finally {
+            await closeBrowserSafely(gBrowser2).catch(() => {});
           }
         }
 
-        if (runDeferredDriveUpload && hasValidData) {
-          deferredUploads.push({
-            xmlBuffer,
-            pdfBuffer: effectivePdf,
-            docnum: invoiceData.docNumber!,
-            ownNit: getOwnNit(invoiceData, direction),
-            issueDate: invoiceData.issueDate!,
-          });
-        }
-
-        invoiceMap.set(cufe, invoiceData);
-      } catch (err) {
-        console.warn(`[CUFE DL] Error XML ${cufe.slice(0, 16)}:`, err);
+        console.log(`[CUFE DL] Final: ${dlOk}/${downloadCufes.length} descargadas`);
+      } finally {
+        await closeBrowserSafely(gBrowser).catch(() => {});
       }
-    }
-
-    if (isJobCancelled(jobId)) return;
-
-    // ── Barrido de compleción: ningún CUFE descargable puede quedar sin datos. ──
-    // Bajo concurrencia, DIAN devuelve 403/timeout transitorios que el reintento
-    // único no siempre recupera; también un parseo aislado puede fallar. El
-    // resultado eran filas solo-CUFE (sin número/valores) que se colaban al Excel
-    // y desaparecían de la hoja "Compras". Aquí se re-resuelven y descargan en
-    // SERIE (sin concurrencia → DIAN no throttlea) y se reprocesa su XML,
-    // repitiendo hasta completarlos, agotar intentos o no haber progreso.
-    // Barridos de compleción robustos. El bloqueo de DIAN es TRANSITORIO y se resetea
-    // al REINGRESAR al token (sesión fresca) + esperar a que "se enfríe". Cada barrido:
-    //  1) espera un cooldown escalado (deja que el bloqueo de la pasada previa expire),
-    //  2) reingresa al token vía extractDocumentIdsByCufe (sesión nueva),
-    //  3) descarga en SERIE (mínima presión → no re-dispara el bloqueo).
-    // NO nos rendimos mientras un barrido siga topando con bloqueo: solo paramos cuando
-    // ya no hay faltantes, o cuando varios barridos seguidos no logran NINGÚN avance
-    // pese a haber esperado (señal de que el resto es genuinamente irrecuperable).
-    const MAX_SWEEPS = Math.max(0, Number(process.env.DIAN_CUFE_COMPLETION_SWEEPS ?? 8));
-    let zeroProgressStreak = 0;
-    for (let sweep = 1; sweep <= MAX_SWEEPS; sweep++) {
-      if (isJobCancelled(jobId)) return;
-      const missing = downloadCufes.filter((c) => !hasData(c));
-      if (missing.length === 0) break;
-
-      // Cooldown para que el bloqueo transitorio expire antes de reintentar. Arranca
-      // corto (el bloqueo se limpia rápido + el reingreso al token lo resetea) y solo
-      // crece si barridos seguidos no logran avance (8s, 16s, 24s..., tope 60s).
-      const cooldownMs = Math.min(8000 * (zeroProgressStreak + 1), 60000);
-      const sweepTotal = missing.length;
-      console.log(`[CUFE DL] Barrido ${sweep}/${MAX_SWEEPS}: ${sweepTotal} sin datos. Enfriando ${cooldownMs/1000}s y reingresando al token...`);
-      setProgress(jobId, {
-        step: `Recuperando faltantes: 0/${sweepTotal} (intento ${sweep}, esperando ${Math.round(cooldownMs/1000)}s)...`,
-        current: 0,
-        total: sweepTotal,
-      });
-      await new Promise((r) => setTimeout(r, cooldownMs));
-      if (isJobCancelled(jobId)) return;
-
-      const missingSet = new Set(missing.map((c) => c.toLowerCase()));
-      const sweepRecords = listingRecords.filter((r) => missingSet.has((r.cufe || "").toLowerCase()));
-
-      // Descarga SERIAL con sesión fresca (reingreso al token resetea el bloqueo).
-      // Barra HONESTA: sube a medida que se recupera cada faltante en este barrido.
-      let sweepOk = 0;
-      try {
-        await extractDocumentIdsByCufe(
-          tokenUrl, startDate, endDate, jobId, direction,
-          () => {},
-          async ({ doc, cookies, page }) => {
-            await downloadDoc(doc, cookies, page);
-            if (dlResults.get(doc.cufe || doc.id)?.destPath) sweepOk++;
-            setProgress(jobId, { step: `Recuperando faltantes: ${sweepOk}/${sweepTotal} (intento ${sweep})...`, current: sweepOk, total: sweepTotal });
-          },
-          sweepRecords,
-        );
-      } catch (err) {
-        console.warn(`[CUFE DL] Error en barrido ${sweep}:`, err instanceof Error ? err.message : err);
-      }
-
-      // Reprocesa el XML de los faltantes que ahora sí se descargaron.
-      let recovered = 0;
-      for (const cufe of missing) {
-        if (hasData(cufe)) continue;
-        const result = dlResults.get(cufe);
-        if (!result?.destPath) continue;
-        try {
-          const zipBuffer = fs.readFileSync(result.destPath);
-          const { xmlBuffer } = await extractFilesFromZip(zipBuffer);
-          if (!xmlBuffer) continue;
-          const invoiceData = await extractInvoiceDataFromXml(xmlBuffer, {
-            id: result.trackId,
-            docnum: result.docnum || "",
-          });
-          invoiceMap.set(cufe, invoiceData);
-          recovered++;
-        } catch (err) {
-          console.warn(`[CUFE DL] Barrido: error XML ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err);
-        }
-      }
-      const remaining = downloadCufes.filter((c) => !hasData(c)).length;
-      console.log(`[CUFE DL] Barrido ${sweep}: recuperados ${recovered}, faltan ${remaining}`);
-      // Solo nos rendimos tras VARIOS barridos seguidos sin avance (con cooldown
-      // creciente ya aplicado): el resto sería genuinamente irrecuperable.
-      zeroProgressStreak = recovered > 0 ? 0 : zeroProgressStreak + 1;
-      if (zeroProgressStreak >= 3) {
-        console.warn(`[CUFE DL] 3 barridos sin avance pese a cooldown; deteniendo. Faltan ${remaining}.`);
-        break;
-      }
-    }
-
-    // Si tras los barridos aún faltan, dejarlo registrado de forma visible (no silencioso).
-    const finalMissing = downloadCufes.filter((c) => !hasData(c));
-    if (finalMissing.length > 0) {
-      console.error(
-        `[CUFE DL] ADVERTENCIA: ${finalMissing.length}/${downloadCufes.length} CUFEs sin datos tras barridos: ` +
-        finalMissing.map((c) => c.slice(0, 16)).join(", ")
-      );
     }
 
     // Generate Excel with ALL CUFEs in original order (includes skipped rows with notes)
@@ -799,11 +616,13 @@ async function processCufeDownloadJob(
     job.outputName = `${filePrefix} ${range}.xlsx`;
     job.outputMime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
-    job.status = "completed";
     const skippedCount = skippedEntries.length;
+    const missingCount = downloadCufes.length - filledCount;
     const skipNote = skippedCount > 0 ? `, ${skippedCount} omitidos (nómina/AR)` : "";
+
+    job.status = "completed";
     setProgress(jobId, {
-      step: `Completado: ${filledCount}/${downloadCufes.length} con datos${filledCount < downloadCufes.length ? `, ${downloadCufes.length - filledCount} sin datos` : ""}${skipNote}`,
+      step: `Completado: ${filledCount}/${downloadCufes.length} facturas${skipNote}`,
       current: allCufes.length,
       total: allCufes.length,
     });
@@ -869,7 +688,6 @@ async function processCufeDownloadJob(
       setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: msg });
     }
   } finally {
-    releaseDianJobSlot();
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
 }

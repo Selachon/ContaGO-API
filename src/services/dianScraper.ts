@@ -450,7 +450,7 @@ function collectPidsByUserDataDir(userDataDir: string): number[] {
  * Libera además el cupo de concurrencia. Los huérfanos acumulados son la causa
  * de los "spawn EAGAIN" intermitentes, así que la limpieza es incondicional.
  */
-async function closeBrowserSafely(browser: Browser): Promise<void> {
+export async function closeBrowserSafely(browser: Browser): Promise<void> {
   const pid = browser.process()?.pid;
   const release = (browser as BrowserWithSlot).__releaseSlot;
 
@@ -1558,7 +1558,7 @@ function buildChromiumLibPath(): string {
   return existing.join(":");
 }
 
-function resolveExecutablePath(): string | null {
+export function resolveExecutablePath(): string | null {
   if (!process.env.PUPPETEER_CACHE_DIR) {
     process.env.PUPPETEER_CACHE_DIR = `${process.cwd()}/.cache/puppeteer`;
   }

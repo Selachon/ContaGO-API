@@ -86,6 +86,18 @@ router.get("/download.crx", (_req: Request, res: Response) => {
   fs.createReadStream(EXT_CRX_PATH).pipe(res);
 });
 
+// Nueva extensión standalone: Descarga Masiva DIAN (sin código de activación).
+const EXT_MASIVA_ZIP_PATH = path.join(EXT_DIR, "ContaGO-DIAN-Extension-DescargaMasiva.zip");
+
+router.get("/download-masiva", (_req: Request, res: Response) => {
+  if (!fs.existsSync(EXT_MASIVA_ZIP_PATH)) {
+    return res.status(404).json({ ok: false, message: "El paquete no está disponible." });
+  }
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", 'attachment; filename="ContaGO-DIAN-Extension-DescargaMasiva.zip"');
+  fs.createReadStream(EXT_MASIVA_ZIP_PATH).pipe(res);
+});
+
 // ── Herramientas habilitadas para el usuario (las usa la extensión) ─────────
 // Modos de la extensión → id de herramienta. La extensión solo habilita los modos
 // cuyo acceso devuelve true (misma lógica que el resto del portal: admin/demo/compra).
