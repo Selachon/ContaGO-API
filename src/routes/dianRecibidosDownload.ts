@@ -62,20 +62,33 @@ function zipName(from: string, to: string, direction: "received" | "sent" = "rec
 }
 
 /**
- * Extrae el rango de fechas de un buffer de Excel usando el mismo parser
- * que extractCufesFromExcel (manejo correcto de sharedStrings, inlineStr,
- * namespaces y seriales de fecha de Excel).
+ * Parsea una cadena de fecha en cualquier formato que produce extractCufesFromExcel:
+ * dd/mm/yyyy, d/m/yyyy o yyyy-mm-dd (serial convertido). Devuelve null si no es válida.
  */
-async function detectDatesFromExcel(buf: Buffer): Promise<{ from: string; to: string } | null> {
+function parseAnyDate(s: string): Date | null {
+  if (!s) return null;
+  let d: number, m: number, y: number;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    [y, m, d] = s.split("-").map(Number);
+  } else if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
+    [d, m, y] = s.split("/").map(Number);
+  } else {
+    return null;
+  }
+  const dt = new Date(y, m - 1, d);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+/**
+ * Extrae el rango de fechas de un archivo Excel usando el mismo parser
+ * que extractCufesFromExcel (sharedStrings correcto, inlineStr, namespaces).
+ */
+async function detectDatesFromExcel(file: Express.Multer.File): Promise<{ from: string; to: string } | null> {
   try {
-    const xlsxBuf = await resolveExcelBuffer({ buffer: buf, originalname: "upload.xlsx" } as any);
+    const xlsxBuf = await resolveExcelBuffer(file);
     const { dates } = await extractCufesFromExcel(xlsxBuf);
     if (!dates || dates.length === 0) return null;
-    // dates ya vienen en formato dd/mm/yyyy — calcular min/max
-    const parsed = dates.map((s) => {
-      const [d, m, y] = s.split("/").map(Number);
-      return new Date(y, m - 1, d);
-    }).filter((d) => !isNaN(d.getTime()));
+    const parsed = dates.map(parseAnyDate).filter((d): d is Date => d !== null);
     if (parsed.length === 0) return null;
     const min = new Date(Math.min(...parsed.map((d) => d.getTime())));
     const max = new Date(Math.max(...parsed.map((d) => d.getTime())));
@@ -170,7 +183,7 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
 // ── Detectar fechas desde Excel ───────────────────────────────────────────────
 router.post("/detect-dates", upload.single("excel"), async (req: Request, res: Response) => {
   if (!req.file) return res.status(400).json({ ok: false, detalle: "Falta el archivo Excel" });
-  const result = await detectDatesFromExcel(req.file.buffer);
+  const result = await detectDatesFromExcel(req.file);
   if (!result) return res.status(422).json({ ok: false, detalle: "No se encontraron fechas en el archivo" });
   res.json({ ok: true, ...result });
 });
