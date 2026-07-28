@@ -208,7 +208,7 @@ router.post("/start", validateDianUrl, async (req: Request, res: Response) => {
   if (!from || !isValidDate(from)) return res.status(400).json({ status: "error", detalle: "Falta 'from' en formato dd/mm/yyyy" });
   if (!to || !isValidDate(to)) return res.status(400).json({ status: "error", detalle: "Falta 'to' en formato dd/mm/yyyy" });
 
-  const includePdf = include_pdf === true || include_pdf === "true" || include_pdf === "1";
+  const includePdf = true; // siempre PDF + XML
   const jobId = uuidv4();
   const jobDirection = direction;
   const job: JobData = {
