@@ -19,6 +19,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { downloadReceivedDocuments, type DownloadProgress, type RecibidoDocument } from "../services/dianRecibidosScraper.js";
+import { resolveExcelBuffer, extractCufesFromExcel } from "./dianCufeDownload.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
@@ -61,80 +62,23 @@ function zipName(from: string, to: string, direction: "received" | "sent" = "rec
 }
 
 /**
- * Extrae fechas en formato dd/mm/yyyy de un buffer de Excel (XLSX) y devuelve
- * el rango mínimo-máximo encontrado.
+ * Extrae el rango de fechas de un buffer de Excel usando el mismo parser
+ * que extractCufesFromExcel (manejo correcto de sharedStrings, inlineStr,
+ * namespaces y seriales de fecha de Excel).
  */
 async function detectDatesFromExcel(buf: Buffer): Promise<{ from: string; to: string } | null> {
   try {
-    // Si el buffer es un ZIP que contiene un XLSX (en vez del XLSX directamente),
-    // extraer el XLSX primero — igual que resolveExcelBuffer en dianCufeDownload.
-    let xlsxBuf = buf;
-    const outer = await JSZip.loadAsync(buf);
-    const hasXlSheet = Object.keys(outer.files).some((f) => /xl\/worksheets\/sheet\d+\.xml$/i.test(f));
-    if (!hasXlSheet) {
-      // Es un ZIP contenedor — buscar el primer XLSX dentro
-      const innerEntry = Object.entries(outer.files).find(([name, entry]) => {
-        const isMacJunk = name.split("/").some((p) => p.startsWith("._"));
-        return !entry.dir && /\.(xlsx|xls)$/i.test(name) && !isMacJunk;
-      });
-      if (innerEntry) {
-        xlsxBuf = await innerEntry[1].async("nodebuffer");
-      }
-    }
-
-    const zip = hasXlSheet ? outer : await JSZip.loadAsync(xlsxBuf);
-    const xmlFiles = Object.keys(zip.files).filter((f) => /xl\/worksheets\/sheet\d+\.xml$/i.test(f));
-    const sharedStringsFile = zip.file(/xl\/sharedStrings\.xml$/i)[0];
-    let sharedStrings: string[] = [];
-    if (sharedStringsFile) {
-      const ssXml = await sharedStringsFile.async("string");
-      sharedStrings = [...ssXml.matchAll(/<t[^>]*>([^<]*)<\/t>/g)].map((m) => m[1]);
-    }
-
-    const datePat = /^\d{1,2}\/\d{1,2}\/\d{4}$/;
-    // Rango plausible de seriales Excel para fechas de facturas DIAN (2000-2040)
-    const SERIAL_MIN = 36526;
-    const SERIAL_MAX = 51544;
-    const serialToDate = (n: number): Date | null => {
-      if (n < SERIAL_MIN || n > SERIAL_MAX) return null;
-      const ms = (n - 25569) * 86400000;
-      const d = new Date(ms);
-      return isNaN(d.getTime()) ? null : d;
-    };
-    const dates: Date[] = [];
-
-    for (const xmlPath of xmlFiles) {
-      const sheetXml = await zip.file(xmlPath)!.async("string");
-      for (const cm of sheetXml.matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/g)) {
-        const attrs = cm[1];
-        const content = cm[2];
-        let val = "";
-        if (attrs.includes('t="s"')) {
-          const v = content.match(/<v>(\d+)<\/v>/);
-          if (v) val = sharedStrings[parseInt(v[1], 10)] || "";
-        } else {
-          const v = content.match(/<v>([^<]*)<\/v>/);
-          if (v) val = v[1];
-        }
-        val = val.trim();
-        if (datePat.test(val)) {
-          const [d, m, y] = val.split("/").map(Number);
-          const dt = new Date(y, m - 1, d);
-          if (!isNaN(dt.getTime())) dates.push(dt);
-        } else {
-          // Fechas como serial numérico de Excel (formato más común en exports DIAN)
-          const n = Number(val);
-          if (Number.isFinite(n) && Math.floor(n) === n) {
-            const dt = serialToDate(n);
-            if (dt) dates.push(dt);
-          }
-        }
-      }
-    }
-
-    if (dates.length === 0) return null;
-    const min = new Date(Math.min(...dates.map((d) => d.getTime())));
-    const max = new Date(Math.max(...dates.map((d) => d.getTime())));
+    const xlsxBuf = await resolveExcelBuffer({ buffer: buf, originalname: "upload.xlsx" } as any);
+    const { dates } = await extractCufesFromExcel(xlsxBuf);
+    if (!dates || dates.length === 0) return null;
+    // dates ya vienen en formato dd/mm/yyyy — calcular min/max
+    const parsed = dates.map((s) => {
+      const [d, m, y] = s.split("/").map(Number);
+      return new Date(y, m - 1, d);
+    }).filter((d) => !isNaN(d.getTime()));
+    if (parsed.length === 0) return null;
+    const min = new Date(Math.min(...parsed.map((d) => d.getTime())));
+    const max = new Date(Math.max(...parsed.map((d) => d.getTime())));
     const fmt = (dt: Date) =>
       `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
     return { from: fmt(min), to: fmt(max) };
