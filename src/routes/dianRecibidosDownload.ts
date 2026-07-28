@@ -68,10 +68,15 @@ function zipName(from: string, to: string, direction: "received" | "sent" = "rec
 function parseAnyDate(s: string): Date | null {
   if (!s) return null;
   let d: number, m: number, y: number;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    [y, m, d] = s.split("-").map(Number);
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    // yyyy-mm-dd (ISO, también con hora al final)
+    [y, m, d] = s.slice(0, 10).split("-").map(Number);
   } else if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
+    // dd/mm/yyyy
     [d, m, y] = s.split("/").map(Number);
+  } else if (/^\d{1,2}-\d{1,2}-\d{4}/.test(s)) {
+    // dd-mm-yyyy (formato del export gratis-vpfe DIAN)
+    [d, m, y] = s.slice(0, 10).split("-").map(Number);
   } else {
     return null;
   }
