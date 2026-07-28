@@ -1,8 +1,7 @@
 /**
- * Descarga Masiva de documentos recibidos DIAN.
+ * Descarga Masiva de documentos DIAN por CUFEs (XML + PDF).
  *
- * POST /dian-recibidos/start         { token_url, from, to, include_pdf?, document_direction? }
- * POST /dian-recibidos/detect-dates  multipart excel → { from, to } auto-detected from dates in file
+ * POST /dian-recibidos/start        multipart: excel + token_url + document_direction?
  * GET  /dian-recibidos/job-status/:jobId
  * GET  /dian-recibidos/job-download/:jobId
  * POST /dian-recibidos/job-cancel/:jobId
@@ -18,8 +17,11 @@ import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
-import { downloadReceivedDocuments, type DownloadProgress, type RecibidoDocument } from "../services/dianRecibidosScraper.js";
+import { closeBrowserSafely, REAL_USER_AGENT } from "../services/dianScraper.js";
+import { authenticateAndNavigate } from "../services/dianRecibidosScraper.js";
 import { resolveExcelBuffer, extractCufesFromExcel } from "./dianCufeDownload.js";
+import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
+import type { DocumentDirection } from "../types/dian.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
@@ -30,15 +32,16 @@ const TOOL_ID = "dian-recibidos";
 
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
+interface ProgressData { step: string; current?: number; total?: number; pct?: number; }
+
 interface JobData {
   status: "pending" | "processing" | "completed" | "error" | "cancelled";
-  progress: DownloadProgress;
+  progress: ProgressData;
   userId: string;
   outputPath?: string;
   outputName?: string;
   error?: string;
   createdAt: number;
-  docs?: RecibidoDocument[];
 }
 
 const jobTracker = new Map<string, JobData>();
@@ -55,59 +58,10 @@ setInterval(() => {
   }
 }, 60_000);
 
-/** Convierte dd/mm/yyyy → nombre amigable para el ZIP */
-function zipName(from: string, to: string, direction: "received" | "sent" = "received"): string {
+function makeZipName(direction: DocumentDirection, total: number): string {
   const label = direction === "sent" ? "emitidos" : "recibidos";
-  return `documentos-${label}-DIAN_${from.replace(/\//g, "-")}_${to.replace(/\//g, "-")}.zip`;
-}
-
-/**
- * Parsea una cadena de fecha en cualquier formato que produce extractCufesFromExcel:
- * dd/mm/yyyy, d/m/yyyy o yyyy-mm-dd (serial convertido). Devuelve null si no es válida.
- */
-function parseAnyDate(s: string): Date | null {
-  if (!s) return null;
-  let d: number, m: number, y: number;
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
-    // yyyy-mm-dd (ISO, también con hora al final)
-    [y, m, d] = s.slice(0, 10).split("-").map(Number);
-  } else if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(s)) {
-    // dd/mm/yyyy
-    [d, m, y] = s.split("/").map(Number);
-  } else if (/^\d{1,2}-\d{1,2}-\d{4}/.test(s)) {
-    // dd-mm-yyyy (formato del export gratis-vpfe DIAN)
-    [d, m, y] = s.slice(0, 10).split("-").map(Number);
-  } else {
-    return null;
-  }
-  const dt = new Date(y, m - 1, d);
-  return isNaN(dt.getTime()) ? null : dt;
-}
-
-/**
- * Extrae el rango de fechas de un archivo Excel usando el mismo parser
- * que extractCufesFromExcel (sharedStrings correcto, inlineStr, namespaces).
- */
-async function detectDatesFromExcel(file: Express.Multer.File): Promise<{ from: string; to: string } | null> {
-  try {
-    const xlsxBuf = await resolveExcelBuffer(file);
-    const { dates } = await extractCufesFromExcel(xlsxBuf);
-    if (!dates || dates.length === 0) return null;
-    const parsed = dates.map(parseAnyDate).filter((d): d is Date => d !== null);
-    if (parsed.length === 0) return null;
-    const min = new Date(Math.min(...parsed.map((d) => d.getTime())));
-    const max = new Date(Math.max(...parsed.map((d) => d.getTime())));
-    const fmt = (dt: Date) =>
-      `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
-    return { from: fmt(min), to: fmt(max) };
-  } catch {
-    return null;
-  }
-}
-
-/** Valida formato dd/mm/yyyy */
-function isValidDate(s: string): boolean {
-  return /^\d{2}\/\d{2}\/\d{4}$/.test(s);
+  const date = new Date().toISOString().slice(0, 10);
+  return `documentos-${label}-DIAN_${date}_${total}docs.zip`;
 }
 
 const router = Router();
@@ -132,7 +86,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
   if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
     return res.status(403).json({ status: "error", detalle: "No autorizado" });
   }
-  res.json({ status: job.status, progress: job.progress, error: job.error, outputName: job.outputName, docs: job.docs });
+  res.json({ status: job.status, progress: job.progress, error: job.error, outputName: job.outputName });
 });
 
 // ── Descarga del ZIP ──────────────────────────────────────────────────────────
@@ -185,86 +139,229 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
   res.json({ status: "cancelled" });
 });
 
-// ── Detectar fechas desde Excel ───────────────────────────────────────────────
-router.post("/detect-dates", upload.single("excel"), async (req: Request, res: Response) => {
-  if (!req.file) return res.status(400).json({ ok: false, detalle: "Falta el archivo Excel" });
-  const result = await detectDatesFromExcel(req.file);
-  if (!result) return res.status(422).json({ ok: false, detalle: "No se encontraron fechas en el archivo" });
-  res.json({ ok: true, ...result });
-});
-
 // ── Iniciar ───────────────────────────────────────────────────────────────────
-router.post("/start", validateDianUrl, async (req: Request, res: Response) => {
-  const { token_url, from, to, include_pdf, document_direction } = req.body as {
+router.post("/start", upload.single("excel"), validateDianUrl, async (req: Request, res: Response) => {
+  const file = req.file;
+  if (!file) return res.status(400).json({ status: "error", detalle: "Debes adjuntar un archivo Excel" });
+
+  const { token_url, document_direction } = req.body as {
     token_url?: string;
-    from?: string;
-    to?: string;
-    include_pdf?: string | boolean;
-    document_direction?: "received" | "sent";
+    document_direction?: string;
   };
-  const direction: "received" | "sent" = document_direction === "sent" ? "sent" : "received";
 
   if (!token_url) return res.status(400).json({ status: "error", detalle: "Falta token_url" });
-  if (!from || !isValidDate(from)) return res.status(400).json({ status: "error", detalle: "Falta 'from' en formato dd/mm/yyyy" });
-  if (!to || !isValidDate(to)) return res.status(400).json({ status: "error", detalle: "Falta 'to' en formato dd/mm/yyyy" });
 
-  const includePdf = true; // siempre PDF + XML
+  const direction: DocumentDirection = document_direction === "sent" ? "sent" : "received";
+
+  let downloadCufes: string[];
+  try {
+    const xlsxBuf = await resolveExcelBuffer(file);
+    const { cufes, mixedDirections } = await extractCufesFromExcel(xlsxBuf);
+    if (mixedDirections) {
+      return res.status(400).json({ status: "error", detalle: "El listado contiene documentos emitidos y recibidos. Por favor sube solo un grupo." });
+    }
+    if (cufes.length === 0) {
+      return res.status(400).json({ status: "error", detalle: "No se encontraron CUFEs procesables en el Excel." });
+    }
+    downloadCufes = cufes;
+  } catch (err) {
+    return res.status(400).json({ status: "error", detalle: `Error leyendo Excel: ${err instanceof Error ? err.message : err}` });
+  }
+
   const jobId = uuidv4();
-  const jobDirection = direction;
   const job: JobData = {
     status: "pending",
-    progress: { step: "En cola..." },
+    progress: { step: "En cola...", current: 0, total: downloadCufes.length },
     userId: req.user!.userId,
     createdAt: Date.now(),
   };
   jobTracker.set(jobId, job);
-  res.json({ jobId });
+  res.json({ jobId, totalCufes: downloadCufes.length });
 
-  // ── Proceso asíncrono ───────────────────────────────────────────────────
+  // ── Proceso asíncrono ───────────────────────────────────────────────────────
   setImmediate(async () => {
     job.status = "processing";
+    const isCancelled = () => (job.status as string) === "cancelled";
+    const outPath = path.join(DOWNLOADS_DIR, `${jobId}.zip`);
+
     try {
-      const { files, docs } = await downloadReceivedDocuments({
-        tokenUrl: token_url,
-        from,
-        to,
-        includePdf,
-        documentDirection: jobDirection,
-        concurrency: 8,
-        rateLimit: 300,
-        progress: (p: DownloadProgress) => { job.progress = p; },
-        isCancelled: () => job.status === "cancelled",
-      });
+      const fmtDdMmYyyy = (ms: number): string => {
+        const dt = new Date(ms);
+        return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
+      };
 
-      if (jobTracker.get(jobId)?.status === "cancelled") return;
+      job.progress = { step: "Autenticando en portal DIAN...", current: 0, total: downloadCufes.length };
 
-      if (files.length === 0) {
+      const { browser: gBrowser, page: gPage } = await authenticateAndNavigate(
+        token_url, "01/01/2024", fmtDdMmYyyy(Date.now()),
+        (p) => { job.progress = { step: p.step || "Autenticando...", current: 0, total: downloadCufes.length }; },
+        direction,
+      );
+
+      try {
+        if (isCancelled()) return;
+
+        const getCookieHeader = async () => {
+          const c = await gPage.cookies();
+          return c.map((c: any) => `${c.name}=${c.value}`).join("; ");
+        };
+
+        const CONCURRENCY = 4;
+        let dlSlots = CONCURRENCY;
+        const dlWaitQueue: Array<() => void> = [];
+        const acquireDl = (): Promise<void> =>
+          dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((r) => dlWaitQueue.push(r));
+        const releaseDl = () => { const n = dlWaitQueue.shift(); if (n) n(); else dlSlots++; };
+
+        const RATE_MS = 60000 / 50;
+        let nextAllowedMs = Date.now();
+        const rateAcquire = async (): Promise<void> => {
+          const wait = nextAllowedMs - Date.now();
+          nextAllowedMs = Math.max(nextAllowedMs, Date.now()) + RATE_MS;
+          if (wait > 0) await new Promise<void>((r) => setTimeout(r, wait));
+        };
+
+        let dlOk = 0;
+        const dlStartMs = Date.now();
+        let cookieHeader = await getCookieHeader();
+        const zipFiles: Array<{ name: string; buffer: Buffer }> = [];
+        const succeededCufes = new Set<string>();
+
+        const processDoc = async (xmlBuf: Buffer, cufe: string): Promise<void> => {
+          let docName: string;
+          try {
+            const inv = await extractInvoiceDataFromXml(xmlBuf, { id: cufe, docnum: "" });
+            docName = (inv.docNumber || cufe.slice(0, 16)).replace(/[^a-zA-Z0-9_\-]/g, "_");
+          } catch {
+            docName = cufe.slice(0, 16);
+          }
+
+          zipFiles.push({ name: `${docName}.xml`, buffer: xmlBuf });
+
+          try {
+            const pdfResp = await fetch(
+              `https://gratis-vpfe.dian.gov.co/IoFacturo/Print/PrintStoragePdf?transactionId=${cufe}&viewMode=attachment`,
+              { headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader } },
+            );
+            if (pdfResp.ok) {
+              const buf = Buffer.from(await pdfResp.arrayBuffer());
+              if (buf[0] === 0x25 && buf[1] === 0x50) {
+                zipFiles.push({ name: `${docName}.pdf`, buffer: buf });
+              }
+            }
+          } catch {}
+
+          succeededCufes.add(cufe.toLowerCase());
+          dlOk++;
+          const elapsedMin = (Date.now() - dlStartMs) / 60000;
+          const fpm = elapsedMin > 0 ? Math.round(dlOk / elapsedMin) : 0;
+          const pct = Math.round((dlOk / downloadCufes.length) * 100);
+          job.progress = {
+            step: `Descargando ${dlOk}/${downloadCufes.length} · ${fpm} fact/min`,
+            current: dlOk, total: downloadCufes.length, pct,
+          };
+        };
+
+        // ── Pasada 1: descarga directa por CUFE con concurrencia ──────────────
+        job.progress = { step: `Descargando ${downloadCufes.length} documentos...`, current: 0, total: downloadCufes.length, pct: 0 };
+
+        const p1Promises = downloadCufes.map(async (cufe) => {
+          await acquireDl();
+          await rateAcquire();
+          try {
+            const xmlResp = await fetch(
+              `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${cufe}&type=2`,
+              { headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader } },
+            );
+            if (!xmlResp.ok) return;
+            await processDoc(Buffer.from(await xmlResp.arrayBuffer()), cufe);
+          } catch (err) {
+            console.warn(`[Recibidos] P1 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err);
+          } finally {
+            releaseDl();
+          }
+        });
+        await Promise.all(p1Promises);
+        if (isCancelled()) return;
+
+        // ── Pasada 2: cookies frescas ─────────────────────────────────────────
+        let missing = downloadCufes.filter((c) => !succeededCufes.has(c.toLowerCase()));
+        if (missing.length > 0) {
+          console.log(`[Recibidos] Pasada 2: ${missing.length} faltantes`);
+          job.progress = { step: `Recuperando ${missing.length} faltantes...`, current: dlOk, total: downloadCufes.length };
+          cookieHeader = await getCookieHeader();
+          for (const cufe of missing) {
+            if (isCancelled()) break;
+            await rateAcquire();
+            try {
+              const xmlResp = await fetch(
+                `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${cufe}&type=2`,
+                { headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader } },
+              );
+              if (xmlResp.ok) await processDoc(Buffer.from(await xmlResp.arrayBuffer()), cufe);
+            } catch {}
+          }
+        }
+
+        // ── Pasada 3: re-autenticar y reintentar ──────────────────────────────
+        missing = downloadCufes.filter((c) => !succeededCufes.has(c.toLowerCase()));
+        if (missing.length > 0 && !isCancelled()) {
+          console.log(`[Recibidos] Pasada 3: ${missing.length} aún faltantes — re-autenticando`);
+          job.progress = { step: `Recuperando ${missing.length} faltantes (re-autenticando)...`, current: dlOk, total: downloadCufes.length };
+          const { browser: gBrowser2, page: gPage2 } = await authenticateAndNavigate(
+            token_url, "01/01/2024", fmtDdMmYyyy(Date.now()), () => {}, direction,
+          );
+          try {
+            const cookies2 = await gPage2.cookies();
+            const hdr2 = cookies2.map((c: any) => `${c.name}=${c.value}`).join("; ");
+            cookieHeader = hdr2;
+            for (const cufe of missing) {
+              if (isCancelled()) break;
+              await rateAcquire();
+              try {
+                const xmlResp = await fetch(
+                  `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${cufe}&type=2`,
+                  { headers: { "User-Agent": REAL_USER_AGENT, Cookie: hdr2 } },
+                );
+                if (xmlResp.ok) await processDoc(Buffer.from(await xmlResp.arrayBuffer()), cufe);
+              } catch {}
+            }
+          } finally {
+            await closeBrowserSafely(gBrowser2).catch(() => {});
+          }
+        }
+
+        console.log(`[Recibidos] Final: ${dlOk}/${downloadCufes.length} descargados`);
+
+        if (zipFiles.length === 0) {
+          job.status = "completed";
+          job.progress = { step: "Sin documentos descargados.", current: 0, total: downloadCufes.length, pct: 100 };
+          return;
+        }
+
+        // ── Empaquetar ZIP ────────────────────────────────────────────────────
+        job.progress = { step: "Generando ZIP...", current: downloadCufes.length, total: downloadCufes.length, pct: 99 };
+        const zip = new JSZip();
+        for (const f of zipFiles) zip.file(f.name, f.buffer);
+        const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+        fs.writeFileSync(outPath, zipBuf);
+
         job.status = "completed";
-        job.progress = { step: "Sin documentos en el rango seleccionado." };
-        job.docs = docs;
-        return;
+        job.outputPath = outPath;
+        job.outputName = makeZipName(direction, dlOk);
+        job.progress = {
+          step: `Listo: ${dlOk}/${downloadCufes.length} documentos descargados.`,
+          current: dlOk, total: downloadCufes.length, pct: 100,
+        };
+      } finally {
+        await closeBrowserSafely(gBrowser).catch(() => {});
       }
-
-      // Empaquetar ZIP
-      job.progress = { step: "Generando ZIP..." };
-      const zip = new JSZip();
-      for (const f of files) zip.file(f.name, f.buffer);
-      const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-
-      const outName = zipName(from, to, jobDirection);
-      const outPath = path.join(DOWNLOADS_DIR, `${jobId}.zip`);
-      fs.writeFileSync(outPath, zipBuf);
-
-      job.status = "completed";
-      job.outputPath = outPath;
-      job.outputName = outName;
-      job.docs = docs;
-      job.progress = { step: `Listo: ${files.length} archivos descargados.`, current: files.length, total: files.length, pct: 100 };
     } catch (err: any) {
-      if (jobTracker.get(jobId)?.status === "cancelled") return;
-      job.status = "error";
-      job.error = err?.message || String(err);
-      job.progress = { step: "Error" };
+      if (!isCancelled()) {
+        job.status = "error";
+        job.error = err?.message || String(err);
+        job.progress = { step: "Error" };
+      }
     }
   });
 });
