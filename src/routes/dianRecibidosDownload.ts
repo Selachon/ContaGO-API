@@ -14,6 +14,7 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
 import multer from "multer";
+import { PDFDocument } from "pdf-lib";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
@@ -144,10 +145,12 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
   const file = req.file;
   if (!file) return res.status(400).json({ status: "error", detalle: "Debes adjuntar un archivo Excel" });
 
-  const { token_url, document_direction } = req.body as {
+  const { token_url, document_direction, unified_pdf } = req.body as {
     token_url?: string;
     document_direction?: string;
+    unified_pdf?: string;
   };
+  const wantsUnifiedPdf = unified_pdf === "true" || unified_pdf === "1";
 
   if (!token_url) return res.status(400).json({ status: "error", detalle: "Falta token_url" });
 
@@ -183,6 +186,7 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
     job.status = "processing";
     const isCancelled = () => (job.status as string) === "cancelled";
     const outPath = path.join(DOWNLOADS_DIR, `${jobId}.zip`);
+    const collectedPdfs: Buffer[] = [];
 
     try {
       const fmtDdMmYyyy = (ms: number): string => {
@@ -258,6 +262,8 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
           if (pdfBuf) docZip.file(`${docName}.pdf`, pdfBuf);
           const docZipBuf = await docZip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
           zipFiles.push({ name: `ZIP/${docName}.zip`, buffer: docZipBuf });
+          // Recolectar para PDF unificado
+          if (wantsUnifiedPdf && pdfBuf) collectedPdfs.push(pdfBuf);
 
           succeededCufes.add(cufe.toLowerCase());
           dlOk++;
@@ -345,6 +351,25 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
           job.status = "completed";
           job.progress = { step: "Sin documentos descargados.", current: 0, total: downloadCufes.length, pct: 100 };
           return;
+        }
+
+        // ── PDF unificado ─────────────────────────────────────────────────────
+        if (wantsUnifiedPdf && collectedPdfs.length > 0) {
+          try {
+            job.progress = { step: "Generando PDF unificado...", current: downloadCufes.length, total: downloadCufes.length, pct: 98 };
+            const merged = await PDFDocument.create();
+            for (const pdfBuf of collectedPdfs) {
+              try {
+                const src = await PDFDocument.load(pdfBuf, { ignoreEncryption: true });
+                const pages = await merged.copyPages(src, src.getPageIndices());
+                pages.forEach((p) => merged.addPage(p));
+              } catch {}
+            }
+            const mergedBytes = await merged.save();
+            zipFiles.push({ name: "todos-los-documentos.pdf", buffer: Buffer.from(mergedBytes) });
+          } catch (err) {
+            console.warn("[Recibidos] Error generando PDF unificado:", err);
+          }
         }
 
         // ── Empaquetar ZIP ────────────────────────────────────────────────────
