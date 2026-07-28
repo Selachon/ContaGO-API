@@ -236,8 +236,7 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
             docName = cufe.slice(0, 16);
           }
 
-          zipFiles.push({ name: `${docName}.xml`, buffer: xmlBuf });
-
+          let pdfBuf: Buffer | null = null;
           try {
             const pdfResp = await fetch(
               `https://gratis-vpfe.dian.gov.co/IoFacturo/Print/PrintStoragePdf?transactionId=${cufe}&viewMode=attachment`,
@@ -245,11 +244,20 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
             );
             if (pdfResp.ok) {
               const buf = Buffer.from(await pdfResp.arrayBuffer());
-              if (buf[0] === 0x25 && buf[1] === 0x50) {
-                zipFiles.push({ name: `${docName}.pdf`, buffer: buf });
-              }
+              if (buf[0] === 0x25 && buf[1] === 0x50) pdfBuf = buf;
             }
           } catch {}
+
+          // Carpeta XML/
+          zipFiles.push({ name: `XML/${docName}.xml`, buffer: xmlBuf });
+          // Carpeta PDF/
+          if (pdfBuf) zipFiles.push({ name: `PDF/${docName}.pdf`, buffer: pdfBuf });
+          // Carpeta ZIP/ — ZIP individual con XML + PDF
+          const docZip = new JSZip();
+          docZip.file(`${docName}.xml`, xmlBuf);
+          if (pdfBuf) docZip.file(`${docName}.pdf`, pdfBuf);
+          const docZipBuf = await docZip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+          zipFiles.push({ name: `ZIP/${docName}.zip`, buffer: docZipBuf });
 
           succeededCufes.add(cufe.toLowerCase());
           dlOk++;
