@@ -411,56 +411,74 @@ function parseBancoBogota(pages: string[][]): { raws: RawMov[]; opening: number 
 }
 
 // ─── Davivienda: cuenta de ahorros/corriente ──────────────────────────────
-// Formato por fila: "DD MM $ MONTO +/- DOCNUM DESCRIPCION [refs...]"
-// Sin columna de saldo corriente: se computa desde Saldo Anterior.
-// Los totales de control vienen en el encabezado (Más Créditos / Menos Débitos).
+// Formato actual:  "DD MM DESCRIPCION OFICINA DOC $MONTO+/- $SALDO+/-"
+// Formato antiguo: "DD MM $ MONTO +/- DOCNUM DESCRIPCION [refs...]"
+// Los totales vienen en el encabezado en la misma línea que su label.
 function parseDavivienda(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
   const all = pages.flat();
 
-  // Año desde "INFORME DEL MES: MARZO /2026"
+  // Año: "INFORME DEL MES:" puede estar en una línea y "/2026" en la siguiente.
   let year = "";
-  const informe = all.find((l) => /INFORME DEL MES:/i.test(l));
-  if (informe) { const m = informe.match(/\/(\d{4})/); if (m) year = m[1]; }
+  const informeIdx = all.findIndex((l) => /INFORME DEL MES:/i.test(l));
+  if (informeIdx >= 0) {
+    const search = all.slice(informeIdx, informeIdx + 3).join(" ");
+    const ym = search.match(/\/(\d{4})/);
+    if (ym) year = ym[1];
+  }
   if (!year) { const m = all.slice(0, 30).join(" ").match(/\b(20\d{2})\b/); if (m) year = m[1]; }
 
-  // Totales del encabezado (cada label en su propia línea, valor en la siguiente).
-  const findNextMoney = (rx: RegExp): number | null => {
-    const idx = all.findIndex((l) => rx.test(l));
-    if (idx < 0) return null;
-    const next = all[idx + 1];
-    const m = next?.match(/\$([\d,]+\.\d{2})/);
-    return m ? num(m[1]) : null;
+  // Totales: el valor puede estar en la misma línea que el label (formato actual)
+  // o en la línea siguiente (formato antiguo). Se prueban ambas.
+  const findMoney = (rx: RegExp): number | null => {
+    for (const l of all) {
+      const m = l.match(rx);
+      if (m) return num(m[1]);
+    }
+    // Fallback: label exacto en una línea, valor en la siguiente.
+    const idx = all.findIndex((l) => rx.source.startsWith("^") ? rx.test(l) : false);
+    if (idx >= 0) { const m = all[idx + 1]?.match(/\$([\d,]+\.\d{2})/); if (m) return num(m[1]); }
+    return null;
   };
-  const opening = findNextMoney(/^Saldo Anterior$/i);
-  const credits  = findNextMoney(/^Más Créditos$/i);
-  const debits   = findNextMoney(/^Menos Débitos$/i);
-  const closing  = findNextMoney(/^Nuevo Saldo$/i);
+  const opening = findMoney(/Saldo Anterior\s+\$([\d,]+\.\d{2})/);
+  const credits  = findMoney(/Más:?\s*Créditos\s+\$([\d,]+\.\d{2})/);
+  const debits   = findMoney(/Menos:\s*Débitos\s+\$([\d,]+\.\d{2})/);
+  const closing  = findMoney(/Nuevo Saldo\s+\$([\d,]+\.\d{2})/);
 
-  // Fila de movimiento: "DD MM $ MONTO +/- DOCNUM DESCRIPCION [refs...]"
-  const rowRx = /^(\d{2})\s+(\d{2})\s+\$\s*([\d,]+\.\d{2})\s+([+-])\s+\d{1,6}\s+(.+)/;
+  // Formato actual: "DD MM DESCRIPCION [OFICINA] DOC $MONTO+/- $SALDO+/-"
+  // El saldo explícito en el PDF se usa directamente (más fiable que calcular).
+  const newRowRx = /^(\d{1,2})\s+(\d{2})\s+(.+?)\s+\d{3,6}\s+\$([\d,]+\.\d{2})([+-])\s+\$([\d,]+\.\d{2})[+-]\s*$/;
+  // Formato antiguo: "DD MM $ MONTO +/- DOCNUM DESCRIPCION"
+  const oldRowRx = /^(\d{2})\s+(\d{2})\s+\$\s*([\d,]+\.\d{2})\s+([+-])\s+\d{1,6}\s+(.+)/;
+
   let runBal = opening ?? 0;
   const raws: RawMov[] = [];
 
   for (const line of all) {
-    const m = line.match(rowRx);
-    if (!m) continue;
-    const [, dd, mm, amountStr, sign, descRaw] = m;
-    const value = num(amountStr);
-    // Quitar números de referencia largos (NIT, orden de pago); conservar sufijo textual
-    // (destinatario CIC069, AMELIA, etc.) que viene después del NIT 9016750463.
-    // Deduplicar tokens consecutivos idénticos que el PDF a veces duplica.
-    const description = descRaw
-      .replace(/\s+\d{7,}/g, "")
-      .replace(/\b(\w+)\s+\1\b/gi, "$1")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (sign === "+") runBal += value; else runBal -= value;
-    raws.push({
-      date: `${year || new Date().getFullYear()}-${mm}-${dd}`,
-      description,
-      value,
-      balance: Math.round(runBal * 100) / 100,
-    });
+    const nm = line.match(newRowRx);
+    if (nm) {
+      const [, dd, mm, descRaw, amountStr, sign, balStr] = nm;
+      const value = num(amountStr);
+      const balance = num(balStr);
+      const description = descRaw
+        .replace(/\s+\d{7,}/g, "")
+        .replace(/\b(\w+)\s+\1\b/gi, "$1")
+        .replace(/\s+/g, " ")
+        .trim();
+      raws.push({ date: `${year || new Date().getFullYear()}-${mm}-${dd}`, description, value, balance });
+      continue;
+    }
+    const om = line.match(oldRowRx);
+    if (om) {
+      const [, dd, mm, amountStr, sign, descRaw] = om;
+      const value = num(amountStr);
+      if (sign === "+") runBal += value; else runBal -= value;
+      const description = descRaw
+        .replace(/\s+\d{7,}/g, "")
+        .replace(/\b(\w+)\s+\1\b/gi, "$1")
+        .replace(/\s+/g, " ")
+        .trim();
+      raws.push({ date: `${year || new Date().getFullYear()}-${mm}-${dd}`, description, value, balance: Math.round(runBal * 100) / 100 });
+    }
   }
   return { raws, opening, declared: { credits, debits }, closing };
 }
