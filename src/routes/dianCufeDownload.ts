@@ -296,7 +296,7 @@ router.post(
     }
 
     const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
-    if (downloadCufes.length > MAX_CUFES) {
+    if (!req.user?.isAdmin && downloadCufes.length > MAX_CUFES) {
       return res.status(400).json({
         status: "error",
         detalle: buildLimitMessage(downloadCufes.length, allDates, MAX_CUFES),
