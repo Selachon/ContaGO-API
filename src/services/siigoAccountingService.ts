@@ -200,21 +200,29 @@ export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean
       if (incAmt > 0) extraTaxes.push({ taxName: GIFT_TAX_NAME, amount: incAmt, percent: Number(li.incPercent) || 0 });
     }
 
-    // Base = base gravable del IVA (TaxableAmount), que ya viene neta de descuentos de
-    // línea. Si el XML no la trae, se cae a LineExtensionAmount o cantidad×precio.
+    // grossBase = costo real de la línea (LineExtensionAmount); taxBase = base gravable del IVA
+    // (TaxableAmount). En XML ambos vienen del parser; en PDF el parser los iguala.
     const taxBase = Number(li.taxableBase) || 0;
-    const grossBase = isGift ? 0 : (taxBase > 0 ? taxBase : (lineExt || (Number(li.quantity) || 0) * (Number(li.unitPrice) || 0)));
+    const grossBase = isGift ? 0 : (lineExt > 0 ? lineExt : ((Number(li.quantity) || 0) * (Number(li.unitPrice) || 0)));
     let base = grossBase;
     let effIvaPct = Number(li.ivaPercent) || 0;
     const parserGaveRate = effIvaPct > 0;
     let exemptRemainder = 0; // porción no gravada del costo (base gravable especial, p. ej. licores)
+
+    // XML: cuando TaxableAmount < LineExtensionAmount (p. ej. licores/bebidas con base
+    // gravable especial DIAN), el costo real es grossBase pero el IVA se aplica solo sobre
+    // taxBase. La diferencia se causa como ítem separado al 0%.
+    if (!opts.reconcile && !isGift && taxBase > 0 && grossBase > taxBase + 1) {
+      base = taxBase;
+      exemptRemainder = r2(grossBase - taxBase);
+    }
+
     // PDF: algunos formatos traen el IVA por línea en MONTO pero con porcentaje = 0 (o mezclan
     // tasas 5%/19% en la misma factura). El IVA cobrado es el real, así que se deriva:
     //  1) la TASA desde IVA/base bruta (snap a 5% o 19%);
     //  2) la BASE neta = IVA / tasa. Si el parser dio la tasa, el faltante es un descuento de
     //     línea (no se causa). Si la tasa se derivó (snap), el faltante es la porción excluida
     //     del costo (base gravable especial) → se causa como ítem aparte al 0%.
-    // En XML no aplica (tasa y base vienen exactas).
     if (opts.reconcile && !isGift && ivaAmt > 0 && base > 0) {
       if (effIvaPct === 0) {
         const raw = (ivaAmt / base) * 100;
