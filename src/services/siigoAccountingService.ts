@@ -187,9 +187,10 @@ export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean
     const lineExt = Number(li.totalUnitPrice) || 0;
     const ivaAmt = Number(li.ivaAmount) || 0;
     const incAmt = Number(li.incAmount) || 0;
-    // Obsequio/bonificación: base a pagar = 0 (LineExtensionAmount) pero con IVA/INC > 0.
-    // Se ignora la base; el impuesto se enruta como ítem extra hacia su cuenta PUC.
-    const isGift = lineExt === 0 && (ivaAmt > 0 || incAmt > 0);
+    // Obsequio/bonificación: el comprador no paga nada por esta línea (LineExtensionAmount=0).
+    // Si hay IVA/INC, el proveedor lo transfiere y se enruta como ítem extra a su cuenta PUC.
+    // Cubre también unidades de regalo con IVA 0% (lineExt=0, ivaAmt=0, taxable>0).
+    const isGift = lineExt === 0;
 
     const extraTaxes: XmlExtraTax[] = (li.taxes || [])
       .filter((t: any) => !IVA_LIKE.has(t.taxName) && Number(t.amount) > 0)
