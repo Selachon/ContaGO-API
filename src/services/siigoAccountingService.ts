@@ -262,6 +262,20 @@ export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean
     return [mainItem];
   });
 
+  // Descuento a nivel documento (AllowanceTotalAmount): reduce el total a pagar, post-IVA.
+  // Se causa como ítem negativo hacia una cuenta PUC parametrizable "Descuento".
+  const discount = Number(xmlData.discount) || 0;
+  if (discount > 0) {
+    items.push({
+      description: "DESCUENTO",
+      base: 0,
+      ivaPercent: 0,
+      incPercent: 0,
+      extraTaxes: [{ taxName: "Descuento", amount: -Math.round(discount * 100) / 100, percent: 0 }],
+      isSurcharge: true,
+    });
+  }
+
   // Recargo a nivel documento (ChargeTotalAmount): se aplica después del total, sin IVA.
   // Se causa como ítem aparte hacia una cuenta PUC parametrizable "Recargo".
   const surcharge = Number(xmlData.surcharge) || 0;
