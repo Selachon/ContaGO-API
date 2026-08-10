@@ -295,7 +295,7 @@ router.post(
       });
     }
 
-    const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
+    const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 750);
     if (!req.user?.isAdmin && downloadCufes.length > MAX_CUFES) {
       return res.status(400).json({
         status: "error",
@@ -458,6 +458,7 @@ async function processCufeDownloadJob(
         let dlOk = 0;
         const dlStartMs = Date.now();
         let cookieHeader = await getCookieHeader();
+        const processedCufes = new Set<string>(); // tracks attempted CUFEs regardless of parse result
 
         const processXml = async (xmlBuf: Buffer, cufe: string): Promise<void> => {
           const originalCufe = cufeOriginalMap.get(cufe.toLowerCase())!;
@@ -511,6 +512,7 @@ async function processCufeDownloadJob(
           }
 
           invoiceMap.set(originalCufe, invoiceData);
+          processedCufes.add(cufe.toLowerCase());
           dlOk++;
           const elapsedMin = (Date.now() - dlStartMs) / 60000;
           const fpm = elapsedMin > 0 ? Math.round(dlOk / elapsedMin) : 0;
@@ -543,7 +545,7 @@ async function processCufeDownloadJob(
         if (isJobCancelled(jobId)) return;
 
         // ── Pasada 2: reintentar fallidos con cookies frescas ────────────────
-        let missing = downloadCufes.filter((c) => !hasData(c));
+        let missing = downloadCufes.filter((c) => !processedCufes.has(c.toLowerCase()));
         if (missing.length > 0) {
           console.log(`[CUFE DL] Pasada 2: ${missing.length} faltantes — cookies frescas`);
           setProgress(jobId, { step: `Recuperando ${missing.length} facturas faltantes...`, current: dlOk, total: downloadCufes.length });
@@ -564,7 +566,7 @@ async function processCufeDownloadJob(
         }
 
         // ── Pasada 3: re-autenticar y reintentar los que queden ─────────────
-        missing = downloadCufes.filter((c) => !hasData(c));
+        missing = downloadCufes.filter((c) => !processedCufes.has(c.toLowerCase()));
         if (missing.length > 0 && !isJobCancelled(jobId)) {
           console.log(`[CUFE DL] Pasada 3: ${missing.length} aún faltantes — re-autenticando`);
           setProgress(jobId, { step: `Recuperando ${missing.length} facturas (re-autenticando)...`, current: dlOk, total: downloadCufes.length });
