@@ -145,27 +145,29 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
   const file = req.file;
   if (!file) return res.status(400).json({ status: "error", detalle: "Debes adjuntar un archivo Excel" });
 
-  const { token_url, document_direction, unified_pdf } = req.body as {
+  const { token_url, unified_pdf } = req.body as {
     token_url?: string;
-    document_direction?: string;
     unified_pdf?: string;
   };
   const wantsUnifiedPdf = unified_pdf === "true" || unified_pdf === "1";
 
   if (!token_url) return res.status(400).json({ status: "error", detalle: "Falta token_url" });
 
-  const direction: DocumentDirection = document_direction === "sent" ? "sent" : "received";
-
+  let direction: DocumentDirection;
   let downloadCufes: string[];
   try {
     const xlsxBuf = await resolveExcelBuffer(file);
-    const { cufes, mixedDirections } = await extractCufesFromExcel(xlsxBuf);
+    const { cufes, mixedDirections, detectedDirection } = await extractCufesFromExcel(xlsxBuf);
     if (mixedDirections) {
       return res.status(400).json({ status: "error", detalle: "El listado contiene documentos emitidos y recibidos. Por favor sube solo un grupo." });
+    }
+    if (!detectedDirection) {
+      return res.status(400).json({ status: "error", detalle: "No se pudo determinar el tipo de documentos. Asegúrate de usar el listado exportado desde la DIAN (debe tener columna 'Grupo')." });
     }
     if (cufes.length === 0) {
       return res.status(400).json({ status: "error", detalle: "No se encontraron CUFEs procesables en el Excel." });
     }
+    direction = detectedDirection;
     downloadCufes = cufes;
   } catch (err) {
     return res.status(400).json({ status: "error", detalle: `Error leyendo Excel: ${err instanceof Error ? err.message : err}` });
