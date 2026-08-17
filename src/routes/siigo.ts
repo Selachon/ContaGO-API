@@ -56,6 +56,7 @@ import {
   unshareCompany,
   transferOwner,
   countCompaniesOwnedBy,
+  countCompaniesOwnedByForTool,
 } from "../services/siigoCompaniesService.js";
 import { getUserSiigoCompanies, setUserSiigoCompanies, getUserById, getUserPurchases } from "../services/database.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
@@ -522,22 +523,49 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const ownerUserId = req.integrationAuthMode === "jwt" ? req.user?.userId : undefined;
 
       // Cupo del plan: un usuario NO admin solo puede tener tantas empresas como
-      // su plan (companiesInPlan). La herramienta se vende por empresa, por mes.
-      // Los admins no tienen límite.
+      // su plan. La herramienta se vende por empresa, por mes.
+      // Si toolCompanyLimits[toolId] existe → limite por herramienta;
+      // si no → límite global companiesInPlan (legado / herramientas DIAN).
+      // toolIds puede venir como array o como string único (compatibilidad)
+      const rawToolIds = req.body.toolIds;
+      const toolIds: string[] = Array.isArray(rawToolIds)
+        ? rawToolIds.map(String).filter(Boolean)
+        : typeof rawToolIds === "string" && rawToolIds.trim()
+          ? [rawToolIds.trim()]
+          : [];
+
       if (req.integrationAuthMode === "jwt" && ownerUserId && !req.user?.isAdmin) {
         const user = await getUserById(ownerUserId);
-        const limit = user?.companiesInPlan && user.companiesInPlan > 0 ? user.companiesInPlan : 1;
-        const owned = await countCompaniesOwnedBy(ownerUserId);
-        if (owned >= limit) {
-          return res.status(403).json({
-            ok: false,
-            code: "COMPANY_LIMIT_REACHED",
-            message: `Tu plan permite ${limit} empresa(s) y ya tienes ${owned}. Para agregar más, amplía tu plan.`,
-          });
+        // Verificar límite por cada herramienta declarada
+        for (const toolId of toolIds) {
+          const perToolLimit = user?.toolCompanyLimits?.[toolId];
+          if (perToolLimit != null) {
+            const owned = await countCompaniesOwnedByForTool(ownerUserId, toolId);
+            if (owned >= perToolLimit) {
+              return res.status(403).json({
+                ok: false,
+                code: "COMPANY_LIMIT_REACHED",
+                message: `Tu plan permite ${perToolLimit} empresa(s) para esta herramienta y ya tienes ${owned}. Contacta al administrador para ampliar tu plan.`,
+              });
+            }
+          }
+        }
+        // Si ninguna herramienta tiene límite individual → límite global
+        const hasPerToolLimit = toolIds.some(id => user?.toolCompanyLimits?.[id] != null);
+        if (!hasPerToolLimit) {
+          const limit = user?.companiesInPlan && user.companiesInPlan > 0 ? user.companiesInPlan : 1;
+          const owned = await countCompaniesOwnedBy(ownerUserId);
+          if (owned >= limit) {
+            return res.status(403).json({
+              ok: false,
+              code: "COMPANY_LIMIT_REACHED",
+              message: `Tu plan permite ${limit} empresa(s) y ya tienes ${owned}. Para agregar más, amplía tu plan.`,
+            });
+          }
         }
       }
 
-      const company = await createCompany(name, username, accessKey, ownerUserId, nit);
+      const company = await createCompany(name, username, accessKey, ownerUserId, nit, toolIds.length ? toolIds : undefined);
       return res.json({ ok: true, data: company });
     } catch (error) {
       return res.status(400).json({

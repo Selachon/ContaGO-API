@@ -23,6 +23,7 @@ export interface User {
   created_at: string;
   demo?: DemoAccess;
   companiesInPlan?: number;
+  toolCompanyLimits?: Record<string, number>;
   licenseStartDate?: string;
 }
 
@@ -54,6 +55,7 @@ export interface AuthResponse {
     purchasedTools: string[];
     nits: string[];
     companiesInPlan?: number;
+    toolCompanyLimits?: Record<string, number>;
     forcePasswordChange?: boolean;
     demo?: DemoAccess & {
       isExpired: boolean;

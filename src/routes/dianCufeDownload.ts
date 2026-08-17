@@ -701,7 +701,15 @@ export async function extractFilesFromZip(zipBuffer: Buffer): Promise<{ xmlBuffe
   for (const [filename, file] of Object.entries(zip.files)) {
     if (file.dir) continue;
     const lower = filename.toLowerCase();
-    if (lower.endsWith(".xml") && !xmlBuffer) xmlBuffer = await file.async("nodebuffer");
+    if (lower.endsWith(".xml") && !xmlBuffer) {
+      const raw = await file.async("nodebuffer");
+      const preview = raw.toString("utf8", 0, 300).trim().toLowerCase();
+      if (preview.startsWith("<!doctype html") || preview.startsWith("<html") ||
+          (preview.includes("<html") && preview.includes("<head"))) {
+        throw new Error("HTML_INSIDE_ZIP: DIAN devolvió HTML dentro del ZIP en lugar del XML (posible bloqueo de sesión transitorio)");
+      }
+      xmlBuffer = raw;
+    }
     if (lower.endsWith(".pdf") && !pdfBuffer) pdfBuffer = await file.async("nodebuffer");
     if (xmlBuffer && pdfBuffer) break;
   }

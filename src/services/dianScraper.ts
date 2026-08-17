@@ -55,18 +55,37 @@ export async function downloadZipInPage(page: Page, trackId: string, isEquivalen
     try { await client.send("Browser.setDownloadBehavior" as any, { behavior: "allow", downloadPath: destDir, eventsEnabled: true } as any); } catch { /* noop */ }
   }
 
+  // Para tokens delegados (pk=A|B) la respuesta fallida de reCAPTCHA viene como
+  // <script>alert('...')</script>. Sin dismissal el alert bloquea JS y causa
+  // "Runtime.callFunctionOn timed out". Dismissimos cualquier diálogo.
+  const dismissDialog = async (d: { dismiss(): Promise<void> }) => { await d.dismiss().catch(() => {}); };
+  page.on("dialog", dismissDialog);
+
   // Dispara la descarga como el portal: invoca su función JS (corre el reCAPTCHA) o,
   // si no existe, hace click en el elemento de descarga de esa fila.
   const fnName = isEquivalente ? "DownloadZipFilesEquivalente" : "DownloadZipFiles";
-  const triggered = await page.evaluate((fn: string, id: string) => {
-    const w = window as unknown as Record<string, unknown>;
-    if (typeof w[fn] === "function") { (w[fn] as (x: string) => void)(id); return "fn"; }
-    // Fallback: click en el elemento cuyo onclick/href referencia este trackId.
-    const sel = `[onclick*="${id}"], a[href*="${id}"], [data-trackid="${id}"], [data-id="${id}"]`;
-    const el = document.querySelector(sel) as HTMLElement | null;
-    if (el) { el.click(); return "click"; }
-    return "none";
-  }, fnName, trackId).catch(() => "error");
+  let triggered: string;
+  try {
+    triggered = await Promise.race([
+      page.evaluate((fn: string, id: string) => {
+        const w = window as unknown as Record<string, unknown>;
+        if (typeof w[fn] === "function") { (w[fn] as (x: string) => void)(id); return "fn"; }
+        // Fallback: click en el elemento cuyo onclick/href referencia este trackId.
+        const sel = `[onclick*="${id}"], a[href*="${id}"], [data-trackid="${id}"], [data-id="${id}"]`;
+        const el = document.querySelector(sel) as HTMLElement | null;
+        if (el) { el.click(); return "click"; }
+        return "none";
+      }, fnName, trackId),
+      // Timeout generoso: si reCAPTCHA falla y el alert es dismissido, la función
+      // JS retorna rápido. El timeout aquí protege casos en que la página navega
+      // (contexto perdido) antes de que evaluate pueda resolver.
+      new Promise<string>((r) => setTimeout(() => r("timeout"), 25_000)),
+    ]);
+  } catch {
+    triggered = "error";
+  } finally {
+    page.off("dialog", dismissDialog);
+  }
 
   if (triggered === "none" || triggered === "error") {
     throw new Error(`DOWNLOAD_TRIGGER_FAILED: no se pudo iniciar la descarga del portal (trigger=${triggered}).`);
@@ -93,6 +112,288 @@ export async function downloadZipInPage(page: Page, trackId: string, isEquivalen
     throw new Error("NOT_ZIP");
   }
   return buf;
+}
+
+/**
+ * Variante de descarga en-navegador para tokens delegados (pk=A|B): usa CDP Fetch
+ * domain para capturar los bytes de la respuesta directamente desde la red, sin
+ * depender de que el navegador escriba el archivo a disco. Esto evita el timeout
+ * causado por el alert-dialog de reCAPTCHA fallido y permite detectar el error de
+ * forma limpia. Si la respuesta NO es ZIP (reCAPTCHA rechazado), lanza error claro.
+ */
+export async function downloadZipViaNetworkCapture(
+  page: Page,
+  trackId: string,
+  isEquivalente: boolean
+): Promise<Buffer> {
+  const urlPattern = isEquivalente ? "*DownloadZipFilesEquivalente*" : "*DownloadZipFiles*";
+  const fnName = isEquivalente ? "DownloadZipFilesEquivalente" : "DownloadZipFiles";
+
+  const client = await page.target().createCDPSession();
+  let capturedBuffer: Buffer | null = null;
+  let captureError: string | null = null;
+
+  // Interceptar respuestas de red a nivel CDP (captura incluso descargas que
+  // pasan por el download manager del navegador, antes de que el browser las
+  // procese). requestStage:"Response" es necesario para leer el body.
+  await client.send("Fetch.enable", {
+    patterns: [{ urlPattern, requestStage: "Response" }],
+  });
+
+  client.on("Fetch.requestPaused", async (event: {
+    requestId: string;
+    responseStatusCode?: number;
+    responseHeaders?: { name: string; value: string }[];
+  }) => {
+    try {
+      if ((event.responseStatusCode ?? 0) === 200) {
+        const { body, base64Encoded } = await client.send("Fetch.getResponseBody", {
+          requestId: event.requestId,
+        }) as { body: string; base64Encoded: boolean };
+        const buf = base64Encoded ? Buffer.from(body, "base64") : Buffer.from(body);
+        const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
+        if (isZip) {
+          capturedBuffer = buf;
+        } else {
+          const preview = buf.toString("utf8", 0, 300).toLowerCase();
+          if (preview.includes("captcha") || preview.includes("recaptcha")) {
+            captureError = `RECAPTCHA_FAILED: DIAN requiere reCAPTCHA para token delegado`;
+          } else {
+            captureError = `NETWORK_NOT_ZIP: respuesta inesperada (${buf.length}b): ${buf.toString("utf8", 0, 100).replace(/\s+/g, " ").trim()}`;
+          }
+        }
+      }
+    } catch (e) {
+      captureError = `INTERCEPT_ERROR: ${e instanceof Error ? e.message : String(e)}`;
+    } finally {
+      await client.send("Fetch.continueRequest", { requestId: event.requestId }).catch(() => {});
+    }
+  });
+
+  const dismissDialog = async (d: { dismiss(): Promise<void> }) => { await d.dismiss().catch(() => {}); };
+  page.on("dialog", dismissDialog);
+
+  try {
+    let triggered: string;
+    try {
+      triggered = await Promise.race([
+        page.evaluate((fn: string, id: string) => {
+          // Redirect window.open to current tab so CDP intercept catches the download.
+          // Some DIAN accounts open downloads in a new tab — this keeps it in scope.
+          (window as any).__origOpen = window.open;
+          window.open = (url?: string | URL) => {
+            if (url) window.location.href = String(url);
+            return null as unknown as Window;
+          };
+          const w = window as unknown as Record<string, unknown>;
+          if (typeof w[fn] === "function") { (w[fn] as (x: string) => void)(id); return "fn"; }
+          const sel = `[data-id="${id}"], [onclick*="${id}"], a[href*="${id}"], [data-trackid="${id}"]`;
+          const el = document.querySelector(sel) as HTMLElement | null;
+          if (el) { el.click(); return "click"; }
+          return "none";
+        }, fnName, trackId),
+        new Promise<string>((r) => setTimeout(() => r("timeout"), 25_000)),
+      ]);
+    } catch {
+      triggered = "error";
+    }
+
+    if (triggered === "none") {
+      throw new Error(`DOWNLOAD_TRIGGER_FAILED: botón no encontrado para trackId ${trackId.slice(0, 20)}...`);
+    }
+
+    // Esperar a que la intercepción capture la respuesta (máx 45s).
+    const deadline = Date.now() + 45_000;
+    while (!capturedBuffer && !captureError && Date.now() < deadline) {
+      await delay(500);
+    }
+
+    if (capturedBuffer) return capturedBuffer;
+    if (captureError) throw new Error(captureError);
+    throw new Error("RECAPTCHA_DOWNLOAD_TIMEOUT: la descarga no produjo ZIP en 45s (posible rechazo de reCAPTCHA)");
+  } finally {
+    page.off("dialog", dismissDialog);
+    try { await client.send("Fetch.disable"); } catch {}
+    try { await client.detach(); } catch {}
+  }
+}
+
+/**
+ * Descarga documentos DIAN usando el CUFE como data-id del botón, capturando
+ * CUALQUIER respuesta ZIP de catalogo-vpfe (no solo DownloadZipFiles).
+ * Útil cuando el portal usa un URL de descarga diferente al estándar.
+ */
+export async function downloadViaPageClick(page: Page, cufe: string): Promise<Buffer> {
+  const client = await page.target().createCDPSession();
+  let capturedBuffer: Buffer | null = null;
+  let captureError: string | null = null;
+
+  // Intercept ALL catalogo-vpfe responses (broad — captures any ZIP from any endpoint)
+  await client.send("Fetch.enable", {
+    patterns: [{ urlPattern: "https://catalogo-vpfe.dian.gov.co/*", requestStage: "Response" }],
+  });
+
+  client.on("Fetch.requestPaused", async (event: {
+    requestId: string;
+    responseStatusCode?: number;
+    responseHeaders?: { name: string; value: string }[];
+    resourceType?: string;
+  }) => {
+    try {
+      const status = event.responseStatusCode ?? 0;
+      const contentType = (event.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type")?.value ?? "";
+      const contentDisp = (event.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-disposition")?.value ?? "";
+      const isAttachment = contentDisp.toLowerCase().includes("attachment");
+      const isZipType = contentType.includes("zip") || contentType.includes("octet-stream");
+      const isPageType = contentType.includes("text/html") || contentType.includes("text/javascript") ||
+        contentType.includes("text/css") || contentType.includes("application/json");
+
+      // Only inspect responses likely to be downloads (attachment or binary type, skip page resources)
+      if (status === 200 && (isAttachment || isZipType || (!isPageType && !capturedBuffer))) {
+        try {
+          const { body, base64Encoded } = await client.send("Fetch.getResponseBody", {
+            requestId: event.requestId,
+          }) as { body: string; base64Encoded: boolean };
+          const buf = base64Encoded ? Buffer.from(body, "base64") : Buffer.from(body);
+          const isZip = buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b;
+          if (isZip && !capturedBuffer) {
+            capturedBuffer = buf;
+          }
+        } catch {
+          // Body not available (redirect, stream error) — skip
+        }
+      }
+    } catch {
+      // Non-critical intercept error
+    } finally {
+      await client.send("Fetch.continueRequest", { requestId: event.requestId }).catch(() => {});
+    }
+  });
+
+  const dismissDialog = async (d: { dismiss(): Promise<void> }) => { await d.dismiss().catch(() => {}); };
+  page.on("dialog", dismissDialog);
+
+  try {
+    const triggered = await Promise.race([
+      page.evaluate((id: string) => {
+        // Redirect window.open to current tab so CDP intercept catches the ZIP
+        window.open = (url?: string | URL) => {
+          if (url) window.location.href = String(url);
+          return null as unknown as Window;
+        };
+        const w = window as any;
+        // Try standard function first
+        if (typeof w.DownloadZipFiles === "function") { w.DownloadZipFiles(id); return "fn"; }
+        // Fall back to clicking button with data-id="<cufe>"
+        const sel = `[data-id="${id}"], [onclick*="${id}"], a[href*="${id}"], [data-trackid="${id}"]`;
+        const el = document.querySelector(sel) as HTMLElement | null;
+        if (el) { el.click(); return "click"; }
+        return "none";
+      }, cufe),
+      new Promise<string>((r) => setTimeout(() => r("timeout"), 25_000)),
+    ]).catch(() => "error");
+
+    if (triggered === "none") {
+      throw new Error(`BUTTON_NOT_FOUND: No se encontró botón para CUFE ${cufe.slice(0, 20)}...`);
+    }
+
+    const deadline = Date.now() + 60_000;
+    while (!capturedBuffer && !captureError && Date.now() < deadline) {
+      await delay(500);
+    }
+
+    if (capturedBuffer) return capturedBuffer;
+    if (captureError) throw new Error(captureError);
+    throw new Error("CLICK_CAPTURE_TIMEOUT: No se capturó ZIP en 60s desde catalogo-vpfe");
+  } finally {
+    page.off("dialog", dismissDialog);
+    try { await client.send("Fetch.disable"); } catch {}
+    try { await client.detach(); } catch {}
+  }
+}
+
+/**
+ * Descarga en batch documentos cuyo doc.id es un CUFE (96 chars), usando una
+ * sesión de navegador que hace click en el botón y captura el ZIP resultante.
+ * Devuelve un Map<cufe, Buffer>.
+ */
+export async function downloadCufeDocumentsBrowser(
+  tokenUrl: string,
+  cufes: string[],
+  direction: "received" | "sent",
+  updateProgress?: (step: string) => void
+): Promise<Map<string, Buffer>> {
+  const results = new Map<string, Buffer>();
+  if (cufes.length === 0) return results;
+
+  const remaining = new Set(cufes.map((c) => c.toLowerCase()));
+  let browser: import("puppeteer").Browser | null = null;
+
+  try {
+    browser = await launchBrowserWithRetry(resolveExecutablePath(), () => {});
+    const page = await browser.newPage();
+    await hardenPageRuntime(page);
+    page.setDefaultTimeout(90000);
+    page.setDefaultNavigationTimeout(90000);
+
+    updateProgress?.("Autenticando para descarga por click...");
+    await navigateWithRetry(page, tokenUrl, 3);
+    const authStart = Date.now();
+    while (Date.now() - authStart < 30_000) {
+      if (!/\/User\/AuthToken/i.test(page.url())) break;
+      await delay(1000);
+    }
+    await delay(2000);
+    if (isLoginPage(page.url())) throw new Error("TOKEN_EXPIRED");
+
+    const docPath = direction === "sent" ? "Sent" : "Received";
+    await page.goto(`https://catalogo-vpfe.dian.gov.co/Document/${docPath}`, {
+      waitUntil: "networkidle2", timeout: 60_000,
+    });
+    await delay(2000);
+
+    // Set max page length
+    await setPageLength(page, 100);
+    await waitForFullTableLoad(page, 100);
+
+    let hasMore = true;
+    let pageIdx = 0;
+
+    while (hasMore && remaining.size > 0) {
+      pageIdx++;
+      // Find visible CUFEs on this table page
+      const visibleCufes: string[] = await page.evaluate(() => {
+        const btns = document.querySelectorAll<HTMLElement>("[data-id]");
+        return Array.from(btns).map((b) => b.getAttribute("data-id") || "").filter(Boolean);
+      });
+
+      for (const cufe of visibleCufes) {
+        const key = cufe.toLowerCase();
+        if (!remaining.has(key)) continue;
+        updateProgress?.(`Descargando por click: ${cufe.slice(0, 16)}...`);
+        try {
+          const buf = await downloadViaPageClick(page, cufe);
+          const origKey = [...cufes].find((c) => c.toLowerCase() === key) || cufe;
+          results.set(origKey, buf);
+          remaining.delete(key);
+          console.log(`[CufeClick] OK: ${cufe.slice(0, 16)}... (${buf.length}b)`);
+        } catch (err) {
+          console.warn(`[CufeClick] Error ${cufe.slice(0, 16)}...: ${err instanceof Error ? err.message.slice(0, 80) : err}`);
+        }
+      }
+
+      if (remaining.size > 0) {
+        hasMore = await goToNextPage(page).catch(() => false);
+        if (hasMore) await delay(1000);
+      } else {
+        hasMore = false;
+      }
+    }
+  } finally {
+    if (browser) await closeBrowserSafely(browser);
+  }
+
+  return results;
 }
 
 interface PrecheckResult {
@@ -215,7 +516,7 @@ export function getBrowserStats(): { active: number; queued: number; max: number
 export async function throttledDianDownload(
   url: string,
   cookieHeader: string,
-  opts: { timeoutMs?: number; maxRetries?: number } = {}
+  opts: { timeoutMs?: number; maxRetries?: number; referer?: string } = {}
 ): Promise<Buffer> {
   const timeoutMs = opts.timeoutMs ?? 120_000;
   // El bloqueo de DIAN ("Solicitud bloqueada"/403) es TRANSITORIO: se limpia
@@ -230,8 +531,22 @@ export async function throttledDianDownload(
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let retryAfterMs = 0;
     try {
+      // Referer: la DIAN valida esta cabecera en DownloadZipFiles para tokens
+      // de acceso delegado (pk=A|B). Sin ella devuelve HTML-en-ZIP en vez del
+      // archivo real. Inferir desde la URL si no se pasa explícitamente.
+      const referer = opts.referer ?? (
+        url.includes("Sent") ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+          : "https://catalogo-vpfe.dian.gov.co/Document/Received"
+      );
       const resp = await fetch(url, {
-        headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader },
+        headers: {
+          "User-Agent": REAL_USER_AGENT,
+          Cookie: cookieHeader,
+          Referer: referer,
+          Origin: "https://catalogo-vpfe.dian.gov.co",
+          Accept: "application/zip,application/octet-stream,*/*;q=0.8",
+          "Accept-Language": "es-CO,es;q=0.9",
+        },
         signal: controller.signal,
       });
       clearTimeout(timer);
@@ -584,6 +899,63 @@ export async function getFreshDianSessionCookies(tokenUrl: string): Promise<Reco
     }
     const cookieArr = await page.cookies();
     return Object.fromEntries(cookieArr.map((c) => [c.name, c.value]));
+  } finally {
+    if (browser) await closeBrowserSafely(browser);
+  }
+}
+
+/**
+ * Abre sesión autenticada en gratis-vpfe y devuelve el cookie header listo
+ * para requests HTTP a gratis-vpfe.dian.gov.co (DownloadXml, PrintStoragePdf).
+ *
+ * El endpoint RedirectToBiller de catalogo-vpfe establece la sesión en gratis-vpfe;
+ * sin este paso las cookies de catalogo-vpfe no son válidas para gratis-vpfe.
+ */
+export async function getFreshGratisVpfeCookies(tokenUrl: string): Promise<string> {
+  let browser: Browser | null = null;
+  try {
+    browser = await launchBrowserWithRetry(resolveExecutablePath(), () => {});
+
+    // authPage: establece sesión en catalogo-vpfe
+    const authPage = await browser.newPage();
+    await hardenPageRuntime(authPage);
+    authPage.setDefaultTimeout(60000);
+    authPage.setDefaultNavigationTimeout(60000);
+
+    await navigateWithRetry(authPage, tokenUrl, 3);
+    // Esperar que AuthToken redirija (mismo patrón que authenticateAndNavigate)
+    const authStart = Date.now();
+    while (Date.now() - authStart < 30_000) {
+      if (!/\/User\/AuthToken/i.test(authPage.url())) break;
+      await delay(1000);
+    }
+    await delay(2000);
+    if (isLoginPage(authPage.url())) throw new Error("TOKEN_EXPIRED: El token ha expirado.");
+
+    // Copiar cookies al nuevo page antes de ir a gratis-vpfe
+    const authCookies = await authPage.cookies();
+
+    // page: navega RedirectToBiller con cookies de auth → establece sesión gratis-vpfe
+    const page = await browser.newPage();
+    await hardenPageRuntime(page);
+    page.setDefaultTimeout(60000);
+    page.setDefaultNavigationTimeout(60000);
+    if (authCookies.length) await page.setCookie(...(authCookies as Parameters<typeof page.setCookie>));
+
+    await page.goto("https://catalogo-vpfe.dian.gov.co/User/RedirectToBiller", {
+      waitUntil: "networkidle2", timeout: 30_000,
+    }).catch(() => {});
+    await delay(2000);
+
+    await page.goto("https://gratis-vpfe.dian.gov.co/Document/Received", {
+      waitUntil: "networkidle2", timeout: 30_000,
+    }).catch(() => {});
+    await delay(2000);
+
+    const cookies = await page.cookies();
+    const header = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    console.log(`[Gratis] sesión establecida: ${cookies.length} cookies, final URL: ${page.url()}`);
+    return header;
   } finally {
     if (browser) await closeBrowserSafely(browser);
   }
@@ -2173,7 +2545,7 @@ function toDianExportDate(dateISO: string, endOfDay: boolean = false): string {
     : `${Number(month)}/${Number(day)}/${year} 12:00:00 AM`;
 }
 
-export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction: DocumentDirection): Promise<ListingRecord[]> {
+export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direction?: DocumentDirection): Promise<ListingRecord[]> {
   // DIAN puede devolver:
   // 1) ZIP contenedor con un .xlsx adentro
   // 2) el .xlsx directamente (que también es un ZIP OOXML)
@@ -2230,15 +2602,24 @@ export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direct
     return [];
   }
 
-  const out: ListingRecord[] = [];
+  // Auto-detectar dirección desde la columna Grupo cuando no se pasa explícitamente.
+  let effectiveDirection: DocumentDirection = direction ?? "received";
+  if (!direction && groupIdx >= 0) {
+    for (let i = 1; i < rows.length; i++) {
+      const g = (rows[i][groupIdx] || "").toLowerCase();
+      if (g.includes("emitid")) { effectiveDirection = "sent"; break; }
+      if (g.includes("recibid")) { effectiveDirection = "received"; break; }
+    }
+  }
 
-  const expectedGroupText = direction === "sent" ? "emitid" : "recibid";
+  const out: ListingRecord[] = [];
+  const expectedGroupText = effectiveDirection === "sent" ? "emitid" : "recibid";
 
   for (let i = 1; i < rows.length; i++) {
     const row = rows[i];
     const group = (groupIdx >= 0 ? row[groupIdx] : "").toLowerCase();
 
-    // Si viene grupo, filtrar estrictamente por dirección solicitada.
+    // Si viene grupo, filtrar estrictamente por dirección detectada/solicitada.
     if (group && !group.includes(expectedGroupText)) continue;
 
     const cufe = normalizeCufe(row[cufeIdx] || "");
@@ -2249,7 +2630,7 @@ export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direct
     if (!docnum) continue;
 
     const fecha = (fechaFallbackIdx >= 0 ? row[fechaFallbackIdx] : "").trim();
-    out.push({ cufe, docnum, fecha, monthKey: monthKeyFromDianDate(fecha) });
+    out.push({ cufe, docnum, fecha, monthKey: monthKeyFromDianDate(fecha), direction: effectiveDirection });
   }
 
   const dedup = new Map<string, ListingRecord>();

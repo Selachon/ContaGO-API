@@ -25,15 +25,55 @@ export interface CompanySettings {
   extraTaxAccounts?: Record<string, string>;
 }
 
+export interface PaymentRecord {
+  paidAt: string;
+  period: string; // "YYYY-MM" — mes al que corresponde el pago
+  amount?: number;
+  method?: string;
+  invoiceRef?: string;
+}
+
+export interface CompanySubscription {
+  licenseStartDate?: string;
+  licenseEndDate?: string;
+  paymentAmount?: number;
+  paymentMethod?: string;
+  invoiceRef?: string;
+  paymentStatus?: "pending" | "paid";
+  paidAt?: string;
+  paymentHistory?: PaymentRecord[];
+}
+
 export interface SiigoCompanyPublic {
   id: string;
   name: string;
   username: string;
-  /** NIT de la empresa (sin dígito de verificación), para validar tokens DIAN. */
   nit?: string;
   ownerUserId?: string;
   sharedWith?: string[];
   settings?: CompanySettings;
+  toolIds: string[];
+  /** Suscripción legada a nivel de empresa (pre-multi-módulo). */
+  subscription?: CompanySubscription;
+  /** Suscripción por módulo: subscriptions[toolId] = datos de ese módulo. */
+  subscriptions: Record<string, CompanySubscription>;
+}
+
+export interface SubscriptionRow {
+  companyId: string;
+  companyName: string;
+  toolId: string;
+  userId: string;
+  userName: string;
+  userEmail: string;
+  licenseStartDate?: string;
+  licenseEndDate?: string;
+  paymentAmount?: number;
+  paymentMethod?: string;
+  invoiceRef?: string;
+  paymentStatus?: "pending" | "paid";
+  paidAt?: string;
+  paymentHistory?: PaymentRecord[];
 }
 
 /** Normaliza un NIT para comparación: descarta el dígito de verificación y deja solo dígitos. */
@@ -41,7 +81,21 @@ export function normalizeNit(value: unknown): string {
   return String(value ?? "").split("-")[0].replace(/\D/g, "");
 }
 
+function resolveToolIds(doc: any): string[] {
+  if (Array.isArray(doc.toolIds)) return doc.toolIds;
+  // compatibilidad con documentos viejos que tenían toolId singular
+  if (doc.toolId) return [doc.toolId];
+  return [];
+}
+
 function toPublic(doc: any): SiigoCompanyPublic {
+  // Suscripción legada a nivel empresa
+  const sub: CompanySubscription = {};
+  if (doc.licenseStartDate) sub.licenseStartDate = doc.licenseStartDate;
+  if (doc.licenseEndDate) sub.licenseEndDate = doc.licenseEndDate;
+  if (doc.paymentAmount != null) sub.paymentAmount = doc.paymentAmount;
+  if (doc.paymentMethod) sub.paymentMethod = doc.paymentMethod;
+  if (doc.invoiceRef) sub.invoiceRef = doc.invoiceRef;
   return {
     id: doc._id.toString(),
     name: doc.name,
@@ -50,7 +104,137 @@ function toPublic(doc: any): SiigoCompanyPublic {
     ownerUserId: doc.ownerUserId ? String(doc.ownerUserId) : undefined,
     sharedWith: Array.isArray(doc.sharedWith) ? doc.sharedWith.map(String) : [],
     settings: doc.settings || {},
+    toolIds: resolveToolIds(doc),
+    subscription: Object.keys(sub).length ? sub : undefined,
+    subscriptions: typeof doc.subscriptions === "object" && doc.subscriptions !== null ? doc.subscriptions : {},
   };
+}
+
+export async function updateToolSubscription(
+  companyId: string,
+  toolId: string,
+  data: CompanySubscription & { period?: string }
+): Promise<SiigoCompanyPublic> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { throw new Error("Empresa inválida."); }
+  const patch: Record<string, unknown> = {};
+  if (data.licenseStartDate !== undefined) patch[`subscriptions.${toolId}.licenseStartDate`] = data.licenseStartDate || null;
+  if (data.licenseEndDate !== undefined) patch[`subscriptions.${toolId}.licenseEndDate`] = data.licenseEndDate || null;
+  if (data.paymentAmount !== undefined) patch[`subscriptions.${toolId}.paymentAmount`] = data.paymentAmount ?? null;
+  if (data.paymentMethod !== undefined) patch[`subscriptions.${toolId}.paymentMethod`] = data.paymentMethod || null;
+  if (data.invoiceRef !== undefined) patch[`subscriptions.${toolId}.invoiceRef`] = data.invoiceRef || null;
+  if (data.paymentStatus !== undefined) patch[`subscriptions.${toolId}.paymentStatus`] = data.paymentStatus;
+  if (data.paidAt !== undefined) patch[`subscriptions.${toolId}.paidAt`] = data.paidAt || null;
+  if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
+
+  const db = getDb().collection<any>(COMPANIES);
+
+  // Si hay pago nuevo, agregar al historial (evitando duplicados por periodo)
+  if (data.paidAt && data.period) {
+    const record: PaymentRecord = {
+      paidAt: data.paidAt,
+      period: data.period,
+      ...(data.paymentAmount != null && { amount: data.paymentAmount }),
+      ...(data.paymentMethod && { method: data.paymentMethod }),
+      ...(data.invoiceRef && { invoiceRef: data.invoiceRef }),
+    };
+    // Quitar entrada previa del mismo periodo antes de insertar
+    await db.updateOne({ _id: oid }, {
+      $pull: { [`subscriptions.${toolId}.paymentHistory`]: { period: data.period } } as any
+    });
+    await db.updateOne({ _id: oid }, {
+      $set: patch,
+      $push: { [`subscriptions.${toolId}.paymentHistory`]: record } as any
+    });
+  } else {
+    const res = await db.updateOne({ _id: oid }, { $set: patch });
+    if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
+  }
+
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid });
+  return toPublic(doc!);
+}
+
+export async function listAllSubscriptionRows(): Promise<SubscriptionRow[]> {
+  const db = getDb();
+  // Empresas que tienen toolIds
+  const companies = await db.collection<any>(COMPANIES)
+    .find({ $or: [{ toolIds: { $exists: true, $not: { $size: 0 } } }, { toolId: { $exists: true } }] })
+    .toArray();
+
+  // Reunir ownerUserIds únicos para hacer una sola consulta de usuarios
+  const userIds = [...new Set(companies.map((c: any) => c.ownerUserId).filter(Boolean))];
+  const users = userIds.length
+    ? await db.collection<any>("users").find({ _id: { $in: userIds.map((id: string) => { try { return new ObjectId(id); } catch { return null; } }).filter(Boolean) } }).toArray()
+    : [];
+  const userMap = new Map(users.map((u: any) => [u._id.toString(), u]));
+
+  const rows: SubscriptionRow[] = [];
+  for (const company of companies) {
+    const toolIds = resolveToolIds(company);
+    const owner = userMap.get(String(company.ownerUserId || ""));
+    const subs: Record<string, any> = company.subscriptions || {};
+    // Fallback legado: si la empresa tiene licenseEndDate a nivel raíz, lo usamos para herramientas sin datos propios
+    const legacySub: CompanySubscription = {};
+    if (company.licenseStartDate) legacySub.licenseStartDate = company.licenseStartDate;
+    if (company.licenseEndDate) legacySub.licenseEndDate = company.licenseEndDate;
+    if (company.paymentAmount != null) legacySub.paymentAmount = company.paymentAmount;
+    if (company.paymentMethod) legacySub.paymentMethod = company.paymentMethod;
+    if (company.invoiceRef) legacySub.invoiceRef = company.invoiceRef;
+
+    for (const toolId of toolIds) {
+      const sub: CompanySubscription = subs[toolId] || (Object.keys(legacySub).length ? legacySub : {});
+      rows.push({
+        companyId: company._id.toString(),
+        companyName: company.name,
+        toolId,
+        userId: String(company.ownerUserId || ""),
+        userName: owner?.name || owner?.email || "—",
+        userEmail: owner?.email || "—",
+        ...sub,
+      });
+    }
+  }
+  return rows;
+}
+
+export async function removePaymentFromHistory(
+  companyId: string,
+  toolId: string,
+  period: string
+): Promise<SiigoCompanyPublic> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { throw new Error("Empresa inválida."); }
+  await getDb().collection<any>(COMPANIES).updateOne(
+    { _id: oid },
+    { $pull: { [`subscriptions.${toolId}.paymentHistory`]: { period } } } as any
+  );
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid });
+  if (!doc) throw new Error("Empresa no encontrada.");
+  return toPublic(doc);
+}
+
+export async function updateCompanySubscription(
+  companyId: string,
+  data: CompanySubscription & { toolIds?: string[] }
+): Promise<SiigoCompanyPublic> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { throw new Error("Empresa inválida."); }
+  const patch: Record<string, unknown> = {};
+  if (data.toolIds !== undefined) {
+    patch.toolIds = data.toolIds;
+    patch.toolId = null; // limpiar campo legado
+  }
+  if (data.licenseStartDate !== undefined) patch.licenseStartDate = data.licenseStartDate || null;
+  if (data.licenseEndDate !== undefined) patch.licenseEndDate = data.licenseEndDate || null;
+  if (data.paymentAmount !== undefined) patch.paymentAmount = data.paymentAmount ?? null;
+  if (data.paymentMethod !== undefined) patch.paymentMethod = data.paymentMethod || null;
+  if (data.invoiceRef !== undefined) patch.invoiceRef = data.invoiceRef || null;
+  if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
+  const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
+  if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid });
+  return toPublic(doc!);
 }
 
 /** _id de un usuario admin para asignar como dueño por defecto (seed, fallback). */
@@ -107,6 +291,14 @@ export async function userOwnsCompany(companyId: string, userId: string): Promis
 /** Cuántas empresas es DUEÑO un usuario (para hacer cumplir el cupo del plan). */
 export async function countCompaniesOwnedBy(userId: string): Promise<number> {
   return getDb().collection<any>(COMPANIES).countDocuments({ ownerUserId: userId });
+}
+
+export async function countCompaniesOwnedByForTool(userId: string, toolId: string): Promise<number> {
+  // Cuenta empresas que tienen este toolId en toolIds (array nuevo) O en toolId (campo legado)
+  return getDb().collection<any>(COMPANIES).countDocuments({
+    ownerUserId: userId,
+    $or: [{ toolIds: toolId }, { toolId }],
+  });
 }
 
 /** Credenciales completas (descifradas) de una empresa, listas para el contexto Siigo. */
@@ -175,7 +367,8 @@ export async function createCompany(
   username: string,
   accessKey: string,
   ownerUserId?: string,
-  nit?: string
+  nit?: string,
+  toolIds?: string[]
 ): Promise<SiigoCompanyPublic> {
   const cleanName = String(name || "").trim();
   const cleanUser = String(username || "").trim();
@@ -206,7 +399,7 @@ export async function createCompany(
   }
 
   const owner = ownerUserId || (await resolveMainAdminId()) || "";
-  const res = await db.collection<any>(COMPANIES).insertOne({
+  const doc: Record<string, unknown> = {
     name: cleanName,
     username: cleanUser,
     accessKeyEnc: encryptSecret(cleanKey),
@@ -214,8 +407,10 @@ export async function createCompany(
     ownerUserId: owner,
     sharedWith: [],
     createdAt: new Date().toISOString(),
-  });
-  return { id: res.insertedId.toString(), name: cleanName, username: cleanUser, nit: cleanNit, ownerUserId: owner, sharedWith: [] };
+  };
+  if (toolIds?.length) doc.toolIds = toolIds;
+  const res = await db.collection<any>(COMPANIES).insertOne(doc);
+  return { id: res.insertedId.toString(), name: cleanName, username: cleanUser, nit: cleanNit, ownerUserId: owner, sharedWith: [], toolIds: toolIds || [], subscriptions: {} };
 }
 
 export async function deleteCompany(id: string): Promise<boolean> {

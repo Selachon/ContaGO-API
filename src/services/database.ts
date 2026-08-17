@@ -77,6 +77,7 @@ interface UserRecord {
   licenseStartDate?: string;
   licenseEndDate?: string;
   companiesInPlan?: number;
+  toolCompanyLimits?: Record<string, number>;
   invoiceRef?: string;
   siigoCompanies?: string[];
   // Activación de la extensión de navegador (descargador DIAN).
@@ -214,6 +215,7 @@ function mapUser(record: UserRecord | null): User | null {
     created_at: record.created_at,
     demo: record.demo,
     companiesInPlan: record.companiesInPlan,
+    toolCompanyLimits: record.toolCompanyLimits,
     licenseStartDate: record.licenseStartDate,
   };
 }
@@ -430,6 +432,7 @@ export interface UserExtras {
   licenseStartDate?: string;
   licenseEndDate?: string;
   companiesInPlan?: number;
+  toolCompanyLimits?: Record<string, number>;
   invoiceRef?: string;
   siigoCompanies?: string[];
 }

@@ -4,7 +4,7 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
-import { acquireDianJobSlot, extractDocumentIdsByCufe, runDianExtractionPrecheck, throttledDianDownload, getFreshDianSessionCookies } from "../services/dianScraper.js";
+import { acquireDianJobSlot, extractDocumentIdsByCufe, runDianExtractionPrecheck, throttledDianDownload, getFreshDianSessionCookies, getFreshGratisVpfeCookies, downloadCufeDocumentsBrowser } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import {
@@ -153,12 +153,9 @@ setInterval(() => {
 router.post("/generate", upload.single("excel"), validateDianUrl, async (req: Request, res: Response) => {
   const token_url = req.body.token_url as string;
   const session_uid = req.body.session_uid as string | undefined;
-  const document_direction = req.body.document_direction as string | undefined;
   const drive_connection_id = req.body.drive_connection_id as string | undefined;
   const include_drive_links = req.body.include_drive_links === "true";
   const uploadedFile = req.file;
-
-  const direction = document_direction === "sent" ? "sent" : "received";
 
   if (!uploadedFile) {
     return res.status(400).json({ status: "error", detalle: "Debes subir el listado exportado desde la DIAN (.xlsx o .zip)." });
@@ -210,12 +207,14 @@ router.post("/generate", upload.single("excel"), validateDianUrl, async (req: Re
   };
   jobTracker.set(jobId, job);
 
-  // Parsear listado del archivo subido antes de responder.
+  // Parsear listado del archivo subido — la dirección se deduce de la columna Grupo.
   let listingRecords: ListingRecord[] = [];
+  let direction: "received" | "sent" = "received";
   try {
-    listingRecords = await parseListingRecordsFromExportZip(uploadedFile.buffer, direction);
+    listingRecords = await parseListingRecordsFromExportZip(uploadedFile.buffer);
+    direction = (listingRecords.find((r) => r.direction)?.direction) ?? "received";
     if (listingRecords.length === 0) {
-      return res.status(400).json({ status: "error", detalle: "El listado subido no contiene documentos válidos para la dirección seleccionada." });
+      return res.status(400).json({ status: "error", detalle: "El listado subido no contiene documentos válidos. Verifica que sea el archivo exportado desde la DIAN." });
     }
   } catch (parseErr) {
     const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
@@ -469,7 +468,8 @@ async function processExcelJob(
   const directionLabel = isSentDocs ? "emitidos" : "recibidos";
   let tokenNit = "";
   try {
-    tokenNit = new URL(tokenUrl).searchParams.get("rk")?.trim() || "";
+    const parsedUrl = new URL(tokenUrl);
+    tokenNit = parsedUrl.searchParams.get("rk")?.trim() || "";
   } catch {
     tokenNit = "";
   }
@@ -499,6 +499,21 @@ async function processExcelJob(
       undefined,
       listingRecords
     );
+
+    // Algunos portales DIAN exponen el CUFE (96 chars) como data-id del botón en vez
+    // de un UUID corto. DownloadZipFiles?trackId=<CUFE> no funciona; se usa
+    // gratis-vpfe/DownloadXml?transactionId=<CUFE> en su lugar.
+    const needsGratisDownload = documents.some((d) => d.id.length > 40);
+    let gratisCookieHeader: string | null = null;
+    if (needsGratisDownload && documents.length > 0) {
+      setProgress(jobId, { step: "Estableciendo sesión gratis-vpfe...", current: 0, total: documents.length });
+      try {
+        gratisCookieHeader = await getFreshGratisVpfeCookies(tokenUrl);
+        console.log(`[Excel] Cookies gratis-vpfe obtenidas OK (${documents.filter(d => d.id.length > 40).length} docs con CUFE como id)`);
+      } catch (err) {
+        console.warn(`[Excel] No se pudo obtener cookies gratis-vpfe: ${err instanceof Error ? err.message : err}`);
+      }
+    }
 
     let actualCompanyName = "";
     let actualCompanyNit = tokenNit || "";
@@ -582,9 +597,14 @@ async function processExcelJob(
     const scheduleZipPrefetch = (docIndex: number) => {
       if (docIndex < 0 || docIndex >= documents.length) return;
       if (zipPrefetch.has(docIndex)) return;
-      const trackId = documents[docIndex]?.id;
-      if (!trackId) return;
-      const p = downloadZipFile(trackId, cookies);
+      const doc = documents[docIndex];
+      if (!doc) return;
+      let p: Promise<Buffer>;
+      if (gratisCookieHeader && doc.id.length > 40) {
+        p = downloadXmlAsZipFromGratis(doc.cufe || doc.id, gratisCookieHeader);
+      } else {
+        p = downloadZipFile(doc.id, cookies, documentDirection);
+      }
       // Marca la promesa como "manejada" para evitar unhandledRejection (que en Node
       // moderno TUMBA el proceso/job entero) si el prefetch revienta con 403 antes de
       // ser await-eado. El await en el bucle sigue recibiendo el rechazo y lo captura.
@@ -911,8 +931,12 @@ async function processExcelJob(
       }
 
       try {
-        // 3.1) Descargar ZIP del trackId (con prefetch concurrente).
-        const zipBuffer = await (zipPrefetch.get(i) || downloadZipFile(doc.id, cookies));
+        const zipBuffer = await (
+          zipPrefetch.get(i) ||
+          (gratisCookieHeader && doc.id.length > 40
+            ? downloadXmlAsZipFromGratis(doc.cufe || doc.id, gratisCookieHeader)
+            : downloadZipFile(doc.id, cookies, documentDirection))
+        );
         await processDocumentFromZip(i, doc, zipBuffer);
         consecutiveErrors = 0; // Reset en éxito
 
@@ -980,7 +1004,49 @@ async function processExcelJob(
 
         let recovered = 0;
         const still: typeof pending = [];
-        for (const item of pending) {
+
+        // Separate CUFE-as-ID docs from standard-UUID docs
+        const cufeItems = pending.filter((p) => p.doc.id.length > 40);
+        const uuidItems = pending.filter((p) => p.doc.id.length <= 40);
+
+        // Batch browser-based download for CUFE-as-ID docs (single browser session)
+        if (cufeItems.length > 0 && !isJobCancelled(jobId)) {
+          setProgress(jobId, {
+            step: `Barrido ${sweep}: descarga por click para ${cufeItems.length} docs con CUFE como id...`,
+            current: successCount,
+            total: totalDocs,
+          });
+          try {
+            const cufeMap = await downloadCufeDocumentsBrowser(
+              tokenUrl,
+              cufeItems.map((p) => p.doc.cufe || p.doc.id),
+              documentDirection,
+              (step) => setProgress(jobId, { step, current: successCount, total: totalDocs }),
+            );
+            for (const item of cufeItems) {
+              if (isJobCancelled(jobId)) break;
+              const cufeKey = item.doc.cufe || item.doc.id;
+              const buf = cufeMap.get(cufeKey);
+              if (buf) {
+                try {
+                  await processDocumentFromZip(item.i, item.doc, buf);
+                  errorCount--;
+                  recovered++;
+                } catch (procErr) {
+                  still.push({ ...item, lastError: procErr instanceof Error ? procErr.message : String(procErr) });
+                }
+              } else {
+                still.push({ ...item, lastError: "CUFE_CLICK_NOT_FOUND: no se encontró en la tabla o la descarga no retornó ZIP" });
+              }
+            }
+          } catch (batchErr) {
+            console.warn(`[Excel] Barrido ${sweep}: error en batch CUFE click: ${batchErr instanceof Error ? batchErr.message.slice(0, 80) : batchErr}`);
+            still.push(...cufeItems.map((p) => ({ ...p, lastError: batchErr instanceof Error ? batchErr.message : String(batchErr) })));
+          }
+        }
+
+        // Standard UUID docs: HTTP download with fresh session
+        for (const item of uuidItems) {
           if (isJobCancelled(jobId)) break;
           try {
             const url = `https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=${item.doc.id}`;
@@ -1114,15 +1180,44 @@ async function processExcelJob(
 
 export async function downloadZipFile(
   trackId: string,
-  cookies: Record<string, string>
+  cookies: Record<string, string>,
+  direction: "received" | "sent" = "received"
 ): Promise<Buffer> {
   const url = `https://catalogo-vpfe.dian.gov.co/Document/DownloadZipFiles?trackId=${trackId}`;
   const cookieHeader = Object.entries(cookies)
     .map(([k, v]) => `${k}=${v}`)
     .join("; ");
-  // Rate-limiter global + backoff (Retry-After) centralizado en dianScraper, para
-  // que el tráfico total a DIAN no dispare 403 aunque corran varios jobs a la vez.
-  return throttledDianDownload(url, cookieHeader, { timeoutMs: 60_000, maxRetries: 4 });
+  const referer = direction === "sent"
+    ? "https://catalogo-vpfe.dian.gov.co/Document/Sent"
+    : "https://catalogo-vpfe.dian.gov.co/Document/Received";
+  return throttledDianDownload(url, cookieHeader, { timeoutMs: 60_000, maxRetries: 4, referer });
+}
+
+/**
+ * Descarga el XML de una factura desde gratis-vpfe usando el CUFE como transactionId
+ * y lo envuelve en un ZIP mínimo para que processDocumentFromZip lo pueda procesar.
+ * gratis-vpfe no requiere reCAPTCHA: es el endpoint correcto para tokens delegados.
+ */
+async function downloadXmlAsZipFromGratis(cufe: string, cookieHeader: string): Promise<Buffer> {
+  const { REAL_USER_AGENT } = await import("../services/dianScraper.js");
+  const xmlUrl = `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${cufe}&type=2`;
+  const resp = await fetch(xmlUrl, {
+    headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader, "Accept-Language": "es-CO,es;q=0.9" },
+    signal: AbortSignal.timeout(60_000),
+  });
+  if (!resp.ok) throw new Error(`GRATIS_VPFE_HTTP_${resp.status}: DownloadXml falló para ${cufe.slice(0, 16)}...`);
+  const xmlBuf = Buffer.from(await resp.arrayBuffer());
+  const preview = xmlBuf.toString("utf8", 0, 300).trim().toLowerCase();
+  if (preview.startsWith("<!doctype html") || preview.startsWith("<html") || preview.includes("<title>")) {
+    throw new Error(`GRATIS_VPFE_SESSION: gratis-vpfe devolvió HTML — sesión inválida o CUFE no encontrado (${cufe.slice(0, 20)}...)`);
+  }
+  if (!preview.startsWith("<?xml") && !preview.startsWith("<fe:") && !preview.startsWith("<invoice") && !preview.startsWith("<ds:")) {
+    throw new Error(`GRATIS_VPFE_UNEXPECTED: respuesta inesperada (${xmlBuf.length}b): ${xmlBuf.toString("utf8", 0, 80).replace(/\s+/g, " ").trim()}`);
+  }
+  // Empaquetar en ZIP para compatibilidad con processDocumentFromZip
+  const zip = new JSZip();
+  zip.file(`${cufe.slice(0, 16)}.xml`, xmlBuf);
+  return Buffer.from(await zip.generateAsync({ type: "nodebuffer" }));
 }
 
 async function runDriveUploadInBackground(
@@ -1202,7 +1297,15 @@ async function extractFilesFromZip(zipBuffer: Buffer): Promise<ExtractedFiles> {
     const lowerName = filename.toLowerCase();
 
     if (lowerName.endsWith(".xml") && !xmlBuffer) {
-      xmlBuffer = await file.async("nodebuffer");
+      const raw = await file.async("nodebuffer");
+      // Detectar HTML disfrazado de XML (DIAN anti-bot: devuelve ZIP válido pero con
+      // página HTML dentro). Lanzar error para que el mecanismo de barridos reintente.
+      const preview = raw.toString("utf8", 0, 300).trim().toLowerCase();
+      if (preview.startsWith("<!doctype html") || preview.startsWith("<html") ||
+          (preview.includes("<html") && preview.includes("<head"))) {
+        throw new Error("HTML_INSIDE_ZIP: DIAN devolvió HTML dentro del ZIP en lugar del XML de la factura (posible bloqueo de sesión transitorio)");
+      }
+      xmlBuffer = raw;
       xmlFilename = filename;
     }
 

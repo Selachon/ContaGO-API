@@ -28,6 +28,7 @@ import {
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
 import { createDemoInvite, listDemoInvites, TOOL_SUCCESSOR, updateUserPassword, resetExtActivation } from "../services/database.js";
+import { listCompaniesForUser, updateCompanySubscription, updateToolSubscription, listAllSubscriptionRows, removePaymentFromHistory } from "../services/siigoCompaniesService.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
 import type { InvoiceData } from "../types/dianExcel.js";
@@ -440,7 +441,7 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
       return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
     }
 
-    const allowedFields = ["name", "nits", "purchasedTools", "isAdmin", "phone", "paymentAmount", "paymentMethod", "licenseStartDate", "licenseEndDate", "companiesInPlan", "invoiceRef"];
+    const allowedFields = ["name", "nits", "purchasedTools", "isAdmin", "phone", "paymentAmount", "paymentMethod", "licenseStartDate", "licenseEndDate", "companiesInPlan", "toolCompanyLimits", "invoiceRef"];
     const updates: Record<string, unknown> = {};
     const before: Record<string, unknown> = {};
 
@@ -490,6 +491,18 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
         } else if (field === "companiesInPlan") {
           const v = parseInt(req.body.companiesInPlan, 10);
           updates.companiesInPlan = isNaN(v) ? undefined : v;
+        } else if (field === "toolCompanyLimits") {
+          const raw = req.body.toolCompanyLimits;
+          if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+            const limits: Record<string, number> = {};
+            for (const [k, v] of Object.entries(raw)) {
+              const n = parseInt(String(v), 10);
+              if (!isNaN(n) && n >= 0) limits[k] = n;
+            }
+            updates.toolCompanyLimits = Object.keys(limits).length ? limits : undefined;
+          } else {
+            updates.toolCompanyLimits = undefined;
+          }
         } else if (field === "invoiceRef") {
           updates.invoiceRef = req.body.invoiceRef ? String(req.body.invoiceRef).trim() : undefined;
         }
@@ -857,4 +870,76 @@ router.put("/accounting-kanban", async (req: Request, res: Response) => {
     res.status(500).json({ ok: false, message: "Error guardando tablero Kanban contable" });
   }
 });
+// ─── Panel de suscripciones ──────────────────────────────────────────────────
+
+router.get("/subscriptions", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  try {
+    const rows = await listAllSubscriptionRows();
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error("[Admin] Error cargando suscripciones:", err);
+    res.status(500).json({ ok: false, message: "Error cargando suscripciones" });
+  }
+});
+
+router.patch("/siigo-companies/:companyId/subscriptions/:toolId", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  const { companyId, toolId } = req.params;
+  const { licenseStartDate, licenseEndDate, paymentAmount, paymentMethod, invoiceRef, paymentStatus, paidAt, period, removePaymentPeriod } = req.body;
+  try {
+    // Revertir cobro: quitar entrada del historial para ese periodo
+    if (removePaymentPeriod) {
+      const updated = await removePaymentFromHistory(companyId, toolId, removePaymentPeriod);
+      return res.json({ ok: true, data: updated });
+    }
+    const updated = await updateToolSubscription(companyId, toolId, {
+      ...(licenseStartDate !== undefined && { licenseStartDate }),
+      ...(licenseEndDate !== undefined && { licenseEndDate }),
+      ...(paymentAmount !== undefined && { paymentAmount: paymentAmount !== "" ? Number(paymentAmount) : undefined }),
+      ...(paymentMethod !== undefined && { paymentMethod }),
+      ...(invoiceRef !== undefined && { invoiceRef }),
+      ...(paymentStatus !== undefined && { paymentStatus }),
+      ...(paidAt !== undefined && { paidAt }),
+      ...(period !== undefined && { period }),
+    });
+    res.json({ ok: true, data: updated });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, message: err.message || "Error actualizando suscripción" });
+  }
+});
+
+// ─── Empresas Siigo por usuario ──────────────────────────────────────────────
+
+router.get("/users/:userId/siigo-companies", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  try {
+    const companies = await listCompaniesForUser(req.params.userId);
+    res.json({ ok: true, data: companies });
+  } catch (err) {
+    console.error("[Admin] Error listando empresas Siigo:", err);
+    res.status(500).json({ ok: false, message: "Error cargando empresas" });
+  }
+});
+
+router.patch("/siigo-companies/:companyId", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  const { companyId } = req.params;
+  const { toolIds, licenseStartDate, licenseEndDate, paymentAmount, paymentMethod, invoiceRef } = req.body;
+  try {
+    const updated = await updateCompanySubscription(companyId, {
+      ...(toolIds !== undefined && { toolIds: Array.isArray(toolIds) ? toolIds : [] }),
+      ...(licenseStartDate !== undefined && { licenseStartDate }),
+      ...(licenseEndDate !== undefined && { licenseEndDate }),
+      ...(paymentAmount !== undefined && { paymentAmount: paymentAmount !== "" ? Number(paymentAmount) : undefined }),
+      ...(paymentMethod !== undefined && { paymentMethod }),
+      ...(invoiceRef !== undefined && { invoiceRef }),
+    });
+    res.json({ ok: true, data: updated });
+  } catch (err: any) {
+    console.error("[Admin] Error actualizando suscripción empresa:", err);
+    res.status(400).json({ ok: false, message: err.message || "Error actualizando suscripción" });
+  }
+});
+
 export default router;
