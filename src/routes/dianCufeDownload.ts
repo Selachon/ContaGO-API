@@ -462,6 +462,10 @@ async function processCufeDownloadJob(
 
         const processXml = async (xmlBuf: Buffer, cufe: string): Promise<void> => {
           const originalCufe = cufeOriginalMap.get(cufe.toLowerCase())!;
+          const preview = xmlBuf.toString("utf8", 0, 300).trim().toLowerCase();
+          if (preview.startsWith("<!doctype html") || preview.startsWith("<html") || preview.includes("<title>")) {
+            throw new Error(`GRATIS_VPFE_SESSION: gratis-vpfe devolvió HTML — sesión inválida o CUFE no encontrado (${cufe.slice(0, 20)}...)`);
+          }
           const invoiceData = await extractInvoiceDataFromXml(xmlBuf, { id: cufe, docnum: "" });
 
           const isDS = !!invoiceData.isDocumentoSoporte;
@@ -531,8 +535,15 @@ async function processCufeDownloadJob(
               `https://gratis-vpfe.dian.gov.co/Document/DownloadXml?transactionId=${cufe}&type=2`,
               { headers: { "User-Agent": REAL_USER_AGENT, Cookie: cookieHeader } },
             );
-            if (!xmlResp.ok) { failedCufes.push(cufe); return; }
+            if (!xmlResp.ok) {
+              console.warn(`[CUFE DL] P1 HTTP ${xmlResp.status} para ${cufe.slice(0, 16)}`);
+              failedCufes.push(cufe); return;
+            }
             const xmlBuf = Buffer.from(await xmlResp.arrayBuffer());
+            const firstBytes = xmlBuf.toString("utf8", 0, 80).replace(/\n/g, " ");
+            if (firstBytes.toLowerCase().includes("html")) {
+              console.warn(`[CUFE DL] P1 respuesta HTML (${xmlResp.status}) para ${cufe.slice(0, 16)}: ${firstBytes}`);
+            }
             await processXml(xmlBuf, cufe);
           } catch (err) {
             console.warn(`[CUFE DL] P1 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err);
@@ -593,6 +604,14 @@ async function processCufeDownloadJob(
         }
 
         console.log(`[CUFE DL] Final: ${dlOk}/${downloadCufes.length} descargadas`);
+
+        // Fallback: CUFEs que fallaron los 3 pases quedan fuera del invoiceMap → registrarlos como error
+        for (const cufe of downloadCufes) {
+          if (!invoiceMap.has(cufe)) {
+            console.warn(`[CUFE DL] CUFE sin datos tras 3 pases: ${cufe.slice(0, 20)}`);
+            invoiceMap.set(cufe, { documentType: "Error descarga", concepto: "No se pudo descargar tras 3 intentos", formaPago: "N/A", subtotal: 0, descuento: 0, anticipos: 0, totalImpuestos: 0, total: 0, retefuente: 0, reteiva: 0, reteica: 0 } as any);
+          }
+        }
       } finally {
         await closeBrowserSafely(gBrowser).catch(() => {});
       }
