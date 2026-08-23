@@ -121,6 +121,35 @@ class RateLimiter {
  * Autentica vía tokenUrl y devuelve la página de gratis-vpfe lista para
  * interactuar (ya posicionada en /Document/Received o /Document/Sent con el filtro aplicado).
  */
+/**
+ * Llena From/To y hace clic en "Buscar" en la página YA autenticada de
+ * gratis-vpfe (Document/Received o /Sent). Reutilizable para re-consultar
+ * sub-rangos de fecha dentro de la MISMA sesión (sin reabrir el token), porque
+ * `GetReceivedDocuments`/`GetSentDocuments` no pagina de verdad más allá de 150
+ * filas — la única forma de traer más de 150 documentos es acotar el rango.
+ */
+export async function applyReceivedDateFilter(page: Page, from: string, to: string): Promise<void> {
+  await page.evaluate((f: string, t: string) => {
+    const $ = (window as any).$;
+    const fromEl = document.getElementById("From") as HTMLInputElement | null;
+    const toEl = document.getElementById("To") as HTMLInputElement | null;
+    const rangeEl = document.getElementById("idDateRange") as HTMLInputElement | null;
+    if (fromEl) { fromEl.value = f; if ($) $(fromEl).trigger("change"); }
+    if (toEl) { toEl.value = t; if ($) $(toEl).trigger("change"); }
+    if (rangeEl) { rangeEl.value = `${f} a ${t}`; }
+  }, from, to);
+  await delay(300);
+  const navDone = page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20_000 }).catch(() => null);
+  await page.evaluate(() => {
+    const btn = Array.from(document.querySelectorAll("button")).find(
+      (b) => (b.textContent || "").trim().toLowerCase().includes("buscar")
+    );
+    if (btn) btn.click();
+  });
+  await navDone;
+  await delay(1500);
+}
+
 export async function authenticateAndNavigate(
   tokenUrl: string,
   from: string,
@@ -176,29 +205,8 @@ export async function authenticateAndNavigate(
     }).catch(() => {});
     await delay(2000);
 
-    // Llenar fechas
-    await page.evaluate((f: string, t: string) => {
-      const $ = (window as any).$;
-      const fromEl = document.getElementById("From") as HTMLInputElement | null;
-      const toEl = document.getElementById("To") as HTMLInputElement | null;
-      const rangeEl = document.getElementById("idDateRange") as HTMLInputElement | null;
-      if (fromEl) { fromEl.value = f; if ($) $(fromEl).trigger("change"); }
-      if (toEl) { toEl.value = t; if ($) $(toEl).trigger("change"); }
-      if (rangeEl) { rangeEl.value = `${f} a ${t}`; }
-    }, from, to);
-    await delay(300);
-
-    // Submit
     progress({ step: "Buscando documentos..." });
-    const navDone = page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20_000 }).catch(() => null);
-    await page.evaluate(() => {
-      const btn = Array.from(document.querySelectorAll("button")).find(
-        (b) => (b.textContent || "").trim().toLowerCase().includes("buscar")
-      );
-      if (btn) btn.click();
-    });
-    await navDone;
-    await delay(3000);
+    await applyReceivedDateFilter(page, from, to);
 
     return { browser, page };
   } catch (err) {
@@ -227,22 +235,49 @@ export async function fetchDocumentList(page: Page, direction: "received" | "sen
     }, buildDtParams(start, length, draw, direction), endpoint);
   };
 
-  // Primera página: obtener total y primeros registros
+  // Primera página: primeros registros. NO confiamos en recordsFiltered/recordsTotal
+  // para decidir cuándo parar: el servidor DIAN los reporta mal cuando hay más de
+  // PAGE_SIZE documentos en el rango, lo que truncaba silenciosamente meses con
+  // >150 documentos (se perdían los más antiguos del rango, al final del orden
+  // DESC por fecha). Pero TAMPOCO podemos confiar en "la página vino llena
+  // (==PAGE_SIZE) → sigo pidiendo": si el servidor ignora `start` y siempre
+  // devuelve la MISMA primera página, eso deja el loop girando indefinidamente
+  // con páginas idénticas. Criterio robusto: seguir mientras la página traiga
+  // AL MENOS UNA fila nueva (por id, `DT_RowId`); si una página no aporta nada
+  // nuevo, el servidor no está paginando de verdad y hay que parar ahí.
+  const rowId = (row: any): string => row?.DT_RowId || row?.DT_RowData?.pkey || "";
   const first = await fetchPage(0, PAGE_SIZE, 1);
-  const total = first.recordsFiltered ?? first.recordsTotal ?? 0;
-  if (total === 0) return [];
+  const allRows: any[] = [];
+  const seenIds = new Set<string>();
+  for (const r of first.data || []) {
+    const id = rowId(r);
+    if (id && seenIds.has(id)) continue;
+    if (id) seenIds.add(id);
+    allRows.push(r);
+  }
+  console.log(`[dianRecibidos] página 1: ${allRows.length} fila(s)`);
+  if (allRows.length === 0) return [];
 
-  const allRows: any[] = [...(first.data || [])];
-
-  // Páginas adicionales si hay más registros
   let draw = 2;
   let start = PAGE_SIZE;
-  while (allRows.length < total) {
+  let lastPageFull = (first.data || []).length === PAGE_SIZE;
+  const MAX_PAGES = 30; // salvaguarda: 30 * 150 = 4,500 documentos por mes
+  while (lastPageFull && draw <= MAX_PAGES) {
     await new Promise<void>((r) => setTimeout(r, 400)); // pausa entre páginas
-    const page_ = await fetchPage(start, PAGE_SIZE, draw++);
+    const page_ = await fetchPage(start, PAGE_SIZE, draw);
     const batch = page_.data || [];
-    if (batch.length === 0) break;
-    allRows.push(...batch);
+    lastPageFull = batch.length === PAGE_SIZE;
+    let newCount = 0;
+    for (const r of batch) {
+      const id = rowId(r);
+      if (id && seenIds.has(id)) continue;
+      if (id) seenIds.add(id);
+      allRows.push(r);
+      newCount++;
+    }
+    console.log(`[dianRecibidos] página ${draw} (start=${start}): ${batch.length} fila(s), ${newCount} nueva(s)`);
+    draw++;
+    if (newCount === 0) break; // el servidor repitió la página: no pagina de verdad, paramos
     start += PAGE_SIZE;
   }
 

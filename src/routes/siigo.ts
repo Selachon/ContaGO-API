@@ -24,6 +24,8 @@ import {
   listPaymentReceipts,
   listPaymentReceiptDocumentTypes,
   getAccountsPayable,
+  getAccountsReceivable,
+  probeRequest,
   listPurchaseDocumentTypes,
   listJournalDocumentTypes,
   createJournalVoucher,
@@ -44,6 +46,7 @@ import {
 import {
   listCompanies,
   listCompaniesForUser,
+  getCompanyPublic,
   userCanAccessCompany,
   userOwnsCompany,
   createCompany,
@@ -63,7 +66,8 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, taxRequiredItemIndex, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
-import { ingestFromDian, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
+import { ingestFromDian, ingestNewByDateRange, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
+import { recordIngestedCufes } from "../services/siigoIngestedCufesService.js";
 import { parseListingRecordsFromExportZip } from "../services/dianScraper.js";
 import {
   parseBankExcel,
@@ -398,6 +402,22 @@ function applyTextFilter(
 // Si la petición trae el header X-Siigo-Company, ejecuta el resto con las
 // credenciales de esa empresa en contexto. Sin header → usa el .env (fallback).
 async function withSiigoCompany(req: Request, res: Response, next: NextFunction): Promise<void> {
+  // Usuarios del portal de cliente: empresa fija, sin chequeo de pertenencia.
+  if ((req.user as any)?.isPortal) {
+    const companyId = (req.user as any).caPortalCompanyId as string | undefined;
+    if (!companyId) return next();
+    try {
+      const ctx = await getCompanyContext(companyId);
+      if (!ctx) {
+        res.status(400).json({ ok: false, source: "siigo", code: "siigo_company_not_found", message: "Empresa Siigo no encontrada" });
+        return;
+      }
+      enterSiigoCompany(ctx);
+      next();
+    } catch (error) { next(error); }
+    return;
+  }
+
   const companyId = req.header("X-Siigo-Company");
   if (!companyId) return next();
   try {
@@ -439,7 +459,9 @@ async function withSiigoCompany(req: Request, res: Response, next: NextFunction)
 // que puede romper el AsyncLocalStorage fijado por withSiigoCompany y hacer que
 // los datos se guarden bajo la empresa equivocada (namespace "env").
 async function runInCompanyCtx<T>(req: Request, fn: () => Promise<T> | T): Promise<T> {
-  const companyId = req.header("X-Siigo-Company");
+  const companyId = (req as any).user?.isPortal
+    ? (req as any).user?.caPortalCompanyId
+    : req.header("X-Siigo-Company");
   const ctx = companyId ? await getCompanyContext(companyId) : null;
   return ctx ? runWithSiigoCompany(ctx, () => fn()) : fn();
 }
@@ -504,6 +526,12 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   // ─── Empresas Siigo (multi-empresa) ──────────────────────────────────
   router.get("/companies", async (req: Request, res: Response) => {
     try {
+      // Portal: devuelve solo la empresa del portal (Castro Arroyave).
+      if ((req.user as any)?.isPortal) {
+        const companyId = (req.user as any).caPortalCompanyId as string;
+        const company = companyId ? await getCompanyPublic(companyId) : null;
+        return res.json({ ok: true, data: company ? [company] : [] });
+      }
       // JWT: solo las empresas que el usuario posee o le comparten.
       // API key interno: todas (integración server-to-server).
       const companies =
@@ -1050,6 +1078,55 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         ok: false,
         message: error instanceof Error ? error.message : "Error procesando el archivo.",
       });
+    }
+  });
+
+  // TEMP: prueba variantes para encontrar saldo CxC/CxP de un tercero.
+  router.get("/egresos/probe-ar", async (req: Request, res: Response) => {
+    const nit = String(req.query.nit || "").replace(/\D/g, "");
+    if (!nit) return res.status(400).json({ ok: false, message: "Falta ?nit=" });
+    const today = new Date().toISOString().slice(0, 10);
+    const past = new Date(Date.now() - 2 * 365 * 86400_000).toISOString().slice(0, 10);
+    const variants = [
+      // CxC
+      { label: "AR basic",         path: "/v1/accounts-receivable", query: { customer_identification: nit } },
+      { label: "AR+dates",         path: "/v1/accounts-receivable", query: { customer_identification: nit, due_date_start: past, due_date_end: today } },
+      { label: "AR identification",path: "/v1/accounts-receivable", query: { identification: nit } },
+      { label: "AR path param",    path: `/v1/accounts-receivable/${nit}`, query: {} },
+      // CxP (quizás el tercero también es proveedor)
+      { label: "AP basic",         path: "/v1/accounts-payable", query: { provider_identification: nit } },
+      { label: "AP+dates",         path: "/v1/accounts-payable", query: { provider_identification: nit, due_date_start: past, due_date_end: today } },
+      // Journals (CC) con ese tercero
+      { label: "Journals customer",path: "/v1/journals", query: { customer_identification: nit, page: 1, page_size: 10 } },
+      { label: "Journals date",    path: "/v1/journals", query: { customer_identification: nit, date_start: past, date_end: today, page: 1, page_size: 10 } },
+      // Vouchers (RC) con ese tercero
+      { label: "Vouchers customer",path: "/v1/vouchers", query: { customer_identification: nit, page: 1, page_size: 10 } },
+      // Invoices (FV)
+      { label: "Invoices customer",path: "/v1/invoices", query: { customer_identification: nit, page: 1, page_size: 10 } },
+    ];
+    const results: any[] = [];
+    for (const v of variants) {
+      try {
+        const data = await runInCompanyCtx(req, () => probeRequest(v.path, v.query));
+        results.push({ label: v.label, path: v.path, query: v.query, ok: true, data });
+      } catch (e: any) {
+        results.push({ label: v.label, path: v.path, query: v.query, ok: false, error: e.message, code: e.code });
+      }
+    }
+    return res.json({ results });
+  });
+
+  // Lista facturas de venta abiertas de un cliente para cruce en CC avanzado.
+  // Nota: Siigo no tiene endpoint de cuentas por cobrar general; se usan /v1/invoices.
+  // Para cruces con otros tipos (CC, NC, etc.) el usuario debe ingresar manualmente.
+  router.get("/egresos/income/receivables", async (req: Request, res: Response) => {
+    try {
+      const nit = String(req.query.customer_identification || "").replace(/\D/g, "");
+      if (!nit) return res.status(400).json({ ok: false, message: "Falta el NIT del cliente." });
+      const data = await runInCompanyCtx(req, () => listCustomerInvoices(nit));
+      return res.json({ ok: true, data });
+    } catch (error) {
+      return handleSiigoError(res, error);
     }
   });
 
@@ -1896,6 +1973,143 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       });
 
     return res.json({ ok: true, jobId });
+  });
+
+  // Bloqueo explícito de CUFEs: cuando el usuario quita una factura de la tabla
+  // y elige "no volver a traer de la DIAN". Es el ÚNICO lugar que escribe en el
+  // registro persistente `siigoIngestedCufes` — la ingesta automática ya no lo
+  // hace, así que por defecto SIEMPRE se vuelve a traer lo que no esté en pantalla.
+  router.post("/accounting/dian-block-cufes", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) {
+      return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
+    }
+    const rawCufes = Array.isArray(req.body?.cufes) ? req.body.cufes.filter((x: unknown) => typeof x === "string" && x.trim()) : [];
+    const cufes = rawCufes.map((c: string) => c.replace(/[^A-Fa-f0-9]/g, "").trim()).filter(Boolean);
+    if (cufes.length === 0) {
+      return res.status(400).json({ ok: false, message: "No se recibieron CUFEs para bloquear." });
+    }
+    await recordIngestedCufes(companyId, cufes.map((c: string) => ({ cufe: c }))).catch(() => undefined);
+    return res.json({ ok: true });
+  });
+
+  // Ingesta por MES, sin subir listado: lista y descarga directamente del portal
+  // DIAN (mismo motor que /accounting/from-dian, sin el paso de Excel manual).
+  router.post("/accounting/from-dian-month", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) {
+      return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
+    }
+    const ctx = await getCompanyContext(companyId);
+    if (!ctx) {
+      return res.status(400).json({ ok: false, message: "Empresa Siigo no encontrada." });
+    }
+
+    const tokenUrl = (req.body?.token_url || req.body?.tokenUrl) as string | undefined;
+    const month = String(req.body?.month || "").trim(); // "YYYY-MM"
+    const forceRedownload = req.body?.forceRedownload === true || req.body?.forceRedownload === "true";
+    let skipCufes: string[] = [];
+    if (Array.isArray(req.body?.skipCufes)) {
+      skipCufes = req.body.skipCufes.filter((x: unknown) => typeof x === "string");
+    }
+
+    if (!tokenUrl || !/catalogo-vpfe\.dian\.gov\.co\/User\/AuthToken/i.test(tokenUrl)) {
+      return res.status(400).json({ ok: false, message: "Token DIAN inválido. Pega la URL completa de ingreso (/User/AuthToken?...)." });
+    }
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ ok: false, message: "Selecciona el mes a traer." });
+    }
+
+    // Misma validación de propiedad que /accounting/from-dian: el token debe ser
+    // de la MISMA empresa asociada (NIT del parámetro `rk` vs NIT guardado).
+    const companyNit = normalizeNit(ctx.nit);
+    if (!companyNit) {
+      return res.status(400).json({
+        ok: false,
+        code: "company_nit_missing",
+        message: "La empresa asociada no tiene NIT configurado. Defínelo en la configuración de la empresa antes de usar la ingesta automática desde DIAN.",
+      });
+    }
+    let tokenNit = "";
+    try {
+      tokenNit = normalizeNit(new URL(tokenUrl).searchParams.get("rk") || "");
+    } catch { /* URL inválida ya cubierta arriba */ }
+    if (!tokenNit) {
+      return res.status(400).json({ ok: false, code: "token_nit_missing", message: "No se pudo determinar el NIT del token (parámetro rk). Verifica que la URL de ingreso esté completa." });
+    }
+    if (tokenNit !== companyNit) {
+      return res.status(403).json({
+        ok: false,
+        code: "token_company_mismatch",
+        message: `El token pertenece a la empresa NIT ${tokenNit}, pero la empresa asociada es NIT ${companyNit}. No se permite contabilizar facturas de otra empresa.`,
+      });
+    }
+
+    // Restricción por mes de licencia (igual que /accounting/from-dian).
+    if (req.user?.userId && !req.user.isAdmin) {
+      const purchases = await getUserPurchases(req.user.userId);
+      const exempt = purchases.includes("causacion-caja");
+      if (!exempt) {
+        const user = await getUserById(req.user.userId);
+        const floor = licenseFloorMonth(user?.licenseStartDate);
+        if (floor && month < floor) {
+          return res.status(400).json({
+            ok: false,
+            code: "month_out_of_window",
+            message: `El mes ${month} es anterior a tu plan (habilitado desde ${floor}). Elige un mes habilitado.`,
+          });
+        }
+      }
+    }
+
+    const [y, m] = month.split("-").map(Number);
+    const fechaInicio = `${month}-01`;
+    const lastDay = new Date(y, m, 0).getDate();
+    const fechaFin = `${month}-${String(lastDay).padStart(2, "0")}`;
+    // Tope de documentos NUEVOS a descargar por corrida (no incluye los que ya
+    // están en pantalla). Si el mes trae más, se descargan los primeros 200 y el
+    // usuario puede volver a darle "Traer y procesar" para el resto.
+    const maxDocuments = 200;
+
+    const jobId = uuidv4();
+    dianIngestJobs.set(jobId, {
+      status: "processing",
+      progress: { step: "En cola...", current: 0, total: 0 },
+      userId: req.user?.userId || "",
+      createdAt: Date.now(),
+    });
+
+    runWithSiigoCompany(ctx, () =>
+      ingestNewByDateRange({
+        companyId,
+        tokenUrl,
+        fechaInicio,
+        fechaFin,
+        maxDocuments,
+        forceRedownload,
+        skipCufes,
+        onProgress: (p) => {
+          const job = dianIngestJobs.get(jobId);
+          if (job && job.status === "processing") job.progress = p;
+        },
+        isCancelled: () => dianIngestJobs.get(jobId)?.status === "cancelled",
+      })
+    )
+      .then((result) => {
+        const job = dianIngestJobs.get(jobId);
+        if (!job || job.status === "cancelled") return;
+        job.status = "completed";
+        job.result = result;
+        job.progress = { step: "Completado", current: result.stats.downloaded, total: result.stats.listed };
+      })
+      .catch((err) => {
+        const job = dianIngestJobs.get(jobId);
+        if (!job || job.status === "cancelled") return;
+        job.status = "error";
+        job.error = err instanceof Error ? err.message : "Error en la ingesta desde DIAN";
+      });
+
+    return res.json({ ok: true, jobId, range: { fechaInicio, fechaFin } });
   });
 
   router.get("/accounting/from-dian/status/:jobId", (req: Request, res: Response) => {

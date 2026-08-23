@@ -1,30 +1,91 @@
-import path from "path";
-import fs from "fs";
-import { fileURLToPath } from "url";
-import { v4 as uuidv4 } from "uuid";
 import type { Page } from "puppeteer";
 import {
   acquireDianJobSlot,
   getCufeListing,
-  extractDocumentIds,
-  extractDocumentIdsByCufe,
-  fetchZipToFile,
-  downloadZipInPage,
-  type CufeDownloadItem,
-  type ListingRecord,
+  REAL_USER_AGENT,
+  closeBrowserSafely,
 } from "./dianScraper.js";
+import { authenticateAndNavigate, applyReceivedDateFilter, fetchDocumentList, downloadXmlFile, type RecibidoDocument } from "./dianRecibidosScraper.js";
 import { processXmlBatch, type BatchItem } from "./siigoAccountingService.js";
-import { getIngestedCufes, getIngestedTrackIds, recordIngestedCufes } from "./siigoIngestedCufesService.js";
+import { getIngestedCufes } from "./siigoIngestedCufesService.js";
 import type { DocumentDirection, ProgressData } from "../types/dian.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
-
-if (!fs.existsSync(DOWNLOADS_DIR)) {
-  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
-}
+const GRATIS_VPFE = "https://gratis-vpfe.dian.gov.co";
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+const fmtDdMmYyyy = (ms: number): string => {
+  const dt = new Date(ms);
+  return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
+};
+
+// ── Helpers de fecha ISO (yyyy-mm-dd), sin librerías externas ──────────────
+const parseISODate = (d: string): Date => {
+  const [y, m, dd] = d.split("-").map(Number);
+  return new Date(y, m - 1, dd);
+};
+const toISODate = (d: Date): string =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const addDaysISO = (iso: string, n: number): string => {
+  const d = parseISODate(iso);
+  d.setDate(d.getDate() + n);
+  return toISODate(d);
+};
+const midISODate = (fromISO: string, toISO: string): string => {
+  const f = parseISODate(fromISO).getTime();
+  const t = parseISODate(toISO).getTime();
+  return toISODate(new Date(f + Math.floor((t - f) / 2)));
+};
+
+/**
+ * `GetReceivedDocuments`/`GetSentDocuments` de gratis-vpfe NO pagina de verdad
+ * más allá de 150 filas (pedir `start` mayor devuelve la MISMA primera página —
+ * confirmado en pruebas: es un límite duro del servidor, no un bug de reporte de
+ * totales). La única forma de traer más de 150 documentos en un rango es acotar
+ * las fechas: si una consulta devuelve exactamente el tope, se parte el rango
+ * en dos mitades y se re-consulta cada una (re-enviando el filtro en la MISMA
+ * página/sesión, sin reabrir el token). Se combinan resultados por CUFE/id.
+ */
+async function fetchDocumentsSplitByRange(
+  page: Page,
+  fromISO: string,
+  toISO: string,
+  direction: DocumentDirection = "received"
+): Promise<RecibidoDocument[]> {
+  const LIMIT = 150; // límite real observado del servidor DIAN (gratis-vpfe)
+  const merged = new Map<string, RecibidoDocument>();
+  const queue: [string, string][] = [[fromISO, toISO]];
+  let guard = 0;
+  while (queue.length) {
+    if (++guard > 200) {
+      console.warn("[Siigo Ingest] Demasiadas particiones de rango — deteniendo por seguridad.");
+      break;
+    }
+    const [f, t] = queue.shift()!;
+    await applyReceivedDateFilter(
+      page,
+      fmtDdMmYyyy(parseISODate(f).getTime()),
+      fmtDdMmYyyy(parseISODate(t).getTime())
+    );
+    const docs = await fetchDocumentList(page, direction === "sent" ? "sent" : "received");
+    console.log(`[Siigo Ingest] Rango ${f}..${t}: ${docs.length} documento(s)`);
+    if (docs.length >= LIMIT && f !== t) {
+      // Posible truncado por el tope del servidor: partir el rango en dos.
+      const mid = midISODate(f, t);
+      const nextFrom = addDaysISO(mid, 1);
+      queue.push([f, mid]);
+      if (nextFrom <= t) queue.push([nextFrom, t]);
+      continue;
+    }
+    if (docs.length >= LIMIT && f === t) {
+      console.warn(`[Siigo Ingest] Día ${f} trae ${docs.length} documento(s) — puede estar truncado (no se puede partir por debajo de un día).`);
+    }
+    for (const d of docs) {
+      const key = d.transactionId || `${d.docNumber}|${d.issueDate}`;
+      if (key) merged.set(key, d);
+    }
+  }
+  return [...merged.values()];
+}
 
 export type IngestGrupo = "Emitidos" | "Recibidos" | "Todos";
 
@@ -92,133 +153,151 @@ function grupoToDirections(grupo: IngestGrupo): DocumentDirection[] {
 }
 
 /**
- * Descarga los CUFEs de una dirección con reintentos: una pasada inicial y hasta
- * `retryRounds` rondas adicionales SOLO sobre los CUFEs que sigan fallando. Esto
- * garantiza que ningún CUFE se "salte" silenciosamente; los que no se recuperen
- * tras agotar las rondas se devuelven explícitamente en `failures`.
+ * Descarga los CUFEs de una dirección exactamente igual que "Descarga Masiva +
+ * Excel DIAN" (`routes/dianCufeDownload.ts` → `authenticateAndNavigate` +
+ * fetch directo a gratis-vpfe): se autentica UNA vez (con un rango de fechas
+ * amplio y fijo, solo para completar el paso de "Buscar" — el rango real de
+ * las facturas es irrelevante aquí, porque `Document/DownloadXml` acepta el
+ * CUFE directamente como `transactionId`, sin necesidad de ubicarlo en una
+ * tabla filtrada por fecha). Tres pasadas: concurrente → cookies frescas →
+ * re-autenticación completa, igual que la herramienta que ya funciona.
  */
-async function downloadDirectionWithRetries(
-  opts: IngestOptions,
+async function downloadCufesGratisVpfe(
+  tokenUrl: string,
   direction: DocumentDirection,
   cufes: string[],
-  tempDir: string
-): Promise<{ success: CufeDownloadItem[]; failures: IngestFailure[]; rounds: number }> {
-  // Mismo paso a paso que "Exportar Excel DIAN" (dianCufeDownload): entrar al token
-  // UNA vez por sesión, resolver los documentos por CUFE y descargar cada ZIP por
-  // HTTP con las cookies de esa sesión (sin reabrir el token). Reintenta los que
-  // fallen abriendo una sesión nueva. Esto evita el falso "TOKEN_EXPIRED" del
-  // flujo anterior (que reabría el token —de un solo uso— en cada ronda).
-  const retryRounds = Math.max(0, opts.retryRounds ?? 3);
-  const dirLabel = direction === "sent" ? "emitidos" : "recibidos";
+  onProgress?: (p: ProgressData) => void,
+  isCancelled?: () => boolean
+): Promise<{ files: { name: string; buffer: Buffer }[]; failures: IngestFailure[] }> {
   const total = cufes.length;
-  const dlResults = new Map<string, CufeDownloadItem>();
-  let dlOk = 0;
+  onProgress?.({ step: "Autenticando en portal DIAN...", current: 0, total });
 
-  // Semáforo de descargas en paralelo con contrapresión (cookies frescas).
-  const MAX_DL = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 5), 12));
-  let dlSlots = MAX_DL;
-  const dlQueue: Array<() => void> = [];
-  const acquireDl = (): Promise<void> =>
-    dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((res) => dlQueue.push(res));
-  const releaseDl = () => { const n = dlQueue.shift(); if (n) n(); else dlSlots++; };
+  const { browser, page } = await authenticateAndNavigate(
+    tokenUrl,
+    "01/01/2024",
+    fmtDdMmYyyy(Date.now()),
+    (p) => onProgress?.({ step: p.step || "Autenticando...", current: 0, total }),
+    direction === "sent" ? "sent" : "received"
+  );
 
-  const downloadDoc = async (
-    doc: { id: string; docnum: string; nit?: string; cufe?: string; docType?: string },
-    cookies: Record<string, string>,
-    page?: Page
-  ): Promise<void> => {
-    const key = normCufe(doc.cufe || "") || (doc.id || "").toLowerCase();
-    const isEquiv = doc.docType?.toLowerCase().includes("equivalente") ?? false;
-    const safeNit = (doc.nit || "SinNIT").replace(/[^a-zA-Z0-9_-]/g, "_");
-    const safeDoc = (doc.docnum || doc.id.slice(0, 12)).replace(/[^a-zA-Z0-9_-]/g, "_");
-    const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
-    try {
-      // Descarga disparando el botón del portal (corre el reCAPTCHA) y captura el
-      // ZIP. Si no hay página, cae al fetch de Node (entornos sin reCAPTCHA).
-      if (page) {
-        const dlDir = path.join(tempDir, `_dl_${key.slice(0, 16)}`);
-        const buf = await downloadZipInPage(page, doc.id, isEquiv, dlDir);
-        fs.writeFileSync(destPath, buf);
-        try { fs.rmSync(dlDir, { recursive: true, force: true }); } catch { /* noop */ }
-      } else {
-        const base = isEquiv
-          ? `${DIAN_BASE}/Document/DownloadZipFilesEquivalente?trackId=`
-          : `${DIAN_BASE}/Document/DownloadZipFiles?trackId=`;
-        const cookieHeader = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-        await fetchZipToFile(`${base}${doc.id}`, destPath, cookieHeader);
-      }
-      dlResults.set(key, { cufe: doc.cufe || "", trackId: doc.id, destPath, docnum: doc.docnum, nit: doc.nit || "", success: true });
-      dlOk++;
-      opts.onProgress?.({ step: `Descargando documentos (${dirLabel}): ${dlOk}/${total}…`, current: dlOk, total });
-    } catch (err) {
-      dlResults.set(key, { cufe: doc.cufe || "", trackId: doc.id, destPath: null, docnum: doc.docnum, nit: doc.nit || "", success: false, error: err instanceof Error ? err.message : String(err) });
-    }
-  };
+  const files: { name: string; buffer: Buffer }[] = [];
+  const processed = new Set<string>();
+  const cufeOriginalMap = new Map(cufes.map((c) => [c.toLowerCase(), c]));
 
-  let pending: ListingRecord[] = cufes.map((c) => ({ cufe: c, docnum: "" }));
-  let round = 0;
-  while (pending.length > 0 && round <= retryRounds) {
-    if (opts.isCancelled?.()) break;
-    const label = round === 0 ? "Descargando documentos" : `Reintento ${round}/${retryRounds}`;
-    const promises: Promise<void>[] = [];
-    try {
-      await extractDocumentIdsByCufe(
-        opts.tokenUrl,
-        opts.fechaInicio,
-        opts.fechaFin,
-        undefined,
-        direction,
-        (p) => opts.onProgress?.({
-          // Mientras no se complete ninguna descarga, muestra la fase REAL del
-          // scraper (navegando/buscando) para no parecer congelado en 0/N.
-          step: dlOk > 0 ? `${label} (${dirLabel}): ${dlOk}/${total}…` : (p?.step || `${label} (${dirLabel})…`),
-          current: dlOk,
-          total,
-        }),
-        async ({ doc, cookies, page }) => {
-          // Con descarga EN-navegador hay que serializar sobre la página del worker
-          // (no se puede fetch en paralelo mientras el worker navega a la siguiente
-          // búsqueda). onDocumentFound ya se await en serie, así que esperamos aquí.
-          if (page) {
-            await downloadDoc(doc, cookies, page);
-          } else {
-            await acquireDl();
-            const dl = (async () => { try { await downloadDoc(doc, cookies); } finally { releaseDl(); } })();
-            promises.push(dl);
-          }
-        },
-        pending,
-      );
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[Siigo Ingest] Sesión de descarga falló (${dirLabel}, ronda ${round}): ${msg}`);
-      // El token DIAN es de UN SOLO USO: si expiró/lo bloquearon, reabrir la sesión
-      // con el mismo token es inútil (vuelve a fallar) y RETIENE el cupo global de
-      // jobs (deja a los demás en "turno 1"). Abortamos de inmediato con un error
-      // claro para que el usuario solicite un token nuevo. `extractDocumentIdsByCufe`
-      // ya reintenta internamente los bloqueos transitorios antes de lanzar esto.
-      if (/TOKEN_EXPIRED|DIAN_BLOCKED|expirad/i.test(msg)) {
-        await Promise.all(promises);
-        if (dlOk === 0) {
-          throw new Error("El token de la DIAN expiró o fue bloqueado por el portal. Solicita un token nuevo en la DIAN y vuelve a intentar (no reutilices el mismo token).");
+  try {
+    if (isCancelled?.()) return { files: [], failures: [] };
+
+    const getCookieHeader = async () => {
+      const c = await page.cookies();
+      return c.map((ck) => `${ck.name}=${ck.value}`).join("; ");
+    };
+
+    const CONCURRENCY = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 4), 12));
+    let dlSlots = CONCURRENCY;
+    const dlWaitQueue: Array<() => void> = [];
+    const acquireDl = (): Promise<void> =>
+      dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((r) => dlWaitQueue.push(r));
+    const releaseDl = () => { const n = dlWaitQueue.shift(); if (n) n(); else dlSlots++; };
+
+    const RATE_MS = 60000 / 50;
+    let nextAllowedMs = Date.now();
+    const rateAcquire = async () => {
+      const wait = nextAllowedMs - Date.now();
+      nextAllowedMs = Math.max(nextAllowedMs, Date.now()) + RATE_MS;
+      if (wait > 0) await delay(wait);
+    };
+
+    let dlOk = 0;
+    let cookieHeader = await getCookieHeader();
+
+    const isHtml = (buf: Buffer) => {
+      const preview = buf.toString("utf8", 0, 300).trim().toLowerCase();
+      return preview.startsWith("<!doctype html") || preview.startsWith("<html") || preview.includes("<title>");
+    };
+
+    const fetchOne = async (cufe: string, hdr: string): Promise<void> => {
+      const xmlResp = await fetch(`${GRATIS_VPFE}/Document/DownloadXml?transactionId=${cufe}&type=2`, {
+        headers: { "User-Agent": REAL_USER_AGENT, Cookie: hdr },
+      });
+      if (!xmlResp.ok) throw new Error(`HTTP ${xmlResp.status}`);
+      const xmlBuf = Buffer.from(await xmlResp.arrayBuffer());
+      if (isHtml(xmlBuf)) throw new Error("GRATIS_VPFE_SESSION: sesión inválida o CUFE no encontrado");
+
+      const originalCufe = cufeOriginalMap.get(cufe.toLowerCase()) || cufe;
+      const safeName = originalCufe.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 44);
+      files.push({ name: `${safeName}.xml`, buffer: xmlBuf });
+
+      // PDF: mejor esfuerzo, no bloquea el éxito del XML.
+      try {
+        const pdfResp = await fetch(`${GRATIS_VPFE}/IoFacturo/Print/PrintStoragePdf?transactionId=${cufe}&viewMode=attachment`, {
+          headers: { "User-Agent": REAL_USER_AGENT, Cookie: hdr },
+        });
+        if (pdfResp.ok) {
+          const pdfBuf = Buffer.from(await pdfResp.arrayBuffer());
+          if (pdfBuf[0] === 0x25 && pdfBuf[1] === 0x50) files.push({ name: `${safeName}.pdf`, buffer: pdfBuf });
         }
-        break; // algo se alcanzó a descargar: corta y devuelve lo logrado
+      } catch { /* PDF opcional */ }
+
+      processed.add(cufe.toLowerCase());
+      dlOk++;
+      onProgress?.({ step: `Descargando documentos: ${dlOk}/${total}…`, current: dlOk, total });
+    };
+
+    // Pasada 1: concurrente con las cookies de la sesión inicial.
+    onProgress?.({ step: `Descargando ${total} documento(s)…`, current: 0, total });
+    await Promise.all(cufes.map(async (cufe) => {
+      await acquireDl();
+      await rateAcquire();
+      try { await fetchOne(cufe, cookieHeader); }
+      catch (err) { console.warn(`[Siigo Ingest] P1 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err); }
+      finally { releaseDl(); }
+    }));
+    if (isCancelled?.()) {
+      const failures: IngestFailure[] = cufes.filter((c) => !processed.has(c.toLowerCase())).map((c) => ({ cufe: c, error: "Cancelado" }));
+      return { files, failures };
+    }
+
+    // Pasada 2: cookies frescas, secuencial.
+    let missing = cufes.filter((c) => !processed.has(c.toLowerCase()));
+    if (missing.length > 0) {
+      onProgress?.({ step: `Recuperando ${missing.length} documento(s)…`, current: dlOk, total });
+      cookieHeader = await getCookieHeader();
+      for (const cufe of missing) {
+        if (isCancelled?.()) break;
+        await rateAcquire();
+        try { await fetchOne(cufe, cookieHeader); }
+        catch (err) { console.warn(`[Siigo Ingest] P2 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err); }
       }
     }
-    await Promise.all(promises);
 
-    pending = pending.filter((r) => !dlResults.get(normCufe(r.cufe || ""))?.destPath);
-    if (pending.length === 0) break;
-    round++;
-    if (round <= retryRounds) await delay(2000 * round);
+    // Pasada 3: re-autenticar (sesión nueva) y reintentar los que queden.
+    missing = cufes.filter((c) => !processed.has(c.toLowerCase()));
+    if (missing.length > 0 && !isCancelled?.()) {
+      onProgress?.({ step: `Recuperando ${missing.length} documento(s) (re-autenticando)…`, current: dlOk, total });
+      const { browser: browser2, page: page2 } = await authenticateAndNavigate(
+        tokenUrl, "01/01/2024", fmtDdMmYyyy(Date.now()), () => {}, direction === "sent" ? "sent" : "received"
+      );
+      try {
+        const cookies2 = await page2.cookies();
+        const hdr2 = cookies2.map((c) => `${c.name}=${c.value}`).join("; ");
+        for (const cufe of missing) {
+          if (isCancelled?.()) break;
+          await rateAcquire();
+          try { await fetchOne(cufe, hdr2); } catch { /* último intento fallido */ }
+        }
+      } finally {
+        await closeBrowserSafely(browser2).catch(() => {});
+      }
+    }
+
+    const failures: IngestFailure[] = cufes
+      .filter((c) => !processed.has(c.toLowerCase()))
+      .map((c) => ({ cufe: cufeOriginalMap.get(c.toLowerCase()) || c, error: "No se pudo descargar tras 3 intentos" }));
+
+    return { files, failures };
+  } finally {
+    await closeBrowserSafely(browser).catch(() => {});
   }
-
-  const success = [...dlResults.values()].filter((r) => r.destPath);
-  const failures: IngestFailure[] = pending.map((r) => ({
-    cufe: r.cufe,
-    error: dlResults.get(normCufe(r.cufe || ""))?.error || "No se pudo descargar tras agotar reintentos",
-  }));
-  return { success, failures, rounds: Math.min(round, retryRounds) };
 }
 
 /**
@@ -239,20 +318,20 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
     return { items: [], stats: { listed: 0, alreadyRegistered: 0, downloaded: 0, failed: 0, rounds: 0 }, failures: [] };
   }
   const directions = grupoToDirections(opts.grupo);
-  const sessionId = uuidv4();
-  const tempDir = path.join(DOWNLOADS_DIR, `siigo-ingest-${sessionId}`);
-  fs.mkdirSync(tempDir, { recursive: true });
 
-  const allSuccess: CufeDownloadItem[] = [];
+  const allFiles: { name: string; buffer: Buffer }[] = [];
+  const succeededCufes: string[] = [];
   const allFailures: IngestFailure[] = [];
   let listed = 0;
   let alreadyRegistered = 0;
-  let maxRounds = 0;
 
-  // Registro persistente de CUFEs ya descargados por esta empresa (para omitir
-  // re-descargas). Si forceRedownload, se ignora.
+  // Registro persistente = SOLO bloqueo explícito del usuario (basurita → "no
+  // volver a traer"), NUNCA se auto-puebla por una descarga exitosa. Así la
+  // herramienta siempre trae lo que no está bloqueado ni en pantalla, aunque ya
+  // se haya traído antes. Si forceRedownload, se ignora incluso el bloqueo.
   const knownCufes = opts.forceRedownload ? new Set<string>() : await getIngestedCufes(opts.companyId);
-  // CUFEs a omitir por estar ya causados / en pantalla (dedup de "Causación + Caja").
+  // CUFEs a omitir por estar ya causados / en pantalla (dedup contra la tabla de
+  // trabajo actual que envía el frontend).
   const skipSet = new Set((opts.skipCufes || []).map((c) => normCufe(c).toLowerCase()).filter(Boolean));
 
   try {
@@ -287,11 +366,9 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
 
       listed += cufes.length;
 
-      // Omitir: (a) los ya registrados en el historial de descargas (salvo
-      // forceRedownload), y (b) los CUFEs en skipCufes (ya causados / ya en
-      // pantalla). El criterio (b) es el correcto para "Causación + Caja": solo se
-      // omiten los que están en "Facturas" (causados) o ya visibles; el resto se
-      // mantiene/recupera al re-traer hasta que se contabilicen.
+      // Omitir: (a) CUFEs bloqueados explícitamente por el usuario, y (b) los que
+      // ya están en la tabla de trabajo actual (skipCufes). El resto se trae
+      // SIEMPRE, aunque ya se haya descargado antes en una corrida anterior.
       let work = cufes.filter((c) => !knownCufes.has(c) && !skipSet.has(normCufe(c).toLowerCase()));
       alreadyRegistered += cufes.length - work.length;
 
@@ -301,19 +378,22 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
 
       if (work.length === 0) continue;
 
-      const { success, failures, rounds } = await downloadDirectionWithRetries(opts, direction, work, tempDir);
-      allSuccess.push(...success);
+      const { files, failures } = await downloadCufesGratisVpfe(
+        opts.tokenUrl, direction, work, opts.onProgress, opts.isCancelled
+      );
+      allFiles.push(...files);
       allFailures.push(...failures);
-      maxRounds = Math.max(maxRounds, rounds);
+      const failedSet = new Set(failures.map((f) => normCufe(f.cufe).toLowerCase()));
+      succeededCufes.push(...work.filter((c) => !failedSet.has(normCufe(c).toLowerCase())));
     }
 
-    if (allSuccess.length === 0) {
+    if (allFiles.length === 0) {
       // Si todo lo listado ya estaba registrado, no es un error: simplemente no
       // hay nada nuevo que traer.
       if (alreadyRegistered > 0 && allFailures.length === 0) {
         return {
           items: [],
-          stats: { listed, alreadyRegistered, downloaded: 0, failed: 0, rounds: maxRounds },
+          stats: { listed, alreadyRegistered, downloaded: 0, failed: 0, rounds: 0 },
           failures: [],
         };
       }
@@ -326,169 +406,155 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
     opts.onProgress?.({
       step: "Procesando XML para contabilización...",
       current: 0,
-      total: allSuccess.length,
+      total: allFiles.length,
     });
 
-    // Cada result.destPath es un ZIP por-documento (XML + PDF). processXmlBatch
-    // los desempaca y empareja XML↔PDF internamente.
-    const files: { name: string; buffer: Buffer }[] = [];
-    for (const r of allSuccess) {
-      if (!r.destPath || !fs.existsSync(r.destPath)) continue;
-      try {
-        files.push({ name: path.basename(r.destPath), buffer: fs.readFileSync(r.destPath) });
-      } catch (err) {
-        allFailures.push({
-          cufe: r.cufe,
-          error: `Descargado pero ilegible: ${err instanceof Error ? err.message : String(err)}`,
-        });
-      }
-    }
+    const items = await processXmlBatch(allFiles);
 
-    const items = await processXmlBatch(files);
-
-    // Registrar los CUFEs efectivamente descargados para no re-descargarlos luego.
-    await recordIngestedCufes(
-      opts.companyId,
-      allSuccess.map((r) => ({ cufe: r.cufe, docnum: r.docnum }))
-    ).catch(() => undefined);
+    // NO se registra automáticamente en `siigoIngestedCufes`: ese registro ahora
+    // es exclusivamente la lista de bloqueo explícito del usuario (basurita →
+    // "no volver a traer"), para que la herramienta siempre traiga lo que no está
+    // en pantalla aunque ya se haya traído antes. Ver `dianBlockCufes`.
 
     return {
       items,
       stats: {
         listed,
         alreadyRegistered,
-        downloaded: allSuccess.length,
+        downloaded: succeededCufes.length,
         failed: allFailures.length,
-        rounds: maxRounds,
+        rounds: 0,
       },
       failures: allFailures,
     };
   } finally {
     releaseDianJobSlot();
-    try {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    } catch {
-      /* limpieza best-effort */
-    }
   }
 }
 
-const DIAN_BASE = "https://catalogo-vpfe.dian.gov.co";
 const normCufe = (v: string) => (v || "").replace(/[^A-Fa-f0-9]/g, "").trim();
 
 /**
- * Ingesta en UNA SOLA SESIÓN: abre el token DIAN una única vez, lista los
- * documentos del rango EN ESA MISMA sesión y descarga cada uno con sus cookies
- * (sin reabrir el token). Esto es OBLIGATORIO porque el token de la DIAN es de un
- * solo uso: cualquier reapertura en un navegador nuevo rebota a login. Pensada
- * para "Traer facturas nuevas del mes" (Recibidos, sin subir archivos).
+ * Ingesta por MES, sin listado manual: abre el token DIAN una única vez con el
+ * rango del mes, lista TODOS los documentos recibidos en ese rango directamente
+ * del portal (`fetchDocumentList`, la misma llamada AJAX que usa "Descarga Masiva
+ * + Excel DIAN"), filtra los que ya se trajeron antes (registro persistente por
+ * CUFE) y descarga solo los nuevos por CUFE directo a gratis-vpfe — el mismo
+ * mecanismo que `downloadCufesGratisVpfe`. Pensada para el selector de mes de
+ * "Contabilizar Gastos Siigo" (sin subir archivos).
  */
 export async function ingestNewByDateRange(opts: {
   companyId: string;
   tokenUrl: string;
-  fechaInicio: string;
-  fechaFin: string;
+  fechaInicio: string; // ISO yyyy-mm-dd
+  fechaFin: string;    // ISO yyyy-mm-dd
+  /** @deprecated no usado internamente; se mantiene por compatibilidad con llamadores existentes (cajaErp.ts). */
   nitReceptor?: string;
   maxDocuments?: number;
+  forceRedownload?: boolean;
+  /** CUFEs a omitir además del registro persistente (ya causados / ya en pantalla). */
+  skipCufes?: string[];
   onProgress?: (p: ProgressData) => void;
   isCancelled?: () => boolean;
 }): Promise<IngestResult> {
   const releaseDianJobSlot = await acquireDianJobSlot((pos) =>
     opts.onProgress?.({ step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`, current: 0, total: 0 })
   );
-  const sessionId = uuidv4();
-  const tempDir = path.join(DOWNLOADS_DIR, `caja-ingest-${sessionId}`);
-  fs.mkdirSync(tempDir, { recursive: true });
 
-  // El CRITERIO de "ya importada" es el CUFE (llave única del documento). La tabla
-  // /Document/Received no muestra el CUFE, pero sí el trackId (1‑a‑1 con el doc):
-  // lo usamos para SALTAR la re-descarga sin perder precisión. El CUFE real lo
-  // leemos del XML al descargar y lo guardamos como identidad.
-  const knownCufes = await getIngestedCufes(opts.companyId);
-  const knownTrackIds = await getIngestedTrackIds(opts.companyId);
-  const downloaded: { trackId: string; docnum: string; destPath: string; fileName: string }[] = [];
+  const knownCufes = opts.forceRedownload ? new Set<string>() : await getIngestedCufes(opts.companyId);
+  const skipSet = new Set((opts.skipCufes || []).map((c) => normCufe(c).toLowerCase()).filter(Boolean));
   const failures: IngestFailure[] = [];
-  let alreadyRegistered = 0;
-  const max = opts.maxDocuments && opts.maxDocuments > 0 ? opts.maxDocuments : Infinity;
 
   try {
-    // Abre el token UNA vez y lista los documentos del rango scrapeando la TABLA
-    // /Document/Received (sin depender de la generación de Export, que es lenta/
-    // inestable). Devuelve cada documento con su trackId + las cookies de sesión.
-    const result = await extractDocumentIds(
-      opts.tokenUrl,
-      opts.fechaInicio,
-      opts.fechaFin,
-      undefined,
-      "received",
-      true, // skipReconciliation: no usar la pestaña Export
-    );
-    const cookieHeader = Object.entries(result.cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-    const listed = result.documents.length;
+    const from = fmtDdMmYyyy(new Date(`${opts.fechaInicio}T00:00:00`).getTime());
+    const to = fmtDdMmYyyy(new Date(`${opts.fechaFin}T00:00:00`).getTime());
 
-    opts.onProgress?.({ step: `Listado: ${listed} documentos. Descargando…`, current: 0, total: listed });
+    opts.onProgress?.({ step: "Autenticando en portal DIAN...", current: 0, total: 0 });
+    const { browser, page } = await authenticateAndNavigate(opts.tokenUrl, from, to, (p) =>
+      opts.onProgress?.({ step: p.step || "Autenticando...", current: 0, total: 0 }), "received");
 
-    // Descarga cada documento con las cookies de la sesión (sin reabrir el token).
-    for (const doc of result.documents) {
-      if (opts.isCancelled?.()) break;
-      if (downloaded.length >= max) break;
-      const trackId = (doc.id || "").trim();
-      // Ya importada: por CUFE (si la tabla lo trajera) o por trackId ya descargado.
-      const tableCufe = normCufe(doc.cufe || "");
-      const realTableCufe = tableCufe.length >= 40 ? tableCufe : "";
-      if ((realTableCufe && knownCufes.has(realTableCufe)) || (trackId && knownTrackIds.has(trackId))) { alreadyRegistered++; continue; }
-      const isEquiv = doc.docType?.toLowerCase().includes("equivalente") ?? false;
-      const base = isEquiv
-        ? `${DIAN_BASE}/Document/DownloadZipFilesEquivalente?trackId=`
-        : `${DIAN_BASE}/Document/DownloadZipFiles?trackId=`;
-      const safeNit = (doc.nit || "SinNIT").replace(/[^a-zA-Z0-9_-]/g, "_");
-      const safeDoc = (doc.docnum || doc.id.slice(0, 12)).replace(/[^a-zA-Z0-9_-]/g, "_");
-      const destPath = path.join(tempDir, `${safeNit} - ${safeDoc}.zip`);
-      const fileName = path.basename(destPath);
-      try {
-        await fetchZipToFile(`${base}${doc.id}`, destPath, cookieHeader);
-        downloaded.push({ trackId, docnum: doc.docnum, destPath, fileName });
-        opts.onProgress?.({ step: `Descargando facturas… (${downloaded.length})`, current: downloaded.length, total: listed });
-      } catch (err) {
-        failures.push({ cufe: "", error: err instanceof Error ? err.message : String(err) });
+    try {
+      if (opts.isCancelled?.()) {
+        return { items: [], stats: { listed: 0, alreadyRegistered: 0, downloaded: 0, failed: 0, rounds: 0 }, failures: [] };
       }
-    }
 
-    if (downloaded.length === 0) {
-      // Nada nuevo (todo ya importado) NO es error.
-      return { items: [], stats: { listed, alreadyRegistered, downloaded: 0, failed: failures.length, rounds: 0 }, failures };
-    }
+      opts.onProgress?.({ step: "Listando documentos del mes...", current: 0, total: 0 });
+      const docs = await fetchDocumentsSplitByRange(page, opts.fechaInicio, opts.fechaFin, "received");
+      const listed = docs.length;
+      console.log(`[Siigo Ingest] Listado ${opts.fechaInicio}..${opts.fechaFin}: ${listed} documento(s) en total`);
 
-    opts.onProgress?.({ step: "Procesando XML para contabilización...", current: 0, total: downloaded.length });
-    const files: { name: string; buffer: Buffer }[] = [];
-    for (const d of downloaded) {
-      if (!fs.existsSync(d.destPath)) continue;
-      try { files.push({ name: d.fileName, buffer: fs.readFileSync(d.destPath) }); }
-      catch (err) { failures.push({ cufe: "", error: `Descargado pero ilegible: ${err instanceof Error ? err.message : String(err)}` }); }
-    }
-    const items = await processXmlBatch(files);
+      let work = docs.filter((d) => {
+        const cufe = normCufe(d.transactionId || "");
+        return cufe && !knownCufes.has(cufe) && !skipSet.has(cufe.toLowerCase());
+      });
+      const alreadyRegistered = listed - work.length;
 
-    // Registrar por el CUFE REAL leído del XML (criterio único), junto al trackId
-    // (para saltar la re-descarga) y el docnum. Se mapea item↔descarga por nombre.
-    const cufeByFile = new Map<string, string>();
-    for (const it of items) {
-      const c = (it.xml as { cufe?: string } | undefined)?.cufe || "";
-      if (it.fileName && c) cufeByFile.set(it.fileName, c);
-    }
-    const recs = downloaded.map((d) => ({
-      cufe: cufeByFile.get(d.fileName) || "",
-      docnum: d.docnum,
-      trackId: d.trackId,
-    }));
-    await recordIngestedCufes(opts.companyId, recs).catch(() => undefined);
+      if (opts.maxDocuments && opts.maxDocuments > 0 && work.length > opts.maxDocuments) {
+        work = work.slice(0, opts.maxDocuments);
+      }
 
-    return {
-      items,
-      stats: { listed, alreadyRegistered, downloaded: downloaded.length, failed: failures.length, rounds: 0 },
-      failures,
-    };
+      if (work.length === 0) {
+        return { items: [], stats: { listed, alreadyRegistered, downloaded: 0, failed: 0, rounds: 0 }, failures: [] };
+      }
+
+      // Descarga concurrente con rate limit, sobre la MISMA sesión (sin reabrir el token).
+      const files: { name: string; buffer: Buffer }[] = [];
+      const succeededCufes: string[] = [];
+      let dlOk = 0;
+      const total = work.length;
+      opts.onProgress?.({ step: `Descargando ${total} documento(s)…`, current: 0, total });
+
+      const CONCURRENCY = Math.max(1, Math.min(Number(process.env.DIAN_DOWNLOAD_WORKERS || 4), 12));
+      let dlSlots = CONCURRENCY;
+      const dlWaitQueue: Array<() => void> = [];
+      const acquireDl = (): Promise<void> =>
+        dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((r) => dlWaitQueue.push(r));
+      const releaseDl = () => { const n = dlWaitQueue.shift(); if (n) n(); else dlSlots++; };
+
+      const RATE_MS = 60000 / 50;
+      let nextAllowedMs = Date.now();
+      const rateAcquire = async () => {
+        const wait = nextAllowedMs - Date.now();
+        nextAllowedMs = Math.max(nextAllowedMs, Date.now()) + RATE_MS;
+        if (wait > 0) await delay(wait);
+      };
+
+      await Promise.all(work.map(async (doc) => {
+        await acquireDl();
+        await rateAcquire();
+        try {
+          if (opts.isCancelled?.()) return;
+          const downloaded = await downloadXmlFile(page, doc.transactionId, doc.docNumber, true);
+          for (const f of downloaded) files.push(f);
+          succeededCufes.push(normCufe(doc.transactionId));
+          dlOk++;
+          opts.onProgress?.({ step: `Descargando documentos: ${dlOk}/${total}…`, current: dlOk, total });
+        } catch (err) {
+          failures.push({ cufe: doc.transactionId, error: err instanceof Error ? err.message : String(err) });
+        } finally {
+          releaseDl();
+        }
+      }));
+
+      if (files.length === 0) {
+        return { items: [], stats: { listed, alreadyRegistered, downloaded: 0, failed: failures.length, rounds: 0 }, failures };
+      }
+
+      opts.onProgress?.({ step: "Procesando XML para contabilización...", current: 0, total: files.length });
+      const items = await processXmlBatch(files);
+
+      // NO se registra automáticamente (ver nota en `ingestFromDian`): el registro
+      // persistente ahora es solo la lista de bloqueo explícito del usuario.
+
+      return {
+        items,
+        stats: { listed, alreadyRegistered, downloaded: succeededCufes.length, failed: failures.length, rounds: 0 },
+        failures,
+      };
+    } finally {
+      await closeBrowserSafely(browser).catch(() => {});
+    }
   } finally {
     releaseDianJobSlot();
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
 }

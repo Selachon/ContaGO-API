@@ -262,6 +262,14 @@ export async function listCompaniesForUser(userId: string): Promise<SiigoCompany
   return docs.map(toPublic);
 }
 
+/** Una empresa por ID en formato público (sin credenciales). Devuelve null si no existe. */
+export async function getCompanyPublic(companyId: string): Promise<SiigoCompanyPublic | null> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { return null; }
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid });
+  return doc ? toPublic(doc) : null;
+}
+
 /** True si el usuario es dueño de la empresa o la tiene compartida. */
 export async function userCanAccessCompany(companyId: string, userId: string): Promise<boolean> {
   let oid: ObjectId;

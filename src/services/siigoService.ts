@@ -446,6 +446,14 @@ export async function getAccountsPayable(query: Record<string, unknown> = {}): P
   return request("/v1/accounts-payable", { query });
 }
 
+export async function getAccountsReceivable(query: Record<string, unknown> = {}): Promise<unknown> {
+  return request("/v1/accounts-receivable", { query });
+}
+
+export async function probeRequest(path: string, query: Record<string, unknown> = {}): Promise<unknown> {
+  return request(path, { query });
+}
+
 /** Crea un Recibo de pago / Egreso (RP). POST a producción: confirmar antes. */
 export async function createPaymentReceipt(body: unknown): Promise<unknown> {
   return request("/v1/payment-receipts", { method: "POST", body });
