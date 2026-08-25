@@ -667,7 +667,7 @@ export function getDianJobStats(): { active: number; queued: number; max: number
 const openBrowsers = new Set<Browser>();
 
 /** Reserva un cupo de navegador; resuelve con la función que lo libera. */
-function acquireBrowserSlot(): Promise<() => void> {
+export function acquireBrowserSlot(): Promise<() => void> {
   return new Promise((resolve) => {
     const grant = () => {
       activeBrowsers++;
@@ -1811,6 +1811,40 @@ async function hardenPageRuntime(page: Page): Promise<void> {
   });
 }
 
+/**
+ * Registra un navegador ya lanzado bajo el cupo compartido `MAX_CONCURRENT_BROWSERS`:
+ * lo suma al watchdog opcional, auto-libera su cupo en `disconnected` y lo
+ * incluye en `openBrowsers` (apagado ordenado) y en el backstop por
+ * user-data-dir de `closeBrowserSafely`. Cualquier scraper del proceso que
+ * lance su propio Chromium (no solo `launchBrowserWithRetry`) debe pasar por
+ * aquí para no exceder el cupo total de Chromiums concurrentes del contenedor.
+ */
+export function registerManagedBrowser(browser: Browser, releaseSlot: () => void): void {
+  (browser as BrowserWithSlot).__releaseSlot = releaseSlot;
+
+  const maxHoldMs = Number(process.env.BROWSER_MAX_HOLD_MS || 0);
+  const holdTimer = maxHoldMs > 0
+    ? setTimeout(() => {
+        console.warn(`Navegador retenido > ${maxHoldMs} ms; se fuerza el cierre para liberar el cupo.`);
+        void closeBrowserSafely(browser).catch(() => undefined);
+      }, maxHoldMs)
+    : null;
+  holdTimer?.unref();
+
+  browser.once("disconnected", () => {
+    if (holdTimer) clearTimeout(holdTimer);
+    openBrowsers.delete(browser);
+    releaseSlot();
+  });
+
+  const spawnArgs = browser.process()?.spawnargs ?? [];
+  const uddArg = spawnArgs.find((a) => a.startsWith("--user-data-dir="));
+  if (uddArg) {
+    (browser as BrowserWithSlot).__userDataDir = uddArg.slice("--user-data-dir=".length);
+  }
+  openBrowsers.add(browser);
+}
+
 async function launchBrowserWithRetry(
   executablePath: string | null,
   updateProgress: (data: Partial<ProgressData>) => void
@@ -1856,37 +1890,9 @@ async function launchBrowserWithRetry(
         ],
         executablePath: executablePath || undefined,
       });
-      // El cupo se libera al cerrar el navegador (closeBrowserSafely).
-      (browser as BrowserWithSlot).__releaseSlot = releaseSlot;
-
-      // Watchdog opcional: si un job deja el navegador colgado, se fuerza el
-      // cierre para no retener el cupo. Desactivado por defecto (0); poner
-      // BROWSER_MAX_HOLD_MS por encima de la duración del job más largo.
-      const maxHoldMs = Number(process.env.BROWSER_MAX_HOLD_MS || 0);
-      const holdTimer = maxHoldMs > 0
-        ? setTimeout(() => {
-            console.warn(`Navegador retenido > ${maxHoldMs} ms; se fuerza el cierre para liberar el cupo.`);
-            void closeBrowserSafely(browser).catch(() => undefined);
-          }, maxHoldMs)
-        : null;
-      holdTimer?.unref();
-
-      // Auto-libera el cupo en cuanto el navegador se desconecta (crash, "Target
-      // closed" o cierre), aunque el job nunca llegue a closeBrowserSafely. Esto
-      // evita que un navegador muerto retenga su cupo. releaseSlot es idempotente.
-      browser.once("disconnected", () => {
-        if (holdTimer) clearTimeout(holdTimer);
-        openBrowsers.delete(browser);
-        releaseSlot();
-      });
-
-      // Guarda el user-data-dir temporal para la limpieza de huérfanos.
-      const spawnArgs = browser.process()?.spawnargs ?? [];
-      const uddArg = spawnArgs.find((a) => a.startsWith("--user-data-dir="));
-      if (uddArg) {
-        (browser as BrowserWithSlot).__userDataDir = uddArg.slice("--user-data-dir=".length);
-      }
-      openBrowsers.add(browser);
+      // El cupo se libera al cerrar el navegador (closeBrowserSafely) o al
+      // desconectarse (crash/"Target closed"); releaseSlot es idempotente.
+      registerManagedBrowser(browser, releaseSlot);
       return browser;
     } catch (err) {
       lastError = err as Error;

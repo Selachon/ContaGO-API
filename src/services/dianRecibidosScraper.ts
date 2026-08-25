@@ -11,7 +11,7 @@
  */
 
 import puppeteer, { type Browser, type Page } from "puppeteer";
-import { resolveExecutablePath, closeBrowserSafely } from "./dianScraper.js";
+import { resolveExecutablePath, closeBrowserSafely, acquireBrowserSlot, registerManagedBrowser } from "./dianScraper.js";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -78,22 +78,35 @@ function buildDtParams(start: number, length: number, draw: number, direction: "
   return p.toString();
 }
 
-/** Lanza Chromium con los args mínimos necesarios */
+/**
+ * Lanza Chromium con los args mínimos necesarios, respetando el mismo cupo
+ * compartido (`MAX_CONCURRENT_BROWSERS`) que usa dianScraper.ts. Sin esto,
+ * este scraper podía sumar Chromiums sin límite por encima del cupo del
+ * exportador Excel y agotar los PIDs/threads del contenedor.
+ */
 async function launchBrowser(): Promise<Browser> {
   const executablePath = resolveExecutablePath() ?? undefined;
-  return puppeteer.launch({
-    headless: true,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-extensions",
-      "--no-first-run",
-    ],
-    executablePath,
-  });
+  const releaseSlot = await acquireBrowserSlot();
+  try {
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--no-first-run",
+      ],
+      executablePath,
+    });
+    registerManagedBrowser(browser, releaseSlot);
+    return browser;
+  } catch (err) {
+    releaseSlot();
+    throw err;
+  }
 }
 
 /** Limita a max 20 descargas por minuto de forma global por instancia. */
