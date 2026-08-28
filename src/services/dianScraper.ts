@@ -457,7 +457,11 @@ const BROWSER_LAUNCH_RETRIES = Number(process.env.PUPPETEER_LAUNCH_RETRIES || 3)
 // agotan los recursos del contenedor y el siguiente lanzamiento falla con
 // "spawn EAGAIN". Además, los procesos que no se cierran bien se acumulan como
 // huérfanos hasta provocar el mismo error de forma intermitente.
-const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 6));
+// Bajado de 6 a 3 (2026-08-27): con 6 seguía recurriendo el agotamiento de
+// PIDs/threads ("pthread_create", "Zygote could not fork") incluso después de
+// unificar el cupo entre todos los scrapers. Medida conservadora mientras se
+// confirma si el techo real es de código o del plan de Railway.
+const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 3));
 const BROWSER_CLOSE_TIMEOUT_MS = Number(process.env.PUPPETEER_CLOSE_TIMEOUT_MS || 15000);
 
 type BrowserWithSlot = Browser & { __releaseSlot?: () => void; __userDataDir?: string };

@@ -4,6 +4,7 @@
  * el PDF queda sin menús ni cromo del portal.
  */
 import puppeteer from "puppeteer";
+import { acquireBrowserSlot, registerManagedBrowser, closeBrowserSafely, resolveExecutablePath } from "./dianScraper.js";
 
 const money = (n: number) => "$" + Math.round(Number(n) || 0).toLocaleString("es-CO");
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
@@ -111,17 +112,22 @@ function buildHtml(data: CajaPdfData): string {
 
 export async function generarCajaPdf(data: CajaPdfData): Promise<Buffer> {
   const html = buildHtml(data);
+  // Comparte el cupo global de navegadores (MAX_CONCURRENT_BROWSERS) con los
+  // scrapers DIAN: sin esto, la generación de PDF podía sumar Chromiums por
+  // fuera del límite y contribuir al agotamiento de PIDs/threads del contenedor.
+  const releaseSlot = await acquireBrowserSlot();
   const browser = await puppeteer.launch({
     headless: true,
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-first-run"],
-    executablePath: puppeteer.executablePath() || undefined,
+    executablePath: resolveExecutablePath() ?? undefined,
   });
+  registerManagedBrowser(browser, releaseSlot);
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });
     const pdf = await page.pdf({ format: "A4", printBackground: true, margin: { top: "0", bottom: "0", left: "0", right: "0" } });
     return Buffer.from(pdf);
   } finally {
-    await browser.close();
+    await closeBrowserSafely(browser);
   }
 }
