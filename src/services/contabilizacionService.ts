@@ -80,6 +80,43 @@ function pythonBin(): string {
   return process.env.PYTHON_BIN || "python3";
 }
 
+// ── Cupo de concurrencia para el subproceso Python ───────────────────────────
+// Sin límite, cada llamada a ejecutarMotor() (una por empresa/lote en curso)
+// dispara un spawn() inmediato. En producción, con varias empresas Siigo
+// procesando contabilización a la vez, esto compite por el mismo presupuesto
+// de PIDs del contenedor que usa Puppeteer/Chromium (ver MAX_CONCURRENT_BROWSERS
+// en dianScraper.ts) y puede contribuir al agotamiento EAGAIN aunque el fix de
+// Chromium esté intacto. Mismo patrón de semáforo con cola.
+const MAX_CONCURRENT_MOTOR = Math.max(1, Number(process.env.MAX_CONCURRENT_MOTOR || 3));
+let activeMotorProcs = 0;
+const motorWaitQueue: Array<() => void> = [];
+
+function acquireMotorSlot(): Promise<() => void> {
+  return new Promise((resolve) => {
+    const grant = () => {
+      activeMotorProcs++;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        activeMotorProcs--;
+        const next = motorWaitQueue.shift();
+        if (next) next();
+      });
+    };
+    if (activeMotorProcs < MAX_CONCURRENT_MOTOR) {
+      grant();
+    } else {
+      motorWaitQueue.push(grant);
+    }
+  });
+}
+
+/** Métricas en vivo del cupo de subprocesos del motor (para el dashboard admin). */
+export function getMotorStats(): { active: number; queued: number; max: number } {
+  return { active: activeMotorProcs, queued: motorWaitQueue.length, max: MAX_CONCURRENT_MOTOR };
+}
+
 function buildArgs(proceso: Proceso, opts: EjecutarOpts): string[] {
   const args: string[] = ["--web"];
 
@@ -114,62 +151,67 @@ function buildArgs(proceso: Proceso, opts: EjecutarOpts): string[] {
  * Lanza el motor y devuelve el JSON de la última línea. Lanza MotorError en
  * validaciones bloqueantes (422) o fallos internos (500).
  */
-export function ejecutarMotor(proceso: Proceso, opts: EjecutarOpts): Promise<MotorResult> {
-  return new Promise((resolve, reject) => {
-    if (opts.out) fs.mkdirSync(opts.out, { recursive: true });
+export async function ejecutarMotor(proceso: Proceso, opts: EjecutarOpts): Promise<MotorResult> {
+  const releaseSlot = await acquireMotorSlot();
+  try {
+    return await new Promise<MotorResult>((resolve, reject) => {
+      if (opts.out) fs.mkdirSync(opts.out, { recursive: true });
 
-    const scriptPath = path.join(motorDir(), SCRIPT[proceso]);
-    const args = [scriptPath, ...buildArgs(proceso, opts)];
+      const scriptPath = path.join(motorDir(), SCRIPT[proceso]);
+      const args = [scriptPath, ...buildArgs(proceso, opts)];
 
-    const child = spawn(pythonBin(), args, {
-      cwd: motorDir(),
-      env: {
-        ...process.env,
-        CONTAGO_OBSEQUIOS_MODE: opts.obsequiosMode,
-        PYTHONIOENCODING: "utf-8",
-      },
+      const child = spawn(pythonBin(), args, {
+        cwd: motorDir(),
+        env: {
+          ...process.env,
+          CONTAGO_OBSEQUIOS_MODE: opts.obsequiosMode,
+          PYTHONIOENCODING: "utf-8",
+        },
+      });
+
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => (stdout += d.toString()));
+      child.stderr.on("data", (d) => (stderr += d.toString()));
+
+      child.on("error", (err) => {
+        reject(new MotorError("motor_no_disponible", `No se pudo ejecutar el motor: ${err.message}`, [], 500));
+      });
+
+      child.on("close", (code) => {
+        const lineas = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+        const ultima = lineas[lineas.length - 1] || "";
+
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(ultima);
+        } catch {
+          parsed = null;
+        }
+
+        if (parsed && parsed.status === "error") {
+          reject(new MotorError(parsed.tipo || "error", parsed.mensaje || "Error de validación", parsed.detalle || [], 422));
+          return;
+        }
+
+        if (parsed && (parsed.status === "ok" || parsed.status === "prefijos")) {
+          resolve(parsed as MotorResult);
+          return;
+        }
+
+        // Sin JSON válido: fallo interno. Adjunta stderr para diagnóstico.
+        const detalle = (stderr || stdout).trim().split("\n").slice(-8);
+        reject(
+          new MotorError(
+            "motor_fallo",
+            `El motor terminó sin un resultado válido (exit ${code}).`,
+            detalle,
+            500
+          )
+        );
+      });
     });
-
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d.toString()));
-    child.stderr.on("data", (d) => (stderr += d.toString()));
-
-    child.on("error", (err) => {
-      reject(new MotorError("motor_no_disponible", `No se pudo ejecutar el motor: ${err.message}`, [], 500));
-    });
-
-    child.on("close", (code) => {
-      const lineas = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
-      const ultima = lineas[lineas.length - 1] || "";
-
-      let parsed: any = null;
-      try {
-        parsed = JSON.parse(ultima);
-      } catch {
-        parsed = null;
-      }
-
-      if (parsed && parsed.status === "error") {
-        reject(new MotorError(parsed.tipo || "error", parsed.mensaje || "Error de validación", parsed.detalle || [], 422));
-        return;
-      }
-
-      if (parsed && (parsed.status === "ok" || parsed.status === "prefijos")) {
-        resolve(parsed as MotorResult);
-        return;
-      }
-
-      // Sin JSON válido: fallo interno. Adjunta stderr para diagnóstico.
-      const detalle = (stderr || stdout).trim().split("\n").slice(-8);
-      reject(
-        new MotorError(
-          "motor_fallo",
-          `El motor terminó sin un resultado válido (exit ${code}).`,
-          detalle,
-          500
-        )
-      );
-    });
-  });
+  } finally {
+    releaseSlot();
+  }
 }

@@ -1891,6 +1891,14 @@ async function launchBrowserWithRetry(
           "--disable-software-rasterizer",
           "--disable-features=WebRtcHideLocalIpsWithMdns,CrashReporter",
           "--mute-audio",
+          // Fusiona renderer/red/compositor en el proceso principal: Chromium deja
+          // de forkear un proceso hijo por pestaña/navegación (la causa directa de
+          // "Cannot fork"/EAGAIN al agotarse PIDs del contenedor). No reduce el
+          // número de navegadores ni pestañas en paralelo (eso sigue gobernado por
+          // MAX_CONCURRENT_BROWSERS/DIAN_CUFE_WORKERS), así no afecta el throughput
+          // de descargas. No es observable por JS de la página (no delata el
+          // fingerprint anti-bot de DIAN).
+          "--single-process",
         ],
         executablePath: executablePath || undefined,
       });
