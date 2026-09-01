@@ -172,10 +172,26 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
     if (contentType.includes("application/json")) {
       const payload = await response.json();
       const record = payload as Record<string, unknown>;
-      const errors = Array.isArray(record.Errors) ? (record.Errors as SiigoApiErrorItem[]) : [];
-      const firstError = errors[0];
-      const message =
+
+      // Siigo usa dos esquemas de error distintos según el endpoint:
+      // - legacy: { Errors: [{ Message, Code, Params }] }
+      // - v1 (p.ej. /v1/purchases): { errors: [{ code, message, params, detail }] }
+      const legacyErrors = Array.isArray(record.Errors) ? (record.Errors as SiigoApiErrorItem[]) : [];
+      const v1Errors = Array.isArray(record.errors) ? (record.errors as SiigoApiErrorItem[]) : [];
+      const firstError = legacyErrors[0] || v1Errors[0];
+      const firstErrorMessage =
         (typeof firstError?.Message === "string" && firstError.Message) ||
+        (typeof (firstError as Record<string, unknown>)?.message === "string" &&
+          (firstError as Record<string, unknown>).message as string) ||
+        null;
+      const firstErrorParams = (firstError as Record<string, unknown>)?.params;
+      const paramSuffix =
+        Array.isArray(firstErrorParams) && firstErrorParams.length
+          ? ` (campo: ${firstErrorParams.join(", ")})`
+          : "";
+
+      const message =
+        (firstErrorMessage && `${firstErrorMessage}${paramSuffix}`) ||
         (typeof record.message === "string" && record.message) ||
         (typeof record.error === "string" && record.error) ||
         (typeof record.errors === "string" && record.errors) ||

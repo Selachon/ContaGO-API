@@ -172,6 +172,26 @@ function handleSiigoError(res: Response, error: unknown): Response {
   });
 }
 
+/**
+ * Siigo devuelve formas de pago inactivas junto con las activas en /v1/payment-types
+ * (a diferencia de otros catálogos), y usar una inactiva en payments[0].id revienta
+ * la contabilización con 400 parameter_inactive. Se filtran aquí para que el
+ * desplegable y el "default" de la empresa nunca puedan quedar apuntando a una ID
+ * muerta.
+ */
+function filterActivePaymentTypes(data: unknown): unknown {
+  const isInactive = (pt: Record<string, unknown>) => pt.active === false;
+
+  if (Array.isArray(data)) {
+    return data.filter((pt) => !isInactive(pt as Record<string, unknown>));
+  }
+  if (data && typeof data === "object" && Array.isArray((data as Record<string, unknown>).results)) {
+    const record = data as Record<string, unknown>;
+    return { ...record, results: (record.results as unknown[]).filter((pt) => !isInactive(pt as Record<string, unknown>)) };
+  }
+  return data;
+}
+
 function getAllowedQuery(req: Request, allowed: string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
 
@@ -1692,7 +1712,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const docId = req.query.document_id ? Number(req.query.document_id) : undefined;
       const docType = req.query.document_type ? String(req.query.document_type) : "FC";
       const data = await listPaymentTypes(docId, docType);
-      return res.json({ ok: true, source: "siigo", data });
+      return res.json({ ok: true, source: "siigo", data: filterActivePaymentTypes(data) });
     } catch (error) {
       return handleSiigoError(res, error);
     }
