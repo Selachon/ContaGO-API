@@ -67,7 +67,7 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, taxRequiredItemIndex, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import { ingestFromDian, ingestNewByDateRange, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
-import { recordIngestedCufes } from "../services/siigoIngestedCufesService.js";
+import { recordIngestedCufes, markCausedInSiigo, markIgnoredInDian, markPendingInDian, listDianInvoices } from "../services/siigoIngestedCufesService.js";
 import { parseListingRecordsFromExportZip } from "../services/dianScraper.js";
 import {
   parseBankExcel,
@@ -2009,7 +2009,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     if (cufes.length === 0) {
       return res.status(400).json({ ok: false, message: "No se recibieron CUFEs para bloquear." });
     }
-    await recordIngestedCufes(companyId, cufes.map((c: string) => ({ cufe: c }))).catch(() => undefined);
+    await Promise.all(cufes.map((c: string) => markIgnoredInDian(companyId!, c))).catch(() => undefined);
     return res.json({ ok: true });
   });
 
@@ -2167,12 +2167,20 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
   router.post("/accounting/submit", async (req: Request, res: Response) => {
     try {
-      const { type, payload } = req.body;
+      const { type, payload, cufe } = req.body;
       if (!type || !payload) return res.status(400).json({ ok: false, message: "type and payload are required" });
 
       console.log(`[SiigoAccounting] Submission request received. Type: ${type}, Supplier: ${payload.supplier?.identification}, Total: ${payload.payments?.[0]?.value}`);
       const result = await submitToSiigo(type, payload);
       console.log(`[SiigoAccounting] Submission SUCCESS for ${payload.supplier?.identification}`);
+
+      // Marcar CUFE como causado en la tabla de seguimiento DIAN
+      const companyId = req.header("X-Siigo-Company");
+      if (companyId && cufe) {
+        const siigoId = (result as any)?.id ? String((result as any).id) : undefined;
+        markCausedInSiigo(companyId, cufe, siigoId).catch(() => {});
+      }
+
       return res.json({ ok: true, data: result });
     } catch (error) {
       const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
@@ -2330,6 +2338,25 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     } catch (error) {
       return res.status(500).json({ ok: false, message: error instanceof Error ? error.message : "Error" });
     }
+  });
+
+  // Lista todas las facturas DIAN registradas para la empresa, con su estado.
+  router.get("/accounting/dian-invoices", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
+    const status = (req.query.status as string) || "all";
+    const invoices = await listDianInvoices(companyId, status as any).catch(() => []);
+    return res.json({ ok: true, invoices });
+  });
+
+  // Vuelve a marcar como 'pending' una factura causada o ignorada.
+  router.post("/accounting/dian-invoices/bring-back", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
+    const { cufe } = req.body;
+    if (!cufe) return res.status(400).json({ ok: false, message: "CUFE requerido." });
+    await markPendingInDian(companyId, cufe);
+    return res.json({ ok: true });
   });
 
   // Convierte errores de multer (p. ej. archivo demasiado grande) en JSON claro,

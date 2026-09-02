@@ -7,7 +7,7 @@ import {
 } from "./dianScraper.js";
 import { authenticateAndNavigate, applyReceivedDateFilter, fetchDocumentList, downloadXmlFile, type RecibidoDocument } from "./dianRecibidosScraper.js";
 import { processXmlBatch, type BatchItem } from "./siigoAccountingService.js";
-import { getIngestedCufes } from "./siigoIngestedCufesService.js";
+import { getIngestedCufes, upsertDianInvoices } from "./siigoIngestedCufesService.js";
 import type { DocumentDirection, ProgressData } from "../types/dian.js";
 
 const GRATIS_VPFE = "https://gratis-vpfe.dian.gov.co";
@@ -411,10 +411,17 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
 
     const items = await processXmlBatch(allFiles);
 
-    // NO se registra automáticamente en `siigoIngestedCufes`: ese registro ahora
-    // es exclusivamente la lista de bloqueo explícito del usuario (basurita →
-    // "no volver a traer"), para que la herramienta siempre traiga lo que no está
-    // en pantalla aunque ya se haya traído antes. Ver `dianBlockCufes`.
+    // Persistir facturas descargadas en la tabla de seguimiento DIAN.
+    const now = new Date().toISOString();
+    await upsertDianInvoices(opts.companyId, items.filter((it) => it.xml).map((it) => ({
+      cufe: it.xml!.cufe || "",
+      docnum: it.xml!.docNumberRaw || "",
+      supplierNit: it.xml!.supplierNit || "",
+      supplierName: it.xml!.supplierName || "",
+      issueDate: it.xml!.date || "",
+      total: it.xml!.totals?.total || 0,
+      fetchedAt: now,
+    }))).catch((e) => console.error("[Siigo Ingest] upsertDianInvoices falló:", e));
 
     return {
       items,
@@ -543,8 +550,16 @@ export async function ingestNewByDateRange(opts: {
       opts.onProgress?.({ step: "Procesando XML para contabilización...", current: 0, total: files.length });
       const items = await processXmlBatch(files);
 
-      // NO se registra automáticamente (ver nota en `ingestFromDian`): el registro
-      // persistente ahora es solo la lista de bloqueo explícito del usuario.
+      const now = new Date().toISOString();
+      await upsertDianInvoices(opts.companyId, items.filter((it) => it.xml).map((it) => ({
+        cufe: it.xml!.cufe || "",
+        docnum: it.xml!.docNumberRaw || "",
+        supplierNit: it.xml!.supplierNit || "",
+        supplierName: it.xml!.supplierName || "",
+        issueDate: it.xml!.date || "",
+        total: it.xml!.totals?.total || 0,
+        fetchedAt: now,
+      }))).catch((e) => console.error("[Siigo Ingest] upsertDianInvoices falló:", e));
 
       return {
         items,

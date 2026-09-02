@@ -192,6 +192,7 @@ export async function connectMongo(): Promise<void> {
   await ensureIndex(siigoProfiles, { companyId: 1 });
   const siigoIngestedCufes = db.collection("siigoIngestedCufes");
   await ensureIndex(siigoIngestedCufes, { companyId: 1, cufe: 1 }, { unique: true });
+  await ensureIndex(siigoIngestedCufes, { companyId: 1, status: 1, fetchedAt: -1 });
   const siigoEgresoMovs = db.collection("siigoEgresoMovs");
   await ensureIndex(siigoEgresoMovs, { companyId: 1, createdAt: -1 });
   await ensureIndex(siigoEgresoMovs, { companyId: 1, bankAccountId: 1, createdAt: -1 });
