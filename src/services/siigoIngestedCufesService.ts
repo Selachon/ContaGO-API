@@ -26,9 +26,11 @@ export interface DianInvoiceRecord {
  */
 export async function getIngestedCufes(companyId: string): Promise<Set<string>> {
   if (!companyId) return new Set();
+  // Solo bloquea re-descarga para facturas ya causadas o ignoradas explícitamente.
+  // Las 'pending' se vuelven a descargar en cada sesión para que aparezcan en la tabla.
   const docs = await getDb()
     .collection<any>(COLLECTION)
-    .find({ companyId }, { projection: { cufe: 1, _id: 0 } })
+    .find({ companyId, status: { $in: ["caused", "ignored"] } }, { projection: { cufe: 1, _id: 0 } })
     .toArray();
   return new Set(docs.map((d) => d.cufe).filter(Boolean));
 }
