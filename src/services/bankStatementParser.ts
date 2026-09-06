@@ -10,6 +10,7 @@
  *  Si algo no cuadra, se reporta en `reconciliation.issues` y la UI lo bloquea.
  */
 import { createRequire } from "module";
+import ExcelJS from "exceljs";
 
 const require = createRequire(import.meta.url);
 // pdf.js empaquetado por pdf-parse (soporta contraseña vía getDocument({password})).
@@ -574,4 +575,92 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
     : parseItau(pages);
   const { movements, reconciliation } = classifyAndReconcile(parsed.raws, parsed.opening, parsed.declared, parsed.closing);
   return { bank, movements, reconciliation };
+}
+
+// ─── Bancolombia: extracto en Excel (export "Estado de cuenta") ───────────
+// Layout: bloques "Información Cliente:" / "Información General:" (DESDE/HASTA)
+// / "Resumen:" (SALDO ANTERIOR, TOTAL ABONOS, TOTAL CARGOS, SALDO ACTUAL) /
+// "Movimientos:" con encabezado FECHA|DESCRIPCIÓN|SUCURSAL|DCTO.|VALOR|SALDO.
+// FECHA viene como "D/MM" sin año (se infiere del rango DESDE/HASTA). Termina
+// con la fila "FIN ESTADO DE CUENTA".
+function cellStr(ws: ExcelJS.Worksheet, row: number, col: number): string {
+  const v = ws.getRow(row).getCell(col).value;
+  if (v == null) return "";
+  if (typeof v === "object" && "text" in (v as any)) return String((v as any).text ?? "");
+  if (typeof v === "object" && "result" in (v as any)) return String((v as any).result ?? "");
+  return String(v).trim();
+}
+
+function findRow(ws: ExcelJS.Worksheet, col: number, predicate: (v: string) => boolean, maxRow?: number): number | null {
+  const limit = maxRow ?? ws.rowCount;
+  for (let r = 1; r <= limit; r++) {
+    if (predicate(cellStr(ws, r, col))) return r;
+  }
+  return null;
+}
+
+function parseBancolombiaExcel(ws: ExcelJS.Worksheet): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
+  const desdeRow = findRow(ws, 1, (v) => /^DESDE$/i.test(v));
+  if (desdeRow == null) {
+    throw new StatementError("No reconozco el formato de este Excel de extracto bancario.", 422, "excel_unsupported");
+  }
+  const desde = cellStr(ws, desdeRow + 1, 1); // "2026/06/30"
+  const hasta = cellStr(ws, desdeRow + 1, 2); // "2026/07/31"
+  const desdeMonth = desde.match(/^\d{4}\/(\d{2})/)?.[1] ?? "";
+  const desdeYear = desde.match(/^(\d{4})/)?.[1] ?? "";
+  const hastaMonth = hasta.match(/^\d{4}\/(\d{2})/)?.[1] ?? "";
+  const hastaYear = hasta.match(/^(\d{4})/)?.[1] ?? new Date().getFullYear().toString();
+
+  const resumenRow = findRow(ws, 1, (v) => /^SALDO ANTERIOR$/i.test(v));
+  const opening = resumenRow != null ? num(cellStr(ws, resumenRow + 1, 1)) : null;
+  const credits = resumenRow != null ? num(cellStr(ws, resumenRow + 1, 2)) : null;
+  const debits = resumenRow != null ? num(cellStr(ws, resumenRow + 1, 3)) : null;
+  const closing = resumenRow != null ? num(cellStr(ws, resumenRow + 1, 4)) : null;
+
+  const movLabelRow = findRow(ws, 1, (v) => /^Movimientos:$/i.test(v));
+  if (movLabelRow == null) {
+    throw new StatementError("No encontré la tabla de movimientos en el Excel del extracto.", 422, "excel_unsupported");
+  }
+  const dataStart = movLabelRow + 2; // +1 = fila de encabezados de columna
+
+  const raws: RawMov[] = [];
+  for (let r = dataStart; r <= ws.rowCount; r++) {
+    const desc = cellStr(ws, r, 2);
+    if (/FIN ESTADO DE CUENTA/i.test(desc)) break;
+    const dateStr = cellStr(ws, r, 1);
+    const m = dateStr.match(/^(\d{1,2})\/(\d{2})$/);
+    if (!m) continue;
+    const [, dd, mm] = m;
+    const year = mm === desdeMonth ? desdeYear : mm === hastaMonth ? hastaYear : hastaYear;
+    const valueStr = cellStr(ws, r, 5);
+    const balanceStr = cellStr(ws, r, 6);
+    if (!valueStr || !balanceStr) continue;
+    raws.push({
+      date: `${year}-${mm}-${dd.padStart(2, "0")}`,
+      description: desc.trim(),
+      value: Math.abs(num(valueStr)),
+      balance: num(balanceStr),
+    });
+  }
+
+  return { raws, opening, declared: { credits, debits }, closing };
+}
+
+/** Parsea un extracto bancario en Excel y devuelve movimientos + cuadre. */
+export async function parseBankExcel(buffer: Buffer): Promise<ParsedStatement> {
+  const wb = new ExcelJS.Workbook();
+  try {
+    await wb.xlsx.load(buffer as unknown as ArrayBuffer);
+  } catch {
+    throw new StatementError("No se pudo leer el Excel (¿archivo dañado?).", 422, "excel_invalido");
+  }
+  const ws = wb.worksheets[0];
+  if (!ws) {
+    throw new StatementError("El Excel del extracto está vacío.", 422, "excel_invalido");
+  }
+  // Por ahora solo se reconoce el export "Estado de cuenta" de Bancolombia
+  // (única muestra validada); otros bancos en Excel deben agregarse aquí.
+  const parsed = parseBancolombiaExcel(ws);
+  const { movements, reconciliation } = classifyAndReconcile(parsed.raws, parsed.opening, parsed.declared, parsed.closing);
+  return { bank: "bancolombia", movements, reconciliation };
 }

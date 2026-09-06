@@ -13,7 +13,7 @@ import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
-import { parseBankPdf, StatementError } from "../services/bankStatementParser.js";
+import { parseBankPdf, parseBankExcel, StatementError } from "../services/bankStatementParser.js";
 import { parseAuxiliaryLedger, LedgerError } from "../services/auxiliaryLedgerParser.js";
 import {
   type RecStatementInput,
@@ -44,16 +44,24 @@ function isPdf(file: Express.Multer.File): boolean {
   return file.mimetype === "application/pdf" || (file.originalname || "").toLowerCase().endsWith(".pdf");
 }
 
-/** Normaliza el extracto (PDF) a la forma que consume el motor. */
+function isXlsx(file: Express.Multer.File): boolean {
+  const name = (file.originalname || "").toLowerCase();
+  return (
+    file.mimetype === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+    name.endsWith(".xlsx")
+  );
+}
+
+/** Normaliza el extracto (PDF o Excel) a la forma que consume el motor. */
 async function parseStatement(file: Express.Multer.File, password?: string) {
-  if (!isPdf(file)) {
+  if (!isPdf(file) && !isXlsx(file)) {
     throw new StatementError(
-      "Por ahora el extracto debe subirse en PDF (Bancolombia o Itaú). El soporte de extracto en Excel llegará pronto.",
+      "El extracto debe subirse en PDF o Excel (.xlsx).",
       422,
-      "extracto_excel_pendiente"
+      "extracto_formato_no_soportado"
     );
   }
-  const parsed = await parseBankPdf(file.buffer, password);
+  const parsed = isXlsx(file) ? await parseBankExcel(file.buffer) : await parseBankPdf(file.buffer, password);
   const statement: RecStatementInput = {
     opening: parsed.reconciliation.openingBalance,
     closing: parsed.reconciliation.closingBalance,
