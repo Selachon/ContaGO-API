@@ -3,14 +3,16 @@
  * AUXILIAR de la contabilidad (misma cuenta y periodo) y arma el cuadre.
  *
  * Estrategia (acordada con el usuario):
+ *  0) Los gastos bancarios del extracto (4x1000, GMF, comisiones, IVA sobre
+ *     comisiones, etc.) se excluyen del cruce por completo: casi nunca se
+ *     causan en la contabilidad renglón por renglón (ni siquiera
+ *     consolidados), así que siempre van 100% a su propia partida
+ *     "gastos bancarios sin contabilizar", agrupados por concepto.
  *  1) Cruce 1:1 por MONTO dentro de tolerancia, separando por dirección
  *     (ingreso↔débito, egreso↔crédito). La fecha se usa como desempate, no
  *     como filtro. Maneja multiplicidad: 3 pagos de $100k en extracto vs 2 en
  *     contabilidad → casa 2, deja 1 como partida (y marca el grupo ambiguo).
- *  2) Subset-sum sobre lo que quedó suelto: varios renglones del extracto que
- *     sumen un renglón de la contabilidad (comisiones desglosadas vs
- *     consolidadas) y viceversa.
- *  3) Lo que siga suelto = partidas conciliatorias en 4 categorías.
+ *  2) Lo que siga suelto = partidas conciliatorias en 5 categorías.
  *
  * Cuadre: usa la identidad de saldos
  *   SaldoFinalExt − SaldoFinalCont = (SaldoIniExt − SaldoIniCont)
@@ -53,7 +55,6 @@ export interface RecLedgerInput {
 
 export interface RecOptions {
   tolerance?: number; // pesos, default 100
-  maxSubsetSize?: number; // tope de elementos por grupo en subset-sum, default 12
   ignoredIds?: string[]; // ids a excluir del cruce (el usuario los marca aparte)
   manualMatches?: { statementIds: string[]; ledgerIds: string[] }[]; // cruces forzados por el usuario
 }
@@ -85,6 +86,7 @@ export interface RecMatch {
 export type PartidaCategory =
   | "ingresos_no_contabilizados"
   | "egresos_no_contabilizados"
+  | "gastos_bancarios_sin_contabilizar"
   | "ingresos_contab_sin_extracto"
   | "egresos_contab_sin_extracto";
 
@@ -98,6 +100,7 @@ export interface Cuadre {
   partidas: {
     ingresos_no_contabilizados: number;
     egresos_no_contabilizados: number;
+    gastos_bancarios_sin_contabilizar: number;
     ingresos_contab_sin_extracto: number;
     egresos_contab_sin_extracto: number;
   };
@@ -128,20 +131,15 @@ const EPS = 0.01;
 
 const round2 = (n: number): number => Math.round(n * 100) / 100;
 
-const BANK_STATEMENT_GROUP_RX =
-  /impto gobierno 4x1000|4\s*x\s*1000|gmf|cuota manejo suc virt empresa|servicio pago a otros bancos|iva cuota manejo suc virt emp|cobro iva pagos automaticos|iva boton|abono intereses ahorros|comision boton|servicio por pagos a nequi|servicio pago a proveedores|servicio pago de nomina/i;
+// Gastos bancarios (4x1000, GMF, comisiones, IVA sobre comisiones, cuotas de
+// manejo, etc.): casi nunca se causan en la contabilidad renglón por renglón
+// (ni siquiera consolidados 1 a 1), así que se excluyen del motor de cruce
+// por completo y van siempre a su propia partida "gastos bancarios sin
+// contabilizar", agrupados por concepto (ver reconcile()).
+const BANK_FEE_RX =
+  /impto gobierno 4x1000|4\s*x\s*1\.?000|gmf|cargo por impuesto|cuota manejo suc virt empresa|servicio pago a otros bancos|iva cuota manejo suc virt emp|cobro iva pagos automaticos|iva boton|comision boton|servicio por pagos a nequi|servicio pago a proveedores|servicio pago de nomina/i;
 
-const BANK_LEDGER_GROUP_RX =
-  /gastos bancarios|intereses y gastos bancarios|comisiones bancarias|cuota manejo|4\s*x\s*1000|gmf|gravamen|servicios bancarios/i;
-
-const isStatementBankGroupItem = (item: RecItem): boolean =>
-  item.kind === "bank_fee" || BANK_STATEMENT_GROUP_RX.test(item.description);
-
-const isLedgerBankGroupItem = (item: RecItem): boolean =>
-  BANK_LEDGER_GROUP_RX.test([item.description, item.thirdParty || "", item.voucher || ""].join(" ")) ||
-  // Comprobantes de Contabilidad (CC-) son asientos de consolidación mensual de
-  // gastos bancarios e intereses; no tienen descripción canónica pero sí agrupan.
-  /^CC-/i.test(item.voucher ?? "");
+const isBankFeeItem = (item: RecItem): boolean => item.kind === "bank_fee" || BANK_FEE_RX.test(item.description);
 
 // ─── Normalización a items con id estable ────────────────────────────────
 function toItems(statement: RecStatementInput, ledger: RecLedgerInput): {
@@ -231,166 +229,6 @@ function matchOneToOne(
   return { matches, stmtLeft, ledLeft };
 }
 
-// ─── Subset-sum acotado: subconjunto de `pool` que sume ≈ target ──────────
-function findSubset(pool: RecItem[], target: number, tol: number, maxSize: number): RecItem[] | null {
-  // Orden desc para podar antes y favorecer pocos elementos grandes.
-  const items = [...pool].sort((a, b) => b.value - a.value);
-  const n = items.length;
-  let best: { idx: number[]; residual: number } | null = null;
-
-  const suffix = new Array(n + 1).fill(0);
-  for (let i = n - 1; i >= 0; i--) suffix[i] = suffix[i + 1] + items[i].value;
-
-  // Límite de nodos explorados: evita bloquear el event loop indefinidamente
-  // cuando el pool tiene muchos ítems con valores repetidos (p.ej. 90 comisiones).
-  let nodes = 0;
-  const MAX_NODES = 2_000_000;
-
-  const chosen: number[] = [];
-  const dfs = (start: number, remaining: number) => {
-    if (nodes++ > MAX_NODES) return;
-    if (best && Math.abs(best.residual) <= EPS) return; // ya hay exacto
-    if (Math.abs(remaining) <= tol) {
-      const residual = Math.abs(remaining);
-      if (!best || residual < best.residual || (residual === best.residual && chosen.length < best.idx.length)) {
-        best = { idx: [...chosen], residual };
-      }
-      if (residual <= EPS) return;
-    }
-    if (chosen.length >= maxSize) return;
-    if (start >= n) return;
-    if (suffix[start] + tol < remaining) return; // ni sumando todo lo restante alcanza
-    for (let i = start; i < n; i++) {
-      // Skip-duplicate: si este ítem tiene el mismo valor que el anterior
-      // al mismo nivel, ya exploramos esa rama — saltamos para evitar la
-      // explosión combinatoria con comisiones bancarias repetidas.
-      if (i > start && Math.abs(items[i].value - items[i - 1].value) < EPS) continue;
-      if (items[i].value - tol > remaining) continue; // este solo ya se pasa
-      chosen.push(i);
-      dfs(i + 1, remaining - items[i].value);
-      chosen.pop();
-      if (best && Math.abs(best.residual) <= EPS) return;
-      if (nodes > MAX_NODES) return;
-    }
-  };
-  dfs(0, target);
-
-  if (!best) return null;
-  // Solo agrupamos si son ≥2 elementos (un 1:1 ya se intentó antes).
-  const b = best as { idx: number[]; residual: number };
-  if (b.idx.length < 2) return null;
-  // Al hacer skip-duplicate, el índice encontrado apunta al primero de cada valor;
-  // pero en el resultado queremos ítems reales — mapeamos expandiendo duplicados.
-  const result: RecItem[] = [];
-  const usedIndexes = new Set(b.idx);
-  const valueCounts = new Map<number, number>();
-  for (const idx of b.idx) {
-    const val = Math.round(items[idx].value * 100);
-    valueCounts.set(val, (valueCounts.get(val) ?? 0) + 1);
-  }
-  const taken = new Map<number, number>();
-  for (let i = 0; i < n && result.length < b.idx.length; i++) {
-    const val = Math.round(items[i].value * 100);
-    const need = valueCounts.get(val) ?? 0;
-    const got = taken.get(val) ?? 0;
-    if (got < need) { result.push(items[i]); taken.set(val, got + 1); }
-  }
-  return result;
-}
-
-// ─── Fase 2: agrupación por subset-sum (comisiones desglosadas/consolidadas) ─
-function matchGroups(
-  stmtLeft: RecItem[],
-  ledLeft: RecItem[],
-  tol: number,
-  maxSize: number
-): { matches: RecMatch[]; stmtLeft: RecItem[]; ledLeft: RecItem[] } {
-  const matches: RecMatch[] = [];
-  let sPool = [...stmtLeft];
-  let lPool = [...ledLeft];
-
-  // Tolerancia ampliada para grupos bancarios: el IVA sobre comisiones y pequeños
-  // redondeos se acumulan cuando hay muchos cargos, por lo que un grupo puede
-  // diferir más que una partida individual.
-  const bankGroupTol = Math.max(tol, 1000);
-
-  for (const dir of ["in", "out"] as Dir[]) {
-    // 2a) Un renglón de contabilidad ↔ varios del extracto (lo más común).
-    let ledTargets = lPool.filter((l) => l.direction === dir).sort((a, b) => b.value - a.value);
-    for (const target of ledTargets) {
-      if (!lPool.includes(target) || !isLedgerBankGroupItem(target)) continue;
-
-      const bankCandidates = sPool.filter(isStatementBankGroupItem);
-      const bankIn = round2(bankCandidates.filter((s) => s.direction === "in").reduce((a, s) => a + s.value, 0));
-      const bankOut = round2(bankCandidates.filter((s) => s.direction === "out").reduce((a, s) => a + s.value, 0));
-      const bankNet = target.direction === "in" ? round2(bankIn - bankOut) : round2(bankOut - bankIn);
-      if (bankCandidates.length >= 2 && Math.abs(bankNet - target.value) <= bankGroupTol) {
-        matches.push({
-          type: "group",
-          direction: dir,
-          statement: bankCandidates,
-          ledger: [target],
-          valueStatement: bankNet,
-          valueLedger: target.value,
-          residual: round2(bankNet - target.value),
-          ambiguous: false,
-        });
-        const bankIds = new Set(bankCandidates.map((s) => s.id));
-        sPool = sPool.filter((s) => !bankIds.has(s.id));
-        lPool = lPool.filter((l) => l.id !== target.id);
-        continue;
-      }
-
-      const candidates = sPool.filter((s) => s.direction === dir && isStatementBankGroupItem(s));
-      // Intentar con el pool COMPLETO del mismo sentido primero (evita la
-      // restricción de maxSize cuando todos los gastos bancarios forman el total).
-      const fullSum = round2(candidates.reduce((a, s) => a + s.value, 0));
-      const fullMatch = candidates.length >= 1 && Math.abs(fullSum - target.value) <= bankGroupTol;
-      const subset = fullMatch ? candidates : findSubset(candidates, target.value, bankGroupTol, maxSize);
-      if (!subset) continue;
-      const sum = round2(subset.reduce((a, s) => a + s.value, 0));
-      matches.push({
-        type: "group",
-        direction: dir,
-        statement: subset,
-        ledger: [target],
-        valueStatement: sum,
-        valueLedger: target.value,
-        residual: round2(sum - target.value),
-        ambiguous: false,
-      });
-      const subsetIds = new Set(subset.map((s) => s.id));
-      sPool = sPool.filter((s) => !subsetIds.has(s.id));
-      lPool = lPool.filter((l) => l.id !== target.id);
-    }
-
-    // 2b) Un renglón del extracto ↔ varios de contabilidad.
-    let stmtTargets = sPool.filter((s) => s.direction === dir).sort((a, b) => b.value - a.value);
-    for (const target of stmtTargets) {
-      if (!sPool.includes(target) || !isStatementBankGroupItem(target)) continue;
-      const candidates = lPool.filter((l) => l.direction === dir && isLedgerBankGroupItem(l));
-      const subset = findSubset(candidates, target.value, bankGroupTol, maxSize);
-      if (!subset) continue;
-      const sum = round2(subset.reduce((a, l) => a + l.value, 0));
-      matches.push({
-        type: "group",
-        direction: dir,
-        statement: [target],
-        ledger: subset,
-        valueStatement: target.value,
-        valueLedger: sum,
-        residual: round2(target.value - sum),
-        ambiguous: false,
-      });
-      const subsetIds = new Set(subset.map((l) => l.id));
-      lPool = lPool.filter((l) => !subsetIds.has(l.id));
-      sPool = sPool.filter((s) => s.id !== target.id);
-    }
-  }
-
-  return { matches, stmtLeft: sPool, ledLeft: lPool };
-}
-
 // ─── Cruces manuales forzados por el usuario ──────────────────────────────
 function applyManual(
   stmt: RecItem[],
@@ -435,7 +273,6 @@ export function reconcile(
   options: RecOptions = {}
 ): ReconciliationResult {
   const tol = options.tolerance ?? 100;
-  const maxSize = options.maxSubsetSize ?? 12;
   const ignored = new Set(options.ignoredIds ?? []);
 
   const { stmt, led } = toItems(statement, ledger);
@@ -444,6 +281,14 @@ export function reconcile(
   const ignoredLed = led.filter((l) => ignored.has(l.id));
   let sActive = stmt.filter((s) => !ignored.has(s.id));
   let lActive = led.filter((l) => !ignored.has(l.id));
+
+  // Gastos bancarios (4x1000, GMF, comisiones, IVA sobre comisiones, etc.):
+  // se excluyen del cruce por completo y van siempre 100% a su propia
+  // partida, sin importar si algún asiento consolidado de la contabilidad
+  // "calzaría" contra ellos — casi nunca se causan uno a uno ni consolidado.
+  const bankFees = sActive.filter((s) => s.direction === "out" && isBankFeeItem(s));
+  const bankFeeIds = new Set(bankFees.map((s) => s.id));
+  sActive = sActive.filter((s) => !bankFeeIds.has(s.id));
 
   const allMatches: RecMatch[] = [];
 
@@ -455,29 +300,18 @@ export function reconcile(
     lActive = r.ledLeft;
   }
 
-  // 1) 1:1 EXACTO (tolerancia mínima, solo decimales): casa los pares claros
-  //    sin que la tolerancia ancha "robe" un renglón que en realidad es un
-  //    grupo (p.ej. el único renglón de intereses contable vs. varios del banco).
-  const tightTol = Math.min(tol, 1);
-  const r1 = matchOneToOne(sActive, lActive, tightTol);
+  // 1) 1:1 dentro de tolerancia (fecha como desempate).
+  const r1 = matchOneToOne(sActive, lActive, tol);
   allMatches.push(...r1.matches);
 
-  // 2) Subset-sum con la tolerancia completa (comisiones desglosadas/consolidadas).
-  const r2 = matchGroups(r1.stmtLeft, r1.ledLeft, tol, maxSize);
-  allMatches.push(...r2.matches);
+  const stmtLeft = r1.stmtLeft;
+  const ledLeft = r1.ledLeft;
 
-  // 3) 1:1 LAXO con la tolerancia completa, sobre lo que aún quedó suelto
-  //    (pagos que difieren en unos pesos y no entraron en ningún grupo).
-  const r3 = matchOneToOne(r2.stmtLeft, r2.ledLeft, tol);
-  allMatches.push(...r3.matches);
-
-  const stmtLeft = r3.stmtLeft;
-  const ledLeft = r3.ledLeft;
-
-  // 3) Partidas conciliatorias.
+  // 2) Partidas conciliatorias.
   const partidas: Record<PartidaCategory, RecItem[]> = {
     ingresos_no_contabilizados: stmtLeft.filter((s) => s.direction === "in"),
     egresos_no_contabilizados: stmtLeft.filter((s) => s.direction === "out"),
+    gastos_bancarios_sin_contabilizar: bankFees,
     ingresos_contab_sin_extracto: ledLeft.filter((l) => l.direction === "in"),
     egresos_contab_sin_extracto: ledLeft.filter((l) => l.direction === "out"),
   };
@@ -485,6 +319,7 @@ export function reconcile(
   const sum = (arr: RecItem[]) => round2(arr.reduce((a, x) => a + x.value, 0));
   const pIngNoContab = sum(partidas.ingresos_no_contabilizados);
   const pEgrNoContab = sum(partidas.egresos_no_contabilizados);
+  const pGastosBancarios = sum(partidas.gastos_bancarios_sin_contabilizar);
   const pIngContabSinExt = sum(partidas.ingresos_contab_sin_extracto);
   const pEgrContabSinExt = sum(partidas.egresos_contab_sin_extracto);
 
@@ -502,7 +337,13 @@ export function reconcile(
   //   netoExt - netoCont (de lo no casado) = +ingNoContab - egrNoContab - ingContabSinExt + egrContabSinExt
   //   + el residual por tolerancia de lo casado
   const explained = round2(
-    openingDiff + pIngNoContab - pEgrNoContab - pIngContabSinExt + pEgrContabSinExt + toleranceAdjustment
+    openingDiff +
+      pIngNoContab -
+      pEgrNoContab -
+      pGastosBancarios -
+      pIngContabSinExt +
+      pEgrContabSinExt +
+      toleranceAdjustment
   );
   const unexplained = round2(closingDiff - explained);
 
@@ -520,6 +361,7 @@ export function reconcile(
       partidas: {
         ingresos_no_contabilizados: pIngNoContab,
         egresos_no_contabilizados: pEgrNoContab,
+        gastos_bancarios_sin_contabilizar: pGastosBancarios,
         ingresos_contab_sin_extracto: pIngContabSinExt,
         egresos_contab_sin_extracto: pEgrContabSinExt,
       },

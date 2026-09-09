@@ -66,6 +66,20 @@ function borderRow(row: ExcelJS.Row, c1: number, c2: number) {
   for (let c = c1; c <= c2; c++) thinBorder(row.getCell(c));
 }
 
+// Agrupa renglones por descripción (concepto) — usado para "Gastos bancarios
+// sin contabilizar", que se muestran consolidados en vez de uno por uno.
+function groupByDescription(items: RecItem[]): { description: string; count: number; total: number }[] {
+  const map = new Map<string, { description: string; count: number; total: number }>();
+  for (const it of items) {
+    const key = it.description || "(sin descripción)";
+    const g = map.get(key) ?? { description: key, count: 0, total: 0 };
+    g.count += 1;
+    g.total = Math.round((g.total + it.value) * 100) / 100;
+    map.set(key, g);
+  }
+  return [...map.values()].sort((a, b) => b.total - a.total);
+}
+
 const ROW_H = 15;
 
 // ─── Hoja PORTADA ────────────────────────────────────────────────────────────
@@ -98,6 +112,7 @@ function buildPortada(
   // Partidas conciliatorias (valores positivos)
   const egresosNoContab   = c.partidas.egresos_no_contabilizados;
   const ingresosNoContab  = c.partidas.ingresos_no_contabilizados;
+  const gastosBancarios   = c.partidas.gastos_bancarios_sin_contabilizar;
   const egresosContabSin  = c.partidas.egresos_contab_sin_extracto;
   const ingresosContabSin = c.partidas.ingresos_contab_sin_extracto;
   const partidasContabNet = egresosContabSin - ingresosContabSin; // neto en libros sin extracto
@@ -169,22 +184,28 @@ function buildPortada(
   r8.getCell(6).alignment = { horizontal: "center", vertical: "middle" };
   moneyFmt(r8.getCell(8));
 
-  // Fila 9: (merge B8:E10) | PARTIDAS NO REFLEJADAS
+  // Fila 9: (merge B8:E11) | PARTIDAS NO REFLEJADAS
   const r9 = ws.addRow([null, null, null, null, null, "+/-", "PARTIDAS NO REFLEJADAS EN EXTRACTO", partidasContabNet]);
   r9.height = ROW_H;
   r9.getCell(6).alignment = { horizontal: "center", vertical: "middle" };
   moneyFmt(r9.getCell(8));
 
-  // Fila 10: TOTAL DIFERENCIA CONCILIADA
-  const r10 = ws.addRow([null, null, null, null, null, "=", "TOTAL DIFERENCIA CONCILIADA", c.explained]);
+  // Fila 10: GASTOS BANCARIOS SIN CONTABILIZAR
+  const r10 = ws.addRow([null, null, null, null, null, "-", "GASTOS BANCARIOS SIN CONTABILIZAR", gastosBancarios]);
   r10.height = ROW_H;
   r10.getCell(6).alignment = { horizontal: "center", vertical: "middle" };
-  boldFont(r10.getCell(7)); moneyFmt(r10.getCell(8)); boldFont(r10.getCell(8));
-  ws.mergeCells(8, 2, 10, 5);
+  moneyFmt(r10.getCell(8));
 
-  // ─── Tablas de detalle (filas 11+) ────────────────────────────────────────
+  // Fila 11: TOTAL DIFERENCIA CONCILIADA
+  const r11 = ws.addRow([null, null, null, null, null, "=", "TOTAL DIFERENCIA CONCILIADA", c.explained]);
+  r11.height = ROW_H;
+  r11.getCell(6).alignment = { horizontal: "center", vertical: "middle" };
+  boldFont(r11.getCell(7)); moneyFmt(r11.getCell(8)); boldFont(r11.getCell(8));
+  ws.mergeCells(8, 2, 11, 5);
 
-  let rn = 11;
+  // ─── Tablas de detalle (filas 12+) ────────────────────────────────────────
+
+  let rn = 12;
 
   const addSectionHeader = (leftLabel: string, rightLabel: string) => {
     const r = ws.addRow([null, leftLabel, null, null, null, rightLabel, null, null]);
@@ -256,6 +277,48 @@ function buildPortada(
   const ing1 = result.partidas.ingresos_no_contabilizados;
   addDataRows(eg1, ing1);
   addSubtotalRow(egresosNoContab, ingresosNoContab);
+
+  // Sección 1b: gastos bancarios sin contabilizar, agrupados por concepto
+  // (4x1000, comisiones, IVA sobre comisiones, etc. — casi nunca se causan
+  // uno a uno en la contabilidad, así que se consolidan por concepto).
+  const bankFeeGroups = groupByDescription(result.partidas.gastos_bancarios_sin_contabilizar);
+  if (bankFeeGroups.length > 0) {
+    ws.addRow([]); rn++;
+    const secRow = ws.addRow([null, "GASTOS BANCARIOS SIN CONTABILIZAR (agrupado por concepto)", null, null, null, null, null, null]);
+    secRow.height = ROW_H;
+    for (let c = 2; c <= 8; c++) fillSolid(secRow.getCell(c), GRAY_MED);
+    boldFont(secRow.getCell(2));
+    ws.mergeCells(rn, 2, rn, 8);
+    rn++;
+
+    const hdrRow = ws.addRow([null, "CONCEPTO", null, null, "MOV.", null, null, "VALOR"]);
+    hdrRow.height = ROW_H;
+    for (let c = 2; c <= 8; c++) { fillSolid(hdrRow.getCell(c), GRAY_LITE); boldFont(hdrRow.getCell(c)); center(hdrRow.getCell(c)); thinBorder(hdrRow.getCell(c)); }
+    ws.mergeCells(rn, 2, rn, 4);
+    ws.mergeCells(rn, 5, rn, 6);
+    rn++;
+
+    let bankFeeTotal = 0;
+    for (const g of bankFeeGroups) {
+      const row = ws.addRow([null, g.description, null, null, g.count, null, null, g.total]);
+      row.height = ROW_H;
+      ws.mergeCells(rn, 2, rn, 4);
+      ws.mergeCells(rn, 5, rn, 6);
+      center(row.getCell(5));
+      moneyFmt(row.getCell(8));
+      borderRow(row, 2, 8);
+      bankFeeTotal = Math.round((bankFeeTotal + g.total) * 100) / 100;
+      rn++;
+    }
+    const totRow = ws.addRow([null, null, null, "TOTAL", null, null, null, bankFeeTotal]);
+    totRow.height = ROW_H;
+    ws.mergeCells(rn, 2, rn, 4);
+    ws.mergeCells(rn, 5, rn, 6);
+    boldFont(totRow.getCell(4)); boldFont(totRow.getCell(8)); moneyFmt(totRow.getCell(8));
+    fillSolid(totRow.getCell(8), AMBER);
+    borderRow(totRow, 2, 8);
+    rn++;
+  }
 
   // Sección 2: egresos libros sin extracto | ingresos libros sin extracto
   ws.addRow([]); rn++;

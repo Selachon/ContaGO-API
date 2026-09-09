@@ -60,7 +60,7 @@ const TOL = 1; // tolerancia en pesos para el cuadre
 const num = (s: unknown): number => Number(String(s ?? "").replace(/[^\d.-]/g, ""));
 
 const FEE_RX =
-  /4x1000|4 x 1000|gmf|gravamen|rendimientos financ|cobro transf|manejo portal|cobro serv disp|davipl|impto gobierno|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|manejo tarj|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
+  /4\s*x\s*1\.?000|gmf|gravamen|rendimientos financ|cobro transf|manejo portal|cobro serv disp|davipl|impto gobierno|cargo por impuesto|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|manejo tarj|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
 
 // ─── Extracción de texto del PDF (líneas reconstruidas por coordenada Y) ──
 async function extractLines(buffer: Buffer, password?: string): Promise<string[][]> {
