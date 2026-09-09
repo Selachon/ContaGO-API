@@ -98,9 +98,8 @@ async function launchBrowser(): Promise<Browser> {
         "--disable-gpu",
         "--disable-extensions",
         "--no-first-run",
-        // Ver nota en dianScraper.ts: elimina el fork por pestaña que causa
-        // EAGAIN sin afectar el número de navegadores/pestañas en paralelo.
-        "--single-process",
+        // NOTA: NO añadir "--single-process" (ver nota en dianScraper.ts):
+        // cuelga el arranque de Chromium hasta el timeout.
       ],
       executablePath,
     });

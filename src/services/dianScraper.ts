@@ -1891,14 +1891,12 @@ async function launchBrowserWithRetry(
           "--disable-software-rasterizer",
           "--disable-features=WebRtcHideLocalIpsWithMdns,CrashReporter",
           "--mute-audio",
-          // Fusiona renderer/red/compositor en el proceso principal: Chromium deja
-          // de forkear un proceso hijo por pestaña/navegación (la causa directa de
-          // "Cannot fork"/EAGAIN al agotarse PIDs del contenedor). No reduce el
-          // número de navegadores ni pestañas en paralelo (eso sigue gobernado por
-          // MAX_CONCURRENT_BROWSERS/DIAN_CUFE_WORKERS), así no afecta el throughput
-          // de descargas. No es observable por JS de la página (no delata el
-          // fingerprint anti-bot de DIAN).
-          "--single-process",
+          // NOTA: NO añadir "--single-process". Cuelga puppeteer.launch (Chromium
+          // no levanta el websocket CDP) hasta agotar el timeout de 120s y los 3
+          // reintentos -> el usuario ve "Iniciando navegador..." varios minutos.
+          // El agotamiento de PIDs/EAGAIN ya lo resuelve tini como PID 1
+          // (Dockerfile) + apagado ordenado; si reaparece, bajar
+          // MAX_CONCURRENT_BROWSERS o subir el límite de PIDs del contenedor.
         ],
         executablePath: executablePath || undefined,
       });
