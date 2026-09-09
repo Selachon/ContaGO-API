@@ -125,6 +125,8 @@ function detectBank(pages: string[][]): string {
   if (allText.includes("banco de occidente")) return "occidente";
   const head40 = pages.flat().slice(0, 40).join(" ").toLowerCase();
   if (head40.includes("itaú") || head40.includes("itau")) return "itau";
+  // BBVA: "PUBLICADO EN BBVANET" aparece en el encabezado de cada página.
+  if (allText.includes("bbvanet")) return "bbva";
   return "desconocido";
 }
 
@@ -133,6 +135,10 @@ interface RawMov {
   description: string;
   value: number;
   balance: number;
+  // Afecta el saldo (se valida en la cadena de continuidad) pero el propio
+  // banco no lo cuenta en sus totales declarados de ABONOS/CARGOS — p.ej.
+  // una "CORRECCION" que reversa un cargo de impuesto previo (ver BBVA).
+  excludeFromTotals?: boolean;
 }
 
 // ─── Bancolombia Sucursal Virtual: "DD mmm YYYY DESCRIPCIÓN [-] $ VALOR" ──
@@ -484,6 +490,63 @@ function parseDavivienda(pages: string[][]): { raws: RawMov[]; opening: number |
   return { raws, opening, declared: { credits, debits }, closing };
 }
 
+// ─── BBVA: "SEQ FECHA_PROCESO FECHA_VALOR DESCRIPCIÓN VALOR SALDO" ─────────
+// El resumen separa CARGOS de sus impuestos (IVA, 4x1000, RETENCIONES); los
+// débitos declarados reales son la suma de todos esos rubros (verificado:
+// SALDO CIERRE MES ANTERIOR + ABONOS - (CARGOS+IVA+4x1000+RETENCIONES) == SALDO FINAL).
+// Se usa la primera fecha (fecha de proceso) porque es la que respeta el
+// orden cronológico de la cadena de saldos; la segunda (fecha valor) puede
+// ir desfasada para efectos de intereses.
+function parseBBVA(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
+  const all = pages.flat();
+
+  const findMoney = (rx: RegExp): number | null => {
+    const line = all.find((l) => rx.test(l));
+    const m = line?.match(rx);
+    return m && m[1] ? num(m[1]) : null;
+  };
+  const opening = findMoney(/SALDO CIERRE MES ANTERIOR\s+([\d,]+\.\d{2})/i);
+  const closing = findMoney(/SALDO FINAL\s+([\d,]+\.\d{2})/i);
+  const credits = findMoney(/\+\s*ABONOS\s+\d+\s+([\d,]+\.\d{2})/i);
+  const cargos = findMoney(/-\s*CARGOS\s+\d+\s+([\d,]+\.\d{2})/i) ?? 0;
+  const iva = findMoney(/-\s*IVA\s+\d+\s+([\d,]+\.\d{2})/i) ?? 0;
+  const gmf = findMoney(/-\s*4\s*POR\s*MIL\s+\d+\s+([\d,]+\.\d{2})/i) ?? 0;
+  const ret = findMoney(/-\s*RETENCIONES\s+([\d,]+\.\d{2})/i) ?? 0;
+  const debits = cargos + iva + gmf + ret;
+
+  const raws: RawMov[] = [];
+  const rowRx = /^\d+\s+(\d{2})-(\d{2})-(\d{4})\s+\d{2}-\d{2}-\d{4}\s+(.+?)\s+([\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})$/;
+  for (const line of all) {
+    const m = line.match(rowRx);
+    if (!m) continue;
+    const [, dd, mm, yyyy, desc, valueStr, balanceStr] = m;
+    raws.push({
+      date: `${yyyy}-${mm}-${dd}`,
+      description: desc.replace(/\s+/g, " ").trim(),
+      value: Math.abs(num(valueStr)),
+      balance: num(balanceStr),
+    });
+  }
+
+  // "CORRECCION IMPTO ..." reversa un cargo de impuesto previo por el mismo
+  // monto exacto (ej. exención de 4x1000 aplicada después del cobro). BBVA no
+  // cuenta ese par en sus totales declarados de ABONOS/CARGOS aunque sí mueve
+  // el saldo, así que se excluyen ambos del cuadre de totales (no del saldo).
+  raws.forEach((r, i) => {
+    if (!/^CORRECCION\s+IMPTO/i.test(r.description)) return;
+    for (let j = i - 1; j >= 0; j--) {
+      const c = raws[j];
+      if (c.excludeFromTotals) continue;
+      if (/^CARGO\s+POR\s+IMPUESTO/i.test(c.description) && Math.abs(c.value - r.value) < TOL) {
+        c.excludeFromTotals = true;
+        r.excludeFromTotals = true;
+        break;
+      }
+    }
+  });
+  return { raws, opening, declared: { credits, debits: debits || null }, closing };
+}
+
 // ─── Clasificación + motor de cuadre ─────────────────────────────────────
 function classifyAndReconcile(
   raws: RawMov[],
@@ -510,8 +573,10 @@ function classifyAndReconcile(
     const kind: MovKind = FEE_RX.test(r.description) ? "bank_fee" : direction === "in" ? "ingreso" : "egreso";
     // Redondear al acumular para evitar drift de punto flotante en extractos con
     // muchos movimientos de centavos (ej. intereses diarios de ahorros).
-    if (direction === "in") credits = Math.round((credits + r.value) * 100) / 100;
-    else debits = Math.round((debits + r.value) * 100) / 100;
+    if (!r.excludeFromTotals) {
+      if (direction === "in") credits = Math.round((credits + r.value) * 100) / 100;
+      else debits = Math.round((debits + r.value) * 100) / 100;
+    }
     movements.push({ date: r.date, description: r.description, value: r.value, balance: r.balance, kind, direction });
     prev = r.balance;
   });
@@ -554,7 +619,7 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
   const bank = detectBank(pages);
   if (bank === "desconocido") {
     throw new StatementError(
-      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente, Banco de Bogotá, Davivienda). Sube el Excel de movimientos.",
+      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente, Banco de Bogotá, Davivienda, BBVA). Sube el Excel de movimientos.",
       422,
       "bank_unsupported"
     );
@@ -572,6 +637,7 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
     : bank === "occidente" ? parseOccidente(pages)
     : bank === "bancobogota" ? parseBancoBogota(pages)
     : bank === "davivienda" ? parseDavivienda(pages)
+    : bank === "bbva" ? parseBBVA(pages)
     : parseItau(pages);
   const { movements, reconciliation } = classifyAndReconcile(parsed.raws, parsed.opening, parsed.declared, parsed.closing);
   return { bank, movements, reconciliation };
