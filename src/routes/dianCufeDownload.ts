@@ -20,7 +20,6 @@ import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import { encryptToken } from "../utils/encryption.js";
 import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
-import { rejectIfNitNotAllowed } from "../utils/nitAccess.js";
 import type { ProgressData, DocumentDirection } from "../types/dian.js";
 import type { InvoiceData } from "../types/dianExcel.js";
 
@@ -294,7 +293,6 @@ router.post(
     };
 
     if (rejectIfWrongDemoNit(req, res, token_url)) return;
-    if (await rejectIfNitNotAllowed(req, res, token_url, TOOL_ID)) return;
 
     if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
       return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
