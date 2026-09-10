@@ -60,7 +60,7 @@ const TOL = 1; // tolerancia en pesos para el cuadre
 const num = (s: unknown): number => Number(String(s ?? "").replace(/[^\d.-]/g, ""));
 
 const FEE_RX =
-  /4\s*x\s*1\.?000|gmf|gravamen|rendimientos financ|cobro transf|manejo portal|cobro serv disp|davipl|impto gobierno|cargo por impuesto|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|manejo tarj|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
+  /4\s*x\s*1\.?000|gmf|gravamen|rendimientos financ|cobro transf|manejo portal|cobro serv disp|davipl|impto gobierno|cargo por impuesto|correccion impto|impuesto trans|impuesto al valor agregado|\biva\b|comisi|comtransferencia|cuota (de )?(plan|manejo)|manejo tarj|inter[eé]s|intereses|seguro de vida|^servicio\b/i;
 
 // ─── Extracción de texto del PDF (líneas reconstruidas por coordenada Y) ──
 async function extractLines(buffer: Buffer, password?: string): Promise<string[][]> {
@@ -528,22 +528,34 @@ function parseBBVA(pages: string[][]): { raws: RawMov[]; opening: number | null;
     });
   }
 
-  // "CORRECCION IMPTO ..." reversa un cargo de impuesto previo por el mismo
-  // monto exacto (ej. exención de 4x1000 aplicada después del cobro). BBVA no
-  // cuenta ese par en sus totales declarados de ABONOS/CARGOS aunque sí mueve
-  // el saldo, así que se excluyen ambos del cuadre de totales (no del saldo).
-  raws.forEach((r, i) => {
-    if (!/^CORRECCION\s+IMPTO/i.test(r.description)) return;
-    for (let j = i - 1; j >= 0; j--) {
-      const c = raws[j];
-      if (c.excludeFromTotals) continue;
-      if (/^CARGO\s+POR\s+IMPUESTO/i.test(c.description) && Math.abs(c.value - r.value) < TOL) {
-        c.excludeFromTotals = true;
-        r.excludeFromTotals = true;
+  // "CORRECCION IMPTO DECRETO" es una devolución (exención por decreto) de un
+  // "CARGO POR IMPUESTO 4X1.000" previo del mismo monto. Contablemente es un
+  // menor valor del impuesto, no un ingreso: se neta contra ese cargo y ambas
+  // filas se eliminan como movimientos aparte. Los saldos de las filas
+  // intermedias se ajustan (+monto) para que la cadena de continuidad cuadre.
+  for (let k = raws.length - 1; k >= 0; k--) {
+    const corr = raws[k];
+    if (!/^CORRECCION\s+IMPTO/i.test(corr.description)) continue;
+    let j = -1;
+    for (let p = k - 1; p >= 0; p--) {
+      if (/^CARGO POR IMPUESTO 4X1\.000$/i.test(raws[p].description) && Math.abs(raws[p].value - corr.value) < TOL) {
+        j = p;
         break;
       }
     }
-  });
+    if (j < 0) {
+      // Sin cargo previo que la absorba (cargo de un mes anterior): al menos
+      // no contarla como ingreso en el cuadre de totales declarados.
+      corr.excludeFromTotals = true;
+      continue;
+    }
+    for (let m = j; m < k; m++) {
+      raws[m].balance = Math.round((raws[m].balance + corr.value) * 100) / 100;
+    }
+    raws[j].value = Math.round((raws[j].value - corr.value) * 100) / 100;
+    raws.splice(k, 1);
+    if (raws[j].value < TOL) raws.splice(j, 1);
+  }
   return { raws, opening, declared: { credits, debits: debits || null }, closing };
 }
 

@@ -74,7 +74,8 @@ function groupByDescription(items: RecItem[]): { description: string; count: num
     const key = it.description || "(sin descripción)";
     const g = map.get(key) ?? { description: key, count: 0, total: 0 };
     g.count += 1;
-    g.total = Math.round((g.total + it.value) * 100) / 100;
+    // Una devolución (dirección "in", ej. corrección de impuesto) resta.
+    g.total = Math.round((g.total + (it.direction === "in" ? -it.value : it.value)) * 100) / 100;
     map.set(key, g);
   }
   return [...map.values()].sort((a, b) => b.total - a.total);

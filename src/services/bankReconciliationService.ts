@@ -137,7 +137,7 @@ const round2 = (n: number): number => Math.round(n * 100) / 100;
 // por completo y van siempre a su propia partida "gastos bancarios sin
 // contabilizar", agrupados por concepto (ver reconcile()).
 const BANK_FEE_RX =
-  /impto gobierno 4x1000|4\s*x\s*1\.?000|gmf|cargo por impuesto|cuota manejo suc virt empresa|servicio pago a otros bancos|iva cuota manejo suc virt emp|cobro iva pagos automaticos|iva boton|comision boton|servicio por pagos a nequi|servicio pago a proveedores|servicio pago de nomina/i;
+  /impto gobierno 4x1000|4\s*x\s*1\.?000|gmf|cargo por impuesto|correccion impto|cuota manejo suc virt empresa|servicio pago a otros bancos|iva cuota manejo suc virt emp|cobro iva pagos automaticos|iva boton|comision boton|servicio por pagos a nequi|servicio pago a proveedores|servicio pago de nomina/i;
 
 const isBankFeeItem = (item: RecItem): boolean => item.kind === "bank_fee" || BANK_FEE_RX.test(item.description);
 
@@ -286,7 +286,9 @@ export function reconcile(
   // se excluyen del cruce por completo y van siempre 100% a su propia
   // partida, sin importar si algún asiento consolidado de la contabilidad
   // "calzaría" contra ellos — casi nunca se causan uno a uno ni consolidado.
-  const bankFees = sActive.filter((s) => s.direction === "out" && isBankFeeItem(s));
+  // Una devolución de un gasto bancario (dirección "in", ej. "CORRECCION IMPTO
+  // DECRETO") va a la misma partida como valor negativo.
+  const bankFees = sActive.filter((s) => isBankFeeItem(s));
   const bankFeeIds = new Set(bankFees.map((s) => s.id));
   sActive = sActive.filter((s) => !bankFeeIds.has(s.id));
 
@@ -319,7 +321,10 @@ export function reconcile(
   const sum = (arr: RecItem[]) => round2(arr.reduce((a, x) => a + x.value, 0));
   const pIngNoContab = sum(partidas.ingresos_no_contabilizados);
   const pEgrNoContab = sum(partidas.egresos_no_contabilizados);
-  const pGastosBancarios = sum(partidas.gastos_bancarios_sin_contabilizar);
+  // Los gastos bancarios son egresos; una devolución (dirección "in") resta.
+  const pGastosBancarios = round2(
+    partidas.gastos_bancarios_sin_contabilizar.reduce((a, x) => a + (x.direction === "in" ? -x.value : x.value), 0)
+  );
   const pIngContabSinExt = sum(partidas.ingresos_contab_sin_extracto);
   const pEgrContabSinExt = sum(partidas.egresos_contab_sin_extracto);
 
