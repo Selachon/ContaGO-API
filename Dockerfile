@@ -1,6 +1,6 @@
 # Dockerfile for ContaGO API
 
-FROM node:20-slim AS builder
+FROM node:20-bookworm-slim AS builder
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ COPY templates ./templates
 # Build TypeScript
 RUN npm run build
 
-FROM node:20-slim
+FROM node:20-bookworm-slim
 
 # Install Chromium dependencies
 RUN apt-get update && apt-get install -y \
