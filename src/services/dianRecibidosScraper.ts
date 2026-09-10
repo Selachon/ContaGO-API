@@ -184,14 +184,26 @@ export async function authenticateAndNavigate(
     progress({ step: "Autenticando con DIAN..." });
     await authPage.goto(tokenUrl, { waitUntil: "domcontentloaded" });
 
-    // Esperar que el AuthToken redirija
+    // Esperar que el AuthToken redirija (hasta 45s: en Railway el redirect de
+    // DIAN a veces tarda más que en local).
     const ts = Date.now();
-    while (Date.now() - ts < 30_000) {
+    while (Date.now() - ts < 45_000) {
       if (!/\/User\/AuthToken/i.test(authPage.url())) break;
       await delay(1000);
     }
     if (/\/User\/AuthToken/i.test(authPage.url())) {
-      throw new Error("El token no redirigió — puede estar expirado o ser de otra IP.");
+      // Capturar qué devolvió realmente DIAN — clave para distinguir token
+      // expirado / IP distinta / captcha / mantenimiento desde los logs.
+      let diag = "";
+      try {
+        const title = await authPage.title();
+        const bodyText = (await authPage.evaluate(
+          () => (document.body ? document.body.innerText : "").replace(/\s+/g, " ").trim().slice(0, 400),
+        )) || "";
+        diag = ` [url=${authPage.url()} title="${title}" body="${bodyText}"]`;
+      } catch { /* página ya cerrada / navegando */ }
+      console.warn(`[dianRecibidos] AuthToken no redirigió.${diag}`);
+      throw new Error(`El token no redirigió — puede estar expirado, ya usado o generado desde otra IP.${diag}`);
     }
     await delay(2000);
     const cookies = await authPage.cookies();
