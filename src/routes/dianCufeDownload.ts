@@ -5,6 +5,7 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
+import { PDFDocument } from "pdf-lib";
 import { closeBrowserSafely, REAL_USER_AGENT, type ListingRecord } from "../services/dianScraper.js";
 import { authenticateAndNavigate } from "../services/dianRecibidosScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
@@ -19,6 +20,7 @@ import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import { encryptToken } from "../utils/encryption.js";
 import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
+import { rejectIfNitNotAllowed } from "../utils/nitAccess.js";
 import type { ProgressData, DocumentDirection } from "../types/dian.js";
 import type { InvoiceData } from "../types/dianExcel.js";
 
@@ -82,6 +84,10 @@ interface JobData {
   outputPath?: string;
   outputName?: string;
   outputMime?: string;
+  // ZIP con XML/PDF de las facturas consultadas, independiente de si se sube
+  // o no a Drive — mismo criterio que "Descarga Masiva DIAN".
+  zipPath?: string;
+  zipName?: string;
   error?: string;
   createdAt: number;
   tempDir?: string;
@@ -110,6 +116,9 @@ setInterval(() => {
     if (now - job.createdAt > JOB_TTL_MS) {
       if (job.outputPath && fs.existsSync(job.outputPath)) {
         try { fs.unlinkSync(job.outputPath); } catch {}
+      }
+      if (job.zipPath && fs.existsSync(job.zipPath)) {
+        try { fs.unlinkSync(job.zipPath); } catch {}
       }
       if (job.tempDir && fs.existsSync(job.tempDir)) {
         try { fs.rmSync(job.tempDir, { recursive: true, force: true }); } catch {}
@@ -150,6 +159,7 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     progress: job.progress,
     error: job.error,
     outputName: job.outputName,
+    zipName: job.zipName,
     driveFolderUrl: job.driveFolderUrl,
     driveUploadStatus: job.driveUploadStatus,
     driveUploadCurrent: job.driveUploadCurrent,
@@ -158,6 +168,30 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
     demoLimit: job.demoLimit,
   });
 });
+
+// Borra el job solo cuando YA no queda ningún entregable pendiente de
+// descargar (Excel y ZIP son descargas independientes): si se elimina el job
+// apenas se baja uno de los dos, el otro botón del frontend queda huérfano.
+function maybeFinalizeJob(jobId: string): void {
+  const job = jobTracker.get(jobId);
+  if (!job) return;
+  const excelGone = !job.outputPath || !fs.existsSync(job.outputPath);
+  const zipGone = !job.zipPath || !fs.existsSync(job.zipPath);
+  if (!excelGone || !zipGone) return;
+  const isDriveUploading = job.driveUploadStatus === "uploading";
+  if (!isDriveUploading) {
+    jobTracker.delete(jobId);
+  } else {
+    const deadline = Date.now() + 30 * 60 * 1000;
+    const check = setInterval(() => {
+      const s = job.driveUploadStatus;
+      if (s === "done" || s === "error" || Date.now() > deadline) {
+        clearInterval(check);
+        jobTracker.delete(jobId);
+      }
+    }, 5_000);
+  }
+}
 
 router.get("/job-download/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
@@ -184,20 +218,37 @@ router.get("/job-download/:jobId", (req: Request, res: Response) => {
       if (job.outputPath && fs.existsSync(job.outputPath)) {
         try { fs.unlinkSync(job.outputPath); } catch {}
       }
-      // Keep job alive until drive upload finishes (or 30min max)
-      const isDriveUploading = job.driveUploadStatus === "uploading";
-      if (!isDriveUploading) {
-        jobTracker.delete(jobId);
-      } else {
-        const deadline = Date.now() + 30 * 60 * 1000;
-        const check = setInterval(() => {
-          const s = job.driveUploadStatus;
-          if (s === "done" || s === "error" || Date.now() > deadline) {
-            clearInterval(check);
-            jobTracker.delete(jobId);
-          }
-        }, 5_000);
+      maybeFinalizeJob(jobId);
+    }, 10_000);
+  });
+});
+
+router.get("/job-download-zip/:jobId", (req: Request, res: Response) => {
+  const { jobId } = req.params;
+  if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+  }
+  const job = jobTracker.get(jobId);
+  if (!job) return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado" });
+  }
+  if (job.status !== "completed") {
+    return res.status(400).json({ status: "error", detalle: `Job no completado (${job.status})` });
+  }
+  if (!job.zipPath || !fs.existsSync(job.zipPath)) {
+    return res.status(404).json({ status: "error", detalle: "ZIP no encontrado" });
+  }
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", `attachment; filename="${job.zipName || "facturas-DIAN.zip"}"`);
+  const stream = fs.createReadStream(job.zipPath);
+  stream.pipe(res);
+  stream.on("end", () => {
+    setTimeout(() => {
+      if (job.zipPath && fs.existsSync(job.zipPath)) {
+        try { fs.unlinkSync(job.zipPath); } catch {}
       }
+      maybeFinalizeJob(jobId);
     }, 10_000);
   });
 });
@@ -243,6 +294,7 @@ router.post(
     };
 
     if (rejectIfWrongDemoNit(req, res, token_url)) return;
+    if (await rejectIfNitNotAllowed(req, res, token_url, TOOL_ID)) return;
 
     if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
       return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
@@ -357,6 +409,7 @@ async function processCufeDownloadJob(
   const sessionId = uuidv4();
   const tempDir = path.join(DOWNLOADS_DIR, sessionId);
   const outputPath = path.join(DOWNLOADS_DIR, `${sessionId}.xlsx`);
+  const zipPath = path.join(DOWNLOADS_DIR, `${sessionId}.zip`);
   job.tempDir = tempDir;
   job.outputPath = outputPath;
 
@@ -387,6 +440,9 @@ async function processCufeDownloadJob(
   const useInlineDriveLinks = includeDriveLinks && doUploadInvoices;
   const runDeferredDriveUpload = doUploadInvoices && !useInlineDriveLinks;
   const deferredUploads: { xmlBuffer: Buffer; pdfBuffer: Buffer | null; docnum: string; ownNit: string; issueDate: string; }[] = [];
+  // ZIP de XML/PDF entregado al usuario siempre, independiente de Drive —
+  // mismo formato (carpetas XML/, PDF/, ZIP/) que "Descarga Masiva DIAN".
+  const zipFiles: Array<{ name: string; buffer: Buffer }> = [];
 
   const onTokenRefresh = async (newAccessToken: string, expiryDate: number) => {
     const encryptedToken = encryptToken(newAccessToken);
@@ -481,7 +537,9 @@ async function processCufeDownloadJob(
 
           const hasValidData = !!(invoiceData.issueDate && invoiceData.docNumber);
           let pdfBuffer: Buffer | null = null;
-          if (doUploadInvoices && !isDS) {
+          // El PDF se trae siempre (salvo Documento Soporte, que no tiene) —
+          // el ZIP de entrega ya no depende de si se sube o no a Drive.
+          if (!isDS) {
             try {
               const pdfResp = await fetch(
                 `https://gratis-vpfe.dian.gov.co/IoFacturo/Print/PrintStoragePdf?transactionId=${cufe}&viewMode=attachment`,
@@ -513,6 +571,18 @@ async function processCufeDownloadJob(
               docnum: invoiceData.docNumber!, ownNit: getOwnNit(invoiceData, direction),
               issueDate: invoiceData.issueDate!,
             });
+          }
+
+          if (hasValidData) {
+            const docName = (invoiceData.docNumber || originalCufe.slice(0, 16)).replace(/[^a-zA-Z0-9_-]/g, "_");
+            zipFiles.push({ name: `XML/${docName}.xml`, buffer: xmlBuf });
+            if (pdfBuffer) zipFiles.push({ name: `PDF/${docName}.pdf`, buffer: pdfBuffer });
+            // ZIP individual por documento (XML+PDF), igual que "Descarga Masiva DIAN".
+            const docZip = new JSZip();
+            docZip.file(`${docName}.xml`, xmlBuf);
+            if (pdfBuffer) docZip.file(`${docName}.pdf`, pdfBuffer);
+            const docZipBuf = await docZip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+            zipFiles.push({ name: `ZIP/${docName}.zip`, buffer: docZipBuf });
           }
 
           invoiceMap.set(originalCufe, invoiceData);
@@ -636,6 +706,42 @@ async function processCufeDownloadJob(
     
     job.outputName = `${filePrefix} ${range}.xlsx`;
     job.outputMime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+    // ZIP con XML/PDF de las facturas consultadas — se entrega siempre,
+    // independiente de si el usuario también las sube a Drive.
+    if (zipFiles.length > 0) {
+      // PDF unificado con todas las facturas — mismo entregable que "Descarga Masiva DIAN".
+      const pdfEntries = zipFiles.filter((f) => f.name.startsWith("PDF/"));
+      if (pdfEntries.length > 0) {
+        setProgress(jobId, { step: "Generando PDF unificado...", current: allCufes.length, total: allCufes.length });
+        try {
+          const merged = await PDFDocument.create();
+          for (const entry of pdfEntries) {
+            try {
+              const src = await PDFDocument.load(entry.buffer, { ignoreEncryption: true });
+              const pages = await merged.copyPages(src, src.getPageIndices());
+              pages.forEach((p) => merged.addPage(p));
+            } catch (err) {
+              console.warn(`[CUFE DL] PDF unificado: no se pudo agregar ${entry.name}:`, err);
+            }
+          }
+          if (merged.getPageCount() > 0) {
+            const mergedBytes = await merged.save();
+            zipFiles.push({ name: "todos-los-documentos.pdf", buffer: Buffer.from(mergedBytes) });
+          }
+        } catch (err) {
+          console.warn("[CUFE DL] Error generando PDF unificado:", err);
+        }
+      }
+
+      setProgress(jobId, { step: "Generando ZIP...", current: allCufes.length, total: allCufes.length });
+      const zip = new JSZip();
+      for (const f of zipFiles) zip.file(f.name, f.buffer);
+      const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+      fs.writeFileSync(zipPath, zipBuf);
+      job.zipPath = zipPath;
+      job.zipName = `${filePrefix} ${range}.zip`;
+    }
 
     const skippedCount = skippedEntries.length;
     const missingCount = downloadCufes.length - filledCount;
