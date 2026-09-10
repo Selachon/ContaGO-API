@@ -625,6 +625,50 @@ function extractTotals(invoice: any): {
     console.error("Error extrayendo totales:", err);
   }
 
+  // Retenciones practicadas: van en <cac:WithholdingTaxTotal> (nodo hermano de
+  // TaxTotal), NO dentro de TaxTotal. Se clasifican por el código numérico
+  // <cac:TaxScheme><cbc:ID> — estandarizado por la DIAN — y NO por <cbc:Name>,
+  // que cada software tipifica distinto ("ReteRenta" vs "ReteFuente" para el
+  // mismo 06). Solo 05/06/07; cualquier otro código (p.ej. "ZZ" con nombre
+  // placeholder que algunos emisores dejan sin diligenciar) se ignora.
+  try {
+    const WHT_NAME_BY_ID: Record<string, string> = {
+      "5": "Retención IVA",
+      "6": "Retención Fuente",
+      "7": "Retención ICA",
+    };
+    const wht = invoice.WithholdingTaxTotal;
+    if (wht) {
+      const whtArr = Array.isArray(wht) ? wht : [wht];
+      for (const w of whtArr) {
+        const subs = w.TaxSubtotal
+          ? (Array.isArray(w.TaxSubtotal) ? w.TaxSubtotal : [w.TaxSubtotal])
+          : [];
+        for (const sub of subs) {
+          const rawId = String(getText(sub.TaxCategory?.TaxScheme?.ID));
+          const normId = rawId.replace(/^0+/, "") || "0";
+          const name = WHT_NAME_BY_ID[normId];
+          if (!name) continue; // ignora ZZ / códigos desconocidos
+          const amount = parseAmount(sub.TaxAmount);
+          const baseAmount = parseAmount(sub.TaxableAmount);
+          const pctRaw = parseAmount(sub.TaxCategory?.Percent);
+          const percent = pctRaw > 0
+            ? pctRaw
+            : baseAmount > 0 ? (amount / baseAmount) * 100 : 0;
+          const existing = taxesMap.get(name);
+          if (existing) {
+            existing.amount += amount; // varias subtotales del mismo código → suma
+            if (percent > existing.percent) existing.percent = percent;
+          } else {
+            taxesMap.set(name, { taxId: rawId, taxName: name, amount, percent });
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Error extrayendo retenciones:", err);
+  }
+
   // Convertir el mapa a array ordenado por ID de impuesto
   const taxes = Array.from(taxesMap.values()).sort((a, b) => {
     // IVA siempre primero
@@ -647,9 +691,9 @@ function normalizeTaxName(rawName: string, normalizedId: string): string {
     "22": "Bolsas",    // Impuesto al consumo de bolsas plásticas
     "35": "ICUI",      // Impuesto a bebidas ultraprocesadas azucaradas
     "3": "IC",         // Impuesto al Consumo (departamental)
-    "5": "ReteIVA",    // Retención de IVA
-    "6": "ReteRenta",  // Retención en la fuente
-    "7": "ReteICA",    // Retención de ICA
+    "5": "Retención IVA",     // Retención de IVA (normalmente en WithholdingTaxTotal)
+    "6": "Retención Fuente",  // Retención en la fuente
+    "7": "Retención ICA",     // Retención de ICA
     "8": "IC Porcentual", // Impuesto al consumo porcentual
   };
 

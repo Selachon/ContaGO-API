@@ -63,6 +63,7 @@ const CURRENCY_HEADERS = new Set([
   "IVA", "% IVA", "ICA", "INC", "% INC", "Bolsas", "% Bolsas",
   "ICUI", "% ICUI", "IC", "Otros Impuestos", "IC Porcentual", "% IC Porcentual",
   "ICL", "IBUA", "% IBUA", "ADV",
+  "Retención Fuente", "Retención IVA", "Retención ICA", "Total Retenciones",
   "Total",
   "Cantidad", "Base del impuesto", "Descuento detalle", "Recargo detalle", "Precio unitario (incluye impuestos)",
   "Bases de IVAS al 19%", "IVAS del 19%", "Bases IVAS 5%", "IVAS 5%", "Bases sin IVA", "IVA 0%",
@@ -192,6 +193,7 @@ function buildSheet1(
     "Fecha", "Concepto", "Forma de pago",
     "Subtotal", "Descuento", "Recargo",
     "IVA", "ICA", "INC", "Bolsas", "ICUI", "IC", "Otros Impuestos", "ICL", "IC Porcentual", "IBUA", "ADV",
+    "Retención Fuente", "Retención IVA", "Retención ICA", "Total Retenciones",
     "Total", "Observaciones",
   ];
   if (includeDriveColumn) baseHeaders.push("Enlace Drive");
@@ -233,6 +235,10 @@ function buildSheet1(
       td["IC Porcentual"]?.amount ?? 0,
       td["IBUA"]?.amount ?? 0,
       td["ADV"]?.amount ?? 0,
+      td["Retención Fuente"]?.amount ?? 0,
+      td["Retención IVA"]?.amount ?? 0,
+      td["Retención ICA"]?.amount ?? 0,
+      (td["Retención Fuente"]?.amount ?? 0) + (td["Retención IVA"]?.amount ?? 0) + (td["Retención ICA"]?.amount ?? 0),
       typeof inv.total === "number" ? inv.total : 0,
       inv.notes || "",
     ];
@@ -374,7 +380,12 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
 // ── Sheet IVA: Reporte Auxiliar IVA ──────────────────────────────────────────
 
 // Impuestos que no son IVA ni retenciones — se excluyen de las columnas extra
-const IVA_EXCLUDED_TAXES = new Set(["IVA", "ReteIVA", "ReteRenta", "ReteICA"]);
+const IVA_EXCLUDED_TAXES = new Set([
+  "IVA",
+  "Retención Fuente", "Retención IVA", "Retención ICA",
+  // nombres legacy por si algún dato viejo aún los trae
+  "ReteIVA", "ReteRenta", "ReteICA",
+]);
 
 function colLetter(n: number): string {
   let s = "";
