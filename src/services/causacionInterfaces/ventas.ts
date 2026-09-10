@@ -26,6 +26,7 @@ import {
 } from "./types.js";
 import {
   cargarLibro,
+  descartarColumnas,
   leerHojaDian,
   leerHojaSimple,
   renombrarExacto,
@@ -55,6 +56,16 @@ const COL_DESCUENTO = "Descuento detalle";
 const COL_BASE_DETALLE = "Base del impuesto";
 
 const COLS_OTROS_IMPUESTOS = ["Bolsas", "ICUI", "IC", "IC Porcentual", "ICL", "IBUA", "ADV"];
+
+// Columnas informativas de retención del Excel DIAN. Este proceso calcula las
+// retenciones desde la tabla maestra, así que las descarta para que no
+// interfieran en agregados ni validaciones.
+const COLS_RETENCION_DIAN = [
+  "Retención Fuente",
+  "Retención IVA",
+  "Retención ICA",
+  "Total Retenciones",
+];
 const MAX_LINEAS_PARTE = 500;
 
 const RENOMBRADO_FACTURAS_EXACTO: Record<string, string> = {
@@ -139,6 +150,7 @@ function leerFacturasVentas(dian: Buffer): Promise<Tabla> {
     const facturas = leerHojaDian(wb, "Facturas DIAN");
     renombrarExacto(facturas, RENOMBRADO_FACTURAS_EXACTO);
     renombrarNormalizado(facturas, RENOMBRADO_FACTURAS_NORMALIZADO);
+    descartarColumnas(facturas, COLS_RETENCION_DIAN);
     return facturas;
   });
 }
@@ -194,6 +206,8 @@ export async function runVentas(input: VentasInput): Promise<VentasResultado> {
   renombrarExacto(detalle, RENOMBRADO_DETALLE_EXACTO);
   renombrarNormalizado(detalle, RENOMBRADO_DETALLE_NORMALIZADO);
   renombrarExacto(paramVentas, RENOMBRADO_PARAM_VENTAS);
+  descartarColumnas(facturas, COLS_RETENCION_DIAN);
+  descartarColumnas(detalle, COLS_RETENCION_DIAN);
 
   // ---- 2. Validación de columnas obligatorias ------------------------------
   exigirColumnas(

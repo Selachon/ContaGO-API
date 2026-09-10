@@ -203,6 +203,21 @@ export function renombrarExacto(tabla: Tabla, mapeo: Record<string, string>): vo
   aplicarRenombrados(tabla, renombrados);
 }
 
+/**
+ * Elimina columnas de una Tabla (in place), por coincidencia exacta tras recortar
+ * espacios. Útil para descartar columnas informativas del Excel DIAN que un
+ * proceso no consume y que no deben interferir en cálculos ni validaciones.
+ */
+export function descartarColumnas(tabla: Tabla, nombres: string[]): void {
+  const quitar = new Set(nombres.map((n) => n.trim()));
+  tabla.columnas = tabla.columnas.filter((c) => !quitar.has(c.trim()));
+  for (const fila of tabla.filas) {
+    for (const clave of Object.keys(fila)) {
+      if (quitar.has(clave.trim())) delete fila[clave];
+    }
+  }
+}
+
 /** Renombra columnas por coincidencia de su forma normalizada (tildes/codificación). */
 export function renombrarNormalizado(tabla: Tabla, mapeo: Record<string, string>): void {
   const renombrados = new Map<string, string>();

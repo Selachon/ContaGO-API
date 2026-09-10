@@ -22,6 +22,7 @@ import {
 } from "./types.js";
 import {
   cargarLibro,
+  descartarColumnas,
   leerHojaDian,
   leerHojaSimple,
   renombrarExacto,
@@ -51,6 +52,17 @@ const COL_BASE_DETALLE = "Base del impuesto";
 
 const COLS_OTROS_IMPUESTOS = ["Bolsas", "ICUI", "IC", "IC Porcentual", "ICL", "IBUA", "ADV"];
 const MAX_LINEAS_PARTE = 500;
+
+// El Excel DIAN incluye columnas informativas de retención (Retención Fuente/IVA/
+// ICA, Total Retenciones). Este proceso calcula las retenciones desde la tabla
+// maestra de impuestos + la parametrización del proveedor, así que las descarta
+// para que no interfieran en agregados ni validaciones.
+const COLS_RETENCION_DIAN = [
+  "Retención Fuente",
+  "Retención IVA",
+  "Retención ICA",
+  "Total Retenciones",
+];
 
 /** Renombrado de columnas de la hoja "Facturas DIAN" (formatos DIAN nuevo/antiguo). */
 const RENOMBRADO_FACTURAS_EXACTO: Record<string, string> = {
@@ -132,6 +144,8 @@ export async function runCompras(input: ComprasInput): Promise<ComprasResultado>
   renombrarNormalizado(facturas, RENOMBRADO_FACTURAS_NORMALIZADO);
   renombrarExacto(detalle, RENOMBRADO_DETALLE_EXACTO);
   renombrarNormalizado(detalle, RENOMBRADO_DETALLE_NORMALIZADO);
+  descartarColumnas(facturas, COLS_RETENCION_DIAN);
+  descartarColumnas(detalle, COLS_RETENCION_DIAN);
 
   // ---- 3. Validación de columnas obligatorias ------------------------------
   exigirColumnas(
