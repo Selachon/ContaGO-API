@@ -41,6 +41,70 @@ const SHEET_REQUERIDA: Record<TablaSlot, string | undefined> = {
 const PLANTILLA_FILENAME = "Plantilla_Terceros_Siigo.xlsm";
 const TABLA_SLOTS: TablaSlot[] = ["paramCompras", "paramVentas", "impuestos"];
 
+/**
+ * Columnas "de fábrica" para arrancar una empresa nueva sin necesidad de subir
+ * un Excel primero, y para el botón de descarga de plantilla. Son exactamente
+ * los nombres que el motor espera (o sus alias crudos que ya renombra solo:
+ * en ventas, p.ej., "Cuenta_ingreso"/"Cuenta_por_cobrar"/"Cuenta_devolucion_ingreso").
+ * Las columnas opcionales de diferenciación de IVA (Cuenta_gasto_exenta/_5/_19/
+ * _otros) NO van aquí: son opt-in y se agregan a mano por empresa que las necesite.
+ */
+const PLANTILLA_COLUMNAS: Record<TablaSlot, string[]> = {
+  paramCompras: [
+    "NIT Emisor",
+    "Proveedor",
+    "Cuenta_gasto",
+    "Cuenta_por_pagar",
+    "Cuenta_otros_impuestos",
+    "Cuenta_ingreso_obsequios",
+    "Tarifa_retefuente",
+    "Tarifa_reteica",
+    "Tarifa_reteiva",
+    "Base_minima_reteica_especial",
+  ],
+  paramVentas: [
+    "NIT Receptor",
+    "Proveedor",
+    "Cuenta_ingreso",
+    "Cuenta_por_cobrar",
+    "Cuenta_otros_impuestos",
+    "Cuenta_devolucion_ingreso",
+    "Tarifa_retefuente",
+    "Tarifa_reteica",
+    "Tarifa_reteiva",
+    "Base_minima_reteica_especial",
+  ],
+  impuestos: ["Código", "Tarifa", "Tipo de impuesto", "Nombre", "Compras", "Ventas", "Base"],
+};
+
+/** Tabla vacía (0 filas) con las columnas de fábrica del slot indicado. */
+export function tablaPlantilla(slot: TablaSlot): Tabla {
+  return {
+    sheetName: SHEET_REQUERIDA[slot] || (slot === "impuestos" ? "Impuestos" : "Proveedores"),
+    columns: [...PLANTILLA_COLUMNAS[slot]],
+    rows: [],
+  };
+}
+
+/**
+ * Siembra la tabla de fábrica (en blanco) para una empresa que todavía no
+ * tiene esa tabla (creada antes de que las empresas nuevas arrancaran con
+ * columnas por defecto). Si la tabla ya existe (tiene columnas), no la toca.
+ */
+export async function iniciarTablaConPlantilla(empresaId: string, slot: TablaSlot): Promise<Tabla> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid });
+  if (!doc) throw new Error("Empresa no encontrada.");
+  const existente = doc.tables?.[slot] as Tabla | undefined;
+  if (existente?.columns?.length) return existente;
+  const tabla = tablaPlantilla(slot);
+  await getDb()
+    .collection<any>(EMPRESAS)
+    .updateOne({ _id: oid }, { $set: { [`tables.${slot}`]: tabla, updatedAt: new Date() } });
+  return tabla;
+}
+
 /** Tipos de comprobante de compras (parámetro inicial, normalmente estable). */
 export interface Comprobantes {
   /** Tipo de comprobante para facturas de compra (p.ej. "CCOMP"). */
@@ -135,7 +199,10 @@ function resumenTablas(doc: any): EmpresaPublic["tablas"] {
   const uno = (slot: TablaSlot) => {
     const tab = t[slot] as Tabla | undefined;
     return {
-      cargada: !!tab && Array.isArray(tab.columns) && tab.columns.length > 0,
+      // "cargada" = tiene datos usables (filas), no solo columnas: las tablas
+      // ahora arrancan con columnas de fábrica pero 0 filas (ver tablaPlantilla),
+      // y eso NO debe leerse como "parametrización completa".
+      cargada: !!tab && Array.isArray(tab.rows) && tab.rows.length > 0,
       filas: tab?.rows?.length || 0,
       columnas: tab?.columns?.length || 0,
     };
@@ -207,7 +274,14 @@ export async function createEmpresa(
     consecutivos: {},
     ownerUserId,
     sharedWith: [],
-    tables: {},
+    // Arranca con las 3 tablas vacías pero con columnas ya listas, para que la
+    // empresa funcione de una vez en el portal sin obligar a subir un Excel
+    // primero. El usuario puede llenarlas a mano o reemplazarlas importando.
+    tables: {
+      paramCompras: tablaPlantilla("paramCompras"),
+      paramVentas: tablaPlantilla("paramVentas"),
+      impuestos: tablaPlantilla("impuestos"),
+    },
     files: {},
     createdAt: now,
     updatedAt: now,

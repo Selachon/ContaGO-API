@@ -145,8 +145,7 @@ export async function leerHojaConEncabezadoDinamico(
   return leerHojaDesdeFila(ws, 1);
 }
 
-/** Materializa una tabla a un archivo .xlsx en `path` (hoja + columnas + valores). */
-export async function escribirTabla(tabla: Tabla, path: string): Promise<void> {
+function construirWorkbook(tabla: Tabla): ExcelJS.Workbook {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet(tabla.sheetName || "Hoja1");
   ws.addRow(tabla.columns);
@@ -156,7 +155,18 @@ export async function escribirTabla(tabla: Tabla, path: string): Promise<void> {
       return v === null || v === undefined ? null : v;
     }));
   }
-  await wb.xlsx.writeFile(path);
+  return wb;
+}
+
+/** Materializa una tabla a un archivo .xlsx en `path` (hoja + columnas + valores). */
+export async function escribirTabla(tabla: Tabla, path: string): Promise<void> {
+  await construirWorkbook(tabla).xlsx.writeFile(path);
+}
+
+/** Igual que `escribirTabla`, pero devuelve el .xlsx en memoria (para descarga por HTTP). */
+export async function tablaABuffer(tabla: Tabla): Promise<Buffer> {
+  const buf = await construirWorkbook(tabla).xlsx.writeBuffer();
+  return Buffer.from(buf);
 }
 
 /**

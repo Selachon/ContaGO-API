@@ -12,6 +12,7 @@
  *     POST   /api/contabilizacion/empresas/:id/import    → importa Excel de parametrización a la BD (1ª vez)
  *     GET    /api/contabilizacion/empresas/:id/tablas/:slot → tabla para editar en el portal
  *     PUT    /api/contabilizacion/empresas/:id/tablas/:slot → guarda la tabla editada (sin cargar archivo)
+ *     GET    /api/contabilizacion/tablas/:slot/plantilla → descarga plantilla .xlsx en blanco (columnas de fábrica)
  *     POST   /api/contabilizacion/empresas/:id/plantilla → sube la plantilla de terceros (.xlsm)
  *
  *   Procesos (multipart: empresaId, dian[, params]):
@@ -50,15 +51,17 @@ import {
   materializarConfig,
   precrearTerceros,
   proveedoresIncompletos,
+  iniciarTablaConPlantilla,
   savePlantillaTerceros,
   setTabla,
+  tablaPlantilla,
   updateEmpresa,
   userCanAccessEmpresa,
   type ConfigEmpresa,
   type PrecreacionResultado,
   type TablaSlot,
 } from "../services/contabilizacionEmpresasService.js";
-import { siguientesConsecutivos } from "../services/contabilizacionTablasIO.js";
+import { siguientesConsecutivos, tablaABuffer } from "../services/contabilizacionTablasIO.js";
 import { extraerNitsDian, extraerTercerosDian } from "../services/contabilizacionDianTerceros.js";
 
 const TABLA_SLOTS: TablaSlot[] = ["paramCompras", "paramVentas", "impuestos"];
@@ -327,6 +330,38 @@ router.get("/empresas/:id/tablas/:slot", async (req: Request, res: Response) => 
     if (!esTablaSlot(req.params.slot)) throw new MotorError("slot_invalido", "Tabla desconocida.", [], 400);
     const tabla = await getTabla(req.params.id, req.params.slot);
     res.json({ status: "ok", tabla });
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
+// Descarga una plantilla .xlsx en blanco (solo encabezados) para un slot dado.
+// No depende de ninguna empresa: mismas columnas de fábrica para todas.
+router.get("/tablas/:slot/plantilla", async (req: Request, res: Response) => {
+  try {
+    if (!esTablaSlot(req.params.slot)) throw new MotorError("slot_invalido", "Tabla desconocida.", [], 400);
+    const buf = await tablaABuffer(tablaPlantilla(req.params.slot));
+    const nombres: Record<TablaSlot, string> = {
+      paramCompras: "Plantilla_Parametrizacion_Compras.xlsx",
+      paramVentas: "Plantilla_Parametrizacion_Ventas.xlsx",
+      impuestos: "Plantilla_Tabla_Maestro_Impuestos.xlsx",
+    };
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${nombres[req.params.slot]}"`);
+    res.send(buf);
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
+// Siembra la tabla de fábrica en blanco para una empresa que aún no la tiene
+// (creada antes de que las empresas nuevas arrancaran con columnas por defecto).
+router.post("/empresas/:id/tablas/:slot/plantilla-vacia", async (req: Request, res: Response) => {
+  try {
+    await exigirAcceso(req);
+    if (!esTablaSlot(req.params.slot)) throw new MotorError("slot_invalido", "Tabla desconocida.", [], 400);
+    const tabla = await iniciarTablaConPlantilla(req.params.id, req.params.slot);
+    res.json({ status: "ok", tabla, empresa: await empresaActualizada(req, req.params.id) });
   } catch (err) {
     enviarError(res, err);
   }
