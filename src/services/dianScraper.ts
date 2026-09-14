@@ -461,7 +461,12 @@ const BROWSER_LAUNCH_RETRIES = Number(process.env.PUPPETEER_LAUNCH_RETRIES || 3)
 // PIDs/threads ("pthread_create", "Zygote could not fork") incluso después de
 // unificar el cupo entre todos los scrapers. Medida conservadora mientras se
 // confirma si el techo real es de código o del plan de Railway.
-const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 3));
+// Bajado de 3 a 2 (2026-09-14): un cliente volvió a ver "spawn EAGAIN" crudo
+// (no el cuelgue de --single-process, ya revertido) con 3 concurrentes. Cada
+// Chromium multiproceso son ~5-8 PIDs/varios hilos; si el techo real es el
+// pids-limit del plan de Railway, 2 da más margen. Si reaparece con 2, el
+// techo es del plan (subir el límite de PIDs o el plan), no del código.
+const MAX_CONCURRENT_BROWSERS = Math.max(1, Number(process.env.MAX_CONCURRENT_BROWSERS || 2));
 const BROWSER_CLOSE_TIMEOUT_MS = Number(process.env.PUPPETEER_CLOSE_TIMEOUT_MS || 15000);
 
 type BrowserWithSlot = Browser & { __releaseSlot?: () => void; __userDataDir?: string };
