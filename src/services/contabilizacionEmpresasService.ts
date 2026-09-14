@@ -86,6 +86,29 @@ export function tablaPlantilla(slot: TablaSlot): Tabla {
   };
 }
 
+/** Columnas opcionales de diferenciación de gasto por tarifa de IVA (ver script_compras.py). */
+const COLUMNAS_TARIFA_IVA = ["Cuenta_gasto_exenta", "Cuenta_gasto_5", "Cuenta_gasto_19", "Cuenta_gasto_otros"];
+
+/**
+ * Agrega las 4 columnas de diferenciación de IVA a `tabla` (paramCompras) si
+ * no las tiene ya, sin tocar filas/valores existentes. No son "libres": es el
+ * único punto donde se crean, ligado a activar `cuentaGastoPorTarifaIva`.
+ */
+function conColumnasTarifaIva(tabla: Tabla | undefined): Tabla {
+  const base = tabla && tabla.columns?.length ? tabla : tablaPlantilla("paramCompras");
+  const faltantes = COLUMNAS_TARIFA_IVA.filter((c) => !base.columns.includes(c));
+  if (!faltantes.length) return base;
+  return {
+    ...base,
+    columns: [...base.columns, ...faltantes],
+    rows: base.rows.map((r) => {
+      const nuevo = { ...r };
+      for (const c of faltantes) if (!(c in nuevo)) nuevo[c] = "";
+      return nuevo;
+    }),
+  };
+}
+
 /**
  * Siembra la tabla de fábrica (en blanco) para una empresa que todavía no
  * tiene esa tabla (creada antes de que las empresas nuevas arrancaran con
@@ -278,7 +301,9 @@ export async function createEmpresa(
     // empresa funcione de una vez en el portal sin obligar a subir un Excel
     // primero. El usuario puede llenarlas a mano o reemplazarlas importando.
     tables: {
-      paramCompras: tablaPlantilla("paramCompras"),
+      paramCompras: cuentaGastoPorTarifaIva
+        ? conColumnasTarifaIva(tablaPlantilla("paramCompras"))
+        : tablaPlantilla("paramCompras"),
       paramVentas: tablaPlantilla("paramVentas"),
       impuestos: tablaPlantilla("impuestos"),
     },
@@ -312,6 +337,14 @@ export async function updateEmpresa(
   }
   if (patch.cuentaGastoPorTarifaIva !== undefined) {
     set.cuentaGastoPorTarifaIva = !!patch.cuentaGastoPorTarifaIva;
+    if (patch.cuentaGastoPorTarifaIva) {
+      // Al activar el flag, aseguramos las 4 columnas de tarifa en paramCompras
+      // de una vez (así el usuario no tiene que crearlas a mano por su cuenta).
+      const actual = await getDb()
+        .collection<any>(EMPRESAS)
+        .findOne({ _id: oid }, { projection: { "tables.paramCompras": 1 } });
+      set["tables.paramCompras"] = conColumnasTarifaIva(actual?.tables?.paramCompras);
+    }
   }
   if (patch.comprobantes !== undefined) set.comprobantes = normComprobantes(patch.comprobantes);
   if (patch.consecutivos !== undefined && patch.consecutivos && typeof patch.consecutivos === "object") {
