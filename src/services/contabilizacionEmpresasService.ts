@@ -67,6 +67,13 @@ export interface EmpresaPublic {
   nombre: string;
   nit: string;
   obsequiosMode: ObsequiosMode;
+  /**
+   * Flag explícito por empresa (NO se infiere de columnas de la tabla): activa,
+   * en compras, la diferenciación de cuenta de gasto por tarifa de IVA
+   * (Cuenta_gasto_exenta/_5/_19/_otros) y el "mayor valor del gasto" cuando la
+   * cuenta resuelta es de clase 5. Default false para no afectar a nadie más.
+   */
+  cuentaGastoPorTarifaIva: boolean;
   comprobantes: Comprobantes;
   /** Siguiente consecutivo recordado por tipo de comprobante. */
   consecutivos: Consecutivos;
@@ -85,6 +92,7 @@ export interface ConfigEmpresa {
   nombre: string;
   nit: string;
   obsequiosMode: ObsequiosMode;
+  cuentaGastoPorTarifaIva: boolean;
   comprobantes: Comprobantes;
   consecutivos: Consecutivos;
   /** Rutas absolutas a .xlsx materializados / archivo de plantilla. */
@@ -142,6 +150,7 @@ function toPublic(doc: any): EmpresaPublic {
     nombre: doc.nombre,
     nit: doc.nit || "",
     obsequiosMode: doc.obsequiosMode === "contabilizar" ? "contabilizar" : "error",
+    cuentaGastoPorTarifaIva: !!doc.cuentaGastoPorTarifaIva,
     comprobantes: normComprobantes(doc.comprobantes),
     consecutivos: (doc.consecutivos && typeof doc.consecutivos === "object" ? doc.consecutivos : {}) as Consecutivos,
     tablas,
@@ -180,7 +189,8 @@ export async function createEmpresa(
   nit: string,
   obsequiosMode: ObsequiosMode,
   ownerUserId: string,
-  comprobantes?: Partial<Comprobantes>
+  comprobantes?: Partial<Comprobantes>,
+  cuentaGastoPorTarifaIva?: boolean
 ): Promise<EmpresaPublic> {
   const cleanNombre = String(nombre || "").trim();
   if (!cleanNombre) throw new Error("El nombre de la empresa es obligatorio.");
@@ -192,6 +202,7 @@ export async function createEmpresa(
     nombre: cleanNombre,
     nit: normalizeNit(nit),
     obsequiosMode: mode,
+    cuentaGastoPorTarifaIva: !!cuentaGastoPorTarifaIva,
     comprobantes: normComprobantes(comprobantes),
     consecutivos: {},
     ownerUserId,
@@ -212,6 +223,7 @@ export async function updateEmpresa(
     nombre?: string;
     nit?: string;
     obsequiosMode?: ObsequiosMode;
+    cuentaGastoPorTarifaIva?: boolean;
     comprobantes?: Partial<Comprobantes>;
     consecutivos?: Consecutivos;
   }
@@ -223,6 +235,9 @@ export async function updateEmpresa(
   if (patch.nit !== undefined) set.nit = normalizeNit(patch.nit);
   if (patch.obsequiosMode !== undefined) {
     set.obsequiosMode = patch.obsequiosMode === "contabilizar" ? "contabilizar" : "error";
+  }
+  if (patch.cuentaGastoPorTarifaIva !== undefined) {
+    set.cuentaGastoPorTarifaIva = !!patch.cuentaGastoPorTarifaIva;
   }
   if (patch.comprobantes !== undefined) set.comprobantes = normComprobantes(patch.comprobantes);
   if (patch.consecutivos !== undefined && patch.consecutivos && typeof patch.consecutivos === "object") {
@@ -719,6 +734,7 @@ export async function materializarConfig(empresaId: string, destDir: string): Pr
     nombre: doc.nombre,
     nit: doc.nit || "",
     obsequiosMode: doc.obsequiosMode === "contabilizar" ? "contabilizar" : "error",
+    cuentaGastoPorTarifaIva: !!doc.cuentaGastoPorTarifaIva,
     comprobantes: normComprobantes(doc.comprobantes),
     consecutivos: (doc.consecutivos && typeof doc.consecutivos === "object" ? doc.consecutivos : {}) as Consecutivos,
   };

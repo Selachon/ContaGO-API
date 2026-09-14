@@ -16,6 +16,13 @@ PARAMS = CTX.params
 #   "contabilizar" -> comportamiento ElToro: avisa y contabiliza IVA vs CxP directamente
 OBSEQUIOS_MODE = os.environ.get("CONTAGO_OBSEQUIOS_MODE", "error").strip().lower()
 
+# Diferenciación de cuenta de gasto por tarifa de IVA (Cuenta_gasto_exenta/_5/_19/
+# _otros) + "mayor valor del gasto" cuando la cuenta resuelta es de clase 5.
+# Flag EXPLÍCITO por empresa (no se infiere de si las columnas existen o están
+# diligenciadas), para que ningún otro cliente quede afectado por accidente
+# aunque su tabla de proveedores llegue a tener columnas con esos nombres.
+CUENTA_GASTO_POR_TARIFA_IVA = os.environ.get("CONTAGO_CUENTA_GASTO_POR_TARIFA_IVA", "").strip() == "1"
+
 
 def renombrar_si_existe(df, mapeo):
     renames = {}
@@ -846,7 +853,7 @@ for _, row in df.iterrows():
     cuenta_gasto_5 = limpiar_cuenta(row.get("Cuenta_gasto_5", ""))
     cuenta_gasto_19 = limpiar_cuenta(row.get("Cuenta_gasto_19", ""))
     cuenta_gasto_otros = limpiar_cuenta(row.get("Cuenta_gasto_otros", ""))
-    tiene_diferenciacion_iva = any(
+    tiene_diferenciacion_iva = CUENTA_GASTO_POR_TARIFA_IVA and any(
         c not in ("", "0")
         for c in [cuenta_gasto_exenta, cuenta_gasto_5, cuenta_gasto_19, cuenta_gasto_otros]
     )

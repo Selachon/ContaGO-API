@@ -70,6 +70,8 @@ export interface EjecutarOpts {
   soloPrefijos?: boolean;
   /** Controla CONTAGO_OBSEQUIOS_MODE (error | contabilizar). */
   obsequiosMode: ObsequiosMode;
+  /** Controla CONTAGO_CUENTA_GASTO_POR_TARIFA_IVA ("1" | ""). Solo compras. */
+  cuentaGastoPorTarifaIva?: boolean;
 }
 
 function motorDir(): string {
@@ -165,6 +167,7 @@ export async function ejecutarMotor(proceso: Proceso, opts: EjecutarOpts): Promi
         env: {
           ...process.env,
           CONTAGO_OBSEQUIOS_MODE: opts.obsequiosMode,
+          CONTAGO_CUENTA_GASTO_POR_TARIFA_IVA: opts.cuentaGastoPorTarifaIva ? "1" : "",
           PYTHONIOENCODING: "utf-8",
         },
       });

@@ -253,8 +253,8 @@ router.get("/empresas", async (req: Request, res: Response) => {
 
 router.post("/empresas", async (req: Request, res: Response) => {
   try {
-    const { nombre, nit, obsequiosMode, comprobantes } = req.body || {};
-    const empresa = await createEmpresa(nombre, nit, obsequiosMode, req.user!.userId, comprobantes);
+    const { nombre, nit, obsequiosMode, comprobantes, cuentaGastoPorTarifaIva } = req.body || {};
+    const empresa = await createEmpresa(nombre, nit, obsequiosMode, req.user!.userId, comprobantes, cuentaGastoPorTarifaIva);
     res.status(201).json({ status: "ok", empresa });
   } catch (err) {
     enviarError(res, err);
@@ -425,6 +425,7 @@ function baseOpts(config: ConfigEmpresa, out: string, dians: string[]): Ejecutar
     impuestos: config.impuestos,
     plantillaTerceros: config.plantillaTerceros,
     obsequiosMode: config.obsequiosMode,
+    cuentaGastoPorTarifaIva: config.cuentaGastoPorTarifaIva,
   };
 }
 
