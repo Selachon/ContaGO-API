@@ -463,6 +463,19 @@ for col in [
 if "Cuenta_ingreso_obsequios" not in param.columns:
     param["Cuenta_ingreso_obsequios"] = ""
 
+# Columnas opcionales para diferenciar la cuenta de gasto según la tarifa de
+# IVA del proveedor (algunos clientes las necesitan; la mayoría las deja
+# vacías y sigue usando una sola Cuenta_gasto, sin cambio de comportamiento).
+COLUMNAS_CUENTA_GASTO_TARIFA = [
+    "Cuenta_gasto_exenta",
+    "Cuenta_gasto_5",
+    "Cuenta_gasto_19",
+    "Cuenta_gasto_otros",
+]
+for col in COLUMNAS_CUENTA_GASTO_TARIFA:
+    if col not in param.columns:
+        param[col] = ""
+
 impuestos["Tarifa"] = pd.to_numeric(impuestos["Tarifa"], errors="coerce").fillna(0)
 impuestos["Base"] = pd.to_numeric(impuestos["Base"], errors="coerce").fillna(0)
 
@@ -692,6 +705,33 @@ otros = (
     .reset_index()
 )
 
+# Reparto de la base (no del IVA) por tarifa, para clientes que diferencian la
+# cuenta de gasto según la tarifa de IVA del proveedor. Clasificación por línea
+# de detalle: 19%/5% por su "% IVA"; entre las líneas de 0% IVA, las que traen
+# impoconsumo/bolsas/otros impuestos van a "otros", el resto a "exenta".
+_es_linea_otros = (
+    detalle_sin_obsequios[otros_impuestos_cols].fillna(0).gt(0).any(axis=1)
+    | (detalle_sin_obsequios["INC"] > 0)
+)
+_pct_iva_linea = detalle_sin_obsequios["% IVA"].round(4)
+
+
+def _sumar_base_bucket(mascara, nombre_col):
+    resultado = (
+        detalle_sin_obsequios[mascara]
+        .groupby(col_factura)[col_base_detalle]
+        .sum()
+        .reset_index()
+    )
+    resultado.rename(columns={col_base_detalle: nombre_col}, inplace=True)
+    return resultado
+
+
+base_exenta_tarifa = _sumar_base_bucket((_pct_iva_linea == 0) & (~_es_linea_otros), "BASE_EXENTA_TARIFA")
+base_otros_tarifa = _sumar_base_bucket((_pct_iva_linea == 0) & _es_linea_otros, "BASE_OTROS_TARIFA")
+base_5_tarifa = _sumar_base_bucket(_pct_iva_linea == 5.0, "BASE_5_TARIFA")
+base_19_tarifa = _sumar_base_bucket(_pct_iva_linea == 19.0, "BASE_19_TARIFA")
+
 df = facturas.merge(iva_19, on=col_factura, how="left")
 df = df.merge(iva_5, on=col_factura, how="left")
 df = df.merge(inc, on=col_factura, how="left")
@@ -702,6 +742,10 @@ df = df.merge(iva_obsequios_5, on=col_factura, how="left")
 df = df.merge(param, on=col_nit, how="left")
 df = df.merge(_iva_inf_19, on=col_factura, how="left")
 df = df.merge(_iva_inf_5, on=col_factura, how="left")
+df = df.merge(base_exenta_tarifa, on=col_factura, how="left")
+df = df.merge(base_otros_tarifa, on=col_factura, how="left")
+df = df.merge(base_5_tarifa, on=col_factura, how="left")
+df = df.merge(base_19_tarifa, on=col_factura, how="left")
 
 for col in df.columns:
     if pd.api.types.is_numeric_dtype(df[col]):
@@ -797,16 +841,84 @@ for _, row in df.iterrows():
 
     descripcion = f"{tipo_doc_abreviado} {factura} {proveedor}"
 
-    if base_gasto > 0:
-        agregar_linea(row, row["Cuenta_gasto"], base_gasto, "D", descripcion)
+    cuenta_gasto_base = limpiar_cuenta(row["Cuenta_gasto"])
+    cuenta_gasto_exenta = limpiar_cuenta(row.get("Cuenta_gasto_exenta", ""))
+    cuenta_gasto_5 = limpiar_cuenta(row.get("Cuenta_gasto_5", ""))
+    cuenta_gasto_19 = limpiar_cuenta(row.get("Cuenta_gasto_19", ""))
+    cuenta_gasto_otros = limpiar_cuenta(row.get("Cuenta_gasto_otros", ""))
+    tiene_diferenciacion_iva = any(
+        c not in ("", "0")
+        for c in [cuenta_gasto_exenta, cuenta_gasto_5, cuenta_gasto_19, cuenta_gasto_otros]
+    )
 
-    if iva_19_valor > 0:
-        imp = buscar_impuesto("IVA", 19)
-        agregar_linea(row, imp["cuenta"], iva_19_valor, "D", f"IVA19 {descripcion}", imp["codigo"])
+    if not tiene_diferenciacion_iva:
+        if base_gasto > 0:
+            agregar_linea(row, row["Cuenta_gasto"], base_gasto, "D", descripcion)
 
-    if iva_5_valor > 0:
-        imp = buscar_impuesto("IVA", 5)
-        agregar_linea(row, imp["cuenta"], iva_5_valor, "D", f"IVA5 {descripcion}", imp["codigo"])
+        if iva_19_valor > 0:
+            imp = buscar_impuesto("IVA", 19)
+            agregar_linea(row, imp["cuenta"], iva_19_valor, "D", f"IVA19 {descripcion}", imp["codigo"])
+
+        if iva_5_valor > 0:
+            imp = buscar_impuesto("IVA", 5)
+            agregar_linea(row, imp["cuenta"], iva_5_valor, "D", f"IVA5 {descripcion}", imp["codigo"])
+    else:
+        # Cuenta de gasto resuelta por bolsa de tarifa (columna específica del
+        # proveedor si está diligenciada; si no, cae a la Cuenta_gasto general).
+        cuenta_bucket = {
+            "exenta": cuenta_gasto_exenta or cuenta_gasto_base,
+            "5": cuenta_gasto_5 or cuenta_gasto_base,
+            "19": cuenta_gasto_19 or cuenta_gasto_base,
+            "otros": cuenta_gasto_otros or cuenta_gasto_base,
+        }
+
+        base_bruta = {
+            "exenta": redondear(max(float(row["BASE_EXENTA_TARIFA"]), 0.0)),
+            "5": redondear(max(float(row["BASE_5_TARIFA"]), 0.0)),
+            "19": redondear(max(float(row["BASE_19_TARIFA"]), 0.0)),
+            "otros": redondear(max(float(row["BASE_OTROS_TARIFA"]), 0.0)),
+        }
+        total_bruto = sum(base_bruta.values())
+
+        if total_bruto > 0:
+            # Cada bolsa lleva la base BRUTA exacta de sus líneas de Detallado
+            # (sin descontar el descuento de cabecera), para que el IVA de la
+            # 2408 dividido por tarifa cuadre exacto contra estas cuentas. El
+            # descuento de cabecera se contabiliza aparte, como línea adicional
+            # de crédito a la cuenta de la bolsa exenta (no toca 5%/19%).
+            for clave in ["exenta", "5", "19", "otros"]:
+                if base_bruta[clave] > 0:
+                    agregar_linea(row, cuenta_bucket[clave], base_bruta[clave], "D", descripcion)
+            if descuento_header > 0:
+                agregar_linea(
+                    row, cuenta_bucket["exenta"], descuento_header, "C", f"DESCUENTO {descripcion}"
+                )
+        elif base_gasto > 0:
+            # Sin desglose de línea disponible para esta factura (p. ej. no
+            # hay detalle asociado): toda la base cae en la Cuenta_gasto general.
+            agregar_linea(row, cuenta_gasto_base, base_gasto, "D", descripcion)
+
+        # IVA 19%/5%: si la cuenta de gasto de esa bolsa es de clase 5
+        # (Gastos), el IVA no es descontable para este proveedor y se lleva
+        # como mayor valor del gasto (línea adicional a la misma cuenta) en
+        # vez de a la cuenta de IVA descontable (2408).
+        if iva_19_valor > 0:
+            if cuenta_bucket["19"].startswith("5"):
+                agregar_linea(
+                    row, cuenta_bucket["19"], iva_19_valor, "D", f"IVA19 MAYOR VALOR GASTO {descripcion}"
+                )
+            else:
+                imp = buscar_impuesto("IVA", 19)
+                agregar_linea(row, imp["cuenta"], iva_19_valor, "D", f"IVA19 {descripcion}", imp["codigo"])
+
+        if iva_5_valor > 0:
+            if cuenta_bucket["5"].startswith("5"):
+                agregar_linea(
+                    row, cuenta_bucket["5"], iva_5_valor, "D", f"IVA5 MAYOR VALOR GASTO {descripcion}"
+                )
+            else:
+                imp = buscar_impuesto("IVA", 5)
+                agregar_linea(row, imp["cuenta"], iva_5_valor, "D", f"IVA5 {descripcion}", imp["codigo"])
 
     if inc_valor > 0:
         imp = buscar_impuesto("INC", 8)
