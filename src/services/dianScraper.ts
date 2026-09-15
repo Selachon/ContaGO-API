@@ -644,19 +644,36 @@ function notifyQueuePositions(): void {
  * recibe la posición (1 = siguiente) cada vez que la fila avanza.
  * Devuelve la función que libera el cupo (idempotente; llamarla en finally).
  */
+// Backstop ON por defecto (40 min): con MAX_DIAN_JOBS=1, un job que se cuelga
+// SIN pasar por browser (p.ej. generando el Excel, subiendo a Drive) también
+// bloqueaba la cola entera para siempre — el watchdog de navegador no lo
+// cubre porque su navegador ya se cerró bien. DIAN_JOB_MAX_HOLD_MS=0 (u "off")
+// desactiva explícitamente.
+const rawJobHoldMs = String(process.env.DIAN_JOB_MAX_HOLD_MS ?? "2400000").trim().toLowerCase();
+const dianJobMaxHoldMs = rawJobHoldMs === "0" || rawJobHoldMs === "off" ? 0 : Number(rawJobHoldMs) || 2400000;
+
 export function acquireDianJobSlot(onPosition?: (position: number) => void): Promise<() => void> {
   return new Promise((resolve) => {
     const grant = () => {
       activeDianJobs++;
       let released = false;
-      resolve(() => {
+      const release = () => {
         if (released) return;
         released = true;
+        if (holdTimer) clearTimeout(holdTimer);
         activeDianJobs--;
         const next = dianJobQueue.shift();
         if (next) next.grant();
         notifyQueuePositions();
-      });
+      };
+      const holdTimer = dianJobMaxHoldMs > 0
+        ? setTimeout(() => {
+            console.warn(`Job DIAN retenido > ${dianJobMaxHoldMs} ms; se fuerza la liberación del cupo de la cola.`);
+            release();
+          }, dianJobMaxHoldMs)
+        : null;
+      holdTimer?.unref();
+      resolve(release);
     };
     if (activeDianJobs < MAX_DIAN_JOBS) {
       grant();
@@ -875,6 +892,14 @@ export function startOrphanBrowserSweep(): void {
       sweepOrphanBrowsers();
     } catch (err) {
       console.warn(`Error en barrido de huérfanos: ${(err as Error)?.message || String(err)}`);
+    }
+    // Aviso temprano en logs: si hay cola formándose, se ve aquí antes de que
+    // un cliente reporte "se queda esperando" — sin esto solo se detectaba
+    // por reclamo de usuario.
+    const bs = getBrowserStats();
+    const js = getDianJobStats();
+    if (bs.queued > 0 || js.queued > 0) {
+      console.warn(`[DIAN pool] navegadores ${bs.active}/${bs.max} (cola ${bs.queued}) · jobs ${js.active}/${js.max} (cola ${js.queued})`);
     }
   }, intervalMs);
   // No mantener vivo el proceso solo por este timer.
@@ -1831,7 +1856,15 @@ async function hardenPageRuntime(page: Page): Promise<void> {
 export function registerManagedBrowser(browser: Browser, releaseSlot: () => void): void {
   (browser as BrowserWithSlot).__releaseSlot = releaseSlot;
 
-  const maxHoldMs = Number(process.env.BROWSER_MAX_HOLD_MS || 0);
+  // Backstop ON por defecto (30 min): un navegador que nunca se desconecta ni
+  // se cierra (página de DIAN colgada, hang en el job) retenía su cupo para
+  // siempre hasta el próximo restart manual — así toda la cola (ambas
+  // herramientas comparten el mismo pool) se veía "congelada" sin explicación.
+  // 30 min da margen de sobra a un job legítimo grande (cientos de docs);
+  // es último recurso, no un límite normal. BROWSER_MAX_HOLD_MS=0 (u "off")
+  // desactiva explícitamente; se puede subir por env si algún lote real lo roza.
+  const rawHoldMs = String(process.env.BROWSER_MAX_HOLD_MS ?? "1800000").trim().toLowerCase();
+  const maxHoldMs = rawHoldMs === "0" || rawHoldMs === "off" ? 0 : Number(rawHoldMs) || 1800000;
   const holdTimer = maxHoldMs > 0
     ? setTimeout(() => {
         console.warn(`Navegador retenido > ${maxHoldMs} ms; se fuerza el cierre para liberar el cupo.`);

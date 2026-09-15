@@ -11,7 +11,7 @@
  */
 
 import puppeteer, { type Browser, type Page } from "puppeteer";
-import { resolveExecutablePath, closeBrowserSafely, acquireBrowserSlot, registerManagedBrowser } from "./dianScraper.js";
+import { resolveExecutablePath, closeBrowserSafely, acquireBrowserSlot, registerManagedBrowser, getBrowserStats } from "./dianScraper.js";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -173,6 +173,13 @@ export async function authenticateAndNavigate(
   direction: "received" | "sent" = "received"
 ): Promise<{ browser: Browser; page: Page }> {
   progress({ step: "Iniciando navegador..." });
+  // Cupo compartido con dianScraper.ts: si ya está lleno, avisar que es cola y
+  // no un cuelgue — antes acquireBrowserSlot() esperaba en silencio y el
+  // usuario veía "Iniciando navegador..." congelado sin explicación.
+  const stats = getBrowserStats();
+  if (stats.active >= stats.max) {
+    progress({ step: "En cola, esperando un navegador disponible..." });
+  }
   const browser = await launchBrowser();
 
   try {
