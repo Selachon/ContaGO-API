@@ -184,36 +184,59 @@ export async function authenticateAndNavigate(
 
   try {
     // ── Página de autenticación (catalogo-vpfe) ──────────────────────────
-    const authPage = await browser.newPage();
-    await hardenPage(authPage);
-    authPage.setDefaultTimeout(60_000);
-
-    progress({ step: "Autenticando con DIAN..." });
-    await authPage.goto(tokenUrl, { waitUntil: "domcontentloaded" });
-
-    // Esperar que el AuthToken redirija (hasta 45s: en Railway el redirect de
-    // DIAN a veces tarda más que en local).
-    const ts = Date.now();
-    while (Date.now() - ts < 45_000) {
-      if (!/\/User\/AuthToken/i.test(authPage.url())) break;
-      await delay(1000);
-    }
-    if (/\/User\/AuthToken/i.test(authPage.url())) {
-      // Capturar qué devolvió realmente DIAN — clave para distinguir token
-      // expirado / IP distinta / captcha / mantenimiento desde los logs.
-      let diag = "";
+    // Con 1 solo intento, un crash puntual de Chromium justo tras el redirect
+    // (sesión CDP cerrada -> "Protocol error Network.getCookies: Session
+    // closed") tumbaba el job entero. El resto del scraper reintenta
+    // (navigateWithRetry, launchBrowserWithRetry); este paso no lo hacía.
+    let cookies: Awaited<ReturnType<Page["cookies"]>> = [];
+    let lastAuthErr: Error | null = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (!browser.isConnected()) {
+        throw lastAuthErr || new Error("El navegador se cerró inesperadamente antes de autenticar.");
+      }
+      let authPage: Page | null = null;
       try {
-        const title = await authPage.title();
-        const bodyText = (await authPage.evaluate(
-          () => (document.body ? document.body.innerText : "").replace(/\s+/g, " ").trim().slice(0, 400),
-        )) || "";
-        diag = ` [url=${authPage.url()} title="${title}" body="${bodyText}"]`;
-      } catch { /* página ya cerrada / navegando */ }
-      console.warn(`[dianRecibidos] AuthToken no redirigió.${diag}`);
-      throw new Error(`El token no redirigió — puede estar expirado, ya usado o generado desde otra IP.${diag}`);
+        authPage = await browser.newPage();
+        await hardenPage(authPage);
+        authPage.setDefaultTimeout(60_000);
+
+        progress({ step: attempt === 1 ? "Autenticando con DIAN..." : `Reintentando autenticación (${attempt}/2)...` });
+        await authPage.goto(tokenUrl, { waitUntil: "domcontentloaded" });
+
+        // Esperar que el AuthToken redirija (hasta 45s: en Railway el redirect de
+        // DIAN a veces tarda más que en local).
+        const ts = Date.now();
+        while (Date.now() - ts < 45_000) {
+          if (!/\/User\/AuthToken/i.test(authPage.url())) break;
+          await delay(1000);
+        }
+        if (/\/User\/AuthToken/i.test(authPage.url())) {
+          // Capturar qué devolvió realmente DIAN — clave para distinguir token
+          // expirado / IP distinta / captcha / mantenimiento desde los logs.
+          let diag = "";
+          try {
+            const title = await authPage.title();
+            const bodyText = (await authPage.evaluate(
+              () => (document.body ? document.body.innerText : "").replace(/\s+/g, " ").trim().slice(0, 400),
+            )) || "";
+            diag = ` [url=${authPage.url()} title="${title}" body="${bodyText}"]`;
+          } catch { /* página ya cerrada / navegando */ }
+          console.warn(`[dianRecibidos] AuthToken no redirigió.${diag}`);
+          // Token vencido/inválido no mejora reintentando: se rompe el loop ya.
+          throw Object.assign(new Error(`El token no redirigió — puede estar expirado, ya usado o generado desde otra IP.${diag}`), { noRetry: true });
+        }
+        await delay(2000);
+        cookies = await authPage.cookies();
+        lastAuthErr = null;
+        break;
+      } catch (err) {
+        lastAuthErr = err as Error;
+        try { await authPage?.close(); } catch { /* ya cerrada */ }
+        if ((err as { noRetry?: boolean })?.noRetry || attempt >= 2) throw lastAuthErr;
+        console.warn(`[dianRecibidos] Falló autenticación (intento ${attempt}/2): ${lastAuthErr.message}. Reintentando con página nueva.`);
+        await delay(2000);
+      }
     }
-    await delay(2000);
-    const cookies = await authPage.cookies();
 
     // ── Página endurecida para gratis-vpfe ──────────────────────────────
     const page = await browser.newPage();
