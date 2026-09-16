@@ -11,6 +11,25 @@ function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
   });
 }
 
+/**
+ * Base gravable real de una línea a partir del IVA declarado en el XML
+ * (TaxAmount / Percent), en vez de asumir que la base es el subtotal
+ * comercial (`totalUnitPrice` = LineExtensionAmount). Para productos con
+ * base especial (cigarrillos, licores: Ley 1819 — IC/impuesto al consumo
+ * excluido de la base de IVA), la base declarada por el emisor es bastante
+ * menor al subtotal comercial; usar el subtotal ahí infla la "Base de IVA"
+ * reportada (verificado: factura ALTIPAL sep-2026, base 19% inflada en
+ * $213.200 y base 5% en $27.728 por esta causa). Si no hay IVA en la línea
+ * (excluida/exenta), no hay de dónde reconstruir la base real: se usa el
+ * subtotal comercial tal cual, que sí es correcto en ese caso.
+ */
+function ivaBase(ivaTax: TaxDetail | undefined, fallback: number): number {
+  if (ivaTax && ivaTax.percent > 0 && ivaTax.amount > 0) {
+    return ivaTax.amount / (ivaTax.percent / 100);
+  }
+  return fallback;
+}
+
 function normalizeNit(nit: string | null | undefined): string {
   const raw = (nit || "").trim();
   if (!raw) return "N/A";
@@ -335,11 +354,12 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
     for (const li of inv.lineItems || []) {
       const td = Object.fromEntries((li.taxes || []).map((t) => [t.taxName, t]));
       const totalTax = (li.taxes || []).reduce((s, t) => s + t.amount, 0);
+      const baseImpuesto = ivaBase(td["IVA"], li.totalUnitPrice || 0);
 
       const rowData: any[] = [
         ...invCommon(itemIdx++, li.description || ""),
         li.quantity,             // J  Cantidad
-        li.totalUnitPrice,       // K  Base del impuesto
+        baseImpuesto,            // K  Base del impuesto
         li.discount,             // L  Descuento detalle
         li.surcharge,            // M  Recargo detalle
         ...buildTaxCols(td),
@@ -470,7 +490,7 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
 
     for (const li of inv.lineItems || []) {
       const ivaTax = (li.taxes || []).find(t => t.taxName === "IVA");
-      const base = li.totalUnitPrice || 0;
+      const base = ivaBase(ivaTax, li.totalUnitPrice || 0);
 
       if (!ivaTax) {
         baseSinIVA += base;
