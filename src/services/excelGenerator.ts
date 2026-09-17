@@ -1,5 +1,5 @@
 import ExcelJS from "exceljs";
-import type { InvoiceData, TaxDetail } from "../types/dianExcel.js";
+import type { InvoiceData, InvoiceLineItem, TaxDetail } from "../types/dianExcel.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -12,22 +12,29 @@ function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
 }
 
 /**
- * Base gravable real de una línea a partir del IVA declarado en el XML
- * (TaxAmount / Percent), en vez de asumir que la base es el subtotal
- * comercial (`totalUnitPrice` = LineExtensionAmount). Para productos con
- * base especial (cigarrillos, licores: Ley 1819 — IC/impuesto al consumo
- * excluido de la base de IVA), la base declarada por el emisor es bastante
- * menor al subtotal comercial; usar el subtotal ahí infla la "Base de IVA"
- * reportada (verificado: factura ALTIPAL sep-2026, base 19% inflada en
- * $213.200 y base 5% en $27.728 por esta causa). Si no hay IVA en la línea
- * (excluida/exenta), no hay de dónde reconstruir la base real: se usa el
- * subtotal comercial tal cual, que sí es correcto en ese caso.
+ * Base gravable real de una línea: usa `taxableBase` (el `TaxableAmount` que
+ * el propio emisor declara en el XML por línea), NO el subtotal comercial
+ * (`totalUnitPrice` = LineExtensionAmount). Para productos con base especial
+ * (cigarrillos, licores, cerveza: Ley 1819 — el IC/impuesto al consumo se
+ * excluye de la base de IVA) o con descuento comercial a nivel de factura
+ * completa, la base declarada es menor al subtotal comercial; usar el
+ * subtotal ahí infla la "Base de IVA" reportada (verificado con varias
+ * facturas reales, sep-2026: diferencias de $27.728 a $213.200 por factura).
+ *
+ * `taxableBase` ya lo parsea `xmlParser.ts` desde `cbc:TaxableAmount` — es el
+ * dato exacto, sin ningún cálculo nuestro de por medio. Reconstruirlo como
+ * `TaxAmount / (Percent/100)` (fix anterior) parecía equivalente pero no lo
+ * es: arrastra el redondeo a 2 decimales que cada línea ya tiene en el XML y
+ * puede quedar a 1-2 centavos del valor real declarado — suficiente para que
+ * la revisión "Base × tarifa = IVA" de un contador no cuadre exacto (factura
+ * de cerveza AGUILA, sep-2026). Solo se recurre a esa reconstrucción (o al
+ * subtotal comercial) cuando no hay `taxableBase` disponible, p.ej. facturas
+ * parseadas desde PDF en vez de XML.
  */
-function ivaBase(ivaTax: TaxDetail | undefined, fallback: number): number {
-  if (ivaTax && ivaTax.percent > 0 && ivaTax.amount > 0) {
-    return ivaTax.amount / (ivaTax.percent / 100);
-  }
-  return fallback;
+function ivaBase(li: Pick<InvoiceLineItem, "taxableBase" | "totalUnitPrice">, ivaTax: TaxDetail | undefined): number {
+  if (li.taxableBase && li.taxableBase > 0) return li.taxableBase;
+  if (ivaTax && ivaTax.percent > 0 && ivaTax.amount > 0) return ivaTax.amount / (ivaTax.percent / 100);
+  return li.totalUnitPrice || 0;
 }
 
 function normalizeNit(nit: string | null | undefined): string {
@@ -354,7 +361,7 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
     for (const li of inv.lineItems || []) {
       const td = Object.fromEntries((li.taxes || []).map((t) => [t.taxName, t]));
       const totalTax = (li.taxes || []).reduce((s, t) => s + t.amount, 0);
-      const baseImpuesto = ivaBase(td["IVA"], li.totalUnitPrice || 0);
+      const baseImpuesto = ivaBase(li, td["IVA"]);
 
       const rowData: any[] = [
         ...invCommon(itemIdx++, li.description || ""),
@@ -490,7 +497,7 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
 
     for (const li of inv.lineItems || []) {
       const ivaTax = (li.taxes || []).find(t => t.taxName === "IVA");
-      const base = ivaBase(ivaTax, li.totalUnitPrice || 0);
+      const base = ivaBase(li, ivaTax);
 
       if (!ivaTax) {
         baseSinIVA += base;
