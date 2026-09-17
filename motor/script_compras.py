@@ -151,7 +151,8 @@ renombrar_si_existe(
         "Cuenta Gasto Base Exenta": "Cuenta_gasto_exenta",
         "Cuenta Gasto Base 5%": "Cuenta_gasto_5",
         "Cuenta Gasto Base 19%": "Cuenta_gasto_19",
-        "Cuenta Gasto Otros Impuestos": "Cuenta_gasto_otros",
+        "Cuenta Gasto Base Otros Conceptos": "Cuenta_gasto_otros",
+        "Cuenta Gasto Otros Impuestos": "Cuenta_gasto_otros",  # nombre intermedio (antes de sep 2026)
     },
 )
 

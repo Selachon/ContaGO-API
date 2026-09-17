@@ -98,15 +98,22 @@ const COLUMNAS_TARIFA_IVA = [
   "Cuenta Gasto Base Exenta",
   "Cuenta Gasto Base 5%",
   "Cuenta Gasto Base 19%",
-  "Cuenta Gasto Otros Impuestos",
+  "Cuenta Gasto Base Otros Conceptos",
 ];
 
-/** Nombres técnicos usados antes de este cambio de UX (sep 2026): se migran solos. */
+/**
+ * Nombres usados antes de este cambio de UX (sep 2026): se migran solos.
+ * Incluye tanto los nombres técnicos originales (Cuenta_gasto_19, etc.) como
+ * el nombre intermedio "Cuenta Gasto Otros Impuestos" (se cambió porque se
+ * confundía visualmente con la columna ya existente "Cuenta_otros_impuestos",
+ * que es la cuenta del IMPUESTO de impoconsumo/bolsas, no la del gasto).
+ */
 const COLUMNAS_TARIFA_IVA_LEGACY: Record<string, string> = {
   Cuenta_gasto_exenta: "Cuenta Gasto Base Exenta",
   Cuenta_gasto_5: "Cuenta Gasto Base 5%",
   Cuenta_gasto_19: "Cuenta Gasto Base 19%",
-  Cuenta_gasto_otros: "Cuenta Gasto Otros Impuestos",
+  Cuenta_gasto_otros: "Cuenta Gasto Base Otros Conceptos",
+  "Cuenta Gasto Otros Impuestos": "Cuenta Gasto Base Otros Conceptos",
 };
 
 /**
