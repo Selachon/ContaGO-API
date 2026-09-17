@@ -46,8 +46,8 @@ const TABLA_SLOTS: TablaSlot[] = ["paramCompras", "paramVentas", "impuestos"];
  * un Excel primero, y para el botón de descarga de plantilla. Son exactamente
  * los nombres que el motor espera (o sus alias crudos que ya renombra solo:
  * en ventas, p.ej., "Cuenta_ingreso"/"Cuenta_por_cobrar"/"Cuenta_devolucion_ingreso").
- * Las columnas opcionales de diferenciación de IVA (Cuenta_gasto_exenta/_5/_19/
- * _otros) NO van aquí: son opt-in y se agregan a mano por empresa que las necesite.
+ * Las columnas opcionales de diferenciación de IVA (ver COLUMNAS_TARIFA_IVA)
+ * NO van aquí: son opt-in y solo se agregan al activar `cuentaGastoPorTarifaIva`.
  */
 const PLANTILLA_COLUMNAS: Record<TablaSlot, string[]> = {
   paramCompras: [
@@ -86,27 +86,71 @@ export function tablaPlantilla(slot: TablaSlot): Tabla {
   };
 }
 
-/** Columnas opcionales de diferenciación de gasto por tarifa de IVA (ver script_compras.py). */
-const COLUMNAS_TARIFA_IVA = ["Cuenta_gasto_exenta", "Cuenta_gasto_5", "Cuenta_gasto_19", "Cuenta_gasto_otros"];
+/**
+ * Columnas opcionales de diferenciación de gasto por tarifa de IVA. El nombre
+ * "de pantalla" (lo que ve y edita el usuario) es distinto del nombre técnico
+ * que espera el motor (Cuenta_gasto_exenta/_5/_19/_otros): script_compras.py
+ * las renombra al vuelo (mismo patrón que ya usa ventas con Cuenta_ingreso→
+ * Cuenta_gasto). Van agrupadas justo después de "Cuenta_gasto" para que no se
+ * confundan con ella ni queden sueltas al final de la tabla.
+ */
+const COLUMNAS_TARIFA_IVA = [
+  "Cuenta Gasto Base Exenta",
+  "Cuenta Gasto Base 5%",
+  "Cuenta Gasto Base 19%",
+  "Cuenta Gasto Otros Impuestos",
+];
+
+/** Nombres técnicos usados antes de este cambio de UX (sep 2026): se migran solos. */
+const COLUMNAS_TARIFA_IVA_LEGACY: Record<string, string> = {
+  Cuenta_gasto_exenta: "Cuenta Gasto Base Exenta",
+  Cuenta_gasto_5: "Cuenta Gasto Base 5%",
+  Cuenta_gasto_19: "Cuenta Gasto Base 19%",
+  Cuenta_gasto_otros: "Cuenta Gasto Otros Impuestos",
+};
 
 /**
  * Agrega las 4 columnas de diferenciación de IVA a `tabla` (paramCompras) si
- * no las tiene ya, sin tocar filas/valores existentes. No son "libres": es el
- * único punto donde se crean, ligado a activar `cuentaGastoPorTarifaIva`.
+ * no las tiene ya, agrupadas justo después de "Cuenta_gasto", sin tocar el
+ * resto de filas/valores. No son "libres": es el único punto donde se crean,
+ * ligado a activar `cuentaGastoPorTarifaIva`. También migra en el sitio los
+ * nombres técnicos antiguos (Cuenta_gasto_19, etc.) a los nuevos "de pantalla",
+ * preservando lo que ya se haya diligenciado.
  */
 function conColumnasTarifaIva(tabla: Tabla | undefined): Tabla {
-  const base = tabla && tabla.columns?.length ? tabla : tablaPlantilla("paramCompras");
-  const faltantes = COLUMNAS_TARIFA_IVA.filter((c) => !base.columns.includes(c));
-  if (!faltantes.length) return base;
-  return {
-    ...base,
-    columns: [...base.columns, ...faltantes],
-    rows: base.rows.map((r) => {
-      const nuevo = { ...r };
-      for (const c of faltantes) if (!(c in nuevo)) nuevo[c] = "";
+  let base = tabla && tabla.columns?.length ? tabla : tablaPlantilla("paramCompras");
+
+  // 1) Migra nombres técnicos antiguos a los nuevos "de pantalla" (preserva valores).
+  const legacyPresente = Object.keys(COLUMNAS_TARIFA_IVA_LEGACY).some((c) => base.columns.includes(c));
+  if (legacyPresente) {
+    const columns = base.columns.map((c) => COLUMNAS_TARIFA_IVA_LEGACY[c] || c);
+    const rows = base.rows.map((r) => {
+      const nuevo: typeof r = {};
+      for (const c of base.columns) nuevo[COLUMNAS_TARIFA_IVA_LEGACY[c] || c] = r[c];
       return nuevo;
-    }),
-  };
+    });
+    base = { ...base, columns, rows };
+  }
+
+  // 2) Agrega en blanco las que todavía no existan.
+  const faltantes = COLUMNAS_TARIFA_IVA.filter((c) => !base.columns.includes(c));
+  const rows = faltantes.length
+    ? base.rows.map((r) => {
+        const nuevo = { ...r };
+        for (const c of faltantes) if (!(c in nuevo)) nuevo[c] = "";
+        return nuevo;
+      })
+    : base.rows;
+
+  // 3) Reagrupa las 4 columnas justo después de "Cuenta_gasto" (en su orden
+  //    canónico), sin importar dónde hayan quedado antes (p. ej. al final,
+  //    si venían de una parametrización creada antes de este reordenamiento).
+  const resto = base.columns.filter((c) => !COLUMNAS_TARIFA_IVA.includes(c));
+  const idxGasto = resto.indexOf("Cuenta_gasto");
+  const insertAt = idxGasto >= 0 ? idxGasto + 1 : resto.length;
+  const columns = [...resto.slice(0, insertAt), ...COLUMNAS_TARIFA_IVA, ...resto.slice(insertAt)];
+
+  return { ...base, columns, rows };
 }
 
 /**

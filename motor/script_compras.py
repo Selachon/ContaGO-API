@@ -140,6 +140,21 @@ detalle.columns = detalle.columns.astype(str).str.strip()
 param.columns = param.columns.astype(str).str.strip()
 impuestos.columns = impuestos.columns.astype(str).str.strip()
 
+# Columnas opcionales de diferenciación de gasto por tarifa de IVA: el nombre
+# "de pantalla" que ve/edita el usuario en el portal es distinto del nombre
+# técnico interno que usa el resto del script (mismo patrón que ventas con
+# Cuenta_ingreso -> Cuenta_gasto). Sigue reconociendo también los nombres
+# técnicos crudos por si una parametrización antigua no se migró todavía.
+renombrar_si_existe(
+    param,
+    {
+        "Cuenta Gasto Base Exenta": "Cuenta_gasto_exenta",
+        "Cuenta Gasto Base 5%": "Cuenta_gasto_5",
+        "Cuenta Gasto Base 19%": "Cuenta_gasto_19",
+        "Cuenta Gasto Otros Impuestos": "Cuenta_gasto_otros",
+    },
+)
+
 # Ajuste de formato DIAN nuevo -> formato interno esperado
 renombrar_si_existe(
     facturas,
