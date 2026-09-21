@@ -10,8 +10,8 @@
  *  6. Por cada documento: GET XML (y opcionalmente PDF) con fetch + cookies.
  */
 
-import puppeteer, { type Browser, type Page } from "puppeteer";
-import { resolveExecutablePath, closeBrowserSafely, acquireBrowserSlot, registerManagedBrowser, getBrowserStats } from "./dianScraper.js";
+import { type Browser, type Page } from "puppeteer";
+import { resolveExecutablePath, closeBrowserSafely, launchBrowserWithRetry } from "./dianScraper.js";
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -79,36 +79,16 @@ function buildDtParams(start: number, length: number, draw: number, direction: "
 }
 
 /**
- * Lanza Chromium con los args mínimos necesarios, respetando el mismo cupo
- * compartido (`MAX_CONCURRENT_BROWSERS`) que usa dianScraper.ts. Sin esto,
- * este scraper podía sumar Chromiums sin límite por encima del cupo del
- * exportador Excel y agotar los PIDs/threads del contenedor.
+ * Lanza Chromium por el lanzador compartido de dianScraper.ts: mismo cupo
+ * (`MAX_CONCURRENT_BROWSERS`), mismos args y, sobre todo, los mismos
+ * reintentos con espera ante EAGAIN/ENOMEM. Antes este scraper hacía su propio
+ * `puppeteer.launch` de un solo intento, y cualquier fallo transitorio del
+ * arranque llegaba al usuario como "Failed to launch the browser process!".
  */
-async function launchBrowser(): Promise<Browser> {
-  const executablePath = resolveExecutablePath() ?? undefined;
-  const releaseSlot = await acquireBrowserSlot();
-  try {
-    const browser = await puppeteer.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-blink-features=AutomationControlled",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions",
-        "--no-first-run",
-        // NOTA: NO añadir "--single-process" (ver nota en dianScraper.ts):
-        // cuelga el arranque de Chromium hasta el timeout.
-      ],
-      executablePath,
-    });
-    registerManagedBrowser(browser, releaseSlot);
-    return browser;
-  } catch (err) {
-    releaseSlot();
-    throw err;
-  }
+async function launchBrowser(progress: ProgressCallback): Promise<Browser> {
+  return launchBrowserWithRetry(resolveExecutablePath(), (d) => {
+    if (d.step) progress({ step: d.step });
+  });
 }
 
 /** Limita a max 20 descargas por minuto de forma global por instancia. */
@@ -173,14 +153,7 @@ export async function authenticateAndNavigate(
   direction: "received" | "sent" = "received"
 ): Promise<{ browser: Browser; page: Page }> {
   progress({ step: "Iniciando navegador..." });
-  // Cupo compartido con dianScraper.ts: si ya está lleno, avisar que es cola y
-  // no un cuelgue — antes acquireBrowserSlot() esperaba en silencio y el
-  // usuario veía "Iniciando navegador..." congelado sin explicación.
-  const stats = getBrowserStats();
-  if (stats.active >= stats.max) {
-    progress({ step: "En cola, esperando un navegador disponible..." });
-  }
-  const browser = await launchBrowser();
+  const browser = await launchBrowser(progress);
 
   try {
     // ── Página de autenticación (catalogo-vpfe) ──────────────────────────

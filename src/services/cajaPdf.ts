@@ -3,8 +3,7 @@
  * HTML limpio con Puppeteer (headless). No depende del print del navegador, así
  * el PDF queda sin menús ni cromo del portal.
  */
-import puppeteer from "puppeteer";
-import { acquireBrowserSlot, registerManagedBrowser, closeBrowserSafely, resolveExecutablePath } from "./dianScraper.js";
+import { launchBrowserWithRetry, closeBrowserSafely, resolveExecutablePath } from "./dianScraper.js";
 
 const money = (n: number) => "$" + Math.round(Number(n) || 0).toLocaleString("es-CO");
 const esc = (s: unknown) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c] as string));
@@ -112,16 +111,8 @@ function buildHtml(data: CajaPdfData): string {
 
 export async function generarCajaPdf(data: CajaPdfData): Promise<Buffer> {
   const html = buildHtml(data);
-  // Comparte el cupo global de navegadores (MAX_CONCURRENT_BROWSERS) con los
-  // scrapers DIAN: sin esto, la generación de PDF podía sumar Chromiums por
-  // fuera del límite y contribuir al agotamiento de PIDs/threads del contenedor.
-  const releaseSlot = await acquireBrowserSlot();
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--no-first-run"],
-    executablePath: resolveExecutablePath() ?? undefined,
-  });
-  registerManagedBrowser(browser, releaseSlot);
+  // Lanzador compartido: cupo global de navegadores + reintentos ante EAGAIN.
+  const browser = await launchBrowserWithRetry(resolveExecutablePath(), () => {});
   try {
     const page = await browser.newPage();
     await page.setContent(html, { waitUntil: "networkidle0" });

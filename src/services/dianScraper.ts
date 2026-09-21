@@ -1887,7 +1887,26 @@ export function registerManagedBrowser(browser: Browser, releaseSlot: () => void
   openBrowsers.add(browser);
 }
 
-async function launchBrowserWithRetry(
+/**
+ * Foto de recursos del contenedor para diagnosticar fallos de arranque de
+ * Chromium sin acceso a la consola de Railway: distingue agotamiento de PIDs
+ * (EAGAIN) de falta de memoria. Lee cgroup v2 y, si no, v1; best-effort.
+ */
+function containerResourceSnapshot(): string {
+  const read = (p: string): string | null => {
+    try { return fs.readFileSync(p, "utf8").trim(); } catch { return null; }
+  };
+  const pidsCur = read("/sys/fs/cgroup/pids.current") ?? read("/sys/fs/cgroup/pids/pids.current");
+  const pidsMax = read("/sys/fs/cgroup/pids.max") ?? read("/sys/fs/cgroup/pids/pids.max");
+  const memCur = read("/sys/fs/cgroup/memory.current") ?? read("/sys/fs/cgroup/memory/memory.usage_in_bytes");
+  const memMax = read("/sys/fs/cgroup/memory.max") ?? read("/sys/fs/cgroup/memory/memory.limit_in_bytes");
+  let procs = "?";
+  try { procs = String(fs.readdirSync("/proc").filter((e) => /^\d+$/.test(e)).length); } catch { /* sin /proc */ }
+  const mb = (v: string | null) => (v && /^\d+$/.test(v) ? `${Math.round(Number(v) / 1048576)}MB` : v ?? "?");
+  return `pids=${pidsCur ?? "?"}/${pidsMax ?? "?"} procs=${procs} mem=${mb(memCur)}/${mb(memMax)} navegadores=${activeBrowsers}/${MAX_CONCURRENT_BROWSERS}`;
+}
+
+export async function launchBrowserWithRetry(
   executablePath: string | null,
   updateProgress: (data: Partial<ProgressData>) => void
 ): Promise<Browser> {
@@ -1947,7 +1966,7 @@ async function launchBrowserWithRetry(
       const isLastAttempt = attempt >= BROWSER_LAUNCH_RETRIES;
       const message = lastError.message || String(lastError);
 
-      console.warn(`Fallo iniciando navegador (intento ${attempt}/${BROWSER_LAUNCH_RETRIES}): ${message}`);
+      console.warn(`Fallo iniciando navegador (intento ${attempt}/${BROWSER_LAUNCH_RETRIES}): ${message} [${containerResourceSnapshot()}]`);
 
       if (isLastAttempt) {
         break;
