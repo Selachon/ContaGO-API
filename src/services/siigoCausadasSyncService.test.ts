@@ -37,9 +37,9 @@ mock.module("./siigoAccountingService.js", {
     },
   },
 });
-const { syncCausadasIfStale, syncCausadasNow, isCausadasSyncRunning } = await import("./siigoCausadasSyncService.js");
+const { syncCausadasIfStale, syncCausadasNow, isCausadasSyncRunning, backfillSiigoDocs } = await import("./siigoCausadasSyncService.js");
 
-const P = (id: string, over: Partial<Record<string, any>> = {}) => ({ id, name: `FC-1-${id}`, nit: "900123456", prefix: "FE", number: `10${id}`, date: "2026-09-10", created: "2026-09-11T00:00:00.000Z", total: 1000, ...over });
+const P = (id: string, over: Partial<Record<string, any>> = {}) => ({ id, name: `FC-1-${id}`, nit: "900123456", prefix: "FE", number: `10${id}`, date: "2026-09-10", created: "2026-09-11T00:00:00.000Z", total: 1000, siigoNumber: id, documentId: "9085", ...over });
 const registry = () => store.get("siigoIngestedCufes") ?? [];
 
 beforeEach(() => { store.clear(); fetchCalls = []; purchasesToReturn = []; siigoFails = false; });
@@ -103,4 +103,29 @@ test("empresas distintas se sincronizan de forma independiente", async () => {
   const rows = store.get("siigoIngestedCufes")!;
   assert.equal(rows.filter((d) => d.companyId === "c1").length, 1);
   assert.equal(rows.filter((d) => d.companyId === "c2").length, 1);
+});
+
+test("backfill: completa el comprobante de Siigo en las causadas que solo tenían siigoId, sin cambiar su estado", async () => {
+  store.set("siigoIngestedCufes", [
+    { companyId: "c1", cufe: "a", status: "caused", siigoId: "10", causedAt: "2026-07-01" },
+    { companyId: "c1", cufe: "b", status: "pending" },
+  ]);
+  purchasesToReturn = [P("10", { name: "FC-1-77", siigoNumber: "77", date: "2026-06-30", total: 555 })];
+  const r = await backfillSiigoDocs("c1", 6);
+  assert.equal(r.updated, 1);
+  const rows = store.get("siigoIngestedCufes")!;
+  assert.deepEqual(
+    { name: rows[0].siigoName, num: rows[0].siigoNumber, date: rows[0].siigoDate, total: rows[0].siigoTotal, status: rows[0].status, causedAt: rows[0].causedAt },
+    { name: "FC-1-77", num: "77", date: "2026-06-30", total: 555, status: "caused", causedAt: "2026-07-01" },
+  );
+  assert.equal(rows[1].status, "pending");
+  const six = new Date(); six.setMonth(six.getMonth() - 6);
+  assert.equal(fetchCalls[0], six.toISOString().slice(0, 10));
+});
+
+test("backfill: si no falta ningún comprobante NO llama a Siigo", async () => {
+  store.set("siigoIngestedCufes", [{ companyId: "c1", cufe: "a", status: "caused", siigoId: "10", siigoName: "FC-1-1" }]);
+  const r = await backfillSiigoDocs("c1");
+  assert.equal(r.updated, 0);
+  assert.equal(fetchCalls.length, 0);
 });

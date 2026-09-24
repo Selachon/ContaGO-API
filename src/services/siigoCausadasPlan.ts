@@ -19,6 +19,10 @@ export interface SiigoPurchaseLite {
   date: string;      // YYYY-MM-DD
   created: string;   // ISO de creación en Siigo
   total: number;
+  /** Consecutivo del comprobante en Siigo (p.ej. 1234 de FC-1-1234). */
+  siigoNumber: string;
+  /** Id del tipo de comprobante en Siigo. */
+  documentId: string;
 }
 
 /** Prefijo de los registros creados a partir de una compra de Siigo sin CUFE conocido. */
@@ -41,6 +45,8 @@ export function normalizePurchase(p: any): SiigoPurchaseLite | null {
     date: String(p?.date ?? "").slice(0, 10),
     created: String(p?.created ?? ""),
     total: Number(p?.total) || 0,
+    siigoNumber: p?.number != null ? String(p.number) : "",
+    documentId: p?.document?.id != null ? String(p.document.id) : "",
   };
 }
 
@@ -142,7 +148,7 @@ export function planCausadasSync(
     if (target) {
       plan.updates.push({
         cufe: target.cufe,
-        set: { status: "caused", siigoId: p.id, siigoName: p.name, causedAt: p.created || nowIso },
+        set: { status: "caused", siigoId: p.id, siigoName: p.name, siigoNumber: p.siigoNumber, siigoDocumentId: p.documentId, siigoDate: p.date, siigoTotal: p.total, causedAt: p.created || nowIso },
       });
       target.status = "caused";       // no reutilizar el mismo registro con otra compra
       target.siigoId = p.id;
@@ -167,8 +173,38 @@ export function planCausadasSync(
       causedAt: p.created || nowIso,
       siigoId: p.id,
       siigoName: p.name,
+      siigoNumber: p.siigoNumber,
+      siigoDocumentId: p.documentId,
+      siigoDate: p.date,
+      siigoTotal: p.total,
     });
     plan.inserted++;
+  }
+  return plan;
+}
+
+export interface DocBackfillPlan {
+  updates: Array<{ cufe: string; set: Record<string, unknown> }>;
+  /** Registros causados con siigoId que Siigo ya no devolvió (fuera de rango o borrados). */
+  notFound: number;
+}
+
+/**
+ * Completa, en los registros YA causados con siigoId, los datos del comprobante de Siigo
+ * (nombre, consecutivo, tipo, fecha, total). SOLO enriquece: nunca cambia el estado ni crea
+ * registros ni toca los que ya tienen su comprobante guardado.
+ */
+export function planSiigoDocBackfill(existing: DianInvoiceRecord[], purchases: SiigoPurchaseLite[]): DocBackfillPlan {
+  const byId = new Map(purchases.map((p) => [p.id, p]));
+  const plan: DocBackfillPlan = { updates: [], notFound: 0 };
+  for (const d of existing) {
+    if (d.status !== "caused" || !d.siigoId || d.siigoName) continue;
+    const p = byId.get(String(d.siigoId));
+    if (!p || !p.name) { plan.notFound++; continue; }
+    plan.updates.push({
+      cufe: d.cufe,
+      set: { siigoName: p.name, siigoNumber: p.siigoNumber, siigoDocumentId: p.documentId, siigoDate: p.date, siigoTotal: p.total },
+    });
   }
   return plan;
 }

@@ -11,7 +11,7 @@
  */
 import { getDb } from "./database.js";
 import { fetchSiigoPurchases } from "./siigoAccountingService.js";
-import { planCausadasSync } from "./siigoCausadasPlan.js";
+import { planCausadasSync, planSiigoDocBackfill } from "./siigoCausadasPlan.js";
 import type { DianInvoiceRecord } from "./siigoIngestedCufesService.js";
 
 const REGISTRY = "siigoIngestedCufes";
@@ -116,4 +116,30 @@ export async function syncCausadasIfStale(companyId: string, maxAgeMs = 10 * 60_
     console.warn(`[CausadasSync] ${companyId.slice(-6)} no se pudo sincronizar con Siigo:`, err instanceof Error ? err.message : err);
     return null;
   }
+}
+
+export interface DocBackfillResult { purchases: number; updated: number; notFound: number; since: string; ms: number }
+
+/**
+ * Completa los datos del comprobante de Siigo (nombre, consecutivo, fecha, total) en las
+ * facturas causadas de la empresa que solo guardaban el id. Es SOLO lectura en Siigo y
+ * SOLO enriquece el registro propio: no cambia estados ni crea facturas. Sirve para el
+ * histórico anterior a que el comprobante se guardara al causar.
+ */
+export async function backfillSiigoDocs(companyId: string, months = MONTHS_BACK): Promise<DocBackfillResult> {
+  const t0 = Date.now();
+  const db = getDb();
+  const since = (() => { const d = new Date(); d.setMonth(d.getMonth() - Math.min(Math.max(1, months), 36)); return d.toISOString().slice(0, 10); })();
+  const existing = (await db.collection<any>(REGISTRY).find({ companyId, status: "caused" }, { projection: { _id: 0 } }).toArray()) as DianInvoiceRecord[];
+  if (!existing.some((d) => d.siigoId && !d.siigoName)) return { purchases: 0, updated: 0, notFound: 0, since, ms: Date.now() - t0 };
+  const purchases = await fetchSiigoPurchases(since);
+  const plan = planSiigoDocBackfill(existing, purchases);
+  if (plan.updates.length > 0) {
+    await db.collection<any>(REGISTRY).bulkWrite(
+      plan.updates.map((u) => ({ updateOne: { filter: { companyId, cufe: u.cufe }, update: { $set: u.set } } })),
+      { ordered: false },
+    );
+  }
+  console.log(`[CausadasSync] ${companyId.slice(-6)} backfill de comprobantes desde ${since}: ${plan.updates.length} completados · ${plan.notFound} sin comprobante en Siigo (${Date.now() - t0} ms)`);
+  return { purchases: purchases.length, updated: plan.updates.length, notFound: plan.notFound, since, ms: Date.now() - t0 };
 }

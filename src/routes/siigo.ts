@@ -68,7 +68,7 @@ const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, taxRequiredItemIndex, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import { ingestFromDian, ingestNewByDateRange, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
 import { recordIngestedCufes, markCausedInSiigo, markIgnoredInDian, markPendingInDian, listDianInvoices, type CausedMeta } from "../services/siigoIngestedCufesService.js";
-import { syncCausadasIfStale, syncCausadasNow, isCausadasSyncRunning } from "../services/siigoCausadasSyncService.js";
+import { syncCausadasIfStale, syncCausadasNow, isCausadasSyncRunning, backfillSiigoDocs } from "../services/siigoCausadasSyncService.js";
 import { SIIGO_CUFE_PREFIX } from "../services/siigoCausadasPlan.js";
 import { parseListingRecordsFromExportZip } from "../services/dianScraper.js";
 import {
@@ -505,6 +505,19 @@ async function persistCaused(companyId: string | undefined, cufe: string | undef
   }
 }
 
+/** Comprobante que Siigo devuelve al causar (compra o nota), tal como se guarda ligado al CUFE. */
+function siigoDocFrom(result: any, causedType: string, userId?: string): CausedMeta {
+  return {
+    siigoName: result?.name ? String(result.name) : undefined,
+    siigoNumber: result?.number != null ? String(result.number) : undefined,
+    siigoDocumentId: result?.document?.id != null ? String(result.document.id) : undefined,
+    siigoDate: result?.date ? String(result.date).slice(0, 10) : undefined,
+    siigoTotal: Number(result?.total) || undefined,
+    causedBy: userId,
+    causedType,
+  };
+}
+
 /** Datos de la factura que la pantalla envía junto con la causación (todos opcionales). */
 function causedMetaFrom(body: any, extra: CausedMeta): CausedMeta {
   const m = body?.meta && typeof body.meta === "object" ? body.meta : {};
@@ -516,6 +529,12 @@ function causedMetaFrom(body: any, extra: CausedMeta): CausedMeta {
     issueDate: str(m.issueDate) || extra.issueDate,
     total: extra.total,
     siigoName: extra.siigoName,
+    siigoNumber: extra.siigoNumber,
+    siigoDocumentId: extra.siigoDocumentId,
+    siigoDate: extra.siigoDate,
+    siigoTotal: extra.siigoTotal,
+    causedBy: extra.causedBy,
+    causedType: extra.causedType,
   };
 }
 
@@ -2232,7 +2251,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         supplierNit: String((payload as any).supplier?.identification || ""),
         issueDate: String((payload as any).date || "").slice(0, 10),
         total: Number((result as any)?.total) || undefined,
-        siigoName: (result as any)?.name ? String((result as any).name) : undefined,
+        ...siigoDocFrom(result, "FC", req.user?.userId),
       }));
 
       return res.json({ ok: true, data: result });
@@ -2316,7 +2335,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const ncSiigoId = (result as any)?.id ? String((result as any).id) : undefined;
       await persistCaused(req.header("X-Siigo-Company"), typeof ncCufe === "string" ? ncCufe : undefined, ncSiigoId, causedMetaFrom({ meta: ncMeta }, {
         issueDate: String((payload as any).date || "").slice(0, 10),
-        siigoName: (result as any)?.name ? String((result as any).name) : undefined,
+        ...siigoDocFrom(result, "NC", req.user?.userId),
       }));
       return res.json({ ok: true, data: result });
     } catch (error) {
@@ -2406,11 +2425,11 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     const companyId = req.header("X-Siigo-Company");
     if (!companyId) return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
     const status = (req.query.status as string) || "all";
-    // Antes de listar se cruza con Siigo (fuente de verdad) para que toda factura ya
-    // causada aparezca en "Causadas", se haya causado por donde se haya causado.
-    // Espera a lo sumo CAUSADAS_SYNC_WAIT_MS; si Siigo tarda o falla se responde con lo
+    // Cruce opcional con Siigo (facturas causadas por fuera de ContaGO). Espera a lo sumo CAUSADAS_SYNC_WAIT_MS; si Siigo tarda o falla se responde con lo
     // que hay (la sincronización termina en segundo plano y la siguiente carga la trae).
-    if (req.query.sync !== "0") {
+    // Por defecto NO: la fuente de verdad es nuestro registro (se guarda el comprobante de Siigo
+    // ligado al CUFE al causar). Se activa con CAUSADAS_SYNC_ENABLED=1 o `?sync=1`.
+    if (req.query.sync === "1" || (process.env.CAUSADAS_SYNC_ENABLED === "1" && req.query.sync !== "0")) {
       const waitMs = Math.max(1000, Number(process.env.CAUSADAS_SYNC_WAIT_MS || 25_000));
       let timer: NodeJS.Timeout | undefined;
       await Promise.race([
@@ -2421,6 +2440,19 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     }
     const invoices = await listDianInvoices(companyId, status as any).catch(() => []);
     return res.json({ ok: true, invoices, syncing: isCausadasSyncRunning(companyId) });
+  });
+
+  // Completa el comprobante de Siigo (nombre, consecutivo, fecha) de las causadas anteriores a que se
+  // guardara al causar. Solo lectura en Siigo y solo enriquece; body opcional { months } (1-36).
+  router.post("/accounting/dian-invoices/backfill-siigo-docs", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
+    try {
+      const result = await backfillSiigoDocs(companyId, Number(req.body?.months) || undefined);
+      return res.json({ ok: true, result });
+    } catch (error) {
+      return res.status(502).json({ ok: false, message: error instanceof Error ? error.message : "No se pudo completar desde Siigo." });
+    }
   });
 
   // Fuerza el cruce con Siigo ahora (completo si full=true) y devuelve el resumen.

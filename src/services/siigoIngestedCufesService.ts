@@ -21,6 +21,18 @@ export interface DianInvoiceRecord {
   siigoId?: string;
   /** Nombre del comprobante en Siigo (p.ej. "FC-1-123"). */
   siigoName?: string;
+  /** Consecutivo del comprobante en Siigo. */
+  siigoNumber?: string;
+  /** Id del tipo de comprobante en Siigo. */
+  siigoDocumentId?: string;
+  /** Fecha del comprobante en Siigo (YYYY-MM-DD). */
+  siigoDate?: string;
+  /** Total del comprobante en Siigo. */
+  siigoTotal?: number;
+  /** Usuario de ContaGO que la causó. */
+  causedBy?: string;
+  /** Tipo de comprobante causado desde ContaGO: FC (compra) o NC (nota crédito). */
+  causedType?: string;
 }
 
 /**
@@ -101,6 +113,12 @@ export interface CausedMeta {
   issueDate?: string;
   total?: number;
   siigoName?: string;
+  siigoNumber?: string;
+  siigoDocumentId?: string;
+  siigoDate?: string;
+  siigoTotal?: number;
+  causedBy?: string;
+  causedType?: string;
 }
 
 /**
@@ -121,6 +139,12 @@ export async function markCausedInSiigo(
   const set: Record<string, unknown> = { status: "caused", causedAt: now };
   if (siigoId) set.siigoId = siigoId;
   if (meta.siigoName) set.siigoName = meta.siigoName;
+  if (meta.siigoNumber) set.siigoNumber = meta.siigoNumber;
+  if (meta.siigoDocumentId) set.siigoDocumentId = meta.siigoDocumentId;
+  if (meta.siigoDate) set.siigoDate = meta.siigoDate;
+  if (meta.siigoTotal) set.siigoTotal = meta.siigoTotal;
+  if (meta.causedBy) set.causedBy = meta.causedBy;
+  if (meta.causedType) set.causedType = meta.causedType;
   if (meta.docnum) set.docnum = meta.docnum;
   if (meta.supplierNit) set.supplierNit = meta.supplierNit;
   if (meta.supplierName) set.supplierName = meta.supplierName;
@@ -221,7 +245,7 @@ export async function adoptSyntheticCaused(
     if (!match) continue;
     await col.updateOne(
       { companyId, cufe: inv.cufe },
-      { $set: { status: "caused", causedAt: match.causedAt, siigoId: match.siigoId, ...(match.siigoName ? { siigoName: match.siigoName } : {}) } }
+      { $set: { status: "caused", causedAt: match.causedAt, siigoId: match.siigoId, ...Object.fromEntries(["siigoName", "siigoNumber", "siigoDocumentId", "siigoDate", "siigoTotal", "causedBy", "causedType"].filter((k) => match[k] != null && match[k] !== "").map((k) => [k, match[k]])) } }
     );
     await col.deleteOne({ companyId, cufe: match.cufe });
     synth.splice(synth.indexOf(match), 1);

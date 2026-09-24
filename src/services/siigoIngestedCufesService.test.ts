@@ -108,3 +108,22 @@ test("las causadas de una empresa no aparecen en otra", async () => {
   await svc.markCausedInSiigo("c1", "a", "1", { docnum: "FE1", supplierNit: "9001" });
   assert.equal((await svc.listDianInvoices("c2", "all")).length, 0);
 });
+
+test("al causar se guarda el comprobante de Siigo completo ligado al CUFE", async () => {
+  await svc.markCausedInSiigo("c1", "cufeX", "S9", { docnum: "FE1", supplierNit: "9001", issueDate: "2026-07-05", siigoName: "FC-1-321", siigoNumber: "321", siigoDocumentId: "9085", siigoDate: "2026-07-05", siigoTotal: 119000, causedBy: "u1", causedType: "FC" });
+  const [r] = await svc.listDianInvoices("c1", "caused");
+  assert.deepEqual(
+    { n: r.siigoName, num: r.siigoNumber, doc: r.siigoDocumentId, d: r.siigoDate, t: r.siigoTotal, by: r.causedBy, type: r.causedType, id: r.siigoId },
+    { n: "FC-1-321", num: "321", doc: "9085", d: "2026-07-05", t: 119000, by: "u1", type: "FC", id: "S9" },
+  );
+});
+
+test("la adopción hereda el comprobante completo de Siigo", async () => {
+  await svc.markCausedInSiigo("c1", "siigo:5", "5", { docnum: "FE77", supplierNit: "9001", siigoName: "FC-1-9", siigoNumber: "9", siigoDate: "2026-06-01", causedBy: "u2" });
+  await svc.upsertDianInvoices("c1", [{ cufe: "real", docnum: "FE77", supplierNit: "9001" }]);
+  const list = await svc.listDianInvoices("c1", "all");
+  assert.equal(list.length, 1);
+  assert.equal(list[0].siigoName, "FC-1-9");
+  assert.equal(list[0].siigoNumber, "9");
+  assert.equal(list[0].causedBy, "u2");
+});

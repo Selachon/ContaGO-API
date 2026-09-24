@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { matchesCaused, nitKey, normalizePurchase, planCausadasSync, sameInvoiceNumber, type SiigoPurchaseLite } from "./siigoCausadasPlan.js";
+import { matchesCaused, nitKey, normalizePurchase, planCausadasSync, planSiigoDocBackfill, sameInvoiceNumber, type SiigoPurchaseLite } from "./siigoCausadasPlan.js";
 import type { DianInvoiceRecord } from "./siigoIngestedCufesService.js";
 
 const NOW = "2026-09-25T10:00:00.000Z";
@@ -8,12 +8,12 @@ const rec = (o: Partial<DianInvoiceRecord> & { cufe: string }): DianInvoiceRecor
   companyId: "c1", docnum: "", status: "pending", supplierNit: "", ingestedAt: NOW, ...o,
 });
 const purchase = (o: Partial<SiigoPurchaseLite> & { id: string }): SiigoPurchaseLite => ({
-  name: "FC-1-1", nit: "", prefix: "", number: "", date: "2026-09-10", created: "2026-09-11T00:00:00.000Z", total: 0, ...o,
+  name: "FC-1-1", nit: "", prefix: "", number: "", date: "2026-09-10", created: "2026-09-11T00:00:00.000Z", total: 0, siigoNumber: "", documentId: "", ...o,
 });
 
 test("normalizePurchase: NIT sin DV, número del proveedor y fecha", () => {
-  const p = normalizePurchase({ id: 77, name: "FC-1-9", supplier: { identification: "900123456-7" }, provider_invoice: { prefix: "SETP", number: "990001234" }, date: "2026-09-10T00:00:00", created: "2026-09-11T08:00:00Z", total: "119000" });
-  assert.deepEqual(p, { id: "77", name: "FC-1-9", nit: "900123456", prefix: "SETP", number: "990001234", date: "2026-09-10", created: "2026-09-11T08:00:00Z", total: 119000 });
+  const p = normalizePurchase({ id: 77, name: "FC-1-9", supplier: { identification: "900123456-7" }, number: 9, document: { id: 9085 }, provider_invoice: { prefix: "SETP", number: "990001234" }, date: "2026-09-10T00:00:00", created: "2026-09-11T08:00:00Z", total: "119000" });
+  assert.deepEqual(p, { id: "77", name: "FC-1-9", nit: "900123456", prefix: "SETP", number: "990001234", date: "2026-09-10", created: "2026-09-11T08:00:00Z", total: 119000, siigoNumber: "9", documentId: "9085" });
   assert.equal(normalizePurchase({ name: "sin id" }), null);
 });
 
@@ -30,7 +30,8 @@ test("compra de Siigo que coincide con una factura pendiente del registro: se ma
   const plan = planCausadasSync("c1", existing, [purchase({ id: "10", name: "FC-1-55", nit: "900123456", prefix: "SETP", number: "990001234" })], NOW);
   assert.equal(plan.updated, 1);
   assert.equal(plan.inserted, 0);
-  assert.deepEqual(plan.updates[0], { cufe: "cufe1", set: { status: "caused", siigoId: "10", siigoName: "FC-1-55", causedAt: "2026-09-11T00:00:00.000Z" } });
+  assert.equal(plan.updates[0].cufe, "cufe1");
+  assert.deepEqual(plan.updates[0].set, { status: "caused", siigoId: "10", siigoName: "FC-1-55", siigoNumber: "", siigoDocumentId: "", siigoDate: "2026-09-10", siigoTotal: 0, causedAt: "2026-09-11T00:00:00.000Z" });
 });
 
 test("compra causada por fuera de ContaGO (sin registro): se crea causada con cufe sintético y el nombre del proveedor si se conoce", () => {
@@ -97,4 +98,18 @@ test("matchesCaused: factura ya causada se detecta; nota crédito y otro proveed
   assert.ok(matchesCaused(index, { supplierNit: "800000001", docNumberRaw: "AB5555", providerInvoicePrefix: "AB", providerInvoiceNumber: "5555" }), "registro de Siigo sin prefijo: por dígitos");
   assert.ok(!matchesCaused(index, { supplierNit: "900123456", docNumberRaw: "SETP990001235", providerInvoiceNumber: "990001235" }));
   assert.equal(nitKey("900.123.456-7"), "900123456");
+});
+
+test("backfill: completa el comprobante de Siigo en causadas que solo tenían siigoId; no toca estado ni las que ya lo tienen", () => {
+  const existing = [
+    rec({ cufe: "a", status: "caused", siigoId: "10" }),
+    rec({ cufe: "b", status: "caused", siigoId: "11", siigoName: "FC-1-2" }),   // ya tiene comprobante
+    rec({ cufe: "c", status: "pending" }),                                        // no causada
+    rec({ cufe: "d", status: "caused", siigoId: "99" }),                          // Siigo ya no la devolvió
+  ];
+  const plan = planSiigoDocBackfill(existing, [purchase({ id: "10", name: "FC-1-55", siigoNumber: "55", documentId: "9085", date: "2026-06-30", total: 1234 }), purchase({ id: "11", name: "FC-1-2" })]);
+  assert.equal(plan.updates.length, 1);
+  assert.deepEqual(plan.updates[0], { cufe: "a", set: { siigoName: "FC-1-55", siigoNumber: "55", siigoDocumentId: "9085", siigoDate: "2026-06-30", siigoTotal: 1234 } });
+  assert.equal(plan.notFound, 1);
+  assert.ok(!("status" in plan.updates[0].set), "nunca cambia el estado");
 });
