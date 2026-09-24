@@ -6,7 +6,8 @@ import {
 } from "./dianScraper.js";
 import { authenticateAndNavigate, applyReceivedDateFilter, fetchDocumentList, downloadXmlFile, type RecibidoDocument } from "./dianRecibidosScraper.js";
 import { processXmlBatch, type BatchItem } from "./siigoAccountingService.js";
-import { getIngestedCufes, upsertDianInvoices } from "./siigoIngestedCufesService.js";
+import { getIngestedCufes, upsertDianInvoices, getCausedInvoiceIndex } from "./siigoIngestedCufesService.js";
+import { matchesCaused } from "./siigoCausadasPlan.js";
 import type { DocumentDirection, ProgressData } from "../types/dian.js";
 
 const GRATIS_VPFE = "https://gratis-vpfe.dian.gov.co";
@@ -306,6 +307,24 @@ async function downloadCufesGratisVpfe(
  * de ZIP. DEBE invocarse dentro del contexto de empresa (runWithSiigoCompany)
  * porque `processXmlBatch` consulta Siigo para detectar facturas ya causadas.
  */
+/**
+ * Marca `alreadyCausada` en las facturas recién descargadas que YA están causadas
+ * (registro DIAN o compras de Siigo sincronizadas, mismo NIT + folio). La pantalla las
+ * omite de la tabla de pendientes y las cuenta; el registro las adopta como causadas.
+ * Solo usa el registro local (sin llamar a Siigo) y nunca falla la ingesta.
+ */
+async function flagAlreadyCausada(companyId: string, items: BatchItem[]): Promise<void> {
+  try {
+    const index = await getCausedInvoiceIndex(companyId);
+    if (index.length === 0) return;
+    for (const it of items) {
+      if (it.ok && it.xml && matchesCaused(index, it.xml)) it.alreadyCausada = true;
+    }
+  } catch (e) {
+    console.warn("[Siigo Ingest] flagAlreadyCausada falló:", e instanceof Error ? e.message : e);
+  }
+}
+
 export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult> {
   if (opts.isCancelled?.()) {
     return { items: [], stats: { listed: 0, alreadyRegistered: 0, downloaded: 0, failed: 0, rounds: 0 }, failures: [] };
@@ -403,6 +422,7 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
     });
 
     const items = await processXmlBatch(allFiles);
+    await flagAlreadyCausada(opts.companyId, items);
 
     // Persistir facturas descargadas en la tabla de seguimiento DIAN.
     const now = new Date().toISOString();
@@ -536,6 +556,7 @@ export async function ingestNewByDateRange(opts: {
 
       opts.onProgress?.({ step: "Procesando XML para contabilización...", current: 0, total: files.length });
       const items = await processXmlBatch(files);
+      await flagAlreadyCausada(opts.companyId, items);
 
       const now = new Date().toISOString();
       await upsertDianInvoices(opts.companyId, items.filter((it) => it.xml).map((it) => ({

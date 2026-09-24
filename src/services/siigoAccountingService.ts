@@ -12,6 +12,7 @@ import {
   SiigoError,
 } from "./siigoService.js";
 import { getSupplierProfile, listLocalSupplierIndex, type SupplierProfile } from "./siigoSuggestionsService.js";
+import { normalizePurchase, type SiigoPurchaseLite } from "./siigoCausadasPlan.js";
 
 /** Impuesto extra (ICL, IBUA, IC, Bolsas…) de una línea del XML. */
 export interface XmlExtraTax {
@@ -421,6 +422,24 @@ async function fetchCausadasKeys(): Promise<Set<string>> {
     }
   }
   return keys;
+}
+
+/**
+ * Compras (FC) de Siigo creadas desde `createdStart` (YYYY-MM-DD), ya normalizadas.
+ * Pagina hasta agotar resultados (tope de seguridad de `maxPages` páginas de 100).
+ */
+export async function fetchSiigoPurchases(createdStart: string, maxPages = 200): Promise<SiigoPurchaseLite[]> {
+  const out: SiigoPurchaseLite[] = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const resp = (await listPurchases({ created_start: createdStart, page, page_size: 100 })) as any;
+    const results: any[] = Array.isArray(resp?.results) ? resp.results : [];
+    for (const r of results) {
+      const p = normalizePurchase(r);
+      if (p) out.push(p);
+    }
+    if (results.length < 100) break;
+  }
+  return out;
 }
 
 export async function processXmlBatch(

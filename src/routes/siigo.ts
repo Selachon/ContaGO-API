@@ -67,7 +67,9 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, taxRequiredItemIndex, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import { ingestFromDian, ingestNewByDateRange, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
-import { recordIngestedCufes, markCausedInSiigo, markIgnoredInDian, markPendingInDian, listDianInvoices } from "../services/siigoIngestedCufesService.js";
+import { recordIngestedCufes, markCausedInSiigo, markIgnoredInDian, markPendingInDian, listDianInvoices, type CausedMeta } from "../services/siigoIngestedCufesService.js";
+import { syncCausadasIfStale, syncCausadasNow, isCausadasSyncRunning } from "../services/siigoCausadasSyncService.js";
+import { SIIGO_CUFE_PREFIX } from "../services/siigoCausadasPlan.js";
 import { parseListingRecordsFromExportZip } from "../services/dianScraper.js";
 import {
   parseBankExcel,
@@ -480,6 +482,43 @@ async function withSiigoCompany(req: Request, res: Response, next: NextFunction)
 // Re-aplica el contexto de empresa DENTRO del handler. Necesario tras multer,
 // que puede romper el AsyncLocalStorage fijado por withSiigoCompany y hacer que
 // los datos se guarden bajo la empresa equivocada (namespace "env").
+/**
+ * Deja constancia de que una factura quedó causada en Siigo. Se ESPERA (con un
+ * reintento) en vez de dispararse y olvidarse: un fallo silencioso aquí era
+ * justo lo que dejaba facturas causadas fuera de la pestaña "Causadas". Si aun así
+ * falla no rompe la causación (que ya ocurrió en Siigo): queda en el log y la
+ * sincronización periódica con Siigo la recupera.
+ * Sin CUFE (p.ej. factura cargada desde PDF) se registra con `siigo:<id>`.
+ */
+async function persistCaused(companyId: string | undefined, cufe: string | undefined, siigoId: string | undefined, meta: CausedMeta): Promise<void> {
+  if (!companyId) return;
+  const key = cufe || (siigoId ? `${SIIGO_CUFE_PREFIX}${siigoId}` : "");
+  if (!key) return;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await markCausedInSiigo(companyId, key, siigoId, meta);
+      return;
+    } catch (err) {
+      console.error(`[SiigoAccounting] No se pudo registrar como causada (${key.slice(0, 20)}..., intento ${attempt}/2):`, err instanceof Error ? err.message : err);
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+}
+
+/** Datos de la factura que la pantalla envía junto con la causación (todos opcionales). */
+function causedMetaFrom(body: any, extra: CausedMeta): CausedMeta {
+  const m = body?.meta && typeof body.meta === "object" ? body.meta : {};
+  const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  return {
+    docnum: str(m.docnum) || extra.docnum,
+    supplierNit: str(m.supplierNit) || extra.supplierNit,
+    supplierName: str(m.supplierName) || extra.supplierName,
+    issueDate: str(m.issueDate) || extra.issueDate,
+    total: extra.total,
+    siigoName: extra.siigoName,
+  };
+}
+
 async function runInCompanyCtx<T>(req: Request, fn: () => Promise<T> | T): Promise<T> {
   const companyId = (req as any).user?.isPortal
     ? (req as any).user?.caPortalCompanyId
@@ -2184,12 +2223,17 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       const result = await submitToSiigo(type, payload);
       console.log(`[SiigoAccounting] Submission SUCCESS for ${payload.supplier?.identification}`);
 
-      // Marcar CUFE como causado en la tabla de seguimiento DIAN
+      // Marcar la factura como causada en la tabla de seguimiento DIAN (pestaña "Causadas")
       const companyId = req.header("X-Siigo-Company");
-      if (companyId && cufe) {
-        const siigoId = (result as any)?.id ? String((result as any).id) : undefined;
-        markCausedInSiigo(companyId, cufe, siigoId).catch(() => {});
-      }
+      const siigoId = (result as any)?.id ? String((result as any).id) : undefined;
+      const pi = (payload as any).provider_invoice || {};
+      await persistCaused(companyId, cufe, siigoId, causedMetaFrom(req.body, {
+        docnum: `${pi.prefix || ""}${pi.number || ""}`,
+        supplierNit: String((payload as any).supplier?.identification || ""),
+        issueDate: String((payload as any).date || "").slice(0, 10),
+        total: Number((result as any)?.total) || undefined,
+        siigoName: (result as any)?.name ? String((result as any).name) : undefined,
+      }));
 
       return res.json({ ok: true, data: result });
     } catch (error) {
@@ -2262,11 +2306,18 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
 
   router.post("/accounting/credit-note-journal", async (req: Request, res: Response) => {
     try {
-      const payload = req.body as JournalPayload;
+      // `cufe` y `meta` son de ContaGO (registro de causadas), no van a Siigo.
+      const { cufe: ncCufe, meta: ncMeta, ...journalBody } = req.body as JournalPayload & { cufe?: string; meta?: unknown };
+      const payload = journalBody as JournalPayload;
       const errors = validateIncomeJournal(payload);
       if (errors.length) return res.status(400).json({ ok: false, message: errors.join(" | ") });
       console.log(`[SiigoJournal] NC → journal: ${payload.items.length} partidas | doc ${payload.document.id}`);
       const result = await runInCompanyCtx(req, () => submitIncomeJournal(payload));
+      const ncSiigoId = (result as any)?.id ? String((result as any).id) : undefined;
+      await persistCaused(req.header("X-Siigo-Company"), typeof ncCufe === "string" ? ncCufe : undefined, ncSiigoId, causedMetaFrom({ meta: ncMeta }, {
+        issueDate: String((payload as any).date || "").slice(0, 10),
+        siigoName: (result as any)?.name ? String((result as any).name) : undefined,
+      }));
       return res.json({ ok: true, data: result });
     } catch (error) {
       const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
@@ -2355,8 +2406,33 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     const companyId = req.header("X-Siigo-Company");
     if (!companyId) return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
     const status = (req.query.status as string) || "all";
+    // Antes de listar se cruza con Siigo (fuente de verdad) para que toda factura ya
+    // causada aparezca en "Causadas", se haya causado por donde se haya causado.
+    // Espera a lo sumo CAUSADAS_SYNC_WAIT_MS; si Siigo tarda o falla se responde con lo
+    // que hay (la sincronización termina en segundo plano y la siguiente carga la trae).
+    if (req.query.sync !== "0") {
+      const waitMs = Math.max(1000, Number(process.env.CAUSADAS_SYNC_WAIT_MS || 25_000));
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        syncCausadasIfStale(companyId, req.query.refresh === "1" ? 0 : undefined),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, waitMs); }),
+      ]);
+      if (timer) clearTimeout(timer);
+    }
     const invoices = await listDianInvoices(companyId, status as any).catch(() => []);
-    return res.json({ ok: true, invoices });
+    return res.json({ ok: true, invoices, syncing: isCausadasSyncRunning(companyId) });
+  });
+
+  // Fuerza el cruce con Siigo ahora (completo si full=true) y devuelve el resumen.
+  router.post("/accounting/dian-invoices/sync", async (req: Request, res: Response) => {
+    const companyId = req.header("X-Siigo-Company");
+    if (!companyId) return res.status(400).json({ ok: false, message: "Debes seleccionar una empresa Siigo." });
+    try {
+      const result = await syncCausadasNow(companyId, !!req.body?.full);
+      return res.json({ ok: true, result });
+    } catch (error) {
+      return res.status(502).json({ ok: false, message: error instanceof Error ? error.message : "No se pudo sincronizar con Siigo." });
+    }
   });
 
   // Vuelve a marcar como 'pending' una factura causada o ignorada.
