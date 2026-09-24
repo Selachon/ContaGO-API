@@ -24,6 +24,7 @@ import { resolveExcelBuffer, extractCufesFromExcel } from "./dianCufeDownload.js
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import type { DocumentDirection } from "../types/dian.js";
 
+import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -47,6 +48,7 @@ interface JobData {
 
 const jobTracker = new Map<string, JobData>();
 
+attachJobs("dian-recibidos", jobTracker);
 setInterval(() => {
   const now = Date.now();
   for (const [jobId, job] of jobTracker) {
@@ -75,6 +77,9 @@ router.use((req, res, next) => {
 });
 
 router.use(requireToolAccess(TOOL_ID));
+// Consultas de estado: registra actividad del cliente y, tras un reinicio, responde
+// "interrumpido" (con lo guardado en Mongo) en vez de un 404 mudo.
+router.use(jobGuardMiddleware("dian-recibidos"));
 
 // ── Status ────────────────────────────────────────────────────────────────────
 router.get("/job-status/:jobId", (req: Request, res: Response) => {
@@ -186,7 +191,7 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
   // ── Proceso asíncrono ───────────────────────────────────────────────────────
   setImmediate(async () => {
     job.status = "processing";
-    const isCancelled = () => (job.status as string) === "cancelled";
+    const isCancelled = () => isJobAborted(job);
     const outPath = path.join(DOWNLOADS_DIR, `${jobId}.zip`);
     const collectedPdfs: Buffer[] = [];
 

@@ -28,6 +28,8 @@ import castroFacturasRoutes from "./routes/castroFacturas.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
 import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
 import { closeAllBrowsers, startOrphanBrowserSweep } from "./services/dianScraper.js";
+import { startJobGuard, onShutdown as jobGuardOnShutdown } from "./services/jobGuard.js";
+import { MongoJobStore } from "./services/jobGuardStore.js";
 import { closeRutBrowser } from "./services/rutConsultaService.js";
 
 // ============================================
@@ -133,6 +135,14 @@ function registerGracefulShutdown(server: ReturnType<typeof app.listen>): void {
     console.log(`Recibido ${signal}: cerrando navegadores y servidor...`);
     server.close();
     try {
+      // Deja constancia de los jobs que no alcanzan a terminar (o espera a que
+      // terminen si SHUTDOWN_DRAIN_MS > 0) para que el cliente reciba un mensaje
+      // claro de "interrumpido" en vez de un 404.
+      await Promise.race([jobGuardOnShutdown(), new Promise((resolve) => setTimeout(resolve, 8000))]);
+    } catch (err) {
+      console.warn("Error registrando jobs interrumpidos:", err);
+    }
+    try {
       await Promise.race([
         Promise.all([closeAllBrowsers(), closeRutBrowser()]),
         new Promise((resolve) => setTimeout(resolve, 20000)),
@@ -169,6 +179,7 @@ ensurePuppeteer()
     });
     registerGracefulShutdown(server);
     startOrphanBrowserSweep();
+    startJobGuard(new MongoJobStore());
   })
   .catch((err) => {
     console.error("Error inicializando la API:", err);

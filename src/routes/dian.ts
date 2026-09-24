@@ -6,7 +6,7 @@ import archiver from "archiver";
 import { v4 as uuidv4 } from "uuid";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import { acquireDianJobSlot, extractDocumentIdsByCufe, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
+import { extractDocumentIdsByCufe, progressTracker, runDianExtractionPrecheck } from "../services/dianScraper.js";
 import { sanitizeFilename } from "../utils/sanitize.js";
 import { formatSpanishLabel } from "../utils/dates.js";
 import { buildDemoLimitInfo, getDemoLimit, type DemoLimitInfo } from "../utils/demoLimit.js";
@@ -16,6 +16,7 @@ import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { getUserNits } from "../services/database.js";
 import type { DownloadRequest, ProgressData } from "../types/dian.js";
 
+import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
 // Magic bytes para validar que un archivo es realmente un PDF
 const PDF_MAGIC_BYTES = Buffer.from([0x25, 0x50, 0x44, 0x46]); // %PDF
 
@@ -66,10 +67,10 @@ interface JobData {
 
 const jobTracker = new Map<string, JobData>();
 
+attachJobs("dian", jobTracker);
 // Evita trabajo innecesario cuando el usuario cancela.
 function isJobCancelled(jobId: string): boolean {
-  const job = jobTracker.get(jobId);
-  return job?.status === "cancelled";
+  return isJobAborted(jobTracker.get(jobId));
 }
 
 // EventSource no permite headers custom; solo /progress/:uid acepta token por query.
@@ -83,6 +84,9 @@ router.use((req, res, next) => {
 
 // Exige compra de herramienta (o admin) para usar descarga masiva.
 router.use(requireToolAccess(DIAN_DOWNLOADER_TOOL_ID));
+// Consultas de estado: registra actividad del cliente y, tras un reinicio, responde
+// "interrumpido" (con lo guardado en Mongo) en vez de un 404 mudo.
+router.use(jobGuardMiddleware("dian"));
 
 // Limpieza periodica de progreso y jobs vencidos por TTL.
 const PROGRESS_TTL_MS = 15 * 60 * 1000;
@@ -427,15 +431,7 @@ async function processDownloadJob(
 
   job.status = "processing";
 
-  // Cola global DIAN: por defecto 1 job a la vez (env DIAN_MAX_CONCURRENT_JOBS).
-  // Varios jobs simultaneos disparan el bloqueo anti-bot por IP y degradan a todos;
-  // serializar mantiene la precision de proceso unico. El usuario ve su turno.
-  const releaseDianJobSlot = await acquireDianJobSlot((pos) => setProgress(jobId, {
-    step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`,
-    current: 0,
-    total: 0,
-  }));
-  if (isJobCancelled(jobId)) { releaseDianJobSlot(); return; }
+  if (isJobCancelled(jobId)) return;
   const isSentDocs = documentDirection === "sent";
   const directionLabel = isSentDocs ? "emitidos" : "recibidos";
   
@@ -531,7 +527,8 @@ async function processDownloadJob(
         }
       },
       undefined,
-      demoTrialLimit || undefined
+      demoTrialLimit || undefined,
+      () => isJobCancelled(jobId)
     );
 
     if (activeDownloads.size > 0) {
@@ -832,8 +829,6 @@ async function processDownloadJob(
     // Mejor esfuerzo de limpieza ante error fatal.
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
     try { fs.unlinkSync(zipPath); } catch {}
-  } finally {
-    releaseDianJobSlot();
   }
 }
 

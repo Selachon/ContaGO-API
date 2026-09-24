@@ -87,6 +87,7 @@ import ExcelJS from "exceljs";
 import { listMovements, getMovement, updateMovement as updateBankMov } from "../services/siigoEgresosStoreService.js";
 import { generarCajaPdf } from "../services/cajaPdf.js";
 
+import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
 export const CAJA_ERP_TOOL_ID = "causacion-caja";
 
 // ── Router público (sin auth) — solo lectura vía token ────────────────────────
@@ -210,6 +211,13 @@ publicCajaRouter.get("/public/:token/excel", async (req, res) => {
 const router = Router();
 router.use(requireAuth);
 router.use(requireToolAccess(CAJA_ERP_TOOL_ID));
+// Control de jobs de descarga DIAN: actividad del cliente + respuesta clara tras un reinicio.
+router.use(jobGuardMiddleware("caja-dian-fetch", {
+  pollPath: /^\/dian\/fetch-new\/(?:status|result)\/([A-Za-z0-9_-]+)/,
+  isStatusPath: (path) => path.includes("/status/"),
+  statusBody: (message) => ({ ok: true, status: "error", error: message, interrupted: true, progress: { step: "Interrumpido", current: 0, total: 0 } }),
+  goneBody: (message) => ({ ok: false, message }),
+}));
 
 // Router de bandeja (drafts): solo requiere auth + acceso a la empresa.
 // Lo usan tanto CausacionCaja (tool=caja) como SiigoXmlAccounting (tool=xml)
@@ -936,6 +944,7 @@ interface DianFetchJob {
   error?: string;
 }
 const dianFetchJobs = new Map<string, DianFetchJob>();
+attachJobs("caja-dian-fetch", dianFetchJobs);
 const DIAN_FETCH_TTL_MS = 2 * 60 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
@@ -1002,7 +1011,7 @@ router.post("/dian/fetch-new", async (req, res) => {
   const { fechaInicio, fechaFin } = monthRange(year, month);
   const maxDocuments = Math.max(1, Number(process.env.DIAN_MAX_DOCUMENTS || 850));
   const jobId = uuidv4();
-  dianFetchJobs.set(jobId, { status: "processing", progress: { step: "En cola...", current: 0, total: 0 }, userId: req.user?.userId || "", createdAt: Date.now() });
+  dianFetchJobs.set(jobId, { status: "processing", progress: { step: "Iniciando...", current: 0, total: 0 }, userId: req.user?.userId || "", createdAt: Date.now() });
 
   runWithSiigoCompany(ctx, () =>
     ingestNewByDateRange({
@@ -1013,18 +1022,18 @@ router.post("/dian/fetch-new", async (req, res) => {
       nitReceptor: companyNit,
       maxDocuments,
       onProgress: (p) => { const j = dianFetchJobs.get(jobId); if (j && j.status === "processing") j.progress = p; },
-      isCancelled: () => dianFetchJobs.get(jobId)?.status === "cancelled",
+      isCancelled: () => isJobAborted(dianFetchJobs.get(jobId)),
     })
   )
     .then((result) => {
       const j = dianFetchJobs.get(jobId);
-      if (!j || j.status === "cancelled") return;
+      if (!j || isJobAborted(j)) return;
       j.status = "completed"; j.result = result;
       j.progress = { step: "Completado", current: result.stats.downloaded, total: result.stats.listed };
     })
     .catch((err) => {
       const j = dianFetchJobs.get(jobId);
-      if (!j) return;
+      if (!j || isJobAborted(j)) return;
       j.status = "error"; j.error = err instanceof Error ? err.message : "Error en la descarga DIAN.";
     });
 

@@ -117,6 +117,8 @@ export interface InvoiceLineItem {
 
 export interface ExcelJobData {
   status: "pending" | "processing" | "completed" | "error" | "cancelled";
+  /** Lo marca el guardián de jobs (jobGuard) al detener un job abandonado o colgado. */
+  aborted?: boolean;
   progress: {
     step: string;
     current: number;

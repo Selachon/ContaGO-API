@@ -111,6 +111,7 @@ import { getUserGoogleDriveById } from "../services/database.js";
 import { uploadPaymentSupportToDrive } from "../services/googleDrive.js";
 import { v4 as uuidv4 } from "uuid";
 import type { ProgressData } from "../types/dian.js";
+import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
 import {
   savePaymentMap,
   rebuildProfilesFromBalance,
@@ -141,6 +142,7 @@ interface DianIngestJob {
   createdAt: number;
 }
 const dianIngestJobs = new Map<string, DianIngestJob>();
+attachJobs("siigo-dian-ingest", dianIngestJobs);
 const DIAN_INGEST_TTL_MS = 3 * 60 * 60 * 1000;
 
 setInterval(() => {
@@ -523,6 +525,14 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     if (req.integrationAuthMode === "internal_api_key") return next();
     return toolGate(req, res, next);
   });
+
+  // Control de jobs de ingesta DIAN: actividad del cliente + respuesta clara tras un reinicio.
+  router.use(jobGuardMiddleware("siigo-dian-ingest", {
+    pollPath: /^\/accounting\/from-dian\/(?:status|result)\/([A-Za-z0-9_-]+)/,
+    isStatusPath: (path) => path.includes("/status/"),
+    statusBody: (message) => ({ ok: true, status: "error", error: message, interrupted: true, progress: { step: "Interrumpido", current: 0, total: 0 } }),
+    goneBody: (message) => ({ ok: false, message }),
+  }));
 
   // Settings por empresa: no necesita contexto Siigo (solo escribe MongoDB),
   // por eso va ANTES de withSiigoCompany.
@@ -1947,7 +1957,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     const jobId = uuidv4();
     dianIngestJobs.set(jobId, {
       status: "processing",
-      progress: { step: "En cola...", current: 0, total: 0 },
+      progress: { step: "Iniciando...", current: 0, total: 0 },
       userId: req.user?.userId || "",
       createdAt: Date.now(),
     });
@@ -1969,12 +1979,12 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
           const job = dianIngestJobs.get(jobId);
           if (job && job.status === "processing") job.progress = p;
         },
-        isCancelled: () => dianIngestJobs.get(jobId)?.status === "cancelled",
+        isCancelled: () => isJobAborted(dianIngestJobs.get(jobId)),
       })
     )
       .then((result) => {
         const job = dianIngestJobs.get(jobId);
-        if (!job || job.status === "cancelled") return;
+        if (!job || isJobAborted(job)) return;
         job.status = "completed";
         // Adjunta cuántas facturas se omitieron por la restricción de mes de licencia.
         if (outOfWindow > 0) Object.assign(result.stats as object, { outOfWindow });
@@ -1987,7 +1997,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       })
       .catch((err) => {
         const job = dianIngestJobs.get(jobId);
-        if (!job || job.status === "cancelled") return;
+        if (!job || isJobAborted(job)) return;
         job.status = "error";
         job.error = err instanceof Error ? err.message : "Error en la ingesta desde DIAN";
       });
@@ -2094,7 +2104,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     const jobId = uuidv4();
     dianIngestJobs.set(jobId, {
       status: "processing",
-      progress: { step: "En cola...", current: 0, total: 0 },
+      progress: { step: "Iniciando...", current: 0, total: 0 },
       userId: req.user?.userId || "",
       createdAt: Date.now(),
     });
@@ -2112,19 +2122,19 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
           const job = dianIngestJobs.get(jobId);
           if (job && job.status === "processing") job.progress = p;
         },
-        isCancelled: () => dianIngestJobs.get(jobId)?.status === "cancelled",
+        isCancelled: () => isJobAborted(dianIngestJobs.get(jobId)),
       })
     )
       .then((result) => {
         const job = dianIngestJobs.get(jobId);
-        if (!job || job.status === "cancelled") return;
+        if (!job || isJobAborted(job)) return;
         job.status = "completed";
         job.result = result;
         job.progress = { step: "Completado", current: result.stats.downloaded, total: result.stats.listed };
       })
       .catch((err) => {
         const job = dianIngestJobs.get(jobId);
-        if (!job || job.status === "cancelled") return;
+        if (!job || isJobAborted(job)) return;
         job.status = "error";
         job.error = err instanceof Error ? err.message : "Error en la ingesta desde DIAN";
       });

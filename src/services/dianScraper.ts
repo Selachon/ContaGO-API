@@ -410,6 +410,8 @@ export interface ListingRecord {
   fecha?: string;
   /** Mes de emisión normalizado "YYYY-MM" (vacío si no se pudo determinar). */
   monthKey?: string;
+  /** Columna "Tipo de documento" del export DIAN (vacío si el export no la trae). */
+  docType?: string;
 }
 
 /**
@@ -486,7 +488,7 @@ let activeDownloads = 0;
 let queuedDownloads = 0;
 const downloadWaitQueue: Array<() => void> = [];
 
-function acquireDownloadSlot(): Promise<() => void> {
+export function acquireDownloadSlot(): Promise<() => void> {
   return new Promise((resolve) => {
     const grant = () => {
       activeDownloads++;
@@ -610,83 +612,6 @@ export async function throttledDianDownload(
     }
   }
   throw lastError || new Error("Descarga fallida");
-}
-
-// ── Cola global de jobs DIAN ──────────────────────────────────────────────────
-// DIAN limita por IP: varios jobs simultáneos disparan el bloqueo anti-bot y
-// degradan a TODOS (verificado: 2 jobs → 5-10% de fallos por 403 sostenido).
-// Serializar los jobs (default 1 a la vez) mantiene la precisión de proceso
-// único; los demás esperan en cola con posición visible para el usuario.
-// DIAN_MAX_CONCURRENT_JOBS: cuántos jobs DIAN corren a la vez.
-//   1 (default) = serializado: un job a la vez, el resto en cola con turno visible.
-//   N > 1       = hasta N jobs simultáneos.
-//   0 u "off"   = SIN límite (comportamiento previo a la cola) — para poder probar
-//                 A/B si la concurrencia de jobs es la causa de las pérdidas.
-const rawMaxDianJobs = String(process.env.DIAN_MAX_CONCURRENT_JOBS ?? "1").trim().toLowerCase();
-const MAX_DIAN_JOBS = rawMaxDianJobs === "0" || rawMaxDianJobs === "off"
-  ? Number.MAX_SAFE_INTEGER
-  : Math.max(1, Number(rawMaxDianJobs) || 1);
-console.log(`[DIAN] Límite de jobs simultáneos: ${MAX_DIAN_JOBS === Number.MAX_SAFE_INTEGER ? "SIN LÍMITE (cola desactivada)" : MAX_DIAN_JOBS}`);
-let activeDianJobs = 0;
-interface DianJobWaiter {
-  grant: () => void;
-  onPosition?: (position: number) => void;
-}
-const dianJobQueue: DianJobWaiter[] = [];
-
-function notifyQueuePositions(): void {
-  dianJobQueue.forEach((w, idx) => {
-    try { w.onPosition?.(idx + 1); } catch { /* progreso es best-effort */ }
-  });
-}
-
-/**
- * Reserva un cupo de job DIAN. Si no hay cupo, espera en cola; `onPosition`
- * recibe la posición (1 = siguiente) cada vez que la fila avanza.
- * Devuelve la función que libera el cupo (idempotente; llamarla en finally).
- */
-// Backstop ON por defecto (40 min): con MAX_DIAN_JOBS=1, un job que se cuelga
-// SIN pasar por browser (p.ej. generando el Excel, subiendo a Drive) también
-// bloqueaba la cola entera para siempre — el watchdog de navegador no lo
-// cubre porque su navegador ya se cerró bien. DIAN_JOB_MAX_HOLD_MS=0 (u "off")
-// desactiva explícitamente.
-const rawJobHoldMs = String(process.env.DIAN_JOB_MAX_HOLD_MS ?? "2400000").trim().toLowerCase();
-const dianJobMaxHoldMs = rawJobHoldMs === "0" || rawJobHoldMs === "off" ? 0 : Number(rawJobHoldMs) || 2400000;
-
-export function acquireDianJobSlot(onPosition?: (position: number) => void): Promise<() => void> {
-  return new Promise((resolve) => {
-    const grant = () => {
-      activeDianJobs++;
-      let released = false;
-      const release = () => {
-        if (released) return;
-        released = true;
-        if (holdTimer) clearTimeout(holdTimer);
-        activeDianJobs--;
-        const next = dianJobQueue.shift();
-        if (next) next.grant();
-        notifyQueuePositions();
-      };
-      const holdTimer = dianJobMaxHoldMs > 0
-        ? setTimeout(() => {
-            console.warn(`Job DIAN retenido > ${dianJobMaxHoldMs} ms; se fuerza la liberación del cupo de la cola.`);
-            release();
-          }, dianJobMaxHoldMs)
-        : null;
-      holdTimer?.unref();
-      resolve(release);
-    };
-    if (activeDianJobs < MAX_DIAN_JOBS) {
-      grant();
-    } else {
-      dianJobQueue.push({ grant, onPosition });
-      notifyQueuePositions();
-    }
-  });
-}
-
-export function getDianJobStats(): { active: number; queued: number; max: number } {
-  return { active: activeDianJobs, queued: dianJobQueue.length, max: MAX_DIAN_JOBS };
 }
 
 // Registro de navegadores abiertos para cerrarlos todos en un apagado ordenado
@@ -931,9 +856,8 @@ export function startOrphanBrowserSweep(): void {
     // un cliente reporte "se queda esperando" — sin esto solo se detectaba
     // por reclamo de usuario.
     const bs = getBrowserStats();
-    const js = getDianJobStats();
-    if (bs.queued > 0 || js.queued > 0) {
-      console.warn(`[DIAN pool] navegadores ${bs.active}/${bs.max} (cola ${bs.queued}) · jobs ${js.active}/${js.max} (cola ${js.queued})`);
+    if (bs.queued > 0) {
+      console.warn(`[DIAN pool] navegadores ${bs.active}/${bs.max} (cola ${bs.queued})`);
     }
   }, intervalMs);
   // No mantener vivo el proceso solo por este timer.
@@ -1348,7 +1272,10 @@ export async function extractDocumentIdsByCufe(
   onProgress?: (data: Partial<ProgressData>) => void,
   onDocumentFound?: OnDocumentFound,
   preloadedRecords?: ListingRecord[],
-  maxDocuments?: number
+  maxDocuments?: number,
+  // Permite abortar la búsqueda CUFE por CUFE (cancelación del usuario o job
+  // abandonado/colgado); sin esto la fase de búsqueda seguía hasta el final.
+  isCancelled?: () => boolean
 ): Promise<ExtractionResult> {
   const direction = documentDirection || "received";
   const isSent = direction === "sent";
@@ -1567,6 +1494,7 @@ export async function extractDocumentIdsByCufe(
       const recycleEvery = Math.max(50, Number(process.env.DIAN_CUFE_RECYCLE_EVERY || 1000));
 
       while (true) {
+        if (isCancelled?.()) break;
         const i = nextIndex;
         if (i >= cufes.length) break;
         nextIndex++;
@@ -1702,6 +1630,7 @@ export async function extractDocumentIdsByCufe(
         let retryDir: DocumentDirection = direction;
         let recovered = 0;
         for (const cufe of pendingCufes) {
+          if (isCancelled?.()) break;
           const record = listedRecords.find((r) => normalizeCufe(r.cufe) === normalizeCufe(cufe));
           const wantDir: DocumentDirection = record?.direction || direction;
           try {
@@ -1744,6 +1673,11 @@ export async function extractDocumentIdsByCufe(
     }
 
     const finalDocuments = documents;
+
+    if (isCancelled?.()) {
+      // El llamador ya revisa la cancelación al volver; no es un error de "cero resultados".
+      return { documents: finalDocuments, cookies: baseCookieMap, companyName, companyNit: companyNitFromPage, listedCount };
+    }
 
     console.log(
       `[DIAN CUFE] listado=${cufes.length} encontrados=${finalDocuments.length} fallidos=${failures} duplicados_omitidos=${duplicatesSkipped}`
@@ -2240,6 +2174,11 @@ const IGNORED_DOC_TYPES = [
   "respuesta aplicación",
 ];
 
+/** True si el "Tipo de documento" del listado es de los que la búsqueda por portal siempre descartaba (Application Response). */
+export function isIgnoredListingDocType(docType: string | undefined): boolean {
+  return !!docType && shouldIgnoreDocType(docType);
+}
+
 function shouldIgnoreDocType(docType: string, isSentDocuments: boolean = false): boolean {
   const normalized = docType.toLowerCase().trim();
   
@@ -2707,6 +2646,7 @@ export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direct
   // Columna de fecha de emisión (para la restricción por mes de licencia).
   const fechaIdx = headers.findIndex((h) => h.includes("fecha") && h.includes("emis"));
   const fechaFallbackIdx = fechaIdx >= 0 ? fechaIdx : headers.findIndex((h) => h.includes("fecha"));
+  const tipoIdx = headers.findIndex((h) => h.includes("tipo de documento"));
 
   if (cufeIdx < 0 || folioIdx < 0) {
     console.warn("[DIAN Export] Encabezados esperados no encontrados", {
@@ -2745,7 +2685,8 @@ export async function parseListingRecordsFromExportZip(zipBuffer: Buffer, direct
     if (!docnum) continue;
 
     const fecha = (fechaFallbackIdx >= 0 ? row[fechaFallbackIdx] : "").trim();
-    out.push({ cufe, docnum, fecha, monthKey: monthKeyFromDianDate(fecha), direction: effectiveDirection });
+    const docType = (tipoIdx >= 0 ? row[tipoIdx] : "").trim();
+    out.push({ cufe, docnum, fecha, monthKey: monthKeyFromDianDate(fecha), direction: effectiveDirection, docType });
   }
 
   const dedup = new Map<string, ListingRecord>();

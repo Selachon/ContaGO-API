@@ -1,6 +1,5 @@
 import type { Page } from "puppeteer";
 import {
-  acquireDianJobSlot,
   getCufeListing,
   REAL_USER_AGENT,
   closeBrowserSafely,
@@ -308,13 +307,7 @@ async function downloadCufesGratisVpfe(
  * porque `processXmlBatch` consulta Siigo para detectar facturas ya causadas.
  */
 export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult> {
-  // Misma cola global que las herramientas DIAN: el auto-ingest también scrapea
-  // el catálogo y compite por el presupuesto anti-bot de la IP.
-  const releaseDianJobSlot = await acquireDianJobSlot((pos) =>
-    opts.onProgress?.({ step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`, current: 0, total: 0 })
-  );
   if (opts.isCancelled?.()) {
-    releaseDianJobSlot();
     return { items: [], stats: { listed: 0, alreadyRegistered: 0, downloaded: 0, failed: 0, rounds: 0 }, failures: [] };
   }
   const directions = grupoToDirections(opts.grupo);
@@ -334,7 +327,7 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
   // trabajo actual que envía el frontend).
   const skipSet = new Set((opts.skipCufes || []).map((c) => normCufe(c).toLowerCase()).filter(Boolean));
 
-  try {
+  {
     for (const direction of directions) {
       if (opts.isCancelled?.()) break;
 
@@ -434,8 +427,6 @@ export async function ingestFromDian(opts: IngestOptions): Promise<IngestResult>
       },
       failures: allFailures,
     };
-  } finally {
-    releaseDianJobSlot();
   }
 }
 
@@ -464,15 +455,11 @@ export async function ingestNewByDateRange(opts: {
   onProgress?: (p: ProgressData) => void;
   isCancelled?: () => boolean;
 }): Promise<IngestResult> {
-  const releaseDianJobSlot = await acquireDianJobSlot((pos) =>
-    opts.onProgress?.({ step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`, current: 0, total: 0 })
-  );
-
   const knownCufes = opts.forceRedownload ? new Set<string>() : await getIngestedCufes(opts.companyId);
   const skipSet = new Set((opts.skipCufes || []).map((c) => normCufe(c).toLowerCase()).filter(Boolean));
   const failures: IngestFailure[] = [];
 
-  try {
+  {
     const from = fmtDdMmYyyy(new Date(`${opts.fechaInicio}T00:00:00`).getTime());
     const to = fmtDdMmYyyy(new Date(`${opts.fechaFin}T00:00:00`).getTime());
 
@@ -569,7 +556,5 @@ export async function ingestNewByDateRange(opts: {
     } finally {
       await closeBrowserSafely(browser).catch(() => {});
     }
-  } finally {
-    releaseDianJobSlot();
   }
 }

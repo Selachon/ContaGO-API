@@ -6,7 +6,7 @@ import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import { acquireDianJobSlot, downloadDocumentsByCufe } from "../services/dianScraper.js";
+import { downloadDocumentsByCufe } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
@@ -14,6 +14,7 @@ import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
 import type { ProgressData, DocumentDirection } from "../types/dian.js";
 
+import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
@@ -38,8 +39,9 @@ interface JobData {
 
 const jobTracker = new Map<string, JobData>();
 
+attachJobs("dian-mass-download", jobTracker);
 function isJobCancelled(jobId: string): boolean {
-  return jobTracker.get(jobId)?.status === "cancelled";
+  return isJobAborted(jobTracker.get(jobId));
 }
 
 function setProgress(jobId: string, data: ProgressData): void {
@@ -77,6 +79,9 @@ router.use((req, res, next) => {
 });
 
 router.use(requireToolAccess(TOOL_ID));
+// Consultas de estado: registra actividad del cliente y, tras un reinicio, responde
+// "interrumpido" (con lo guardado en Mongo) en vez de un 404 mudo.
+router.use(jobGuardMiddleware("dian-mass-download"));
 
 router.get("/job-status/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
@@ -306,15 +311,7 @@ async function processMassDownloadJob(
   const job = jobTracker.get(jobId);
   if (!job) return;
 
-  // Cola global DIAN: por defecto 1 job a la vez (env DIAN_MAX_CONCURRENT_JOBS).
-  // Varios jobs simultaneos disparan el bloqueo anti-bot por IP y degradan a todos;
-  // serializar mantiene la precision de proceso unico. El usuario ve su turno.
-  const releaseDianJobSlot = await acquireDianJobSlot((pos) => setProgress(jobId, {
-    step: `En cola para evitar el bloqueo de DIAN (turno ${pos})...`,
-    current: 0,
-    total: 0,
-  }));
-  if (isJobCancelled(jobId)) { releaseDianJobSlot(); return; }
+  if (isJobCancelled(jobId)) return;
 
   job.status = "processing";
 
@@ -459,7 +456,6 @@ async function processMassDownloadJob(
       setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: msg });
     }
   } finally {
-    releaseDianJobSlot();
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
 }

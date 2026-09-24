@@ -16,6 +16,7 @@ import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitI
 import type { ProgressData, DocumentDirection } from "../types/dian.js";
 import type { InvoiceData } from "../types/dianExcel.js";
 
+import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
 const ES_MONTHS = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
 
 function formatDateES(isoDate: string): string {
@@ -65,8 +66,9 @@ interface JobData {
 
 const jobTracker = new Map<string, JobData>();
 
+attachJobs("dian-third-parties", jobTracker);
 function isJobCancelled(jobId: string): boolean {
-  return jobTracker.get(jobId)?.status === "cancelled";
+  return isJobAborted(jobTracker.get(jobId));
 }
 
 function setProgress(jobId: string, data: ProgressData): void {
@@ -104,6 +106,9 @@ router.use((req, res, next) => {
 });
 
 router.use(requireToolAccess(TOOL_ID));
+// Consultas de estado: registra actividad del cliente y, tras un reinicio, responde
+// "interrumpido" (con lo guardado en Mongo) en vez de un 404 mudo.
+router.use(jobGuardMiddleware("dian-third-parties"));
 
 router.get("/job-status/:jobId", (req: Request, res: Response) => {
   const { jobId } = req.params;
