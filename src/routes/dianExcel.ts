@@ -707,6 +707,10 @@ export async function processExcelJob(
           docType: doc.docType, // Tipo de documento de la tabla DIAN
         });
 
+        // Camino directo: el listado puede venir sin folio; se toma del XML para nombrar
+        // archivos/Drive igual que cuando el folio salía de la tabla del portal.
+        if (!doc.docnum && invoiceData.docNumber) doc = { ...doc, docnum: invoiceData.docNumber };
+
         const isDS = !!invoiceData.isDocumentoSoporte;
 
         if (!actualCompanyName || actualCompanyName === "N/A") {

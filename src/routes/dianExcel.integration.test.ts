@@ -216,3 +216,15 @@ test("job abortado por el guardián (colgado/abandonado) también corta el traba
   assert.equal(job.status, "error");
   assert.equal(fs.existsSync(job.excelPath!), false);
 });
+
+test("listado sin folio: los archivos del ZIP se nombran con el número de factura del XML", async () => {
+  stubNetwork({ calls: [], missing: new Set() });
+  const job = newJob("it-nofolio");
+  const records = [1, 2].map((n) => ({ cufe: cufeOf(n), docnum: "", direction: "received" as const, docType: "" }));
+  await processExcelJob("it-nofolio", TOKEN, undefined, undefined, "u1", "received", undefined, false, records);
+  cleanup.push(job.excelPath!, job.filesZipPath!);
+  assert.equal(job.status, "completed", job.error);
+  const zip = await JSZip.loadAsync(fs.readFileSync(job.filesZipPath!));
+  const names = Object.keys(zip.files).filter((n) => n.endsWith(".xml")).map((n) => n.split("/").pop());
+  assert.deepEqual(names.sort(), ["FE100.xml", "FE101.xml"]);
+});
