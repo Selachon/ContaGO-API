@@ -179,8 +179,23 @@ export async function authenticateAndNavigate(
         // Esperar que el AuthToken redirija (hasta 45s: en Railway el redirect de
         // DIAN a veces tarda más que en local).
         const ts = Date.now();
+        // Si la DIAN devuelve la pantalla de "Iniciar sesión / Selecciona una opción"
+        // (token vencido, ya usado o de otra IP) y sigue igual varios segundos, no tiene
+        // caso esperar los 45 s completos: cada segundo de espera retiene un cupo de
+        // navegador (máx. 2) y hace esperar a los demás usuarios ("En cola...").
+        let loginScreenSince = 0;
         while (Date.now() - ts < 45_000) {
           if (!/\/User\/AuthToken/i.test(authPage.url())) break;
+          const onLoginScreen = await authPage.evaluate(() => {
+            const t = (document.body ? document.body.innerText : "").toLowerCase();
+            return t.includes("selecciona una opción para continuar") && (t.includes("representante legal") || t.includes("usuario autorizado"));
+          }).catch(() => false);
+          if (onLoginScreen) {
+            if (!loginScreenSince) loginScreenSince = Date.now();
+            if (Date.now() - loginScreenSince >= 10_000) break;
+          } else {
+            loginScreenSince = 0;
+          }
           await delay(1000);
         }
         if (/\/User\/AuthToken/i.test(authPage.url())) {

@@ -38,6 +38,12 @@ function isDriveQuotaError(err: unknown): boolean {
     msg.includes("the user's drive storage quota");
 }
 
+/** "fetch failed" no dice nada: la causa real (ECONNRESET, ETIMEDOUT, ENOTFOUND...) vive en err.cause. */
+function fetchCause(err: unknown): string {
+  const c = (err as { cause?: { code?: string; message?: string } })?.cause;
+  return c ? `[causa: ${c.code || c.message || "?"}]` : "";
+}
+
 function formatDateES(isoDate: string): string {
   const [y, m, d] = isoDate.split("-");
   const mon = ES_MONTHS[parseInt(m, 10) - 1] || m;
@@ -625,7 +631,7 @@ async function processCufeDownloadJob(
             }
             await processXml(xmlBuf, cufe);
           } catch (err) {
-            console.warn(`[CUFE DL] P1 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err);
+            console.warn(`[CUFE DL] P1 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err, fetchCause(err));
             failedCufes.push(cufe);
           } finally {
             releaseDl();
@@ -650,7 +656,7 @@ async function processCufeDownloadJob(
               );
               if (xmlResp.ok) await processXml(Buffer.from(await xmlResp.arrayBuffer()), cufe);
             } catch (err) {
-              console.warn(`[CUFE DL] P2 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err);
+              console.warn(`[CUFE DL] P2 error ${cufe.slice(0, 16)}:`, err instanceof Error ? err.message : err, fetchCause(err));
             }
           }
         }
