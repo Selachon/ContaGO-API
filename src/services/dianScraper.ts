@@ -1,6 +1,7 @@
 import puppeteer, { Browser, Page, Cookie } from "puppeteer";
 import fs from "fs";
 import path from "path";
+import os from "os";
 import JSZip from "jszip";
 import type { DocumentInfo, ProgressData, DocumentDirection } from "../types/dian.js";
 
@@ -878,6 +879,38 @@ export function sweepOrphanBrowsers(): number {
   return killed;
 }
 
+/**
+ * Borra perfiles temporales `puppeteer_dev_*` huérfanos de /tmp. Cuando cerramos
+ * un navegador a la fuerza (timeout de close(), watchdog, crash) Puppeteer no
+ * llega a borrar su perfil; con el tiempo llenan /tmp y Chromium deja de poder
+ * arrancar aunque haya PIDs y memoria de sobra. Solo toca perfiles que no
+ * pertenecen a un navegador abierto y con más de `minAgeMs` de antigüedad.
+ */
+export function cleanStaleBrowserProfiles(minAgeMs = 15 * 60 * 1000): number {
+  const tmp = os.tmpdir();
+  const inUse = new Set<string>();
+  for (const b of openBrowsers) {
+    const d = (b as BrowserWithSlot).__userDataDir;
+    if (d) inUse.add(path.resolve(d));
+  }
+  let removed = 0;
+  let entries: string[];
+  try { entries = fs.readdirSync(tmp); } catch { return 0; }
+  const now = Date.now();
+  for (const name of entries) {
+    if (!name.startsWith(PUPPETEER_PROFILE_MARKER)) continue;
+    const full = path.join(tmp, name);
+    if (inUse.has(path.resolve(full))) continue;
+    try {
+      if (now - fs.statSync(full).mtimeMs < minAgeMs) continue;
+      fs.rmSync(full, { recursive: true, force: true });
+      removed++;
+    } catch { /* en uso o ya borrado */ }
+  }
+  if (removed > 0) console.warn(`Limpieza de perfiles: ${removed} perfil(es) puppeteer_dev_* huérfano(s) borrado(s) de ${tmp}.`);
+  return removed;
+}
+
 let sweepTimer: NodeJS.Timeout | null = null;
 /**
  * Arranca el barrido periódico. Idempotente. Intervalo por defecto 5 min;
@@ -890,6 +923,7 @@ export function startOrphanBrowserSweep(): void {
   sweepTimer = setInterval(() => {
     try {
       sweepOrphanBrowsers();
+      cleanStaleBrowserProfiles();
     } catch (err) {
       console.warn(`Error en barrido de huérfanos: ${(err as Error)?.message || String(err)}`);
     }
@@ -1903,7 +1937,13 @@ function containerResourceSnapshot(): string {
   let procs = "?";
   try { procs = String(fs.readdirSync("/proc").filter((e) => /^\d+$/.test(e)).length); } catch { /* sin /proc */ }
   const mb = (v: string | null) => (v && /^\d+$/.test(v) ? `${Math.round(Number(v) / 1048576)}MB` : v ?? "?");
-  return `pids=${pidsCur ?? "?"}/${pidsMax ?? "?"} procs=${procs} mem=${mb(memCur)}/${mb(memMax)} navegadores=${activeBrowsers}/${MAX_CONCURRENT_BROWSERS}`;
+  let tmpInfo = "?";
+  try {
+    const st = fs.statfsSync(os.tmpdir());
+    const profiles = fs.readdirSync(os.tmpdir()).filter((e) => e.startsWith(PUPPETEER_PROFILE_MARKER)).length;
+    tmpInfo = `${Math.round((st.bavail * st.bsize) / 1048576)}MB libres, ${profiles} perfiles`;
+  } catch { /* sin statfs */ }
+  return `pids=${pidsCur ?? "?"}/${pidsMax ?? "?"} procs=${procs} mem=${mb(memCur)}/${mb(memMax)} tmp=${tmpInfo} navegadores=${activeBrowsers}/${MAX_CONCURRENT_BROWSERS}`;
 }
 
 export async function launchBrowserWithRetry(
@@ -1975,6 +2015,8 @@ export async function launchBrowserWithRetry(
       updateProgress({
         step: `Reintentando inicio de navegador (${attempt}/${BROWSER_LAUNCH_RETRIES})...`,
       });
+      // Un /tmp lleno de perfiles huérfanos también impide arrancar Chromium.
+      try { cleanStaleBrowserProfiles(2 * 60 * 1000); } catch { /* best-effort */ }
 
       // EAGAIN/ENOMEM = el SO no pudo crear el proceso por falta de recursos:
       // se espera más tiempo para dar margen a que se liberen.
@@ -1986,7 +2028,7 @@ export async function launchBrowserWithRetry(
   // Falló de forma definitiva: se libera el cupo para no bloquear la cola.
   releaseSlot();
   throw new Error(
-    `No fue posible iniciar Chromium tras ${BROWSER_LAUNCH_RETRIES} intentos. Último error: ${lastError?.message || "desconocido"}`
+    `No fue posible iniciar Chromium tras ${BROWSER_LAUNCH_RETRIES} intentos. Último error: ${lastError?.message || "desconocido"} [${containerResourceSnapshot()}]`
   );
 }
 
