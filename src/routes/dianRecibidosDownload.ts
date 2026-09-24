@@ -209,6 +209,7 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
         direction,
       );
 
+      let gBrowserClosed = false;
       try {
         if (isCancelled()) return;
 
@@ -235,6 +236,11 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
         let dlOk = 0;
         const dlStartMs = Date.now();
         let cookieHeader = await getCookieHeader();
+        // La página solo servía para obtener la sesión: se cierra YA para liberar el cupo de
+        // navegador (máx. 2) durante toda la descarga. Antes cada job retenía uno hasta el
+        // final y con 2 jobs largos un tercer usuario quedaba en "En cola, esperando un navegador".
+        await closeBrowserSafely(gBrowser).catch(() => {});
+        gBrowserClosed = true;
         const zipFiles: Array<{ name: string; buffer: Buffer }> = [];
         const succeededCufes = new Set<string>();
 
@@ -310,7 +316,7 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
         if (missing.length > 0) {
           console.log(`[Recibidos] Pasada 2: ${missing.length} faltantes`);
           job.progress = { step: `Recuperando ${missing.length} faltantes...`, current: dlOk, total: downloadCufes.length };
-          cookieHeader = await getCookieHeader();
+          // La sesión no cambia entre pasadas (la página estaba inactiva): se reutiliza el header.
           for (const cufe of missing) {
             if (isCancelled()) break;
             await rateAcquire();
@@ -394,7 +400,7 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
           current: dlOk, total: downloadCufes.length, pct: 100,
         };
       } finally {
-        await closeBrowserSafely(gBrowser).catch(() => {});
+        if (!gBrowserClosed) await closeBrowserSafely(gBrowser).catch(() => {});
       }
     } catch (err: any) {
       if (!isCancelled()) {

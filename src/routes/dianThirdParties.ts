@@ -392,6 +392,7 @@ async function processCufeDownloadJob(
       direction,
     );
 
+    let gBrowserClosed = false;
     try {
       if (isJobCancelled(jobId)) return;
 
@@ -404,6 +405,10 @@ async function processCufeDownloadJob(
 
       const cookiesArr = await gPage.cookies();
       const cookieHeader = cookiesArr.map((c: any) => `${c.name}=${c.value}`).join("; ");
+      // La página solo servía para listar y obtener la sesión: se cierra YA para liberar el
+      // cupo de navegador (máx. 2) durante toda la descarga.
+      await closeBrowserSafely(gBrowser).catch(() => {});
+      gBrowserClosed = true;
 
       const cufeSetLower = new Set(downloadCufes.map((c) => c.toLowerCase()));
       const cufeOriginalMap = new Map(downloadCufes.map((c) => [c.toLowerCase(), c]));
@@ -474,8 +479,8 @@ async function processCufeDownloadJob(
 
       if (failedDocs.length > 0) {
         console.log(`[ThirdParties] Reintentando ${failedDocs.length} descarga(s) fallida(s)...`);
-        const freshCookies = await gPage.cookies();
-        const freshHdr = freshCookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+        // La sesión no cambia (la página estaba inactiva): se reutiliza el header.
+        const freshHdr = cookieHeader;
         for (const f of failedDocs) {
           if (isJobCancelled(jobId)) break;
           try {
@@ -492,7 +497,7 @@ async function processCufeDownloadJob(
         }
       }
     } finally {
-      await closeBrowserSafely(gBrowser).catch(() => {});
+      if (!gBrowserClosed) await closeBrowserSafely(gBrowser).catch(() => {});
     }
   }
 
