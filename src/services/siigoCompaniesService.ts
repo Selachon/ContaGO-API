@@ -23,6 +23,12 @@ export interface CompanySettings {
   noCondenseItems?: boolean;
   /** Mapa de nombre de impuesto extra → código de cuenta PUC para causación (ej. { ICL: "239530", IBUA: "239590" }). */
   extraTaxAccounts?: Record<string, string>;
+  /** Si true, el motor de sugerencias también muestra cuentas 14xx (inventario) en el dropdown de cuenta de gasto. */
+  useInventoryAccounts?: boolean;
+  /** Si true, el IVA se causa como ítem de cuenta (mayor valor costo) en vez de usar el maestro de impuestos de Siigo. */
+  ivaComoMayorValor?: boolean;
+  /** Códigos de cuentas PUC habilitadas para IVA mayor valor (ej. ["14150182","14152380"]). */
+  ivaMayorValorAccounts?: string[];
 }
 
 export interface PaymentRecord {
@@ -345,6 +351,9 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.skipCostCenter !== undefined) patch["settings.skipCostCenter"] = Boolean(settings.skipCostCenter);
   if (settings.noCondenseItems !== undefined) patch["settings.noCondenseItems"] = Boolean(settings.noCondenseItems);
   if (settings.extraTaxAccounts !== undefined) patch["settings.extraTaxAccounts"] = settings.extraTaxAccounts || {};
+  if (settings.useInventoryAccounts !== undefined) patch["settings.useInventoryAccounts"] = Boolean(settings.useInventoryAccounts);
+  if (settings.ivaComoMayorValor !== undefined) patch["settings.ivaComoMayorValor"] = Boolean(settings.ivaComoMayorValor);
+  if (settings.ivaMayorValorAccounts !== undefined) patch["settings.ivaMayorValorAccounts"] = Array.isArray(settings.ivaMayorValorAccounts) ? settings.ivaMayorValorAccounts : [];
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");

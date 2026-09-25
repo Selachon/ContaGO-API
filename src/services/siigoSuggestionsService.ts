@@ -38,6 +38,8 @@ export interface SupplierProfile {
   gastoCode: string | null;
   gastoName: string | null;
   gastoAccounts: AccountCatalogEntry[];
+  /** Cuentas 14xx con movimiento para este proveedor (mayor valor IVA / inventario), ordenadas por débito. */
+  inventarioAccounts: AccountCatalogEntry[];
   retefuente: RetentionHint | null;
   reteiva: RetentionHint | null;
   reteica: RetentionHint | null;
@@ -213,7 +215,7 @@ function buildFromBalance(
   };
 
   const cell = (r: string[], i: number) => (i >= 0 ? String(r[i] ?? "").trim() : "");
-  const raw = new Map<string, { nit: string; name: string; gasto: AccRow[]; refte: AccRow[]; reiva: AccRow[]; reica: AccRow[]; ivades: AccRow[]; pago: (AccRow & { paymentName: string; paymentCode: string })[] }>();
+  const raw = new Map<string, { nit: string; name: string; gasto: AccRow[]; refte: AccRow[]; reiva: AccRow[]; reica: AccRow[]; ivades: AccRow[]; cuentas14: AccRow[]; pago: (AccRow & { paymentName: string; paymentCode: string })[] }>();
   const catalog = new Map<string, string>();
 
   for (let i = headerIdx + 1; i < rows.length; i++) {
@@ -236,9 +238,10 @@ function buildFromBalance(
     };
 
     let p = raw.get(nit);
-    if (!p) { p = { nit, name: tercero, gasto: [], refte: [], reiva: [], reica: [], ivades: [], pago: [] }; raw.set(nit, p); }
+    if (!p) { p = { nit, name: tercero, gasto: [], refte: [], reiva: [], reica: [], ivades: [], pago: [], cuentas14: [] }; raw.set(nit, p); }
 
     if (/^[567]/.test(code)) p.gasto.push(acc);
+    else if (/^14/.test(code)) p.cuentas14.push(acc);
     else if (code.startsWith("2365")) p.refte.push(acc);
     else if (code.startsWith("2367")) p.reiva.push(acc);
     else if (code.startsWith("2368")) p.reica.push(acc);
@@ -261,6 +264,13 @@ function buildFromBalance(
       else byCode.set(g.code, { code: g.code, name: g.name, debito: g.debito });
     }
     const gastoAccounts = [...byCode.values()].sort((a, b) => b.debito - a.debito).map(({ code, name }) => ({ code, name }));
+    const byCode14 = new Map<string, { code: string; name: string; debito: number }>();
+    for (const g of p.cuentas14) {
+      const e = byCode14.get(g.code);
+      if (e) e.debito += g.debito;
+      else byCode14.set(g.code, { code: g.code, name: g.name, debito: g.debito });
+    }
+    const inventarioAccounts = [...byCode14.values()].sort((a, b) => b.debito - a.debito).map(({ code, name }) => ({ code, name }));
     const rf = top(p.refte, "credito");
     const ri = top(p.reiva, "credito");
     const rc = top(p.reica, "credito");
@@ -275,7 +285,7 @@ function buildFromBalance(
       else if (/compra|bien/i.test(ivaTop.name)) ivaKind = "bienes";
     }
     out.push({
-      nit: p.nit, name: p.name, gastoCode: gastoAccounts[0]?.code ?? null, gastoName: gastoAccounts[0]?.name ?? null, gastoAccounts,
+      nit: p.nit, name: p.name, gastoCode: gastoAccounts[0]?.code ?? null, gastoName: gastoAccounts[0]?.name ?? null, gastoAccounts, inventarioAccounts,
       retefuente: rf ? { accountName: rf.name, rate: parseRate(rf.name) } : null,
       reteiva: ri ? { accountName: ri.name, rate: parseRate(ri.name) } : null,
       reteica: rc ? { accountName: rc.name, rate: parseRate(rc.name) } : null,
