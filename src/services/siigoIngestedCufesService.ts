@@ -200,6 +200,22 @@ export async function markPendingInDian(companyId: string, cufe: string): Promis
 }
 
 /**
+ * Elimina (o solo cuenta, con dryRun) los registros DIAN de una empresa emitidos antes de
+ * `minFecha` (yyyy-mm-dd). Nunca toca los `caused` ni los que no tienen fecha.
+ */
+export async function purgeDianInvoicesBefore(
+  companyId: string,
+  minFecha: string,
+  dryRun = false
+): Promise<number> {
+  if (!companyId || !/^\d{4}-\d{2}-\d{2}$/.test(minFecha)) return 0;
+  const filter = { companyId, status: { $ne: "caused" }, issueDate: { $nin: ["", null], $lt: minFecha } };
+  const col = getDb().collection<any>(COLLECTION);
+  if (dryRun) return col.countDocuments(filter);
+  return (await col.deleteMany(filter)).deletedCount;
+}
+
+/**
  * Lista las facturas DIAN de una empresa con filtro opcional de status.
  * Retorna las más recientes primero.
  *

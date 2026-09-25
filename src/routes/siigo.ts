@@ -67,7 +67,7 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 const SIIGO_TOOL_ID = "siigo-xml-accounting";
 import { processXmlForAccounting, processXmlBatch, submitToSiigo, supplierNotFoundNit, taxRequiredItemIndex, getCustomersIndex, invalidateCustomersIndex } from "../services/siigoAccountingService.js";
 import { ingestFromDian, ingestNewByDateRange, type IngestGrupo, type IngestResult } from "../services/siigoDianIngestService.js";
-import { recordIngestedCufes, markCausedInSiigo, markIgnoredInDian, markPendingInDian, listDianInvoices, type CausedMeta } from "../services/siigoIngestedCufesService.js";
+import { recordIngestedCufes, markCausedInSiigo, markIgnoredInDian, markPendingInDian, listDianInvoices, purgeDianInvoicesBefore, type CausedMeta } from "../services/siigoIngestedCufesService.js";
 import { syncCausadasIfStale, syncCausadasNow, isCausadasSyncRunning, backfillSiigoDocs } from "../services/siigoCausadasSyncService.js";
 import { SIIGO_CUFE_PREFIX } from "../services/siigoCausadasPlan.js";
 import { parseListingRecordsFromExportZip } from "../services/dianScraper.js";
@@ -602,11 +602,35 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         const allowed = userId ? await userCanAccessCompany(req.params.id, userId) : false;
         if (!allowed) return res.status(403).json({ ok: false, message: "Sin acceso a esta empresa." });
       }
-      const { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts } = req.body || {};
-      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts });
-      return res.json({ ok: true, data: saved });
+      const { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts, useInventoryAccounts, ivaComoMayorValor, ivaMayorValorAccounts, retefuenteMinBases, minFechaIngesta } = req.body || {};
+      if (minFechaIngesta && !/^\d{4}-\d{2}-\d{2}$/.test(String(minFechaIngesta))) {
+        return res.status(400).json({ ok: false, message: "minFechaIngesta debe tener formato yyyy-mm-dd." });
+      }
+      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts, useInventoryAccounts, ivaComoMayorValor, ivaMayorValorAccounts, retefuenteMinBases, minFechaIngesta });
+      // Vista previa de lo que borraría la limpieza (POST /companies/:id/dian-invoices/purge).
+      const anteriores = minFechaIngesta ? await purgeDianInvoicesBefore(req.params.id, String(minFechaIngesta), true) : 0;
+      return res.json({ ok: true, data: saved, anteriores });
     } catch (error) {
       return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error actualizando configuración." });
+    }
+  });
+
+  // Borra los registros DIAN no causados anteriores a la fecha mínima de importación de la empresa.
+  router.post("/companies/:id/dian-invoices/purge", async (req: Request, res: Response) => {
+    try {
+      if (req.integrationAuthMode === "jwt") {
+        const userId = req.user?.userId;
+        const allowed = userId ? await userCanAccessCompany(req.params.id, userId) : false;
+        if (!allowed) return res.status(403).json({ ok: false, message: "Sin acceso a esta empresa." });
+      }
+      const ctx = await getCompanyContext(req.params.id);
+      const minFechaIngesta = (ctx?.settings?.minFechaIngesta as string | undefined) || "";
+      if (!minFechaIngesta) return res.status(400).json({ ok: false, message: "La empresa no tiene fecha mínima de importación." });
+      const dryRun = req.body?.dryRun !== false;
+      const count = await purgeDianInvoicesBefore(req.params.id, minFechaIngesta, dryRun);
+      return res.json({ ok: true, dryRun, minFechaIngesta, count });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error en la limpieza." });
     }
   });
 
@@ -2158,6 +2182,9 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     const fechaInicioRaw = `${month}-01`;
     const fechaInicio = minFechaIngesta && minFechaIngesta > fechaInicioRaw ? minFechaIngesta : fechaInicioRaw;
     const fechaFin = `${month}-${String(lastDay).padStart(2, "0")}`;
+    if (fechaInicio > fechaFin) {
+      return res.status(400).json({ ok: false, message: `El mes ${month} es anterior a la fecha mínima de importación (${minFechaIngesta}).` });
+    }
     // Tope de documentos NUEVOS a descargar por corrida (no incluye los que ya
     // están en pantalla). Si el mes trae más, se descargan los primeros 200 y el
     // usuario puede volver a darle "Traer y procesar" para el resto.
