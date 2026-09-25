@@ -535,6 +535,7 @@ function causedMetaFrom(body: any, extra: CausedMeta): CausedMeta {
     siigoTotal: extra.siigoTotal,
     causedBy: extra.causedBy,
     causedType: extra.causedType,
+    ivaAccountCode: str(body?.ivaAccountCode) || str(m.ivaAccountCode) || extra.ivaAccountCode,
   };
 }
 

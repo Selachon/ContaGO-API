@@ -2,6 +2,7 @@ import JSZip from "jszip";
 import { XMLParser } from "fast-xml-parser";
 import { getDb } from "./database.js";
 import { request, getCurrentSiigoCompanyId } from "./siigoService.js";
+import { getLearnedIvaAccount } from "./siigoIngestedCufesService.js";
 
 // Colecciones MongoDB
 const PROFILES = "siigoSupplierProfiles";
@@ -53,6 +54,8 @@ export interface SupplierProfile {
    * DIAN, no bajo el proveedor). Determina el default IVA 19% Servicios vs IVA 19%.
    */
   ivaKind: "servicios" | "bienes" | null;
+  /** Cuenta IVA mayor valor usada la última vez para este proveedor (aprendida de causaciones previas). */
+  learnedIvaCode: string | null;
   updatedAt: string;
 }
 
@@ -289,7 +292,7 @@ function buildFromBalance(
       retefuente: rf ? { accountName: rf.name, rate: parseRate(rf.name) } : null,
       reteiva: ri ? { accountName: ri.name, rate: parseRate(ri.name) } : null,
       reteica: rc ? { accountName: rc.name, rate: parseRate(rc.name) } : null,
-      paymentName: pg?.paymentName ?? null, paymentCode: pg?.paymentCode ?? null, cxpCode: pg?.code ?? null, ivaKind, updatedAt: now,
+      paymentName: pg?.paymentName ?? null, paymentCode: pg?.paymentCode ?? null, cxpCode: pg?.code ?? null, ivaKind, learnedIvaCode: null, updatedAt: now,
     });
   }
   return { profiles: out, accountsCatalog: [...catalog.entries()].map(([code, name]) => ({ code, name })).sort((a, b) => a.code.localeCompare(b.code)) };
@@ -445,10 +448,16 @@ export async function listLocalSupplierIndex(): Promise<{ id: string; identifica
 export async function getSupplierProfile(nit: string): Promise<SupplierProfile | null> {
   const key = normNit(nit);
   if (!key) return null;
-  const doc = await getDb().collection<any>(PROFILES).findOne({ _id: `${currentCompany()}:${key}` });
-  if (!doc) return null;
+  const cid = currentCompany();
+  const doc = await getDb().collection<any>(PROFILES).findOne({ _id: `${cid}:${key}` });
+  const learnedIvaCode = await getLearnedIvaAccount(cid, key).catch(() => null);
+  if (!doc) {
+    // Sin perfil de balance: devolver objeto mínimo con lo aprendido
+    if (!learnedIvaCode) return null;
+    return { nit: key, name: "", gastoCode: null, gastoName: null, gastoAccounts: [], inventarioAccounts: [], retefuente: null, reteiva: null, reteica: null, paymentName: null, paymentCode: null, cxpCode: null, ivaKind: null, learnedIvaCode, updatedAt: "" };
+  }
   const { _id, ...rest } = doc;
-  return rest as SupplierProfile;
+  return { ...rest, inventarioAccounts: rest.inventarioAccounts || [], learnedIvaCode } as SupplierProfile;
 }
 
 export async function getSuggestionsStatus(): Promise<{ profileCount: number; profilesUpdatedAt: string | null; paymentMapCount: number; paymentMapUpdatedAt: string | null; }> {

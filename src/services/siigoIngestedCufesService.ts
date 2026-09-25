@@ -33,6 +33,8 @@ export interface DianInvoiceRecord {
   causedBy?: string;
   /** Tipo de comprobante causado desde ContaGO: FC (compra) o NC (nota crédito). */
   causedType?: string;
+  /** Cuenta PUC de IVA mayor valor usada en esta causación (modo ivaComoMayorValor). */
+  ivaAccountCode?: string;
 }
 
 /**
@@ -119,6 +121,7 @@ export interface CausedMeta {
   siigoTotal?: number;
   causedBy?: string;
   causedType?: string;
+  ivaAccountCode?: string;
 }
 
 /**
@@ -145,6 +148,7 @@ export async function markCausedInSiigo(
   if (meta.siigoTotal) set.siigoTotal = meta.siigoTotal;
   if (meta.causedBy) set.causedBy = meta.causedBy;
   if (meta.causedType) set.causedType = meta.causedType;
+  if (meta.ivaAccountCode) set.ivaAccountCode = meta.ivaAccountCode;
   if (meta.docnum) set.docnum = meta.docnum;
   if (meta.supplierNit) set.supplierNit = meta.supplierNit;
   if (meta.supplierName) set.supplierName = meta.supplierName;
@@ -168,6 +172,23 @@ export async function markIgnoredInDian(companyId: string, cufe: string): Promis
       { $set: { status: "ignored" }, $setOnInsert: { companyId, cufe, docnum: "", ingestedAt: now } },
       { upsert: true }
     );
+}
+
+/**
+ * Devuelve la cuenta IVA mayor valor usada más recientemente para un proveedor.
+ * Se usa para sugerir el mismo código la próxima vez sin necesidad de recargar el balance.
+ */
+export async function getLearnedIvaAccount(companyId: string, supplierNit: string): Promise<string | null> {
+  if (!companyId || !supplierNit) return null;
+  const clean = String(supplierNit).split("-")[0].replace(/\D/g, "");
+  if (!clean) return null;
+  const doc = await getDb()
+    .collection<any>(COLLECTION)
+    .findOne(
+      { companyId, supplierNit: clean, status: "caused", ivaAccountCode: { $exists: true, $ne: "" } },
+      { sort: { causedAt: -1 }, projection: { ivaAccountCode: 1, _id: 0 } }
+    );
+  return doc?.ivaAccountCode || null;
 }
 
 /** Vuelve a marcar una factura como pendiente (el contador quiere re-causarla). */
