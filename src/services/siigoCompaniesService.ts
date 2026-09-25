@@ -29,6 +29,8 @@ export interface CompanySettings {
   ivaComoMayorValor?: boolean;
   /** Códigos de cuentas PUC habilitadas para IVA mayor valor (ej. ["14150182","14152380"]). */
   ivaMayorValorAccounts?: string[];
+  /** Base mínima de retención en la fuente por tarifa. Clave = tasa (ej. "3.5"), valor = monto en COP. */
+  retefuenteMinBases?: Record<string, number>;
 }
 
 export interface PaymentRecord {
@@ -354,6 +356,7 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.useInventoryAccounts !== undefined) patch["settings.useInventoryAccounts"] = Boolean(settings.useInventoryAccounts);
   if (settings.ivaComoMayorValor !== undefined) patch["settings.ivaComoMayorValor"] = Boolean(settings.ivaComoMayorValor);
   if (settings.ivaMayorValorAccounts !== undefined) patch["settings.ivaMayorValorAccounts"] = Array.isArray(settings.ivaMayorValorAccounts) ? settings.ivaMayorValorAccounts : [];
+  if (settings.retefuenteMinBases !== undefined) patch["settings.retefuenteMinBases"] = settings.retefuenteMinBases || {};
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
