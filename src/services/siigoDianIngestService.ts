@@ -472,6 +472,8 @@ export async function ingestNewByDateRange(opts: {
   forceRedownload?: boolean;
   /** CUFEs a omitir además del registro persistente (ya causados / ya en pantalla). */
   skipCufes?: string[];
+  /** Fecha mínima de emisión (yyyy-mm-dd). Facturas con issueDate anterior se descartan tras parsear el XML. */
+  minFechaIngesta?: string;
   onProgress?: (p: ProgressData) => void;
   isCancelled?: () => boolean;
 }): Promise<IngestResult> {
@@ -555,8 +557,13 @@ export async function ingestNewByDateRange(opts: {
       }
 
       opts.onProgress?.({ step: "Procesando XML para contabilización...", current: 0, total: files.length });
-      const items = await processXmlBatch(files);
-      await flagAlreadyCausada(opts.companyId, items);
+      const allItems = await processXmlBatch(files);
+      await flagAlreadyCausada(opts.companyId, allItems);
+
+      const minFecha = opts.minFechaIngesta || "";
+      const items = minFecha
+        ? allItems.filter((it) => !it.xml?.date || it.xml.date >= minFecha)
+        : allItems;
 
       const now = new Date().toISOString();
       await upsertDianInvoices(opts.companyId, items.filter((it) => it.xml).map((it) => ({

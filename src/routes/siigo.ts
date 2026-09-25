@@ -2152,8 +2152,11 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     }
 
     const [y, m] = month.split("-").map(Number);
-    const fechaInicio = `${month}-01`;
     const lastDay = new Date(y, m, 0).getDate();
+    const minFechaIngesta = (ctx.settings?.minFechaIngesta as string | undefined) || "";
+    // Si la empresa tiene fecha mínima de ingesta y cae dentro de este mes, arrancamos desde ahí.
+    const fechaInicioRaw = `${month}-01`;
+    const fechaInicio = minFechaIngesta && minFechaIngesta > fechaInicioRaw ? minFechaIngesta : fechaInicioRaw;
     const fechaFin = `${month}-${String(lastDay).padStart(2, "0")}`;
     // Tope de documentos NUEVOS a descargar por corrida (no incluye los que ya
     // están en pantalla). Si el mes trae más, se descargan los primeros 200 y el
@@ -2177,6 +2180,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         maxDocuments,
         forceRedownload,
         skipCufes,
+        minFechaIngesta: minFechaIngesta || undefined,
         onProgress: (p) => {
           const job = dianIngestJobs.get(jobId);
           if (job && job.status === "processing") job.progress = p;
@@ -2439,7 +2443,9 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       ]);
       if (timer) clearTimeout(timer);
     }
-    const invoices = await listDianInvoices(companyId, status as any).catch(() => []);
+    const ctx = await getCompanyContext(companyId).catch(() => null);
+    const minFechaIngesta = (ctx?.settings?.minFechaIngesta as string | undefined) || undefined;
+    const invoices = await listDianInvoices(companyId, status as any, minFechaIngesta).catch(() => []);
     return res.json({ ok: true, invoices, syncing: isCausadasSyncRunning(companyId) });
   });
 

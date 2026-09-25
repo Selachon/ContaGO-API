@@ -16,6 +16,8 @@ export interface SiigoContext {
   accessKey: string;
   /** NIT de la empresa asociada. Fuente de verdad para validar el token DIAN. */
   nit?: string;
+  /** Ajustes opcionales de la empresa (settings de siigoCompanies). */
+  settings?: Record<string, unknown>;
 }
 
 const siigoAls = new AsyncLocalStorage<SiigoContext>();

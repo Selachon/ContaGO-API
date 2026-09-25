@@ -209,20 +209,23 @@ export async function markPendingInDian(companyId: string, cufe: string): Promis
  */
 export async function listDianInvoices(
   companyId: string,
-  status?: DianInvoiceStatus | "all"
+  status?: DianInvoiceStatus | "all",
+  minFechaIngesta?: string
 ): Promise<DianInvoiceRecord[]> {
   if (!companyId) return [];
   const col = getDb().collection<any>(COLLECTION);
   const sort = { fetchedAt: -1, ingestedAt: -1 } as const;
   const noId = { projection: { _id: 0 } };
+  // Filtro de fecha mínima: excluye documentos anteriores si la empresa lo configura.
+  const dateFilter = minFechaIngesta ? { $or: [{ issueDate: { $gte: minFechaIngesta } }, { issueDate: "" }, { issueDate: { $exists: false } }] } : {};
   let docs: any[];
   if (status && status !== "all") {
-    const q = col.find({ companyId, status }, noId).sort(sort);
+    const q = col.find({ companyId, status, ...dateFilter }, noId).sort(sort);
     docs = await (status === "caused" ? q : q.limit(2000)).toArray();
   } else {
     const [caused, rest] = await Promise.all([
-      col.find({ companyId, status: "caused" }, noId).sort(sort).toArray(),
-      col.find({ companyId, status: { $ne: "caused" } }, noId).sort(sort).limit(2000).toArray(),
+      col.find({ companyId, status: "caused", ...dateFilter }, noId).sort(sort).toArray(),
+      col.find({ companyId, status: { $ne: "caused" }, ...dateFilter }, noId).sort(sort).limit(2000).toArray(),
     ]);
     docs = [...caused, ...rest].sort((a, b) => String(b.fetchedAt || b.ingestedAt || "").localeCompare(String(a.fetchedAt || a.ingestedAt || "")));
   }

@@ -31,6 +31,8 @@ export interface CompanySettings {
   ivaMayorValorAccounts?: string[];
   /** Base mínima de retención en la fuente por tarifa. Clave = tasa (ej. "3.5"), valor = monto en COP. */
   retefuenteMinBases?: Record<string, number>;
+  /** Fecha mínima de emisión (yyyy-mm-dd) para importar facturas DIAN. Facturas anteriores se ignoran. */
+  minFechaIngesta?: string;
 }
 
 export interface PaymentRecord {
@@ -334,6 +336,7 @@ export async function getCompanyContext(id: string): Promise<SiigoContext | null
     username: doc.username,
     accessKey: decryptSecret(doc.accessKeyEnc),
     nit: doc.nit || "",
+    settings: doc.settings || {},
   };
 }
 
@@ -357,6 +360,7 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.ivaComoMayorValor !== undefined) patch["settings.ivaComoMayorValor"] = Boolean(settings.ivaComoMayorValor);
   if (settings.ivaMayorValorAccounts !== undefined) patch["settings.ivaMayorValorAccounts"] = Array.isArray(settings.ivaMayorValorAccounts) ? settings.ivaMayorValorAccounts : [];
   if (settings.retefuenteMinBases !== undefined) patch["settings.retefuenteMinBases"] = settings.retefuenteMinBases || {};
+  if (settings.minFechaIngesta !== undefined) patch["settings.minFechaIngesta"] = settings.minFechaIngesta || null;
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
