@@ -1,5 +1,5 @@
 import { ObjectId, type Collection } from "mongodb";
-import type { DemoAccess, UserRole } from "../types/auth.js";
+import type { BillingInfo, DemoAccess, UserRole } from "../types/auth.js";
 import { db } from "./database.js";
 
 // ============================================
@@ -29,7 +29,10 @@ interface UserRecord {
   licenseStartDate?: string;
   licenseEndDate?: string;
   companiesInPlan?: number;
+  toolCompanyLimits?: Record<string, number>;
+  toolNits?: Record<string, string[]>;
   invoiceRef?: string;
+  billing?: BillingInfo;
 }
 
 interface AdminUser {
@@ -52,7 +55,10 @@ interface AdminUser {
   licenseStartDate?: string;
   licenseEndDate?: string;
   companiesInPlan?: number;
+  toolCompanyLimits?: Record<string, number>;
+  toolNits?: Record<string, string[]>;
   invoiceRef?: string;
+  billing?: BillingInfo;
 }
 
 interface AdminAuditLog {
@@ -351,7 +357,10 @@ function mapUserToAdmin(record: UserRecord): AdminUser {
     licenseStartDate: record.licenseStartDate,
     licenseEndDate: record.licenseEndDate,
     companiesInPlan: record.companiesInPlan,
+    toolCompanyLimits: record.toolCompanyLimits,
+    toolNits: record.toolNits,
     invoiceRef: record.invoiceRef,
+    billing: record.billing,
   };
 }
 

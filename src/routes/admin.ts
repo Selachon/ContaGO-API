@@ -44,6 +44,13 @@ const manualDianUpload = multer({
   },
 });
 
+const RUT_DIR = path.resolve("data/user-ruts");
+fs.mkdirSync(RUT_DIR, { recursive: true });
+const rutUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+});
+
 const DEMO_ALLOWED_TOOLS = new Set([
   "dian-cufe-downloader",
   "dian-mass-download",
@@ -441,7 +448,7 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
       return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
     }
 
-    const allowedFields = ["name", "nits", "purchasedTools", "isAdmin", "phone", "paymentAmount", "paymentMethod", "licenseStartDate", "licenseEndDate", "companiesInPlan", "toolCompanyLimits", "invoiceRef"];
+    const allowedFields = ["name", "nits", "toolNits", "purchasedTools", "isAdmin", "phone", "paymentAmount", "paymentMethod", "licenseStartDate", "licenseEndDate", "companiesInPlan", "toolCompanyLimits", "invoiceRef", "billing"];
     const updates: Record<string, unknown> = {};
     const before: Record<string, unknown> = {};
 
@@ -466,6 +473,23 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
         } else if (field === "nits") {
           const nits = Array.isArray(req.body.nits) ? req.body.nits : [];
           updates.nits = [...new Set(nits.filter((n: unknown) => typeof n === "string" && n.trim()).map((n: string) => n.trim()))];
+        } else if (field === "toolNits") {
+          const raw = req.body.toolNits;
+          if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+            const clean: Record<string, string[]> = {};
+            for (const [toolId, arr] of Object.entries(raw)) {
+              if (!Array.isArray(arr)) continue;
+              const nits = [...new Set(
+                (arr as unknown[])
+                  .filter((n): n is string => typeof n === "string" && n.trim() !== "")
+                  .map((n) => n.trim())
+              )];
+              if (nits.length) clean[toolId] = nits;
+            }
+            updates.toolNits = Object.keys(clean).length ? clean : undefined;
+          } else {
+            updates.toolNits = undefined;
+          }
         } else if (field === "purchasedTools") {
           const tools = Array.isArray(req.body.purchasedTools) ? req.body.purchasedTools : [];
           const normalized = tools
@@ -505,6 +529,37 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
           }
         } else if (field === "invoiceRef") {
           updates.invoiceRef = req.body.invoiceRef ? String(req.body.invoiceRef).trim() : undefined;
+        } else if (field === "billing") {
+          const raw = req.body.billing;
+          if (!raw || typeof raw !== "object") {
+            return res.status(400).json({ ok: false, message: "Datos de facturación inválidos" });
+          }
+          const isCompany = !!raw.isCompany;
+          const PERSON_ID_TYPES = new Set(["CC", "CE", "PA", "PEP"]);
+          const idType = isCompany
+            ? "NIT"
+            : (PERSON_ID_TYPES.has(raw.idType) ? raw.idType : "CC");
+          const billingId = typeof raw.id === "string" ? raw.id.trim() : "";
+          const billingEmail = typeof raw.email === "string" ? raw.email.trim() : "";
+          const city = typeof raw.city === "string" ? raw.city.trim() : "";
+          const address = typeof raw.address === "string" ? raw.address.trim() : "";
+          const companyName = typeof raw.companyName === "string" ? raw.companyName.trim() : "";
+          const firstName = typeof raw.firstName === "string" ? raw.firstName.trim() : "";
+          const lastName = typeof raw.lastName === "string" ? raw.lastName.trim() : "";
+
+          if (!billingId) return res.status(400).json({ ok: false, message: "Facturación: el NIT o CC es requerido" });
+          if (!billingEmail) return res.status(400).json({ ok: false, message: "Facturación: el correo de facturación es requerido" });
+          if (!city) return res.status(400).json({ ok: false, message: "Facturación: la ciudad es requerida" });
+          if (!address) return res.status(400).json({ ok: false, message: "Facturación: la dirección es requerida" });
+          if (isCompany && !companyName) return res.status(400).json({ ok: false, message: "Facturación: la razón social es requerida" });
+          if (!isCompany && (!firstName || !lastName)) return res.status(400).json({ ok: false, message: "Facturación: nombres y apellidos son requeridos" });
+
+          const existingBilling = (currentUserObj.billing as Record<string, unknown> | undefined) || {};
+          updates.billing = {
+            idType, id: billingId, isCompany, email: billingEmail, city, address,
+            ...(isCompany ? { companyName } : { firstName, lastName }),
+            ...(existingBilling.rutFile ? { rutFile: existingBilling.rutFile } : {}),
+          };
         }
       }
     }
@@ -532,6 +587,86 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[Admin] Error actualizando usuario:", err);
     res.status(500).json({ ok: false, message: "Error interno al actualizar usuario" });
+  }
+});
+
+// ============================================
+// POST /admin/users/:id/rut - Subir RUT (facturación electrónica)
+// ============================================
+router.post("/users/:id/rut", rutUpload.single("rut"), async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const actorId = req.user!.userId;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+    }
+    const file = req.file;
+    if (!file) {
+      return res.status(400).json({ ok: false, message: "No se recibió el archivo del RUT" });
+    }
+    if (!/\.pdf$/i.test(file.originalname) && file.mimetype !== "application/pdf") {
+      return res.status(400).json({ ok: false, message: "El RUT debe ser un archivo PDF" });
+    }
+
+    const currentUser = await getUserById(id);
+    if (!currentUser) {
+      return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    }
+
+    const filename = `${id}.pdf`;
+    fs.writeFileSync(path.join(RUT_DIR, filename), file.buffer);
+
+    const rutFile = {
+      filename,
+      originalName: file.originalname,
+      uploadedAt: new Date().toISOString(),
+    };
+    const existingBilling = ((currentUser as unknown as Record<string, unknown>).billing as Record<string, unknown>) || {};
+    const success = await updateUser(id, { billing: { ...existingBilling, rutFile } });
+    if (!success) {
+      return res.status(500).json({ ok: false, message: "Error al guardar el RUT" });
+    }
+
+    await logAdminAction({
+      actorId,
+      action: "upload_user_rut",
+      targetUserId: id,
+      after: { rutFile },
+    });
+
+    const updatedUser = await getUserById(id);
+    res.json({ ok: true, user: updatedUser, message: "RUT cargado correctamente" });
+  } catch (err) {
+    console.error("[Admin] Error subiendo RUT:", err);
+    res.status(500).json({ ok: false, message: "Error interno al subir el RUT" });
+  }
+});
+
+// ============================================
+// GET /admin/users/:id/rut - Descargar RUT (facturación electrónica)
+// ============================================
+router.get("/users/:id/rut", async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+    }
+    const user = await getUserById(id);
+    const rutFile = (user as unknown as Record<string, unknown> | null)?.billing
+      ? ((user as unknown as Record<string, unknown>).billing as Record<string, unknown>).rutFile as { filename: string; originalName: string } | undefined
+      : undefined;
+    if (!user || !rutFile) {
+      return res.status(404).json({ ok: false, message: "Este usuario no tiene RUT cargado" });
+    }
+    const filePath = path.join(RUT_DIR, rutFile.filename);
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ ok: false, message: "El archivo del RUT no se encuentra" });
+    }
+    res.download(filePath, rutFile.originalName || rutFile.filename);
+  } catch (err) {
+    console.error("[Admin] Error descargando RUT:", err);
+    res.status(500).json({ ok: false, message: "Error interno al descargar el RUT" });
   }
 });
 

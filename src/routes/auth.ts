@@ -8,6 +8,7 @@ import {
   getUserByEmail,
   getUserNits,
   getUserPurchases,
+  NIT_SCOPED_TOOLS,
   isDemoTrialExpired,
   updateUserPassword,
   verifyPassword,
@@ -32,7 +33,27 @@ import type { AuthResponse, JWTPayload, User } from "../types/auth.js";
 const router = Router();
 
 const ALLOW_PUBLIC_REGISTER = process.env.ALLOW_PUBLIC_REGISTER === "true";
-const DIAN_THIRD_PARTIES_TOOL_ID = "dian-third-parties-excel";
+const NIT_SCOPED_TOOL_LABELS: Record<string, string> = {
+  "dian-recibidos": "Descarga Masiva DIAN",
+  "dian-cufe-downloader": "Descarga masiva + Excel DIAN",
+  "dian-third-parties-excel": "Terceros DIAN a Excel",
+  "dian-mass-download": "Descarga Masiva (Legacy)",
+  "contabilizacion-dian-siigo": "Causación Siigo (Interfaces)",
+};
+
+/** Limpia un mapa {toolId: string[]} recibido del cliente. */
+function cleanToolNits(raw: unknown): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [toolId, arr] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(arr)) continue;
+    const nits = [...new Set(
+      arr.filter((n): n is string => typeof n === "string" && n.trim() !== "").map((n) => n.trim())
+    )];
+    if (nits.length) out[toolId] = nits;
+  }
+  return out;
+}
 
 function getJwtSecret(): string {
   // Garantizado por la validación en index.ts
@@ -66,6 +87,7 @@ function buildAuthUser(user: User, purchasedTools: string[], nits: string[]): No
     role,
     purchasedTools,
     nits,
+    toolNits: user.toolNits || {},
     companiesInPlan: user.companiesInPlan,
     toolCompanyLimits: user.toolCompanyLimits,
     forcePasswordChange: !!user.force_password_change,
@@ -321,8 +343,9 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
     return res.status(403).json(response);
   }
 
-  const { email, name, isAdmin, nits, purchasedTools,
-    phone, paymentAmount, paymentMethod, licenseStartDate, licenseEndDate, companiesInPlan, invoiceRef
+  const { email, name, isAdmin, nits, purchasedTools, toolNits,
+    phone, paymentAmount, paymentMethod, licenseStartDate, licenseEndDate, companiesInPlan, invoiceRef,
+    billing
   } = req.body;
 
   if (!email || !name || typeof email !== "string" || typeof name !== "string") {
@@ -337,6 +360,51 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
 
   if (name.trim().length < 2) {
     const response: AuthResponse = { ok: false, message: "El nombre es demasiado corto" };
+    return res.status(400).json(response);
+  }
+
+  // Datos de facturación electrónica: no siempre coinciden con el nombre/email
+  // de la cuenta del portal, así que se piden y validan aparte.
+  if (!billing || typeof billing !== "object") {
+    const response: AuthResponse = { ok: false, message: "Los datos de facturación electrónica son requeridos" };
+    return res.status(400).json(response);
+  }
+
+  const billingIsCompany = !!billing.isCompany;
+  const PERSON_ID_TYPES = new Set(["CC", "CE", "PA", "PEP"]);
+  const billingIdType = billingIsCompany
+    ? "NIT"
+    : (PERSON_ID_TYPES.has(billing.idType) ? billing.idType : "CC");
+  const billingId = typeof billing.id === "string" ? billing.id.trim() : "";
+  const billingEmail = typeof billing.email === "string" ? billing.email.trim() : "";
+  const billingCity = typeof billing.city === "string" ? billing.city.trim() : "";
+  const billingAddress = typeof billing.address === "string" ? billing.address.trim() : "";
+  const billingCompanyName = typeof billing.companyName === "string" ? billing.companyName.trim() : "";
+  const billingFirstName = typeof billing.firstName === "string" ? billing.firstName.trim() : "";
+  const billingLastName = typeof billing.lastName === "string" ? billing.lastName.trim() : "";
+
+  if (!billingId) {
+    const response: AuthResponse = { ok: false, message: "Facturación: el NIT o CC es requerido" };
+    return res.status(400).json(response);
+  }
+  if (!billingEmail || !isValidEmail(billingEmail)) {
+    const response: AuthResponse = { ok: false, message: "Facturación: el correo de facturación no es válido" };
+    return res.status(400).json(response);
+  }
+  if (!billingCity) {
+    const response: AuthResponse = { ok: false, message: "Facturación: la ciudad es requerida" };
+    return res.status(400).json(response);
+  }
+  if (!billingAddress) {
+    const response: AuthResponse = { ok: false, message: "Facturación: la dirección es requerida" };
+    return res.status(400).json(response);
+  }
+  if (billingIsCompany && !billingCompanyName) {
+    const response: AuthResponse = { ok: false, message: "Facturación: la razón social es requerida" };
+    return res.status(400).json(response);
+  }
+  if (!billingIsCompany && (!billingFirstName || !billingLastName)) {
+    const response: AuthResponse = { ok: false, message: "Facturación: nombres y apellidos son requeridos" };
     return res.status(400).json(response);
   }
 
@@ -366,11 +434,16 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
       .filter(Boolean)
   ));
 
-  const canSkipNitRestriction = !!isAdmin || cleanTools.includes(DIAN_THIRD_PARTIES_TOOL_ID);
+  const cleanToolNitsMap = cleanToolNits(toolNits);
 
-  if (!canSkipNitRestriction && cleanNits.length === 0) {
-    const response: AuthResponse = { ok: false, message: "Debes proporcionar al menos un NIT" };
-    return res.status(400).json(response);
+  if (!isAdmin) {
+    const scopedSelected = cleanTools.filter((t) => NIT_SCOPED_TOOLS.has(t));
+    const sinNits = scopedSelected.filter((t) => !(cleanToolNitsMap[t]?.length));
+    if (sinNits.length > 0) {
+      const nombres = sinNits.map((t) => NIT_SCOPED_TOOL_LABELS[t] || t).join(", ");
+      const response: AuthResponse = { ok: false, message: `Asigna NITs habilitados a: ${nombres}` };
+      return res.status(400).json(response);
+    }
   }
 
   const existing = await getUserByEmail(email.toLowerCase().trim());
@@ -400,6 +473,17 @@ router.post("/admin/create-user", requireAuth, async (req: Request, res: Respons
 
   if (companiesInPlan != null) { const v = parseInt(companiesInPlan, 10); if (!isNaN(v)) extras.companiesInPlan = v; }
   if (invoiceRef) extras.invoiceRef = String(invoiceRef).trim();
+  if (Object.keys(cleanToolNitsMap).length) extras.toolNits = cleanToolNitsMap;
+
+  extras.billing = {
+    idType: billingIdType,
+    id: billingId,
+    isCompany: billingIsCompany,
+    email: billingEmail,
+    city: billingCity,
+    address: billingAddress,
+    ...(billingIsCompany ? { companyName: billingCompanyName } : { firstName: billingFirstName, lastName: billingLastName }),
+  };
 
   const temporaryPassword = generateTemporaryPassword();
 

@@ -1,5 +1,25 @@
 export type UserRole = "USER" | "ADMIN" | "DEMO";
 
+// Datos de facturación electrónica del usuario/cliente. No siempre coinciden
+// con el nombre/email de la cuenta del portal (p.ej. la razón social de la
+// empresa que factura vs. el contacto que usa la herramienta).
+export interface BillingInfo {
+  idType: "NIT" | "CC" | "CE" | "PA" | "PEP";
+  id: string;
+  isCompany: boolean;
+  firstName?: string;
+  lastName?: string;
+  companyName?: string;
+  email: string;
+  city: string;
+  address: string;
+  rutFile?: {
+    filename: string;
+    originalName: string;
+    uploadedAt: string;
+  };
+}
+
 export interface DemoAccess {
   nit: string;
   normalizedNit: string;
@@ -24,7 +44,9 @@ export interface User {
   demo?: DemoAccess;
   companiesInPlan?: number;
   toolCompanyLimits?: Record<string, number>;
+  toolNits?: Record<string, string[]>;
   licenseStartDate?: string;
+  billing?: BillingInfo;
 }
 
 export interface UserPurchase {
@@ -54,6 +76,7 @@ export interface AuthResponse {
     role?: UserRole;
     purchasedTools: string[];
     nits: string[];
+    toolNits?: Record<string, string[]>;
     companiesInPlan?: number;
     toolCompanyLimits?: Record<string, number>;
     forcePasswordChange?: boolean;

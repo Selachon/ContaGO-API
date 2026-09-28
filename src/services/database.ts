@@ -1,7 +1,7 @@
 import bcrypt from "bcrypt";
 import { createHash, randomBytes } from "crypto";
 import { MongoClient, type Db, type Collection, ObjectId } from "mongodb";
-import type { DemoAccess, User, UserRole } from "../types/auth.js";
+import type { BillingInfo, DemoAccess, User, UserRole } from "../types/auth.js";
 import type { GoogleDriveConfig } from "../types/dianExcel.js";
 
 export const DEMO_TRIAL_HOURS = Number(process.env.DEMO_TRIAL_HOURS || 72);
@@ -78,8 +78,13 @@ interface UserRecord {
   licenseEndDate?: string;
   companiesInPlan?: number;
   toolCompanyLimits?: Record<string, number>;
+  // NITs habilitados por herramienta. La clave es el id de herramienta; el valor,
+  // los NITs (normalizados o no) que ese usuario puede operar en ella. Sustituye
+  // al uso de `nits` como lista global para las herramientas con alcance por NIT.
+  toolNits?: Record<string, string[]>;
   invoiceRef?: string;
   siigoCompanies?: string[];
+  billing?: BillingInfo;
   // Activación de la extensión de navegador (descargador DIAN).
   // El usuario genera el código UNA vez desde el portal; la extensión lo canjea
   // por un token de larga duración. Un admin puede restablecerlo para regenerar.
@@ -217,7 +222,9 @@ function mapUser(record: UserRecord | null): User | null {
     demo: record.demo,
     companiesInPlan: record.companiesInPlan,
     toolCompanyLimits: record.toolCompanyLimits,
+    toolNits: record.toolNits || {},
     licenseStartDate: record.licenseStartDate,
+    billing: record.billing,
   };
 }
 
@@ -434,8 +441,10 @@ export interface UserExtras {
   licenseEndDate?: string;
   companiesInPlan?: number;
   toolCompanyLimits?: Record<string, number>;
+  toolNits?: Record<string, string[]>;
   invoiceRef?: string;
   siigoCompanies?: string[];
+  billing?: BillingInfo;
 }
 
 export async function createUser(
@@ -583,6 +592,57 @@ export async function getUserNits(userId: string): Promise<string[]> {
     const oid = new ObjectId(userId);
     const record = await usersCollection().findOne({ _id: oid }, { projection: { nits: 1 } });
     return record?.nits || [];
+  } catch {
+    return [];
+  }
+}
+
+// Herramientas cuyo acceso se restringe por NIT habilitado (no por la lista global).
+// Incluye ids vigentes y legacy (mismo cliente, mismo alcance de NITs).
+export const NIT_SCOPED_TOOLS = new Set<string>([
+  "dian-recibidos",
+  "dian-cufe-downloader",
+  "dian-third-parties-excel",
+  "dian-mass-download",
+  "dian-downloader",
+  "dian-excel-exporter",
+  "contabilizacion-dian-siigo",
+]);
+
+// Grupos de herramientas que comparten la misma lista de NITs (vigente + legacy).
+const NIT_ALIAS_GROUPS: string[][] = [
+  ["dian-recibidos", "dian-mass-download", "dian-downloader"],
+  ["dian-cufe-downloader", "dian-excel-exporter"],
+];
+
+function nitToolAliases(toolId: string): string[] {
+  const group = NIT_ALIAS_GROUPS.find((g) => g.includes(toolId));
+  return group ? group : [toolId];
+}
+
+/** Normaliza un NIT a solo dígitos, descartando el dígito de verificación. */
+export function normalizeNitValue(value: unknown): string {
+  return String(value ?? "").split("-")[0].replace(/\D/g, "");
+}
+
+/**
+ * NITs que el usuario tiene habilitados para una herramienta concreta.
+ * Devuelve la lista normalizada (solo dígitos). `[]` = sin acceso a ningún NIT
+ * en esa herramienta. No cae a la lista global `nits`.
+ */
+export async function getAllowedNits(userId: string, toolId: string): Promise<string[]> {
+  try {
+    const oid = new ObjectId(userId);
+    const record = await usersCollection().findOne({ _id: oid }, { projection: { toolNits: 1 } });
+    const map = record?.toolNits || {};
+    const out = new Set<string>();
+    for (const alias of nitToolAliases(toolId)) {
+      for (const nit of map[alias] || []) {
+        const n = normalizeNitValue(nit);
+        if (n) out.add(n);
+      }
+    }
+    return [...out];
   } catch {
     return [];
   }
