@@ -27,8 +27,12 @@ export interface CompanySettings {
   useInventoryAccounts?: boolean;
   /** Si true, el IVA se causa como ítem de cuenta (mayor valor costo) en vez de usar el maestro de impuestos de Siigo. */
   ivaComoMayorValor?: boolean;
-  /** Códigos de cuentas PUC habilitadas para IVA mayor valor (ej. ["14150182","14152380"]). */
+  /** Códigos de cuentas PUC habilitadas para IVA mayor valor (lista general, legacy). */
   ivaMayorValorAccounts?: string[];
+  /** Cuentas candidatas para IVA 5% mayor valor. */
+  ivaMayorValor5Accounts?: string[];
+  /** Cuentas candidatas para IVA 19% mayor valor. */
+  ivaMayorValor19Accounts?: string[];
   /** Base mínima de retención en la fuente por tarifa. Clave = tasa (ej. "3.5"), valor = monto en COP. */
   retefuenteMinBases?: Record<string, number>;
   /** Fecha mínima de emisión (yyyy-mm-dd) para importar facturas DIAN. Facturas anteriores se ignoran. */
@@ -359,6 +363,8 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.useInventoryAccounts !== undefined) patch["settings.useInventoryAccounts"] = Boolean(settings.useInventoryAccounts);
   if (settings.ivaComoMayorValor !== undefined) patch["settings.ivaComoMayorValor"] = Boolean(settings.ivaComoMayorValor);
   if (settings.ivaMayorValorAccounts !== undefined) patch["settings.ivaMayorValorAccounts"] = Array.isArray(settings.ivaMayorValorAccounts) ? settings.ivaMayorValorAccounts : [];
+  if (settings.ivaMayorValor5Accounts !== undefined) patch["settings.ivaMayorValor5Accounts"] = Array.isArray(settings.ivaMayorValor5Accounts) ? settings.ivaMayorValor5Accounts : [];
+  if (settings.ivaMayorValor19Accounts !== undefined) patch["settings.ivaMayorValor19Accounts"] = Array.isArray(settings.ivaMayorValor19Accounts) ? settings.ivaMayorValor19Accounts : [];
   if (settings.retefuenteMinBases !== undefined) patch["settings.retefuenteMinBases"] = settings.retefuenteMinBases || {};
   if (settings.minFechaIngesta !== undefined) patch["settings.minFechaIngesta"] = settings.minFechaIngesta || null;
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
