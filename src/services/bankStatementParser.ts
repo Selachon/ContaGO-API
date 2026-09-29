@@ -724,6 +724,58 @@ function parseBancolombiaExcel(ws: ExcelJS.Worksheet): { raws: RawMov[]; opening
   return { raws, opening, declared: { credits, debits }, closing };
 }
 
+// ─── Bancolombia: export "CSV" en Excel (CUENTA | FECHA | VALOR | OBSERVACION) ─
+// Layout plano tipo CSV-en-Excel (nombre de archivo típico "CSV_<cuenta>_...xlsx"):
+// una fila de encabezados sueltos en columnas no contiguas (CUENTA, FECHA, VALOR,
+// OBSERVACION) y filas de movimiento con FECHA como entero yyyymmdd y VALOR
+// firmado en texto (ej. " -4000.00" = egreso, " 5000000.00" = ingreso). No trae
+// saldo corriente ni totales de control declarados; el saldo se sintetiza
+// acumulando el propio valor firmado (igual que parseBancolombiaVirtual).
+function parseBancolombiaCsvExcel(ws: ExcelJS.Worksheet): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } | null {
+  let headerRow: number | null = null;
+  let cols: { fecha?: number; valor?: number; obs?: number } = {};
+  for (let r = 1; r <= Math.min(ws.rowCount, 5); r++) {
+    const row = ws.getRow(r);
+    const found: typeof cols = {};
+    row.eachCell({ includeEmpty: false }, (_cell, col) => {
+      const v = cellStr(ws, r, col).toUpperCase();
+      if (v === "FECHA") found.fecha = col;
+      else if (v === "VALOR") found.valor = col;
+      else if (/^OBSERVACION/.test(v)) found.obs = col;
+    });
+    if (found.fecha && found.valor && found.obs) {
+      headerRow = r;
+      cols = found;
+      break;
+    }
+  }
+  if (headerRow == null) return null;
+
+  type Unsorted = { date: string; description: string; signed: number };
+  const rows: Unsorted[] = [];
+  for (let r = headerRow + 1; r <= ws.rowCount; r++) {
+    const dateStr = cellStr(ws, r, cols.fecha!);
+    const valueStr = cellStr(ws, r, cols.valor!);
+    const desc = cellStr(ws, r, cols.obs!);
+    if (!dateStr || !valueStr) continue;
+    const m = dateStr.match(/^(\d{4})(\d{2})(\d{2})$/);
+    if (!m) continue;
+    const [, y, mo, d] = m;
+    rows.push({ date: `${y}-${mo}-${d}`, description: desc.trim(), signed: num(valueStr) });
+  }
+  // El export trae las filas más recientes primero; se ordena ascendente para
+  // que el saldo sintetizado se acumule en orden cronológico.
+  rows.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+
+  let runBal = 0;
+  const raws: RawMov[] = rows.map((r) => {
+    runBal += r.signed;
+    return { date: r.date, description: r.description, value: Math.abs(r.signed), balance: Math.round(runBal * 100) / 100 };
+  });
+
+  return { raws, opening: 0, declared: { credits: null, debits: null }, closing: null };
+}
+
 /** Parsea un extracto bancario en Excel y devuelve movimientos + cuadre. */
 export async function parseBankExcel(buffer: Buffer): Promise<ParsedStatement> {
   const wb = new ExcelJS.Workbook();
@@ -736,9 +788,10 @@ export async function parseBankExcel(buffer: Buffer): Promise<ParsedStatement> {
   if (!ws) {
     throw new StatementError("El Excel del extracto está vacío.", 422, "excel_invalido");
   }
-  // Por ahora solo se reconoce el export "Estado de cuenta" de Bancolombia
-  // (única muestra validada); otros bancos en Excel deben agregarse aquí.
-  const parsed = parseBancolombiaExcel(ws);
+  // Se intenta primero el layout "CSV" plano (CUENTA/FECHA/VALOR/OBSERVACION);
+  // si no matchea, se cae al export "Estado de cuenta" de Bancolombia.
+  const csvParsed = parseBancolombiaCsvExcel(ws);
+  const parsed = csvParsed ?? parseBancolombiaExcel(ws);
   const { movements, reconciliation } = classifyAndReconcile(parsed.raws, parsed.opening, parsed.declared, parsed.closing);
   return { bank: "bancolombia", movements, reconciliation };
 }
