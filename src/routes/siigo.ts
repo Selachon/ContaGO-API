@@ -536,6 +536,8 @@ function causedMetaFrom(body: any, extra: CausedMeta): CausedMeta {
     causedBy: extra.causedBy,
     causedType: extra.causedType,
     ivaAccountCode: str(body?.ivaAccountCode) || str(m.ivaAccountCode) || extra.ivaAccountCode,
+    ivaAccountsByRate: (body?.ivaAccountsByRate && typeof body.ivaAccountsByRate === "object" ? body.ivaAccountsByRate : undefined) || extra.ivaAccountsByRate,
+    learnedGastoCode: str(body?.gastoCode) || str(m.gastoCode) || extra.learnedGastoCode,
   };
 }
 

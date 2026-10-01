@@ -2,7 +2,7 @@ import JSZip from "jszip";
 import { XMLParser } from "fast-xml-parser";
 import { getDb } from "./database.js";
 import { request, getCurrentSiigoCompanyId } from "./siigoService.js";
-import { getLearnedIvaAccount } from "./siigoIngestedCufesService.js";
+import { getLearnedAccounts } from "./siigoIngestedCufesService.js";
 
 // Colecciones MongoDB
 const PROFILES = "siigoSupplierProfiles";
@@ -56,6 +56,10 @@ export interface SupplierProfile {
   ivaKind: "servicios" | "bienes" | null;
   /** Cuenta IVA mayor valor usada la última vez para este proveedor (aprendida de causaciones previas). */
   learnedIvaCode: string | null;
+  /** Cuentas IVA mayor valor por tarifa aprendidas de la última causación, ej. {"5":"14xxx","19":"14yyy"}. */
+  learnedIvaAccountsByRate: Record<string, string>;
+  /** Cuenta de gasto aprendida de la última causación para este proveedor. */
+  learnedGastoCode: string | null;
   updatedAt: string;
 }
 
@@ -292,7 +296,7 @@ function buildFromBalance(
       retefuente: rf ? { accountName: rf.name, rate: parseRate(rf.name) } : null,
       reteiva: ri ? { accountName: ri.name, rate: parseRate(ri.name) } : null,
       reteica: rc ? { accountName: rc.name, rate: parseRate(rc.name) } : null,
-      paymentName: pg?.paymentName ?? null, paymentCode: pg?.paymentCode ?? null, cxpCode: pg?.code ?? null, ivaKind, learnedIvaCode: null, updatedAt: now,
+      paymentName: pg?.paymentName ?? null, paymentCode: pg?.paymentCode ?? null, cxpCode: pg?.code ?? null, ivaKind, learnedIvaCode: null, learnedIvaAccountsByRate: {}, learnedGastoCode: null, updatedAt: now,
     });
   }
   return { profiles: out, accountsCatalog: [...catalog.entries()].map(([code, name]) => ({ code, name })).sort((a, b) => a.code.localeCompare(b.code)) };
@@ -449,15 +453,17 @@ export async function getSupplierProfile(nit: string): Promise<SupplierProfile |
   const key = normNit(nit);
   if (!key) return null;
   const cid = currentCompany();
-  const doc = await getDb().collection<any>(PROFILES).findOne({ _id: `${cid}:${key}` });
-  const learnedIvaCode = await getLearnedIvaAccount(cid, key).catch(() => null);
+  const [doc, learned] = await Promise.all([
+    getDb().collection<any>(PROFILES).findOne({ _id: `${cid}:${key}` }),
+    getLearnedAccounts(cid, key).catch(() => ({ gastoCode: null, ivaAccountsByRate: {} })),
+  ]);
+  const learnedIvaCode = Object.values(learned.ivaAccountsByRate)[0] || null;
   if (!doc) {
-    // Sin perfil de balance: devolver objeto mínimo con lo aprendido
-    if (!learnedIvaCode) return null;
-    return { nit: key, name: "", gastoCode: null, gastoName: null, gastoAccounts: [], inventarioAccounts: [], retefuente: null, reteiva: null, reteica: null, paymentName: null, paymentCode: null, cxpCode: null, ivaKind: null, learnedIvaCode, updatedAt: "" };
+    if (!learned.gastoCode && !learnedIvaCode) return null;
+    return { nit: key, name: "", gastoCode: null, gastoName: null, gastoAccounts: [], inventarioAccounts: [], retefuente: null, reteiva: null, reteica: null, paymentName: null, paymentCode: null, cxpCode: null, ivaKind: null, learnedIvaCode, learnedIvaAccountsByRate: learned.ivaAccountsByRate, learnedGastoCode: learned.gastoCode, updatedAt: "" };
   }
   const { _id, ...rest } = doc;
-  return { ...rest, inventarioAccounts: rest.inventarioAccounts || [], learnedIvaCode } as SupplierProfile;
+  return { ...rest, inventarioAccounts: rest.inventarioAccounts || [], learnedIvaCode, learnedIvaAccountsByRate: learned.ivaAccountsByRate, learnedGastoCode: learned.gastoCode } as SupplierProfile;
 }
 
 export async function getSuggestionsStatus(): Promise<{ profileCount: number; profilesUpdatedAt: string | null; paymentMapCount: number; paymentMapUpdatedAt: string | null; }> {

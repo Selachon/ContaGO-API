@@ -35,6 +35,10 @@ export interface DianInvoiceRecord {
   causedType?: string;
   /** Cuenta PUC de IVA mayor valor usada en esta causación (modo ivaComoMayorValor). */
   ivaAccountCode?: string;
+  /** Cuentas IVA mayor valor por tarifa usadas en esta causación, ej. {"5":"14xxx","19":"14yyy"}. */
+  ivaAccountsByRate?: Record<string, string>;
+  /** Cuenta de gasto (5xx/6xx/7xx/14xx) del primer ítem, aprendida para sugerir la próxima vez. */
+  learnedGastoCode?: string;
 }
 
 /**
@@ -122,6 +126,10 @@ export interface CausedMeta {
   causedBy?: string;
   causedType?: string;
   ivaAccountCode?: string;
+  /** Cuentas IVA mayor valor por tarifa, ej. {"5":"14xxx","19":"14yyy"}. */
+  ivaAccountsByRate?: Record<string, string>;
+  /** Cuenta de gasto del primer ítem (aprendizaje). */
+  learnedGastoCode?: string;
 }
 
 /**
@@ -149,6 +157,8 @@ export async function markCausedInSiigo(
   if (meta.causedBy) set.causedBy = meta.causedBy;
   if (meta.causedType) set.causedType = meta.causedType;
   if (meta.ivaAccountCode) set.ivaAccountCode = meta.ivaAccountCode;
+  if (meta.ivaAccountsByRate && Object.keys(meta.ivaAccountsByRate).length) set.ivaAccountsByRate = meta.ivaAccountsByRate;
+  if (meta.learnedGastoCode) set.learnedGastoCode = meta.learnedGastoCode;
   if (meta.docnum) set.docnum = meta.docnum;
   if (meta.supplierNit) set.supplierNit = meta.supplierNit;
   if (meta.supplierName) set.supplierName = meta.supplierName;
@@ -189,6 +199,31 @@ export async function getLearnedIvaAccount(companyId: string, supplierNit: strin
       { sort: { causedAt: -1 }, projection: { ivaAccountCode: 1, _id: 0 } }
     );
   return doc?.ivaAccountCode || null;
+}
+
+/**
+ * Devuelve las cuentas aprendidas de la última causación de un proveedor:
+ * cuenta de gasto y cuentas IVA mayor valor por tarifa.
+ */
+export async function getLearnedAccounts(
+  companyId: string,
+  supplierNit: string
+): Promise<{ gastoCode: string | null; ivaAccountsByRate: Record<string, string> }> {
+  const empty = { gastoCode: null, ivaAccountsByRate: {} };
+  if (!companyId || !supplierNit) return empty;
+  const clean = String(supplierNit).split("-")[0].replace(/\D/g, "");
+  if (!clean) return empty;
+  const doc = await getDb()
+    .collection<any>(COLLECTION)
+    .findOne(
+      { companyId, supplierNit: clean, status: "caused", $or: [{ learnedGastoCode: { $exists: true, $ne: "" } }, { ivaAccountsByRate: { $exists: true } }] },
+      { sort: { causedAt: -1 }, projection: { learnedGastoCode: 1, ivaAccountsByRate: 1, ivaAccountCode: 1, _id: 0 } }
+    );
+  if (!doc) return empty;
+  return {
+    gastoCode: doc.learnedGastoCode || null,
+    ivaAccountsByRate: doc.ivaAccountsByRate || {},
+  };
 }
 
 /** Vuelve a marcar una factura como pendiente (el contador quiere re-causarla). */
