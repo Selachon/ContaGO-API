@@ -127,6 +127,8 @@ function detectBank(pages: string[][]): string {
   if (head40.includes("itaú") || head40.includes("itau")) return "itau";
   // BBVA: "PUBLICADO EN BBVANET" aparece en el encabezado de cada página.
   if (allText.includes("bbvanet")) return "bbva";
+  // Banco Caja Social: dominio y NIT propios en el pie de cada página.
+  if (allText.includes("bancocajasocial.com") || allText.includes("banco caja social")) return "cajasocial";
   return "desconocido";
 }
 
@@ -559,6 +561,53 @@ function parseBBVA(pages: string[][]): { raws: RawMov[]; opening: number | null;
   return { raws, opening, declared: { credits, debits: debits || null }, closing };
 }
 
+// ─── Banco Caja Social: "Extracto Individual" Cuenta Corriente ───────────
+// Fila: "MES DD DESCRIPCIÓN DOCUMENTO LUGAR VALOR SALDO_DISPONIBLE SALDO_TOTAL"
+// (ej. "AGO 01 DEBITO PAGO NOMINA Y O PR 06946038 ACH -25,883,652.00 183,687,461.25 183,687,461.25").
+// Cada fila suele traer una línea de referencia extra justo debajo (ej.
+// "DEBITO POR LOTE:..."), que se descarta (no aporta al cuadre). El año no
+// viene en la fecha de cada fila, se toma del rango "Periodo del Informe".
+function parseBancoCajaSocial(pages: string[][]): { raws: RawMov[]; opening: number | null; declared: { credits: number | null; debits: number | null }; closing: number | null } {
+  const all = pages.flat();
+  const MONTH: Record<string, string> = {
+    ene: "01", feb: "02", mar: "03", abr: "04", may: "05", jun: "06",
+    jul: "07", ago: "08", sep: "09", oct: "10", nov: "11", dic: "12",
+  };
+
+  const periodoLine = all.find((l) => /^\d{1,2}\s+de\s+\w+\s+a\s+\d{1,2}\s+de\s+\w+\s+de\s+\d{4}$/i.test(l));
+  const year = periodoLine?.match(/(\d{4})$/)?.[1] ?? String(new Date().getFullYear());
+
+  const headerIdx = all.findIndex((l) => /^Saldo Disponible Anterior/i.test(l));
+  let opening: number | null = null, credits: number | null = null, debits: number | null = null, closing: number | null = null;
+  if (headerIdx !== -1 && all[headerIdx + 1]) {
+    const vals = all[headerIdx + 1].match(/-?[\d,]+\.\d{2}/g) ?? [];
+    // Orden: Saldo Disponible Anterior | Saldo Total Anterior | Más Créditos | Menos Débitos | Nuevo Saldo
+    if (vals.length >= 5) {
+      opening = num(vals[1]);
+      credits = num(vals[2]);
+      debits = Math.abs(num(vals[3]));
+      closing = num(vals[4]);
+    }
+  }
+
+  const rowRx = /^(ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)\s+(\d{2})\s+(.+?)\s+\S+\s+\S+\s+(-?[\d,]+\.\d{2})\s+[\d,]+\.\d{2}\s+([\d,]+\.\d{2})$/i;
+  const raws: RawMov[] = [];
+  for (const line of all) {
+    const m = line.match(rowRx);
+    if (!m) continue;
+    const [, mmm, dd, desc, valueStr, balanceStr] = m;
+    const mm = MONTH[mmm.toLowerCase()] ?? "01";
+    raws.push({
+      date: `${year}-${mm}-${dd.padStart(2, "0")}`,
+      description: desc.replace(/\s+/g, " ").trim(),
+      value: Math.abs(num(valueStr)),
+      balance: num(balanceStr),
+    });
+  }
+
+  return { raws, opening, declared: { credits, debits }, closing };
+}
+
 // ─── Clasificación + motor de cuadre ─────────────────────────────────────
 function classifyAndReconcile(
   raws: RawMov[],
@@ -631,7 +680,7 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
   const bank = detectBank(pages);
   if (bank === "desconocido") {
     throw new StatementError(
-      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente, Banco de Bogotá, Davivienda, BBVA). Sube el Excel de movimientos.",
+      "No reconozco el banco de este extracto (por ahora: Bancolombia, Itaú, Occidente, Banco de Bogotá, Davivienda, BBVA, Banco Caja Social). Sube el Excel de movimientos.",
       422,
       "bank_unsupported"
     );
@@ -650,6 +699,7 @@ export async function parseBankPdf(buffer: Buffer, password?: string): Promise<P
     : bank === "bancobogota" ? parseBancoBogota(pages)
     : bank === "davivienda" ? parseDavivienda(pages)
     : bank === "bbva" ? parseBBVA(pages)
+    : bank === "cajasocial" ? parseBancoCajaSocial(pages)
     : parseItau(pages);
   const { movements, reconciliation } = classifyAndReconcile(parsed.raws, parsed.opening, parsed.declared, parsed.closing);
   return { bank, movements, reconciliation };
