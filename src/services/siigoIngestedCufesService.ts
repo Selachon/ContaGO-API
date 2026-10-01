@@ -157,7 +157,10 @@ export async function markCausedInSiigo(
   if (meta.causedBy) set.causedBy = meta.causedBy;
   if (meta.causedType) set.causedType = meta.causedType;
   if (meta.ivaAccountCode) set.ivaAccountCode = meta.ivaAccountCode;
-  if (meta.ivaAccountsByRate && Object.keys(meta.ivaAccountsByRate).length) set.ivaAccountsByRate = meta.ivaAccountsByRate;
+  if (meta.ivaAccountsByRate) {
+    const nonEmpty = Object.fromEntries(Object.entries(meta.ivaAccountsByRate).filter(([, v]) => v));
+    if (Object.keys(nonEmpty).length) set.ivaAccountsByRate = nonEmpty;
+  }
   if (meta.learnedGastoCode) set.learnedGastoCode = meta.learnedGastoCode;
   if (meta.docnum) set.docnum = meta.docnum;
   if (meta.supplierNit) set.supplierNit = meta.supplierNit;
