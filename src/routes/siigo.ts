@@ -602,11 +602,11 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         const allowed = userId ? await userCanAccessCompany(req.params.id, userId) : false;
         if (!allowed) return res.status(403).json({ ok: false, message: "Sin acceso a esta empresa." });
       }
-      const { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts, useInventoryAccounts, ivaComoMayorValor, ivaMayorValorAccounts, retefuenteMinBases, minFechaIngesta } = req.body || {};
+      const { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts, useInventoryAccounts, ivaComoMayorValor, ivaMayorValorAccounts, ivaMayorValor5Accounts, ivaMayorValor19Accounts, retefuenteMinBases, minFechaIngesta } = req.body || {};
       if (minFechaIngesta && !/^\d{4}-\d{2}-\d{2}$/.test(String(minFechaIngesta))) {
         return res.status(400).json({ ok: false, message: "minFechaIngesta debe tener formato yyyy-mm-dd." });
       }
-      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts, useInventoryAccounts, ivaComoMayorValor, ivaMayorValorAccounts, retefuenteMinBases, minFechaIngesta });
+      const saved = await updateCompanySettings(req.params.id, { useProducts, warehouseId, defaultProductCode, defaultPaymentTypeId, skipCostCenter, noCondenseItems, extraTaxAccounts, useInventoryAccounts, ivaComoMayorValor, ivaMayorValorAccounts, ivaMayorValor5Accounts, ivaMayorValor19Accounts, retefuenteMinBases, minFechaIngesta });
       // Vista previa de lo que borraría la limpieza (POST /companies/:id/dian-invoices/purge).
       const anteriores = minFechaIngesta ? await purgeDianInvoicesBefore(req.params.id, String(minFechaIngesta), true) : 0;
       return res.json({ ok: true, data: saved, anteriores });
