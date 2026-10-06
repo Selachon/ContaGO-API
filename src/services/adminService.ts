@@ -35,6 +35,21 @@ interface UserRecord {
   billing?: BillingInfo;
 }
 
+/** Suscripción propia de un servicio del usuario (si falta un campo, aplica el del usuario). */
+export interface UserToolSubscription {
+  licenseStartDate?: string;
+  licenseEndDate?: string;
+  paymentAmount?: number;
+  paymentMethod?: string;
+  invoiceRef?: string;
+  paidAt?: string;
+  status?: "active" | "cancelled";
+  cancelledAt?: string;
+  skippedPeriods?: string[];
+  paymentHistory?: Array<{ period: string; paidAt: string; amount?: number }>;
+  invoiceHistory?: Array<{ period: string; invoicedAt: string; invoiceRef?: string }>;
+}
+
 interface AdminUser {
   id: string;
   email: string;
@@ -57,6 +72,7 @@ interface AdminUser {
   companiesInPlan?: number;
   toolCompanyLimits?: Record<string, number>;
   toolNits?: Record<string, string[]>;
+  toolSubscriptions?: Record<string, UserToolSubscription>;
   invoiceRef?: string;
   billing?: BillingInfo;
 }
@@ -359,6 +375,7 @@ function mapUserToAdmin(record: UserRecord): AdminUser {
     companiesInPlan: record.companiesInPlan,
     toolCompanyLimits: record.toolCompanyLimits,
     toolNits: record.toolNits,
+    toolSubscriptions: (record as any).toolSubscriptions,
     invoiceRef: record.invoiceRef,
     billing: record.billing,
   };
@@ -410,6 +427,15 @@ export async function listUsers(params: ListUsersParams): Promise<{ users: Admin
   return { users, total };
 }
 
+/** Todos los usuarios (sin paginar) para la tabla de suscripciones. */
+export async function listAllUsersForSubscriptions(): Promise<AdminUser[]> {
+  const records = await usersCollection()
+    .find({}, { projection: { password_hash: 0, google_drive: 0, google_drives: 0 } })
+    .sort({ created_at: -1 })
+    .toArray();
+  return records.map(mapUserToAdmin);
+}
+
 export async function getUserById(id: string): Promise<AdminUser | null> {
   try {
     const oid = new ObjectId(id);
@@ -440,6 +466,90 @@ export async function updateUser(id: string, updates: Record<string, unknown>): 
     console.error("[AdminService] Error actualizando usuario:", err);
     return false;
   }
+}
+
+const TOOL_SUB_FIELDS = ["licenseStartDate", "licenseEndDate", "paymentAmount", "paymentMethod", "invoiceRef", "paidAt"] as const;
+
+/** Operaciones por mes de un servicio mensual (pagos, facturas y salida), como en las empresas Siigo. */
+export interface UserToolPeriodOps {
+  paymentPeriod?: string; periodPaidAt?: string; removePaymentPeriod?: string;
+  invoicePeriod?: string; invoicePeriodRef?: string; invoiceDate?: string; removeInvoicePeriod?: string;
+  status?: string; cancelledAt?: string | null;
+}
+
+const PERIOD_RE = /^\d{4}-\d{2}$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** Actualiza campos de la suscripción de UN servicio del usuario; null/"" borra el campo. */
+export async function updateUserToolSubscription(
+  id: string,
+  toolId: string,
+  data: Partial<Record<(typeof TOOL_SUB_FIELDS)[number], unknown>> & UserToolPeriodOps
+): Promise<UserToolSubscription | null> {
+  const oid = new ObjectId(id);
+  const base = `toolSubscriptions.${toolId}`;
+  const now = new Date().toISOString();
+
+  // Pagos/facturas por mes: arreglos aparte (se quita el mes y se vuelve a agregar en otra operación)
+  const periodOps: Array<{ pull?: Record<string, unknown>; push?: Record<string, unknown> }> = [];
+  for (const p of [data.paymentPeriod, data.removePaymentPeriod, data.invoicePeriod, data.removeInvoicePeriod]) {
+    if (p !== undefined && !PERIOD_RE.test(String(p))) throw new Error("Periodo inválido (use AAAA-MM).");
+  }
+  if (data.removePaymentPeriod) periodOps.push({ pull: { [`${base}.paymentHistory`]: { period: data.removePaymentPeriod } } });
+  if (data.paymentPeriod) {
+    if (!DATE_RE.test(String(data.periodPaidAt || ""))) throw new Error("Fecha de pago inválida (use AAAA-MM-DD).");
+    const amount = (await usersCollection().findOne({ _id: oid }, { projection: { toolSubscriptions: 1 } }) as any)?.toolSubscriptions?.[toolId]?.paymentAmount;
+    periodOps.push({ pull: { [`${base}.paymentHistory`]: { period: data.paymentPeriod } } });
+    periodOps.push({ push: { [`${base}.paymentHistory`]: { period: data.paymentPeriod, paidAt: data.periodPaidAt, ...(amount != null && { amount }) } } });
+  }
+  if (data.removeInvoicePeriod) periodOps.push({ pull: { [`${base}.invoiceHistory`]: { period: data.removeInvoicePeriod } } });
+  if (data.invoicePeriod) {
+    const invoicedAt = data.invoiceDate || now.slice(0, 10);
+    if (!DATE_RE.test(String(invoicedAt))) throw new Error("Fecha de factura inválida.");
+    const ref = String(data.invoicePeriodRef || "").trim();
+    periodOps.push({ pull: { [`${base}.invoiceHistory`]: { period: data.invoicePeriod } } });
+    periodOps.push({ push: { [`${base}.invoiceHistory`]: { period: data.invoicePeriod, invoicedAt, ...(ref && { invoiceRef: ref }) } } });
+  }
+  for (const op of periodOps) {
+    const res = await usersCollection().updateOne({ _id: oid }, (op.pull ? { $pull: op.pull } : { $push: op.push }) as any);
+    if (res.matchedCount === 0) return null;
+  }
+
+  const $set: Record<string, unknown> = { updated_at: now };
+  const $unset: Record<string, ""> = {};
+  if (data.status !== undefined) {
+    if (!["active", "cancelled"].includes(String(data.status))) throw new Error("Estado inválido.");
+    $set[`${base}.status`] = data.status;
+    if (data.status === "active") $unset[`${base}.cancelledAt`] = "";
+  }
+  if (data.cancelledAt) {
+    if (!DATE_RE.test(String(data.cancelledAt))) throw new Error("Fecha de salida inválida.");
+    $set[`${base}.cancelledAt`] = data.cancelledAt;
+  }
+  for (const f of TOOL_SUB_FIELDS) {
+    if (data[f] === undefined) continue;
+    const key = `toolSubscriptions.${toolId}.${f}`;
+    const raw = data[f];
+    if (raw === null || raw === "") { $unset[key] = ""; continue; }
+    if (f === "paymentAmount") {
+      const n = Number(raw);
+      if (isNaN(n) || n < 0) throw new Error("Valor inválido.");
+      $set[key] = n;
+    } else if (f === "licenseStartDate" || f === "licenseEndDate" || f === "paidAt") {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(raw))) throw new Error("Fecha inválida (use AAAA-MM-DD).");
+      $set[key] = String(raw);
+    } else {
+      $set[key] = String(raw).trim();
+    }
+  }
+  if (Object.keys($set).length === 1 && Object.keys($unset).length === 0 && !periodOps.length) throw new Error("Sin campos a actualizar.");
+  const res = await usersCollection().updateOne(
+    { _id: oid },
+    { $set, ...(Object.keys($unset).length ? { $unset } : {}) } as any
+  );
+  if (res.matchedCount === 0) return null;
+  const rec: any = await usersCollection().findOne({ _id: oid }, { projection: { toolSubscriptions: 1 } });
+  return rec?.toolSubscriptions?.[toolId] || {};
 }
 
 export async function suspendUser(id: string): Promise<boolean> {

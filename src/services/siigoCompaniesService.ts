@@ -47,7 +47,17 @@ export interface PaymentRecord {
   invoiceRef?: string;
 }
 
+export interface InvoiceRecord {
+  period: string; // "YYYY-MM" — mes facturado
+  invoicedAt: string;
+  invoiceRef?: string;
+}
+
 export interface CompanySubscription {
+  /** "cancelled" = el cliente salió. Ausente = activa. */
+  status?: "active" | "cancelled";
+  cancelledAt?: string;
+  invoiceHistory?: InvoiceRecord[];
   licenseStartDate?: string;
   licenseEndDate?: string;
   paymentAmount?: number;
@@ -80,6 +90,9 @@ export interface SubscriptionRow {
   userId: string;
   userName: string;
   userEmail: string;
+  status?: "active" | "cancelled";
+  cancelledAt?: string;
+  invoiceHistory?: InvoiceRecord[];
   licenseStartDate?: string;
   licenseEndDate?: string;
   paymentAmount?: number;
@@ -127,7 +140,7 @@ function toPublic(doc: any): SiigoCompanyPublic {
 export async function updateToolSubscription(
   companyId: string,
   toolId: string,
-  data: CompanySubscription & { period?: string }
+  data: CompanySubscription & { period?: string; invoicePeriod?: string; invoiceDate?: string; removeInvoicePeriod?: string }
 ): Promise<SiigoCompanyPublic> {
   let oid: ObjectId;
   try { oid = new ObjectId(companyId); } catch { throw new Error("Empresa inválida."); }
@@ -136,12 +149,40 @@ export async function updateToolSubscription(
   if (data.licenseEndDate !== undefined) patch[`subscriptions.${toolId}.licenseEndDate`] = data.licenseEndDate || null;
   if (data.paymentAmount !== undefined) patch[`subscriptions.${toolId}.paymentAmount`] = data.paymentAmount ?? null;
   if (data.paymentMethod !== undefined) patch[`subscriptions.${toolId}.paymentMethod`] = data.paymentMethod || null;
-  if (data.invoiceRef !== undefined) patch[`subscriptions.${toolId}.invoiceRef`] = data.invoiceRef || null;
+  if (data.invoiceRef !== undefined && !data.invoicePeriod) patch[`subscriptions.${toolId}.invoiceRef`] = data.invoiceRef || null;
   if (data.paymentStatus !== undefined) patch[`subscriptions.${toolId}.paymentStatus`] = data.paymentStatus;
   if (data.paidAt !== undefined) patch[`subscriptions.${toolId}.paidAt`] = data.paidAt || null;
-  if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
+  if (data.status !== undefined) {
+    if (data.status !== "active" && data.status !== "cancelled") throw new Error("Estado inválido.");
+    patch[`subscriptions.${toolId}.status`] = data.status;
+    patch[`subscriptions.${toolId}.cancelledAt`] = data.status === "cancelled" ? (data.cancelledAt || new Date().toISOString().slice(0, 10)) : null;
+  }
 
   const db = getDb().collection<any>(COMPANIES);
+
+  // Facturación del período (independiente del cobro)
+  if (data.invoicePeriod) {
+    const record: InvoiceRecord = {
+      period: data.invoicePeriod,
+      invoicedAt: data.invoiceDate || new Date().toISOString().slice(0, 10),
+      ...(data.invoiceRef && { invoiceRef: data.invoiceRef }),
+    };
+    const path = `subscriptions.${toolId}.invoiceHistory`;
+    await db.updateOne({ _id: oid }, { $pull: { [path]: { period: data.invoicePeriod } } as any });
+    const res = await db.updateOne({ _id: oid }, { $push: { [path]: record } as any });
+    if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
+  }
+  if (data.removeInvoicePeriod) {
+    await db.updateOne({ _id: oid }, { $pull: { [`subscriptions.${toolId}.invoiceHistory`]: { period: data.removeInvoicePeriod } } as any });
+  }
+  if (Object.keys(patch).length === 0) {
+    if (data.invoicePeriod || data.removeInvoicePeriod) {
+      const doc = await db.findOne({ _id: oid });
+      if (!doc) throw new Error("Empresa no encontrada.");
+      return toPublic(doc);
+    }
+    throw new Error("Sin campos a actualizar.");
+  }
 
   // Si hay pago nuevo, agregar al historial (evitando duplicados por periodo)
   if (data.paidAt && data.period) {
@@ -185,9 +226,10 @@ export async function listAllSubscriptionRows(): Promise<SubscriptionRow[]> {
 
   const rows: SubscriptionRow[] = [];
   for (const company of companies) {
-    const toolIds = resolveToolIds(company);
-    const owner = userMap.get(String(company.ownerUserId || ""));
     const subs: Record<string, any> = company.subscriptions || {};
+    // También las herramientas con suscripción registrada aunque ya no figuren en toolIds (p. ej. Egresos cobrado sin estar asignado)
+    const toolIds = [...new Set([...resolveToolIds(company), ...Object.keys(subs).filter((t) => subs[t]?.licenseStartDate)])];
+    const owner = userMap.get(String(company.ownerUserId || ""));
     // Fallback legado: si la empresa tiene licenseEndDate a nivel raíz, lo usamos para herramientas sin datos propios
     const legacySub: CompanySubscription = {};
     if (company.licenseStartDate) legacySub.licenseStartDate = company.licenseStartDate;

@@ -9,6 +9,8 @@ import JSZip from "jszip";
 import multer from "multer";
 import {
   listUsers,
+  listAllUsersForSubscriptions,
+  updateUserToolSubscription,
   getUserById,
   updateUser,
   suspendUser,
@@ -27,6 +29,7 @@ import {
   type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
+import { saveRut, getRut, rutAvailability } from "../services/rutStorage.js";
 import { createDemoInvite, listDemoInvites, TOOL_SUCCESSOR, updateUserPassword, resetExtActivation } from "../services/database.js";
 import { listCompaniesForUser, updateCompanySubscription, updateToolSubscription, listAllSubscriptionRows, removePaymentFromHistory } from "../services/siigoCompaniesService.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
@@ -44,8 +47,6 @@ const manualDianUpload = multer({
   },
 });
 
-const RUT_DIR = path.resolve("data/user-ruts");
-fs.mkdirSync(RUT_DIR, { recursive: true });
 const rutUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024, files: 1 },
@@ -615,7 +616,7 @@ router.post("/users/:id/rut", rutUpload.single("rut"), async (req: Request, res:
     }
 
     const filename = `${id}.pdf`;
-    fs.writeFileSync(path.join(RUT_DIR, filename), file.buffer);
+    await saveRut(id, file.buffer, file.originalname);
 
     const rutFile = {
       filename,
@@ -659,11 +660,14 @@ router.get("/users/:id/rut", async (req: Request, res: Response) => {
     if (!user || !rutFile) {
       return res.status(404).json({ ok: false, message: "Este usuario no tiene RUT cargado" });
     }
-    const filePath = path.join(RUT_DIR, rutFile.filename);
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ ok: false, message: "El archivo del RUT no se encuentra" });
+    const rut = await getRut(id, rutFile.filename);
+    if (!rut) {
+      return res.status(404).json({ ok: false, message: "El archivo del RUT no se encuentra. Hay que volver a cargarlo." });
     }
-    res.download(filePath, rutFile.originalName || rutFile.filename);
+    const name = (rutFile.originalName || rutFile.filename || "RUT.pdf").replace(/[^\w.\- ]/g, "_");
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${name}"`);
+    res.send(rut.data);
   } catch (err) {
     console.error("[Admin] Error descargando RUT:", err);
     res.status(500).json({ ok: false, message: "Error interno al descargar el RUT" });
@@ -1018,10 +1022,55 @@ router.get("/subscriptions", requireAuth, async (req: Request, res: Response) =>
   }
 });
 
+router.get("/subscriptions/users", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  try {
+    const users = await listAllUsersForSubscriptions();
+    // Si el PDF del RUT realmente está disponible (el registro puede existir sin el archivo)
+    const withRut = users.filter((u) => u.billing?.rutFile).map((u) => ({ id: u.id, filename: u.billing!.rutFile!.filename }));
+    const available = await rutAvailability(withRut);
+    const data = users.map((u) => ({ ...u, rutAvailable: available.has(u.id) }));
+    res.json({ ok: true, data });
+  } catch (err) {
+    console.error("[Admin] Error cargando usuarios para suscripciones:", err);
+    res.status(500).json({ ok: false, message: "Error cargando usuarios" });
+  }
+});
+
+router.patch("/users/:id/tool-subscriptions/:toolId", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  const { id, toolId } = req.params;
+  if (!ObjectId.isValid(id)) return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+  try {
+    const current = await getUserById(id);
+    if (!current) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    const {
+      licenseStartDate, licenseEndDate, paymentAmount, paymentMethod, invoiceRef, paidAt,
+      paymentPeriod, periodPaidAt, removePaymentPeriod, invoicePeriod, invoicePeriodRef, invoiceDate, removeInvoicePeriod, status, cancelledAt,
+    } = req.body;
+    const after = await updateUserToolSubscription(id, toolId, {
+      licenseStartDate, licenseEndDate, paymentAmount, paymentMethod, invoiceRef, paidAt,
+      paymentPeriod, periodPaidAt, removePaymentPeriod, invoicePeriod, invoicePeriodRef, invoiceDate, removeInvoicePeriod, status, cancelledAt,
+    });
+    await logAdminAction({
+      actorId: req.user.userId,
+      action: "update_tool_subscription",
+      targetUserId: id,
+      before: { toolId, ...(current.toolSubscriptions?.[toolId] || {}) },
+      after: { toolId, ...(after || {}) },
+      ip: req.ip,
+      userAgent: req.get("user-agent"),
+    });
+    res.json({ ok: true, data: after });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, message: err.message || "Error actualizando suscripción del servicio" });
+  }
+});
+
 router.patch("/siigo-companies/:companyId/subscriptions/:toolId", requireAuth, async (req: Request, res: Response) => {
   if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
   const { companyId, toolId } = req.params;
-  const { licenseStartDate, licenseEndDate, paymentAmount, paymentMethod, invoiceRef, paymentStatus, paidAt, period, removePaymentPeriod } = req.body;
+  const { licenseStartDate, licenseEndDate, paymentAmount, paymentMethod, invoiceRef, paymentStatus, paidAt, period, removePaymentPeriod, status, cancelledAt, invoicePeriod, invoiceDate, removeInvoicePeriod } = req.body;
   try {
     // Revertir cobro: quitar entrada del historial para ese periodo
     if (removePaymentPeriod) {
@@ -1037,6 +1086,11 @@ router.patch("/siigo-companies/:companyId/subscriptions/:toolId", requireAuth, a
       ...(paymentStatus !== undefined && { paymentStatus }),
       ...(paidAt !== undefined && { paidAt }),
       ...(period !== undefined && { period }),
+      ...(status !== undefined && { status }),
+      ...(cancelledAt !== undefined && { cancelledAt }),
+      ...(invoicePeriod !== undefined && { invoicePeriod }),
+      ...(invoiceDate !== undefined && { invoiceDate }),
+      ...(removeInvoicePeriod !== undefined && { removeInvoicePeriod }),
     });
     res.json({ ok: true, data: updated });
   } catch (err: any) {
