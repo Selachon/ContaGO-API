@@ -11,6 +11,9 @@ import {
   listUsers,
   listAllUsersForSubscriptions,
   updateUserToolSubscription,
+  addToolPayment,
+  updateToolPayment,
+  deleteToolPayment,
   getUserById,
   updateUser,
   suspendUser,
@@ -29,6 +32,7 @@ import {
   type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
+import { COMMISSION_RATE, listLedgerRows, setInvoice, planLegacyImport, runLegacyImport } from "../services/facturacionService.js";
 import { saveRut, getRut, rutAvailability } from "../services/rutStorage.js";
 import { createDemoInvite, listDemoInvites, TOOL_SUCCESSOR, updateUserPassword, resetExtActivation } from "../services/database.js";
 import { listCompaniesForUser, updateCompanySubscription, updateToolSubscription, listAllSubscriptionRows, removePaymentFromHistory } from "../services/siigoCompaniesService.js";
@@ -1009,6 +1013,104 @@ router.put("/accounting-kanban", async (req: Request, res: Response) => {
     res.status(500).json({ ok: false, message: "Error guardando tablero Kanban contable" });
   }
 });
+// ─── Facturación: ventas recibidas, factura relacionada e ingreso real del mes ──
+
+router.get("/facturacion", async (_req: Request, res: Response) => {
+  try {
+    res.json({ ok: true, ...(await listLedgerRows()), commissionRate: COMMISSION_RATE });
+  } catch (err) {
+    console.error("[Admin] Error cargando facturación:", err);
+    res.status(500).json({ ok: false, message: "Error cargando las ventas" });
+  }
+});
+
+router.post("/facturacion/factura", async (req: Request, res: Response) => {
+  try {
+    const { targets, invoiceRef, invoicedAt } = req.body || {};
+    if (!Array.isArray(targets)) return res.status(400).json({ ok: false, message: "Ventas inválidas" });
+    const clean = targets.map((t: any) => ({ userId: String(t?.userId || ""), toolId: String(t?.toolId || ""), paymentId: String(t?.paymentId || "") }));
+    const changed = await setInvoice(clean, String(invoiceRef || ""), invoicedAt ? String(invoicedAt) : undefined);
+    await logAdminAction({
+      actorId: req.user!.userId, action: String(invoiceRef || "").trim() ? "set_sale_invoice" : "clear_sale_invoice",
+      after: { invoiceRef: String(invoiceRef || "").trim(), invoicedAt, ventas: clean.length }, ip: req.ip, userAgent: req.get("user-agent"),
+    });
+    res.json({ ok: true, changed });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, message: err.message || "Error registrando la factura" });
+  }
+});
+
+// Vista previa de los pagos anteriores que se llevarían al libro (no escribe)
+router.get("/facturacion/importar", async (_req: Request, res: Response) => {
+  try {
+    const { writes, ...summary } = await planLegacyImport();
+    res.json({ ok: true, ...summary, sample: writes.slice(0, 8).map(w => ({ userId: w.userId, toolId: w.toolId, count: w.payments.length, first: w.payments[0]?.paidAt, amount: w.payments[0]?.amount })) });
+  } catch (err) {
+    console.error("[Admin] Error armando importación:", err);
+    res.status(500).json({ ok: false, message: "Error armando la importación" });
+  }
+});
+
+router.post("/facturacion/importar", async (req: Request, res: Response) => {
+  if (req.body?.confirm !== true) return res.status(400).json({ ok: false, message: "Falta la confirmación explícita." });
+  try {
+    const { writes, ...summary } = await runLegacyImport();
+    await logAdminAction({ actorId: req.user!.userId, action: "import_legacy_payments", after: { entries: summary.entries, users: summary.users }, ip: req.ip, userAgent: req.get("user-agent") });
+    res.json({ ok: true, ...summary });
+  } catch (err) {
+    console.error("[Admin] Error importando pagos anteriores:", err);
+    res.status(500).json({ ok: false, message: "Error importando los pagos anteriores" });
+  }
+});
+
+// Excel de lo que se ve en pantalla (mes o año, con los filtros aplicados)
+router.post("/facturacion/export", async (req: Request, res: Response) => {
+  try {
+    const rows: any[] = Array.isArray(req.body?.rows) ? req.body.rows.slice(0, 20000) : [];
+    const title = String(req.body?.title || "Ventas").replace(/[^\w\- ]/g, "").slice(0, 40) || "Ventas";
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet(title.slice(0, 31));
+    ws.columns = [
+      { header: "Fecha de pago", key: "paidAt", width: 14 },
+      { header: "Cliente", key: "client", width: 32 },
+      { header: "NIT / ID", key: "clientId", width: 16 },
+      { header: "Herramienta", key: "tool", width: 34 },
+      { header: "Tipo", key: "type", width: 14 },
+      { header: "Valor", key: "amount", width: 14, style: { numFmt: "$#,##0" } },
+      { header: `Comisión Venta (${Math.round(COMMISSION_RATE * 100)}%)`, key: "commission", width: 22, style: { numFmt: "$#,##0" } },
+      { header: "Forma de pago", key: "method", width: 22 },
+      { header: "Estado", key: "status", width: 14 },
+      { header: "Factura / Nota crédito", key: "invoiceRef", width: 22 },
+      { header: "Fecha factura / NC", key: "invoicedAt", width: 16 },
+    ];
+    ws.getRow(1).eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF2563EB" } };
+      cell.alignment = { vertical: "middle", horizontal: "center" };
+    });
+    let total = 0, commission = 0;
+    for (const r of rows) {
+      const amount = Number(r.amount) || 0, com = Number(r.commission) || 0;
+      total += amount; commission += com;
+      ws.addRow({
+        paidAt: String(r.paidAt || ""), client: String(r.client || ""), clientId: String(r.clientId || ""), tool: String(r.tool || ""),
+        type: String(r.type || ""), amount, commission: com, method: String(r.method || ""),
+        status: r.refund ? (r.invoiceRef ? "Con nota crédito" : "NC pendiente") : (r.invoiceRef ? "Facturado" : "Por facturar"), invoiceRef: String(r.invoiceRef || ""), invoicedAt: String(r.invoicedAt || ""),
+      });
+    }
+    const totalRow = ws.addRow({ client: "TOTAL", amount: total, commission });
+    totalRow.font = { bold: true };
+    ws.views = [{ state: "frozen", ySplit: 1 }];
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="facturacion_${new Date().toISOString().slice(0, 10)}.xlsx"`);
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error("[Admin] Error exportando facturación:", err);
+    res.status(500).json({ ok: false, message: "Error exportando" });
+  }
+});
+
 // ─── Panel de suscripciones ──────────────────────────────────────────────────
 
 router.get("/subscriptions", requireAuth, async (req: Request, res: Response) => {
@@ -1064,6 +1166,58 @@ router.patch("/users/:id/tool-subscriptions/:toolId", requireAuth, async (req: R
     res.json({ ok: true, data: after });
   } catch (err: any) {
     res.status(400).json({ ok: false, message: err.message || "Error actualizando suscripción del servicio" });
+  }
+});
+
+// Libro de pagos de un servicio: activación, renovación y mejora (cada pago es un movimiento propio)
+router.post("/users/:id/tool-subscriptions/:toolId/payments", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  const { id, toolId } = req.params;
+  if (!ObjectId.isValid(id)) return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+  try {
+    const user = await addToolPayment(id, toolId, req.body || {});
+    if (!user) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    await logAdminAction({
+      actorId: req.user.userId, action: "add_tool_payment", targetUserId: id,
+      after: { toolId, ...(req.body || {}) }, ip: req.ip, userAgent: req.get("user-agent"),
+    });
+    res.json({ ok: true, user });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, message: err.message || "Error registrando el pago" });
+  }
+});
+
+router.patch("/users/:id/tool-subscriptions/:toolId/payments/:paymentId", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  const { id, toolId, paymentId } = req.params;
+  if (!ObjectId.isValid(id)) return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+  try {
+    const user = await updateToolPayment(id, toolId, paymentId, req.body || {});
+    if (!user) return res.status(404).json({ ok: false, message: "Pago no encontrado" });
+    await logAdminAction({
+      actorId: req.user.userId, action: "update_tool_payment", targetUserId: id,
+      after: { toolId, paymentId, ...(req.body || {}) }, ip: req.ip, userAgent: req.get("user-agent"),
+    });
+    res.json({ ok: true, user });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, message: err.message || "Error actualizando el pago" });
+  }
+});
+
+router.delete("/users/:id/tool-subscriptions/:toolId/payments/:paymentId", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  const { id, toolId, paymentId } = req.params;
+  if (!ObjectId.isValid(id)) return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+  try {
+    const user = await deleteToolPayment(id, toolId, paymentId);
+    if (!user) return res.status(404).json({ ok: false, message: "Pago no encontrado" });
+    await logAdminAction({
+      actorId: req.user.userId, action: "delete_tool_payment", targetUserId: id,
+      after: { toolId, paymentId }, ip: req.ip, userAgent: req.get("user-agent"),
+    });
+    res.json({ ok: true, user });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, message: err.message || "Error eliminando el pago" });
   }
 });
 

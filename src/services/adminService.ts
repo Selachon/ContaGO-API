@@ -1,4 +1,5 @@
 import { ObjectId, type Collection } from "mongodb";
+import { randomUUID } from "crypto";
 import type { BillingInfo, DemoAccess, UserRole } from "../types/auth.js";
 import { db } from "./database.js";
 
@@ -48,6 +49,37 @@ export interface UserToolSubscription {
   skippedPeriods?: string[];
   paymentHistory?: Array<{ period: string; paidAt: string; amount?: number }>;
   invoiceHistory?: Array<{ period: string; invoicedAt: string; invoiceRef?: string }>;
+  /** Libro de pagos del servicio: cada pago es un movimiento propio (no se sobrescribe el anterior). */
+  payments?: ToolPayment[];
+}
+
+export type ToolPaymentType = "activacion" | "renovacion" | "mejora" | "devolucion";
+
+export interface ToolPayment {
+  id: string;
+  type: ToolPaymentType;
+  paidAt: string;
+  amount: number;
+  method?: string;
+  invoiceRef?: string;
+  /** Fecha de la factura (emitida afuera) relacionada con esta venta; en una devolución, de la nota crédito. */
+  invoicedAt?: string;
+  /** Devolución: id de la venta que se devuelve (el valor `amount` de una devolución es negativo). */
+  refundOf?: string;
+  /** Venta traída de datos anteriores al libro; con fecha estimada si se usó el inicio de la suscripción. */
+  imported?: boolean;
+  dateEstimated?: boolean;
+  periodicityMonths?: number;
+  periodStart?: string;
+  periodEnd?: string;
+  /** Mejora acoplada al vencimiento del plan original. */
+  alignToBase?: boolean;
+  addCompanies?: number;
+  addNits?: string[];
+  /** Cómo quedó el plan de la herramienta al registrar la venta (empresas y NITs habilitados). */
+  planAfter?: { companies?: number; nits: string[] };
+  note?: string;
+  createdAt: string;
 }
 
 interface AdminUser {
@@ -550,6 +582,266 @@ export async function updateUserToolSubscription(
   if (res.matchedCount === 0) return null;
   const rec: any = await usersCollection().findOne({ _id: oid }, { projection: { toolSubscriptions: 1 } });
   return rec?.toolSubscriptions?.[toolId] || {};
+}
+
+// ─── Libro de pagos por servicio ─────────────────────────────────────────────
+
+const TOOL_ID_RE = /^[a-z0-9-]+$/;
+const PERIODICITIES = [1, 3, 6, 12];
+
+/** Suma n meses a AAAA-MM-DD conservando el día (si el mes no lo tiene, usa el último). */
+function addMonthsIso(d: string, n: number): string {
+  const [y, m, day] = d.slice(0, 10).split("-").map(Number);
+  const t = m - 1 + n;
+  const yy = y + Math.floor(t / 12);
+  const mm = ((t % 12) + 12) % 12;
+  const dd = Math.min(day, new Date(Date.UTC(yy, mm + 1, 0)).getUTCDate());
+  return `${yy}-${String(mm + 1).padStart(2, "0")}-${String(dd).padStart(2, "0")}`;
+}
+
+export interface NewToolPaymentInput {
+  type?: string;
+  paidAt?: string;
+  amount?: unknown;
+  method?: string;
+  invoiceRef?: string;
+  periodicityMonths?: unknown;
+  periodStart?: string;
+  alignToBase?: boolean;
+  addCompanies?: unknown;
+  addNits?: unknown;
+  note?: string;
+  /** Devolución: venta original y si la herramienta se da de baja. */
+  refundOf?: string;
+  cancelTool?: boolean;
+}
+
+const SALE_LOCKED_MSG = "La venta ya está facturada: no se puede modificar ni eliminar. Solo se cambia por código interno.";
+
+/** Devolución de dinero: queda en el libro con valor negativo y pide nota crédito en Facturación. No toca fechas ni límites del plan. */
+async function addToolRefund(id: string, toolId: string, rec: any, input: NewToolPaymentInput, paidAt: string): Promise<AdminUser | null> {
+  const raw = Number(input.amount);
+  if (input.amount === "" || input.amount == null || isNaN(raw) || raw <= 0) throw new Error("Indique el valor devuelto (mayor que cero).");
+  const note = String(input.note || "").trim();
+  if (!note) throw new Error("Indique el motivo de la devolución.");
+  const method = String(input.method || "").trim();
+  if (method === "Obsequio") throw new Error("Una devolución no puede ser un obsequio.");
+
+  const payments: ToolPayment[] = rec.toolSubscriptions?.[toolId]?.payments || [];
+  let refundOf: string | undefined;
+  if (input.refundOf) {
+    const original = payments.find((p) => p.id === String(input.refundOf));
+    if (!original) throw new Error("La venta que se devuelve no existe.");
+    if (original.type === "devolucion") throw new Error("No se puede devolver una devolución.");
+    const already = payments.filter((p) => p.type === "devolucion" && p.refundOf === original.id).reduce((t, p) => t + Math.abs(p.amount), 0);
+    if (raw + already > original.amount + 0.001) {
+      throw new Error(`La devolución supera lo pagado: la venta fue de ${original.amount} y ya se devolvieron ${already}.`);
+    }
+    refundOf = original.id;
+  }
+
+  const now = new Date().toISOString();
+  const payment: ToolPayment = {
+    id: randomUUID(), type: "devolucion", paidAt, amount: -raw, ...(method && { method }), note, ...(refundOf && { refundOf }), createdAt: now,
+  };
+  const base = `toolSubscriptions.${toolId}`;
+  const $set: Record<string, unknown> = { updated_at: now };
+  if (input.cancelTool) { $set[`${base}.status`] = "cancelled"; $set[`${base}.cancelledAt`] = paidAt; }
+  await usersCollection().updateOne({ _id: new ObjectId(id) }, { $set, $push: { [`${base}.payments`]: payment } } as any);
+  return getUserById(id);
+}
+
+/**
+ * Registra un pago en el libro del servicio y aplica su efecto sobre el plan:
+ * - activacion / renovacion: fijan el periodo vigente (renovacion extiende desde el vencimiento si aún rige).
+ * - mejora: suma empresas y/o NITs; no toca las fechas ni el valor del plan base.
+ */
+export async function addToolPayment(id: string, toolId: string, input: NewToolPaymentInput): Promise<AdminUser | null> {
+  if (!TOOL_ID_RE.test(toolId)) throw new Error("Servicio inválido.");
+  const oid = new ObjectId(id);
+  const rec: any = await usersCollection().findOne({ _id: oid }, { projection: { password_hash: 0 } });
+  if (!rec) return null;
+
+  const type = String(input.type) as ToolPaymentType;
+  if (!["activacion", "renovacion", "mejora", "devolucion"].includes(type)) throw new Error("Tipo de pago inválido.");
+  const paidAt = String(input.paidAt || "");
+  if (!DATE_RE.test(paidAt)) throw new Error("Fecha de pago inválida (use AAAA-MM-DD).");
+  if (type === "devolucion") return addToolRefund(id, toolId, rec, input, paidAt);
+  // Obsequio: se activa algo sin cobro, el valor siempre es 0
+  const gift = String(input.method || "").trim() === "Obsequio";
+  const amount = gift ? 0 : Number(input.amount);
+  if (!gift && (input.amount === "" || input.amount == null || isNaN(amount) || amount < 0)) throw new Error("Valor inválido.");
+
+  const sub: any = rec.toolSubscriptions?.[toolId] || {};
+  const base = `toolSubscriptions.${toolId}`;
+  const baseStart: string | undefined = sub.licenseStartDate ?? rec.licenseStartDate;
+  const baseEnd: string | undefined = sub.licenseEndDate ?? rec.licenseEndDate;
+  const baseAmount = sub.paymentAmount ?? rec.paymentAmount;
+
+  const months = Number(input.periodicityMonths);
+  const alignToBase = type === "mejora" && !!input.alignToBase;
+  if (!alignToBase && !PERIODICITIES.includes(months)) throw new Error("Periodicidad inválida (1, 3, 6 o 12 meses).");
+
+  const payment: ToolPayment = {
+    id: randomUUID(), type, paidAt, amount,
+    ...(input.method && { method: String(input.method).trim() }),
+    ...(input.invoiceRef && String(input.invoiceRef).trim() && { invoiceRef: String(input.invoiceRef).trim() }),
+    ...(input.note && String(input.note).trim() && { note: String(input.note).trim() }),
+    createdAt: new Date().toISOString(),
+  };
+  const $set: Record<string, unknown> = { updated_at: payment.createdAt };
+  const $push: Record<string, unknown> = {};
+  const $addToSet: Record<string, unknown> = {};
+
+  // Primer pago del libro: conservar el pago anterior (campos sueltos) para que el reporte no lo pierda
+  const prior: ToolPayment[] = [];
+  if (!(sub.payments || []).length && sub.paidAt && baseAmount != null && baseStart && baseEnd) {
+    prior.push({
+      id: "legacy", type: "activacion", paidAt: String(sub.paidAt).slice(0, 10), amount: Number(baseAmount),
+      ...(sub.paymentMethod ?? rec.paymentMethod ? { method: sub.paymentMethod ?? rec.paymentMethod } : {}),
+      ...((sub.invoiceRef ?? rec.invoiceRef) ? { invoiceRef: sub.invoiceRef ?? rec.invoiceRef } : {}),
+      periodStart: baseStart, periodEnd: baseEnd, note: "Pago anterior (migrado)", createdAt: payment.createdAt,
+    });
+  }
+
+  if (type === "mejora") {
+    const companies = input.addCompanies === "" || input.addCompanies == null ? 0 : Number(input.addCompanies);
+    if (isNaN(companies) || companies < 0 || !Number.isInteger(companies)) throw new Error("Empresas adicionales inválidas.");
+    const nits = [...new Set((Array.isArray(input.addNits) ? input.addNits : []).map((n) => String(n).trim()).filter(Boolean))];
+    if (!companies && !nits.length && !payment.note) throw new Error("Indique qué se agrega: empresas, NITs o una nota.");
+    if (companies) {
+      // El cupo sube donde realmente rige: el límite propio de la herramienta, o el global "Empresas en el plan"
+      const own = rec.toolCompanyLimits?.[toolId];
+      if (own != null) $set[`toolCompanyLimits.${toolId}`] = Number(own) + companies;
+      else if (rec.companiesInPlan != null) $set.companiesInPlan = Number(rec.companiesInPlan) + companies;
+      else throw new Error("El servicio no tiene un límite de empresas definido; fíjelo primero.");
+      payment.addCompanies = companies;
+    }
+    if (nits.length) {
+      $addToSet[`toolNits.${toolId}`] = { $each: nits };
+      $addToSet.nits = { $each: nits };
+      payment.addNits = nits;
+    }
+    if (alignToBase) {
+      if (!baseEnd) throw new Error("El plan base no tiene fecha de vencimiento para acoplar la mejora.");
+      payment.alignToBase = true;
+      payment.periodStart = paidAt;
+      payment.periodEnd = baseEnd;
+    } else {
+      const start = input.periodStart && DATE_RE.test(input.periodStart) ? input.periodStart : paidAt;
+      payment.periodicityMonths = months;
+      payment.periodStart = start;
+      payment.periodEnd = addMonthsIso(start, months);
+    }
+  } else {
+    // Una herramienta con plan propio vigente no se "activa" otra vez: se renueva o se mejora
+    if (type === "activacion" && sub.licenseEndDate && sub.status !== "cancelled") {
+      throw new Error("La herramienta ya está activa: registre una renovación o una mejora.");
+    }
+    // Activación: arranca el día indicado. Renovación: continúa el periodo vigente si aún no vence.
+    let start = input.periodStart && DATE_RE.test(input.periodStart) ? input.periodStart : paidAt;
+    if (type === "renovacion" && !input.periodStart && baseEnd && baseEnd >= paidAt) start = baseEnd;
+    const end = addMonthsIso(start, months);
+    payment.periodicityMonths = months;
+    payment.periodStart = start;
+    payment.periodEnd = end;
+    // Servicio mensual: el mes pagado queda en el historial mensual y se conserva el inicio propio del servicio
+    if (months === 1) {
+      $push[`${base}.paymentHistory`] = { period: start.slice(0, 7), paidAt, amount };
+      if (!sub.licenseStartDate) $set[`${base}.licenseStartDate`] = start;
+    } else {
+      $set[`${base}.licenseStartDate`] = start;
+    }
+    // Activación de una herramienta por NIT: se habilitan los NITs indicados
+    const nits = [...new Set((Array.isArray(input.addNits) ? input.addNits : []).map((n) => String(n).trim()).filter(Boolean))];
+    if (type === "activacion" && nits.length) {
+      $addToSet[`toolNits.${toolId}`] = { $each: nits };
+      $addToSet.nits = { $each: nits };
+      payment.addNits = nits;
+    }
+    $set[`${base}.licenseEndDate`] = end;
+    $set[`${base}.paymentAmount`] = amount;
+    $set[`${base}.paidAt`] = paidAt;
+    $set[`${base}.status`] = "active";
+    if (payment.method) $set[`${base}.paymentMethod`] = payment.method;
+    if (payment.invoiceRef) $set[`${base}.invoiceRef`] = payment.invoiceRef;
+    $addToSet.purchasedTools = toolId;
+  }
+
+  // Foto del plan tras la venta: es lo que la venta dejó incluido (empresas y NITs)
+  const companiesAfter = ($set[`toolCompanyLimits.${toolId}`] as number | undefined)
+    ?? ($set.companiesInPlan as number | undefined)
+    ?? rec.toolCompanyLimits?.[toolId] ?? rec.companiesInPlan;
+  const nitsAfter = [...new Set([...(rec.toolNits?.[toolId] || []), ...(payment.addNits || [])])];
+  payment.planAfter = { ...(companiesAfter != null && { companies: Number(companiesAfter) }), nits: nitsAfter };
+
+  $push[`${base}.payments`] = { $each: [...prior, payment] };
+  const ops: Record<string, unknown> = { $set, $push };
+  if (Object.keys($addToSet).length) ops.$addToSet = $addToSet;
+  if (type !== "mejora") ops.$unset = { [`${base}.cancelledAt`]: "" };
+  await usersCollection().updateOne({ _id: oid }, ops as any);
+  return getUserById(id);
+}
+
+const PAYMENT_EDIT_FIELDS = ["paidAt", "amount", "method", "invoiceRef", "invoicedAt", "periodStart", "periodEnd", "note"] as const;
+
+/** Corrige datos de un pago (factura, fecha, valor…). No recalcula el efecto sobre el plan. */
+export async function updateToolPayment(
+  id: string, toolId: string, paymentId: string, patch: Partial<Record<(typeof PAYMENT_EDIT_FIELDS)[number], unknown>>
+): Promise<AdminUser | null> {
+  if (!TOOL_ID_RE.test(toolId)) throw new Error("Servicio inválido.");
+  const oid = new ObjectId(id);
+  const key = `toolSubscriptions.${toolId}.payments`;
+  const $set: Record<string, unknown> = { updated_at: new Date().toISOString() };
+  const $unset: Record<string, ""> = {};
+  for (const f of PAYMENT_EDIT_FIELDS) {
+    if (patch[f] === undefined) continue;
+    const path = `${key}.$[p].${f}`;
+    const raw = patch[f];
+    if (raw === null || raw === "") {
+      if (f === "paidAt" || f === "amount") throw new Error("Campo obligatorio.");
+      $unset[path] = "";
+    } else if (f === "amount") {
+      const n = Number(raw);
+      if (isNaN(n) || n < 0) throw new Error("Valor inválido.");
+      $set[path] = n;
+    } else if (f === "paidAt" || f === "invoicedAt" || f === "periodStart" || f === "periodEnd") {
+      if (!DATE_RE.test(String(raw))) throw new Error("Fecha inválida (use AAAA-MM-DD).");
+      $set[path] = String(raw);
+    } else {
+      $set[path] = String(raw).trim();
+    }
+  }
+  if (Object.keys($set).length === 1 && !Object.keys($unset).length) throw new Error("Sin campos a actualizar.");
+  // Una venta facturada queda bloqueada: solo se cambia por código interno
+  const res = await usersCollection().updateOne(
+    { _id: oid, [key]: { $elemMatch: { id: paymentId, invoiceRef: { $exists: false } } } },
+    { $set, ...(Object.keys($unset).length ? { $unset } : {}) } as any,
+    { arrayFilters: [{ "p.id": paymentId }] }
+  );
+  if (res.matchedCount === 0) {
+    const exists = await usersCollection().findOne({ _id: oid, [`${key}.id`]: paymentId }, { projection: { _id: 1 } });
+    if (exists) throw new Error(SALE_LOCKED_MSG);
+    return null;
+  }
+  return getUserById(id);
+}
+
+/** Quita un pago del libro (no revierte empresas/NITs ni fechas ya aplicadas al plan). */
+export async function deleteToolPayment(id: string, toolId: string, paymentId: string): Promise<AdminUser | null> {
+  if (!TOOL_ID_RE.test(toolId)) throw new Error("Servicio inválido.");
+  const key = `toolSubscriptions.${toolId}.payments`;
+  const oid = new ObjectId(id);
+  const res = await usersCollection().updateOne(
+    { _id: oid, [key]: { $elemMatch: { id: paymentId, invoiceRef: { $exists: false } } } },
+    { $pull: { [key]: { id: paymentId } }, $set: { updated_at: new Date().toISOString() } } as any
+  );
+  if (res.matchedCount === 0) {
+    const exists = await usersCollection().findOne({ _id: oid, [`${key}.id`]: paymentId }, { projection: { _id: 1 } });
+    if (exists) throw new Error(SALE_LOCKED_MSG);
+    return null;
+  }
+  return getUserById(id);
 }
 
 export async function suspendUser(id: string): Promise<boolean> {
