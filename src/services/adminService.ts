@@ -1,3 +1,4 @@
+import { clearSuspensionCache } from "./subscriptionExpiry.js";
 import { ObjectId, type Collection } from "mongodb";
 import { randomUUID } from "crypto";
 import type { BillingInfo, DemoAccess, UserRole } from "../types/auth.js";
@@ -51,6 +52,10 @@ export interface UserToolSubscription {
   invoiceHistory?: Array<{ period: string; invoicedAt: string; invoiceRef?: string }>;
   /** Libro de pagos del servicio: cada pago es un movimiento propio (no se sobrescribe el anterior). */
   payments?: ToolPayment[];
+  /** Obsequio sin cobro propio. */
+  gift?: boolean;
+  /** Herramienta cuyas fechas de renovación sigue esta (p. ej. un obsequio atado a Causación Siigo). */
+  followsTool?: string;
 }
 
 export type ToolPaymentType = "activacion" | "renovacion" | "mejora" | "devolucion";
@@ -69,6 +74,10 @@ export interface ToolPayment {
   /** Venta traída de datos anteriores al libro; con fecha estimada si se usó el inicio de la suscripción. */
   imported?: boolean;
   dateEstimated?: boolean;
+  /** Venta traída del cobro de una empresa Siigo: a qué empresa corresponde y la clave que evita importarla dos veces. */
+  companyId?: string;
+  companyName?: string;
+  sourceKey?: string;
   periodicityMonths?: number;
   periodStart?: string;
   periodEnd?: string;
@@ -107,6 +116,8 @@ interface AdminUser {
   toolSubscriptions?: Record<string, UserToolSubscription>;
   invoiceRef?: string;
   billing?: BillingInfo;
+  /** Excepción: no se suspende por vencimiento hasta esta fecha (AAAA-MM-DD). */
+  suspensionExemptUntil?: string;
 }
 
 interface AdminAuditLog {
@@ -408,6 +419,7 @@ function mapUserToAdmin(record: UserRecord): AdminUser {
     toolCompanyLimits: record.toolCompanyLimits,
     toolNits: record.toolNits,
     toolSubscriptions: (record as any).toolSubscriptions,
+    suspensionExemptUntil: (record as any).suspensionExemptUntil,
     invoiceRef: record.invoiceRef,
     billing: record.billing,
   };
@@ -493,6 +505,7 @@ export async function updateUser(id: string, updates: Record<string, unknown>): 
         },
       }
     );
+    clearSuspensionCache();
     return result.modifiedCount > 0 || result.matchedCount > 0;
   } catch (err) {
     console.error("[AdminService] Error actualizando usuario:", err);
@@ -580,6 +593,7 @@ export async function updateUserToolSubscription(
     { $set, ...(Object.keys($unset).length ? { $unset } : {}) } as any
   );
   if (res.matchedCount === 0) return null;
+  clearSuspensionCache();
   const rec: any = await usersCollection().findOne({ _id: oid }, { projection: { toolSubscriptions: 1 } });
   return rec?.toolSubscriptions?.[toolId] || {};
 }
@@ -648,6 +662,7 @@ async function addToolRefund(id: string, toolId: string, rec: any, input: NewToo
   const $set: Record<string, unknown> = { updated_at: now };
   if (input.cancelTool) { $set[`${base}.status`] = "cancelled"; $set[`${base}.cancelledAt`] = paidAt; }
   await usersCollection().updateOne({ _id: new ObjectId(id) }, { $set, $push: { [`${base}.payments`]: payment } } as any);
+  clearSuspensionCache();
   return getUserById(id);
 }
 
@@ -780,6 +795,7 @@ export async function addToolPayment(id: string, toolId: string, input: NewToolP
   if (Object.keys($addToSet).length) ops.$addToSet = $addToSet;
   if (type !== "mejora") ops.$unset = { [`${base}.cancelledAt`]: "" };
   await usersCollection().updateOne({ _id: oid }, ops as any);
+  clearSuspensionCache();
   return getUserById(id);
 }
 
@@ -824,6 +840,7 @@ export async function updateToolPayment(
     if (exists) throw new Error(SALE_LOCKED_MSG);
     return null;
   }
+  clearSuspensionCache();
   return getUserById(id);
 }
 

@@ -1044,7 +1044,7 @@ router.post("/facturacion/factura", async (req: Request, res: Response) => {
 router.get("/facturacion/importar", async (_req: Request, res: Response) => {
   try {
     const { writes, ...summary } = await planLegacyImport();
-    res.json({ ok: true, ...summary, sample: writes.slice(0, 8).map(w => ({ userId: w.userId, toolId: w.toolId, count: w.payments.length, first: w.payments[0]?.paidAt, amount: w.payments[0]?.amount })) });
+    res.json({ ok: true, ...summary, removalsCount: summary.removals.length, sample: writes.slice(0, 8).map(w => ({ userId: w.userId, toolId: w.toolId, count: w.payments.length, first: w.payments[0]?.paidAt, amount: w.payments[0]?.amount })) });
   } catch (err) {
     console.error("[Admin] Error armando importación:", err);
     res.status(500).json({ ok: false, message: "Error armando la importación" });

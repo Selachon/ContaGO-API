@@ -38,6 +38,7 @@ export interface FacturacionRow {
   planAfter?: ToolPayment["planAfter"];
   imported: boolean;
   note?: string;
+  companyName?: string;
   /** Devolución: pide nota crédito en lugar de factura; `original` es la venta que se devuelve. */
   refund: boolean;
   original?: { paidAt: string; amount: number; invoiceRef?: string; type: ToolPayment["type"] };
@@ -96,7 +97,7 @@ export async function listLedgerRows(): Promise<{ rows: FacturacionRow[]; client
           method: p.method, invoiceRef: p.invoiceRef, invoicedAt: p.invoicedAt,
           periodStart: p.periodStart, periodEnd: p.periodEnd, periodicityMonths: p.periodicityMonths, alignToBase: p.alignToBase,
           addCompanies: p.addCompanies, addNits: p.addNits, planAfter: p.planAfter,
-          imported: !!p.imported, note: p.note, refund: p.type === "devolucion",
+          imported: !!p.imported, note: p.note, refund: p.type === "devolucion", companyName: p.companyName,
           ...(orig && { original: { paidAt: orig.paidAt, amount: Number(orig.amount) || 0, invoiceRef: orig.invoiceRef, type: orig.type } }),
         });
       }
@@ -170,14 +171,79 @@ export interface LegacyImportPlan {
   skippedNoDate: Array<{ user: string; toolId: string }>;
   skippedNoValue: Array<{ user: string; toolId: string }>;
   writes: Array<{ userId: string; toolId: string; payments: ToolPayment[] }>;
+  /** Cobros de empresas Siigo que se llevan al libro (una venta por mes pagado, y los obsequios) */
+  companyEntries: number;
+  companyGifts: number;
+  /** Ventas importadas antes a nivel de usuario que duplican los cobros de empresa: se reemplazan */
+  removals: Array<{ userId: string; toolId: string; paymentId: string; user: string; desc: string }>;
 }
 
 /** Arma (sin escribir) los pagos anteriores que aún no están en el libro. Sin fecha de pago se usa el inicio de la suscripción. */
 export async function planLegacyImport(): Promise<LegacyImportPlan> {
   const docs = await users().find({ is_admin: { $ne: true }, role: { $ne: "DEMO" } }).toArray();
-  const plan: LegacyImportPlan = { users: 0, entries: 0, estimatedDate: 0, skippedNoDate: [], skippedNoValue: [], writes: [] };
+  const plan: LegacyImportPlan = { users: 0, entries: 0, estimatedDate: 0, skippedNoDate: [], skippedNoValue: [], writes: [], companyEntries: 0, companyGifts: 0, removals: [] };
   const now = new Date().toISOString();
   const touched = new Set<string>();
+
+  // Cobros por empresa Siigo: son la fuente de esas herramientas, así que los datos sueltos del usuario no se importan
+  const byId = new Map(docs.map((d: any) => [String(d._id), d]));
+  const companyTool = new Set<string>();
+  const addCompanyWrite = (u: any, toolId: string, payments: ToolPayment[]) => {
+    if (!payments.length) return;
+    plan.writes.push({ userId: String(u._id), toolId, payments });
+    plan.entries += payments.length;
+    touched.add(String(u._id));
+  };
+  const comps = await getDb().collection<any>("siigoCompanies").find({}).toArray();
+  for (const co of comps) {
+    const u: any = byId.get(String(co.ownerUserId));
+    if (!u) continue; // dueño admin, demo o inexistente
+    for (const [toolId, sub] of Object.entries<any>(co.subscriptions || {})) {
+      if (!TOOL_ID_RE.test(toolId)) continue;
+      companyTool.add(`${u._id}|${toolId}`);
+      const existing = new Set(((u.toolSubscriptions?.[toolId]?.payments || []) as ToolPayment[]).map(p => p.sourceKey).filter(Boolean));
+      const out: ToolPayment[] = [];
+      const base = { companyId: String(co._id), companyName: co.name, imported: true as const, createdAt: now };
+      if (sub.gift) {
+        const key = `${co._id}|${toolId}|gift`;
+        if (!existing.has(key) && sub.licenseStartDate) {
+          out.push({ ...base, id: randomUUID(), type: "activacion", paidAt: sub.licenseStartDate.slice(0, 10), amount: 0, method: "Obsequio",
+            periodStart: sub.licenseStartDate, ...(sub.licenseEndDate && { periodEnd: sub.licenseEndDate }), sourceKey: key, note: `Obsequio · empresa ${co.name}` });
+          plan.companyGifts++;
+        }
+      }
+      const history = [...(sub.paymentHistory || [])].filter((h: any) => h?.paidAt && h.period).sort((a: any, b: any) => String(a.period).localeCompare(String(b.period)));
+      history.forEach((h: any, i: number) => {
+        const key = `${co._id}|${toolId}|${h.period}`;
+        if (existing.has(key)) return;
+        const amount = Number(h.amount ?? sub.paymentAmount);
+        if (isNaN(amount)) { plan.skippedNoValue.push({ user: u.email, toolId }); return; }
+        const start: string | undefined = sub.licenseStartDate;
+        const n = start ? monthsBetween(`${start.slice(0, 7)}-01`, `${h.period}-01`) : null;
+        const periodStart = start && n != null && n >= 0 ? addMonthsIso(start, n) : `${h.period}-01`;
+        const inv = (sub.invoiceHistory || []).find((x: any) => x.period === h.period);
+        const invoiceRef = h.invoiceRef ?? inv?.invoiceRef;
+        const method = h.method ?? sub.paymentMethod;
+        out.push({
+          ...base, id: randomUUID(), type: i === 0 && !sub.gift ? "activacion" : "renovacion", paidAt: String(h.paidAt).slice(0, 10), amount,
+          ...(method && { method }), ...(invoiceRef && { invoiceRef }), ...(inv?.invoicedAt && invoiceRef && { invoicedAt: inv.invoicedAt }),
+          periodicityMonths: 1, periodStart, periodEnd: addMonthsIso(periodStart, 1), sourceKey: key, note: `Importado · empresa ${co.name}`,
+        });
+        plan.companyEntries++;
+      });
+      addCompanyWrite(u, toolId, out);
+    }
+  }
+  // Ventas importadas antes a nivel de usuario (sin empresa) que ahora duplican los cobros de empresa
+  for (const key of companyTool) {
+    const [uid, toolId] = key.split("|");
+    const u: any = byId.get(uid);
+    for (const p of ((u?.toolSubscriptions?.[toolId]?.payments || []) as ToolPayment[])) {
+      if (p.imported && !p.sourceKey && !p.companyId) {
+        plan.removals.push({ userId: uid, toolId, paymentId: p.id, user: u.email, desc: `${p.paidAt} · $${p.amount}${p.invoiceRef ? ` · factura "${p.invoiceRef}"` : ""}${p.dateEstimated ? " · fecha estimada" : ""}` });
+      }
+    }
+  }
 
   for (const u of docs) {
     const tools: string[] = [...new Set<string>([...(u.purchasedTools || []), ...Object.keys(u.toolSubscriptions || {})])];
@@ -185,6 +251,7 @@ export async function planLegacyImport(): Promise<LegacyImportPlan> {
     const single = tools.length === 1;
     for (const toolId of tools) {
       if (!TOOL_ID_RE.test(toolId)) continue;
+      if (companyTool.has(`${u._id}|${toolId}`)) continue; // la fuente son los cobros de empresa
       const sub: any = u.toolSubscriptions?.[toolId] || {};
       const ledger: ToolPayment[] = sub.payments || [];
       const hasLedger = ledger.length > 0;
@@ -245,6 +312,12 @@ export async function planLegacyImport(): Promise<LegacyImportPlan> {
 
 export async function runLegacyImport(): Promise<LegacyImportPlan> {
   const plan = await planLegacyImport();
+  for (const r of plan.removals) {
+    await users().updateOne(
+      { _id: new ObjectId(r.userId) },
+      { $pull: { [`toolSubscriptions.${r.toolId}.payments`]: { id: r.paymentId } }, $set: { updated_at: new Date().toISOString() } } as any
+    );
+  }
   for (const w of plan.writes) {
     await users().updateOne(
       { _id: new ObjectId(w.userId) },

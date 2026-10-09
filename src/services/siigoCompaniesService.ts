@@ -1,3 +1,4 @@
+import { clearSuspensionCache } from "./subscriptionExpiry.js";
 import { ObjectId } from "mongodb";
 import { getDb } from "./database.js";
 import { encryptSecret, decryptSecret } from "./secretCrypto.js";
@@ -206,6 +207,7 @@ export async function updateToolSubscription(
     if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
   }
 
+  clearSuspensionCache(); // el vencimiento de la empresa define el acceso del usuario
   const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid });
   return toPublic(doc!);
 }
@@ -289,6 +291,7 @@ export async function updateCompanySubscription(
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
+  clearSuspensionCache(); // el vencimiento de la empresa define el acceso del usuario
   const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid });
   return toPublic(doc!);
 }

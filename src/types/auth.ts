@@ -80,6 +80,8 @@ export interface AuthResponse {
     companiesInPlan?: number;
     toolCompanyLimits?: Record<string, number>;
     forcePasswordChange?: boolean;
+    /** Herramientas suspendidas por vencimiento + días de gracia (siguen en la cuenta, sin acceso hasta renovar). */
+    suspendedTools?: Array<{ toolId: string; end: string; suspendedFrom: string }>;
     demo?: DemoAccess & {
       isExpired: boolean;
       remainingMs: number;

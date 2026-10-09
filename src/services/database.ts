@@ -1,3 +1,4 @@
+import { getSuspendedTools } from "./subscriptionExpiry.js";
 import bcrypt from "bcrypt";
 import { createHash, randomBytes } from "crypto";
 import { MongoClient, type Db, type Collection, ObjectId } from "mongodb";
@@ -546,7 +547,9 @@ export async function getUserPurchases(userId: string): Promise<string[]> {
   try {
     const oid = new ObjectId(userId);
     const record = await usersCollection().findOne({ _id: oid }, { projection: { purchasedTools: 1 } });
-    const tools: string[] = record?.purchasedTools || [];
+    // Las herramientas con suscripción vencida (+ días de gracia) no cuentan como compradas hasta que renueve
+    const suspended = new Set((await getSuspendedTools(userId)).map((t) => t.toolId));
+    const tools: string[] = (record?.purchasedTools || []).filter((t: string) => !suspended.has(t));
     // Expand decommissioned IDs to their successors so existing users keep access
     const expanded = new Set(tools);
     for (const tool of tools) {
@@ -576,8 +579,10 @@ export async function hasPurchase(userId: string, toolId: string, aliases: strin
   try {
     const oid = new ObjectId(userId);
     const idsToCheck = aliases.length > 0 ? [toolId, ...aliases] : [toolId];
-    const record = await usersCollection().findOne({ _id: oid, purchasedTools: { $in: idsToCheck } });
-    return !!record;
+    const record = await usersCollection().findOne({ _id: oid, purchasedTools: { $in: idsToCheck } }, { projection: { purchasedTools: 1 } });
+    if (!record) return false;
+    const suspended = new Set((await getSuspendedTools(userId)).map((t) => t.toolId));
+    return idsToCheck.some((id) => (record.purchasedTools || []).includes(id) && !suspended.has(id));
   } catch {
     return false;
   }

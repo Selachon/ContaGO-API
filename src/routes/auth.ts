@@ -1,3 +1,4 @@
+import { getSuspendedTools } from "../services/subscriptionExpiry.js";
 import { Router, Request, Response } from "express";
 import jwt from "jsonwebtoken";
 import {
@@ -69,7 +70,7 @@ function generateTemporaryPassword(): string {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
-function buildAuthUser(user: User, purchasedTools: string[], nits: string[]): NonNullable<AuthResponse["user"]> {
+function buildAuthUser(user: User, purchasedTools: string[], nits: string[], suspendedTools: Array<{ toolId: string; end: string; suspendedFrom: string }> = []): NonNullable<AuthResponse["user"]> {
   const role = user.role || (user.is_admin ? "ADMIN" : "USER");
   const demo = user.demo
     ? {
@@ -91,6 +92,7 @@ function buildAuthUser(user: User, purchasedTools: string[], nits: string[]): No
     companiesInPlan: user.companiesInPlan,
     toolCompanyLimits: user.toolCompanyLimits,
     forcePasswordChange: !!user.force_password_change,
+    suspendedTools,
     demo,
   };
 }
@@ -149,15 +151,16 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
   };
 
   const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
-  const [purchasedTools, nits] = await Promise.all([
+  const [purchasedTools, nits, suspendedTools] = await Promise.all([
     getUserPurchases(user.id),
     getUserNits(user.id),
+    getSuspendedTools(user.id),
   ]);
 
   const response: AuthResponse = {
     ok: true,
     token,
-    user: buildAuthUser(user, purchasedTools, nits),
+    user: buildAuthUser(user, purchasedTools, nits, suspendedTools),
   };
 
   res.cookie(AUTH_COOKIE_NAME, token, getAuthCookieOptions());
@@ -314,15 +317,16 @@ router.post("/demo/register", rateLimit(5, 15 * 60 * 1000), async (req: Request,
     role: "DEMO",
   };
   const authToken = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
-  const [purchasedTools, nits] = await Promise.all([
+  const [purchasedTools, nits, suspendedTools] = await Promise.all([
     getUserPurchases(user.id),
     getUserNits(user.id),
+    getSuspendedTools(user.id),
   ]);
 
   const response: AuthResponse = {
     ok: true,
     token: authToken,
-    user: buildAuthUser(user, purchasedTools, nits),
+    user: buildAuthUser(user, purchasedTools, nits, suspendedTools),
   };
 
   res.cookie(AUTH_COOKIE_NAME, authToken, getAuthCookieOptions());
@@ -564,14 +568,15 @@ router.get("/me", async (req: Request, res: Response) => {
       return res.status(403).json({ ok: false, message: "Tu cuenta ha sido suspendida. Contacta al administrador." });
     }
 
-    const [purchasedTools, nits] = await Promise.all([
+    const [purchasedTools, nits, suspendedTools] = await Promise.all([
       getUserPurchases(user.id),
       getUserNits(user.id),
+      getSuspendedTools(user.id),
     ]);
 
     return res.json({
       ok: true,
-      user: buildAuthUser(user, purchasedTools, nits),
+      user: buildAuthUser(user, purchasedTools, nits, suspendedTools),
     });
   } catch {
     return res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });
