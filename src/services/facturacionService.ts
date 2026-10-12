@@ -29,6 +29,10 @@ export interface FacturacionRow {
   method?: string;
   invoiceRef?: string;
   invoicedAt?: string;
+  /** Última factura de PRUEBA (ambiente de habilitación): no cuenta como facturada ni bloquea la venta. */
+  testInvoice?: { id?: string; fullNumber: string; cufe: string; legalStatus: string; accepted: boolean; at: string };
+  /** Última nota crédito de PRUEBA de una devolución (no cuenta como nota crédito relacionada ni bloquea). */
+  testCreditNote?: { id?: string; fullNumber: string; cufe: string; legalStatus: string; accepted: boolean; at: string };
   periodStart?: string;
   periodEnd?: string;
   periodicityMonths?: number;
@@ -41,7 +45,7 @@ export interface FacturacionRow {
   companyName?: string;
   /** Devolución: pide nota crédito en lugar de factura; `original` es la venta que se devuelve. */
   refund: boolean;
-  original?: { paidAt: string; amount: number; invoiceRef?: string; type: ToolPayment["type"] };
+  original?: { paidAt: string; amount: number; invoiceRef?: string; type: ToolPayment["type"]; testInvoice?: FacturacionRow["testInvoice"] };
 }
 
 /** Datos de facturación del cliente (se muestran al facturar, no en la tabla). */
@@ -94,11 +98,11 @@ export async function listLedgerRows(): Promise<{ rows: FacturacionRow[]; client
           clientName: client.name, clientId: client.id, userEmail: u.email,
           type: p.type, paidAt: p.paidAt, dateEstimated: !!p.dateEstimated, amount, gift,
           commission: gift ? 0 : Math.round(amount * COMMISSION_RATE),
-          method: p.method, invoiceRef: p.invoiceRef, invoicedAt: p.invoicedAt,
+          method: p.method, invoiceRef: p.invoiceRef, invoicedAt: p.invoicedAt, testInvoice: (p as any).testInvoice, testCreditNote: (p as any).testCreditNote,
           periodStart: p.periodStart, periodEnd: p.periodEnd, periodicityMonths: p.periodicityMonths, alignToBase: p.alignToBase,
           addCompanies: p.addCompanies, addNits: p.addNits, planAfter: p.planAfter,
           imported: !!p.imported, note: p.note, refund: p.type === "devolucion", companyName: p.companyName,
-          ...(orig && { original: { paidAt: orig.paidAt, amount: Number(orig.amount) || 0, invoiceRef: orig.invoiceRef, type: orig.type } }),
+          ...(orig && { original: { paidAt: orig.paidAt, amount: Number(orig.amount) || 0, invoiceRef: orig.invoiceRef, type: orig.type, testInvoice: (orig as any).testInvoice } }),
         });
       }
     }

@@ -15,7 +15,12 @@
     "test:dian": "tsx scripts/test-dian.ts",
     "migrate:sqlite-mongo": "tsx scripts/migrateSqliteToMongo.ts",
     "template:dian-excel": "node scripts/generateDianExcelTemplate.mjs",
-    "postinstall": "node scripts/installPuppeteer.mjs"
+    "postinstall": "node scripts/installPuppeteer.mjs",
+    "test:erp": "tsx --test src/erp/erp.test.ts",
+    "erp:seed": "tsx scripts/erp-seed.ts",
+    "test:erp:e2e": "tsx scripts/erp-e2e.ts",
+    "test:dian-excel-cufes": "tsx --test src/services/dianExcelCufes.test.ts",
+    "test:dian-batch-download": "tsx --test src/services/dianBatchDownload.test.ts"
   },
   "keywords": [
     "contago",
@@ -60,6 +65,7 @@
     "puppeteer": "^23.5.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "qrcode": "^1.5.4",
     "soap": "^1.8.0",
     "uuid": "^10.0.0",
     "xlsx": "^0.18.5",
@@ -69,6 +75,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/mailparser": "^3.4.6",
+    "@types/qrcode": "^1.5.6",
     "@types/supertest": "^7.2.0",
     "supertest": "^7.2.2",
     "tsx": "^4.19.1",

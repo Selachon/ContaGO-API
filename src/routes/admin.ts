@@ -33,6 +33,8 @@ import {
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
 import { COMMISSION_RATE, listLedgerRows, setInvoice, planLegacyImport, runLegacyImport } from "../services/facturacionService.js";
+import { emitTestInvoice, getInvoiceFile } from "../services/alanubeInvoicing.js";
+import { CREDIT_CONCEPTS, defaultConcept, describeCreditNoteTarget, emitTestCreditNote } from "../services/alanubeCreditNotes.js";
 import { saveRut, getRut, rutAvailability } from "../services/rutStorage.js";
 import { createDemoInvite, listDemoInvites, TOOL_SUCCESSOR, updateUserPassword, resetExtActivation } from "../services/database.js";
 import { listCompaniesForUser, updateCompanySubscription, updateToolSubscription, listAllSubscriptionRows, removePaymentFromHistory } from "../services/siigoCompaniesService.js";
@@ -1037,6 +1039,87 @@ router.post("/facturacion/factura", async (req: Request, res: Response) => {
     res.json({ ok: true, changed });
   } catch (err: any) {
     res.status(400).json({ ok: false, message: err.message || "Error registrando la factura" });
+  }
+});
+
+// Factura de PRUEBA vía Alanube (ambiente de habilitación): no marca la venta como facturada ni la bloquea.
+// Recibe el borrador editable; el valor de cada venta siempre sale de la base de datos.
+router.post("/facturacion/alanube/prueba", async (req: Request, res: Response) => {
+  try {
+    const b = req.body || {};
+    if (!Array.isArray(b.lines)) return res.status(400).json({ ok: false, message: "Ventas inválidas" });
+    const str = (v: unknown, max: number) => String(v ?? "").slice(0, max);
+    const result = await emitTestInvoice({
+      userId: str(b.userId, 40),
+      customer: { name: str(b.customer?.name, 200), idType: str(b.customer?.idType, 4), id: str(b.customer?.id, 30), phone: str(b.customer?.phone, 30) },
+      lines: b.lines.map((l: any) => ({ toolId: str(l?.toolId, 60), paymentId: str(l?.paymentId, 80), description: str(l?.description, 400) })),
+      payment: { form: b.payment?.form === "2" ? "2" : "1", days: Number(b.payment?.days) || undefined, method: str(b.payment?.method, 3) || undefined },
+      notes: Array.isArray(b.notes) ? b.notes.map((n: unknown) => str(n, 500)) : [],
+    }, req.user!.userId);
+    await logAdminAction({
+      actorId: req.user!.userId, action: "alanube_test_invoice",
+      after: { factura: result.fullNumber, estado: result.legalStatus, ventas: result.sales, total: result.total }, ip: req.ip, userAgent: req.get("user-agent"),
+    });
+    res.json({ ok: true, result });
+  } catch (err: any) {
+    console.error("[Admin] Factura de prueba Alanube:", err?.message);
+    res.status(400).json({ ok: false, message: err.message || "No se pudo emitir la factura de prueba" });
+  }
+});
+
+// Nota crédito de PRUEBA: contexto de una devolución (factura que acredita, lo ya acreditado y el concepto sugerido)
+router.get("/facturacion/alanube/nc/contexto", async (req: Request, res: Response) => {
+  try {
+    const q = (k: string) => String(req.query[k] || "");
+    const { refund, original, invoice, credited } = await describeCreditNoteTarget(q("userId"), q("toolId"), q("paymentId"));
+    const amount = Math.abs(Number(refund.amount) || 0);
+    const reason = refund.invoiceRef ? "Esta devolución ya tiene su nota crédito relacionada."
+      : !original?.testInvoice?.id || !invoice ? "La venta original no tiene una factura electrónica de prueba: emítela primero."
+      : !invoice.accepted ? "La factura original no fue aceptada por la DIAN." : null;
+    res.json({
+      ok: true, canEmit: !reason, reason, refundAmount: amount, credited, concepts: CREDIT_CONCEPTS,
+      invoice: invoice ? { id: invoice.alanubeId, fullNumber: invoice.fullNumber, total: invoice.total, date: String(invoice.response?.date || invoice.at).slice(0, 10) } : null,
+      defaultConcept: invoice ? defaultConcept(amount, invoice.total) : "1",
+    });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, message: err.message || "No se pudo preparar la nota crédito" });
+  }
+});
+
+// Nota crédito de PRUEBA vía Alanube para una devolución (no marca la devolución como relacionada ni la bloquea)
+router.post("/facturacion/alanube/nc", async (req: Request, res: Response) => {
+  try {
+    const b = req.body || {};
+    const str = (v: unknown, max: number) => String(v ?? "").slice(0, max);
+    const result = await emitTestCreditNote({
+      userId: str(b.userId, 40), toolId: str(b.toolId, 60), paymentId: str(b.paymentId, 80),
+      conceptCode: str(b.conceptCode, 1), description: str(b.description, 400),
+      notes: Array.isArray(b.notes) ? b.notes.map((n: unknown) => str(n, 500)) : [],
+    }, req.user!.userId);
+    await logAdminAction({
+      actorId: req.user!.userId, action: "alanube_test_credit_note",
+      after: { nota: result.fullNumber, factura: result.invoiceNumber, estado: result.legalStatus, total: result.total }, ip: req.ip, userAgent: req.get("user-agent"),
+    });
+    res.json({ ok: true, result });
+  } catch (err: any) {
+    console.error("[Admin] Nota crédito de prueba Alanube:", err?.message);
+    res.status(400).json({ ok: false, message: err.message || "No se pudo emitir la nota crédito de prueba" });
+  }
+});
+
+// PDF (representación gráfica) o XML de una factura emitida por Alanube
+router.get("/facturacion/alanube/:id/:kind", async (req: Request, res: Response) => {
+  try {
+    const kind = (["xml", "pdf", "zip"] as const).find(k => k === req.params.kind) ?? null;
+    if (!kind || !/^[A-Za-z0-9]{10,40}$/.test(req.params.id)) return res.status(400).json({ ok: false, message: "Solicitud inválida" });
+    const file = await getInvoiceFile(req.params.id, kind);
+    if (!file) return res.status(404).json({ ok: false, message: kind === "pdf" ? "Factura no encontrada" : "No hay XML guardado para esta factura" });
+    res.setHeader("Content-Type", file.contentType);
+    res.setHeader("Content-Disposition", `${kind === "pdf" ? "inline" : "attachment"}; filename="${file.filename}"`);
+    res.send(file.data);
+  } catch (err: any) {
+    console.error("[Admin] Archivo de factura Alanube:", err?.message);
+    res.status(500).json({ ok: false, message: "No se pudo obtener el archivo" });
   }
 });
 

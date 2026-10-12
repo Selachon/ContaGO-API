@@ -25,8 +25,14 @@ import dianRecibidosDownloadRoutes from "./routes/dianRecibidosDownload.js";
 import dianMailRoutes from "./routes/dianMail.js";
 import pdfParseRoutes from "./routes/pdfParse.js";
 import castroFacturasRoutes from "./routes/castroFacturas.js";
+import caPortalRoutes from "./routes/castroArroyaveCaja.js";
+import erpRoutes from "./erp/routes/index.js";
+import supportDocsRoutes from "./routes/supportDocs.js";
+import supportDocsPublicRoutes from "./routes/supportDocsPublic.js";
+import billingRoutes from "./billing/routes.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
 import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
+import { ensureErpIndexes } from "./erp/db.js";
 import { closeAllBrowsers, startOrphanBrowserSweep } from "./services/dianScraper.js";
 import { startJobGuard, onShutdown as jobGuardOnShutdown } from "./services/jobGuard.js";
 import { MongoJobStore } from "./services/jobGuardStore.js";
@@ -94,6 +100,11 @@ app.use("/caja-erp", cajaErpRoutes);
 app.use("/api/contabilizacion", contabilizacionRoutes);
 app.use("/api/pdf-parse", pdfParseRoutes);
 app.use("/castro-facturas", castroFacturasRoutes);
+app.use("/ca-portal", caPortalRoutes);
+app.use("/erp", erpRoutes);
+app.use("/documentos-soporte", supportDocsRoutes);
+app.use("/public/documentos-soporte", supportDocsPublicRoutes);
+app.use("/facturacion", billingRoutes);
 
 // Health check
 app.get("/", (_req, res) => {
@@ -172,6 +183,7 @@ ensurePuppeteer()
   .then(seedAdminUser)
   .then(migrateToolSlugs)
   .then(seedSiigoCompanyFromEnv)
+  .then(ensureErpIndexes)
   .then(() => {
     const server = app.listen(PORT, () => {
       console.log(`ContaGO API running on port ${PORT}`);
