@@ -438,26 +438,33 @@ function parseDavivienda(pages: string[][]): { raws: RawMov[]; opening: number |
 
   // Totales: el valor puede estar en la misma línea que el label (formato actual)
   // o en la línea siguiente (formato antiguo). Se prueban ambas.
-  const findMoney = (rx: RegExp): number | null => {
+  const findMoney = (rx: RegExp, label?: string): number | null => {
     for (const l of all) {
       const m = l.match(rx);
       if (m) return num(m[1]);
     }
-    // Fallback: label exacto en una línea, valor en la siguiente.
-    const idx = all.findIndex((l) => rx.source.startsWith("^") ? rx.test(l) : false);
-    if (idx >= 0) { const m = all[idx + 1]?.match(/\$([\d,]+\.\d{2})/); if (m) return num(m[1]); }
+    // Fallback: label exacto en una línea, valor (con "$") en la siguiente.
+    if (label) {
+      const idx = all.findIndex((l) => l.trim() === label);
+      if (idx >= 0) { const m = all[idx + 1]?.match(/\$([\d,]+\.\d{2})/); if (m) return num(m[1]); }
+    }
     return null;
   };
-  const opening = findMoney(/Saldo Anterior\s+\$([\d,]+\.\d{2})/);
-  const credits  = findMoney(/Más:?\s*Créditos\s+\$([\d,]+\.\d{2})/);
-  const debits   = findMoney(/Menos:\s*Débitos\s+\$([\d,]+\.\d{2})/);
-  const closing  = findMoney(/Nuevo Saldo\s+\$([\d,]+\.\d{2})/);
+  const opening = findMoney(/Saldo Anterior\s+\$([\d,]+\.\d{2})/, "Saldo Anterior");
+  const credits  = findMoney(/Más:?\s*Créditos\s+\$([\d,]+\.\d{2})/, "Más Créditos");
+  const debits   = findMoney(/Menos:\s*Débitos\s+\$([\d,]+\.\d{2})/, "Menos Débitos");
+  const closing  = findMoney(/Nuevo Saldo\s+\$([\d,]+\.\d{2})/, "Nuevo Saldo");
 
   // Formato actual: "DD MM DESCRIPCION [OFICINA] DOC $MONTO+/- $SALDO+/-"
   // El saldo explícito en el PDF se usa directamente (más fiable que calcular).
   const newRowRx = /^(\d{1,2})\s+(\d{2})\s+(.+?)\s+\d{3,6}\s+\$([\d,]+\.\d{2})([+-])\s+\$([\d,]+\.\d{2})[+-]\s*$/;
   // Formato antiguo: "DD MM $ MONTO +/- DOCNUM DESCRIPCION"
   const oldRowRx = /^(\d{2})\s+(\d{2})\s+\$\s*([\d,]+\.\d{2})\s+([+-])\s+\d{1,6}\s+(.+)/;
+  // Formato "Cuenta de Ahorros DAMAS": "DD MM OFICINA DESCRIPCION DOC $ DEBITO $ CREDITO"
+  // (sin saldo por fila; se acumula desde Saldo Anterior). El grupo de descripción
+  // es greedy a propósito: el backtracking deja el último número suelto (3-10 dígitos)
+  // como Doc., aunque la descripción traiga otros números de referencia intermedios.
+  const damasRowRx = /^(\d{1,2})\s+(\d{2})\s+\d{3,6}\s+(.+)\s+\d{3,10}\s+\$\s*([\d,]+\.\d{2})\s+\$\s*([\d,]+\.\d{2})\s*$/;
 
   let runBal = opening ?? 0;
   const raws: RawMov[] = [];
@@ -487,6 +494,22 @@ function parseDavivienda(pages: string[][]): { raws: RawMov[]; opening: number |
         .replace(/\s+/g, " ")
         .trim();
       raws.push({ date: `${year || new Date().getFullYear()}-${mm}-${dd}`, description, value, balance: Math.round(runBal * 100) / 100 });
+      continue;
+    }
+    const dm = line.match(damasRowRx);
+    if (dm) {
+      const [, dd, mm, descRaw, debitoStr, creditoStr] = dm;
+      const debito = num(debitoStr);
+      const credito = num(creditoStr);
+      if (debito === 0 && credito === 0) continue;
+      const signed = credito - debito;
+      runBal += signed;
+      const description = descRaw
+        .replace(/\s+\d{7,}/g, "")
+        .replace(/\b(\w+)\s+\1\b/gi, "$1")
+        .replace(/\s+/g, " ")
+        .trim();
+      raws.push({ date: `${year || new Date().getFullYear()}-${mm}-${dd}`, description, value: Math.abs(signed), balance: Math.round(runBal * 100) / 100 });
     }
   }
   return { raws, opening, declared: { credits, debits }, closing };
