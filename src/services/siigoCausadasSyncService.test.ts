@@ -129,3 +129,20 @@ test("backfill: si no falta ningún comprobante NO llama a Siigo", async () => {
   assert.equal(r.updated, 0);
   assert.equal(fetchCalls.length, 0);
 });
+
+test("recuperación: la compra de Siigo se ata al CUFE real de un borrador sin registro; el dryRun no escribe nada", async () => {
+  store.set("cajaErpDrafts", [{ companyId: "c1", rowId: "r1", row: { cufe: "AB12", docNumberRaw: "FE101", supplier: { identification: "900123456" }, supplierName: "PROV", date: "2026-08-20" } }]);
+  purchasesToReturn = [P("1", { total: 777 })];   // nit 900123456, FE + 101
+  const dry = await syncCausadasNow("c1", true, { dryRun: true, since: "2026-08-01" });
+  assert.equal(dry.preview?.fromDrafts, 1);
+  assert.equal(dry.preview?.syntheticNew, 0);
+  assert.equal((store.get("siigoIngestedCufes") ?? []).length, 0, "dryRun: sin escrituras");
+  assert.equal((store.get("siigoCausadasSync") ?? []).length, 0, "dryRun: no guarda estado del cruce");
+  assert.equal(fetchCalls[0], "2026-08-01");
+
+  const real = await syncCausadasNow("c1", true, { since: "2026-08-01" });
+  assert.equal(real.updated, 1);
+  const rows = store.get("siigoIngestedCufes")!;
+  assert.equal(rows.length, 1);
+  assert.deepEqual({ cufe: rows[0].cufe, status: rows[0].status, name: rows[0].siigoName, nit: rows[0].supplierNit, prov: rows[0].supplierName, total: rows[0].total }, { cufe: "ab12", status: "caused", name: "FC-1-1", nit: "900123456", prov: "PROV", total: 777 });
+});

@@ -113,3 +113,26 @@ test("backfill: completa el comprobante de Siigo en causadas que solo tenían si
   assert.equal(plan.notFound, 1);
   assert.ok(!("status" in plan.updates[0].set), "nunca cambia el estado");
 });
+
+test("recuperación: una compra que coincide con un borrador SIN registro se ata al CUFE real (crea el registro con datos del borrador)", () => {
+  const draft = { ...rec({ cufe: "cufeReal", docnum: "MLP123456", supplierNit: "900123456", supplierName: "PROVEEDOR SAS", issueDate: "2026-08-20", status: "pending" }), fromDraft: true as const };
+  const plan = planCausadasSync("c1", [draft], [purchase({ id: "31", name: "FC-1-401", nit: "900123456", prefix: "MLP", number: "123456", date: "2026-08-21", total: 90000, siigoNumber: "401", documentId: "9085" })], NOW);
+  assert.equal(plan.updated, 1);
+  assert.equal(plan.inserted, 0, "no debe crearse además un registro sintético duplicado");
+  const u = plan.updates[0];
+  assert.equal(u.cufe, "cufeReal");
+  assert.deepEqual(
+    { nit: u.base?.supplierNit, name: u.base?.supplierName, doc: u.base?.docnum, fecha: u.base?.issueDate, total: u.base?.total },
+    { nit: "900123456", name: "PROVEEDOR SAS", doc: "MLP123456", fecha: "2026-08-20", total: 90000 },
+  );
+  assert.equal(u.set.status, "caused");
+  assert.equal(u.set.siigoName, "FC-1-401");
+});
+
+test("recuperación: la compra sin borrador ni registro se crea causada y toma el nombre del proveedor desde un borrador del mismo NIT", () => {
+  const draftOtro = { ...rec({ cufe: "otroCufe", docnum: "ZZ1", supplierNit: "900123456", supplierName: "PROVEEDOR SAS", status: "pending" }), fromDraft: true as const };
+  const plan = planCausadasSync("c1", [draftOtro], [purchase({ id: "40", nit: "900123456", prefix: "AB", number: "7777" })], NOW);
+  assert.equal(plan.inserted, 1);
+  assert.equal(plan.inserts[0].supplierName, "PROVEEDOR SAS");
+  assert.equal(plan.inserts[0].cufe, "siigo:40");
+});

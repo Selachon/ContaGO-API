@@ -11,7 +11,7 @@
  */
 import { getDb } from "./database.js";
 import { fetchSiigoPurchases } from "./siigoAccountingService.js";
-import { planCausadasSync, planSiigoDocBackfill } from "./siigoCausadasPlan.js";
+import { planCausadasSync, planSiigoDocBackfill, type DraftDerivedRecord } from "./siigoCausadasPlan.js";
 import type { DianInvoiceRecord } from "./siigoIngestedCufesService.js";
 
 const REGISTRY = "siigoIngestedCufes";
@@ -30,13 +30,47 @@ export interface CausadasSyncResult {
   inserted: number;
   skipped: number;
   ms: number;
+  /** Solo en dryRun: de dónde saldrían los cambios. */
+  preview?: { fromDrafts: number; fromRegistry: number; syntheticNew: number };
 }
 
 const inflight = new Map<string, Promise<CausadasSyncResult>>();
 
 const isoDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
-async function runSync(companyId: string, force: boolean): Promise<CausadasSyncResult> {
+export interface SyncOptions {
+  /** Fecha mínima (YYYY-MM-DD) de creación de las compras a traer; por defecto 12 meses (o incremental). */
+  since?: string;
+  /** Solo calcula y devuelve el plan; no escribe nada. */
+  dryRun?: boolean;
+}
+
+/**
+ * Registros reconstruidos desde la bandeja (`cajaErpDrafts`) de facturas que NO tienen registro
+ * en el servidor: sirven para que una compra de Siigo se ate a la factura REAL (mismo CUFE)
+ * y desaparezca de pendientes, en vez de quedar duplicada con un registro sintético.
+ */
+async function draftDerivedRecords(companyId: string, registryCufes: Set<string>): Promise<DraftDerivedRecord[]> {
+  const drafts = await getDb().collection<any>("cajaErpDrafts").find({ companyId }).toArray();
+  const out: DraftDerivedRecord[] = [];
+  const clean = (s: unknown) => String(s ?? "").replace(/[^A-Fa-f0-9]/g, "").toLowerCase();
+  for (const d of drafts) {
+    const r = d.row || {};
+    const cufe = clean(r.cufe);
+    if (!cufe || registryCufes.has(cufe)) continue;
+    const pi = r.provider_invoice || {};
+    out.push({
+      fromDraft: true, companyId, cufe, status: "pending", ingestedAt: "",
+      docnum: String(r.docNumberRaw || `${pi.prefix || ""}${pi.number || ""}`),
+      supplierNit: String(r.supplier?.identification || ""),
+      supplierName: String(r.supplierName || ""),
+      issueDate: String(r.date || ""),
+    });
+  }
+  return out;
+}
+
+async function runSync(companyId: string, force: boolean, opts: SyncOptions = {}): Promise<CausadasSyncResult> {
   const t0 = Date.now();
   const db = getDb();
   const meta = await db.collection<any>(META).findOne({ companyId });
@@ -47,7 +81,7 @@ async function runSync(companyId: string, force: boolean): Promise<CausadasSyncR
   const lastSync = meta?.lastSyncAt ? Date.parse(meta.lastSyncAt) : 0;
   const full = force || !lastFull || now - lastFull > FULL_EVERY_MS || !lastSync;
   const sinceMs = full ? twelveMonthsAgo : Math.max(twelveMonthsAgo, lastSync - OVERLAP_MS);
-  const since = isoDay(sinceMs);
+  const since = opts.since && /^\d{4}-\d{2}-\d{2}$/.test(opts.since) ? opts.since : isoDay(sinceMs);
 
   const purchases = await fetchSiigoPurchases(since);
 
@@ -56,10 +90,21 @@ async function runSync(companyId: string, force: boolean): Promise<CausadasSyncR
     .find({ companyId }, { projection: { _id: 0 } })
     .toArray()) as DianInvoiceRecord[];
   const nowIso = new Date(now).toISOString();
-  const plan = planCausadasSync(companyId, existing, purchases, nowIso);
+  const fromDrafts = await draftDerivedRecords(companyId, new Set(existing.map((d) => String(d.cufe).toLowerCase())));
+  const plan = planCausadasSync(companyId, [...existing, ...fromDrafts], purchases, nowIso);
+
+  if (opts.dryRun) {
+    return {
+      companyId, mode: "full", since, purchases: purchases.length, updated: plan.updated, inserted: plan.inserted,
+      skipped: plan.skipped, ms: Date.now() - t0,
+      preview: { fromDrafts: plan.updates.filter((u) => u.base).length, fromRegistry: plan.updates.filter((u) => !u.base).length, syntheticNew: plan.inserted },
+    };
+  }
 
   const ops: any[] = [
-    ...plan.updates.map((u) => ({ updateOne: { filter: { companyId, cufe: u.cufe }, update: { $set: u.set } } })),
+    ...plan.updates.map((u) => u.base
+      ? { updateOne: { filter: { companyId, cufe: u.cufe }, update: { $set: u.set, $setOnInsert: { ...u.base } }, upsert: true } }
+      : { updateOne: { filter: { companyId, cufe: u.cufe }, update: { $set: u.set } } }),
     ...plan.inserts.map((r) => {
       const { companyId: _c, cufe: _k, ...rest } = r;
       return { updateOne: { filter: { companyId, cufe: r.cufe }, update: { $setOnInsert: { companyId, cufe: r.cufe, ...rest } }, upsert: true } };
@@ -87,10 +132,10 @@ export function isCausadasSyncRunning(companyId: string): boolean {
 }
 
 /** Sincroniza ahora (o reutiliza la ejecución en curso). Lanza si Siigo/Mongo fallan. */
-export function syncCausadasNow(companyId: string, force = false): Promise<CausadasSyncResult> {
+export function syncCausadasNow(companyId: string, force = false, opts: SyncOptions = {}): Promise<CausadasSyncResult> {
   const running = inflight.get(companyId);
   if (running) return running;
-  const p = runSync(companyId, force).catch(async (err) => {
+  const p = runSync(companyId, force, opts).catch(async (err) => {
     await getDb().collection<any>(META)
       .updateOne({ companyId }, { $set: { companyId, lastError: { at: new Date().toISOString(), message: err instanceof Error ? err.message : String(err) } } }, { upsert: true })
       .catch(() => undefined);

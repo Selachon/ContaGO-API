@@ -6,13 +6,15 @@ import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
 import { PDFDocument } from "pdf-lib";
-import { downloadDocumentsByCufe } from "../services/dianScraper.js";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
+import { rejectIfNitNotAllowed } from "../utils/nitAccess.js";
 import type { ProgressData, DocumentDirection } from "../types/dian.js";
+import { classifyGrupo, extractCufesFromExcel, resolveExcelBuffer } from "../services/dianExcelCufes.js";
+import { runDianBatchDownload } from "../services/dianBatchDownload.js";
 
 import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -165,6 +167,7 @@ router.post(
     };
 
     if (rejectIfWrongDemoNit(req, res, token_url)) return;
+    if (await rejectIfNitNotAllowed(req, res, token_url, TOOL_ID)) return;
 
     if (start_date && !/^\d{4}-\d{2}-\d{2}$/.test(start_date)) {
       return res.status(400).json({ status: "error", detalle: "start_date debe tener formato YYYY-MM-DD" });
@@ -248,28 +251,6 @@ router.post(
   }
 );
 
-async function extractFilesFromZip(zipBuffer: Buffer): Promise<{ xmlBuffer: Buffer | null; pdfBuffer: Buffer | null }> {
-  const zip = await JSZip.loadAsync(zipBuffer);
-  let xmlBuffer: Buffer | null = null;
-  let pdfBuffer: Buffer | null = null;
-  for (const [filename, file] of Object.entries(zip.files)) {
-    if (file.dir) continue;
-    const lower = filename.toLowerCase();
-    if (lower.endsWith(".xml") && !xmlBuffer) {
-      const raw = await file.async("nodebuffer");
-      const preview = raw.toString("utf8", 0, 300).trim().toLowerCase();
-      if (preview.startsWith("<!doctype html") || preview.startsWith("<html") ||
-          (preview.includes("<html") && preview.includes("<head"))) {
-        throw new Error("HTML_INSIDE_ZIP: DIAN devolvió HTML dentro del ZIP en lugar del XML (posible bloqueo de sesión transitorio)");
-      }
-      xmlBuffer = raw;
-    }
-    if (lower.endsWith(".pdf") && !pdfBuffer) pdfBuffer = await file.async("nodebuffer");
-    if (xmlBuffer && pdfBuffer) break;
-  }
-  return { xmlBuffer, pdfBuffer };
-}
-
 function safeFilename(nit: string, docNumber: string): string {
   const safeNit = nit.replace(/[^a-zA-Z0-9]/g, "");
   const safeDoc = docNumber.replace(/[^a-zA-Z0-9\-_]/g, "");
@@ -311,36 +292,27 @@ async function processMassDownloadJob(
   const job = jobTracker.get(jobId);
   if (!job) return;
 
-  if (isJobCancelled(jobId)) return;
-
   job.status = "processing";
 
   const sessionId = uuidv4();
-  const tempDir = path.join(DOWNLOADS_DIR, sessionId);
   const outputPath = path.join(DOWNLOADS_DIR, `${sessionId}.zip`);
-  job.tempDir = tempDir;
   job.outputPath = outputPath;
 
-  // try/finally desde AQUÍ: si fs.mkdirSync (u otra cosa) falla, el finally igual
-  // libera el cupo de la cola compartida y no la congela para los demás.
   try {
-  fs.mkdirSync(tempDir, { recursive: true });
+    if (isJobCancelled(jobId)) return;
+
+    // Cola global anti-bloqueo + descarga por CUFE + extracción de cada ZIP:
+    // exactamente la misma función que usa el ERP para importar facturas. El
+    // único punto donde este flujo y el del ERP divergen es lo que sigue de
+    // aquí en adelante (armar el ZIP vs. crear documentos).
+    const { successful, downloaded, failed } = await runDianBatchDownload({
+      tokenUrl, cufes, direction, startDate, endDate,
+      onProgress: (progress) => setProgress(jobId, progress),
+      isCancelled: () => isJobCancelled(jobId),
+    });
 
     if (isJobCancelled(jobId)) return;
 
-    const { results, downloaded, failed } = await downloadDocumentsByCufe(
-      tokenUrl, cufes, startDate, endDate, direction, tempDir,
-      (progress) => setProgress(jobId, {
-        step: progress.step || "Descargando...",
-        current: progress.current ?? 0,
-        total: progress.total ?? cufes.length,
-      }),
-      () => isJobCancelled(jobId)
-    );
-
-    if (isJobCancelled(jobId)) return;
-
-    const successful = results.filter((r) => r.success && r.destPath);
     if (successful.length === 0) {
       throw new Error(`Ningún documento descargado exitosamente (${failed} errores).`);
     }
@@ -356,8 +328,7 @@ async function processMassDownloadJob(
     for (const result of successful) {
       if (isJobCancelled(jobId)) return;
       try {
-        const zipBuffer = fs.readFileSync(result.destPath!);
-        const { xmlBuffer, pdfBuffer } = await extractFilesFromZip(zipBuffer);
+        const { xmlBuffer, pdfBuffer } = result;
 
         let nit = result.nit || "";
         let docNumber = result.docnum || "";
@@ -455,27 +426,7 @@ async function processMassDownloadJob(
       job.error = msg;
       setProgress(jobId, { step: "Error", current: 0, total: 0, detalle: msg });
     }
-  } finally {
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch {}
   }
-}
-
-const DATE_RE = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$|^\d{4}[\/\-]\d{2}[\/\-]\d{2}$/;
-const DATE_SCAN_COLS = ["A","C","D","E","F","G","H","I","J","K"];
-
-async function resolveExcelBuffer(file: Express.Multer.File): Promise<Buffer> {
-  if (file.originalname.toLowerCase().endsWith(".zip")) {
-    const zip = await JSZip.loadAsync(file.buffer);
-    for (const [filename, entry] of Object.entries(zip.files)) {
-      const isExcel = /\.(xlsx|xls)$/i.test(filename);
-      const isMacJunk = filename.split("/").some(part => part.startsWith("._"));
-      if (!entry.dir && isExcel && !isMacJunk) {
-        return entry.async("nodebuffer");
-      }
-    }
-    throw new Error("No se encontró un archivo Excel (.xlsx) dentro del ZIP.");
-  }
-  return file.buffer;
 }
 
 function buildLimitMessage(total: number, dates: string[], limit: number): string {
@@ -487,122 +438,6 @@ function buildLimitMessage(total: number, dates: string[], limit: number): strin
     return `${start} a ${end} (${count} facturas)`;
   }).join(" — ");
   return `El Excel excede el límite de ${limit}. Prueba el rango ${rangos}`;
-}
-
-function classifyGrupo(grupoVal: string): "sent" | "received" | "nomina" | "applicationResponse" | "unknown" {
-  const norm = grupoVal.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
-  if (norm.includes("nomin")) return "nomina";
-  if (norm.includes("application") || norm.includes("respuesta de aplic")) return "applicationResponse";
-  if (/emitid/.test(norm)) return "sent";
-  if (/recibid/.test(norm)) return "received";
-  return "unknown";
-}
-
-async function extractCufesFromExcel(buffer: Buffer): Promise<{
-  cufes: string[];
-  dates: string[];
-  detectedDirection: DocumentDirection | null;
-  mixedDirections: boolean;
-  skippedCount: number;
-}> {
-  const zip = await JSZip.loadAsync(buffer);
-  const allFiles = Object.keys(zip.files);
-
-  const sharedStrings: string[] = [];
-  const ssPath = allFiles.find((f) => f.toLowerCase().endsWith("sharedstrings.xml")) || "";
-  const ssFile = ssPath ? zip.file(ssPath) : null;
-  if (ssFile) {
-    const ssXml = await ssFile.async("string");
-    for (const siMatch of ssXml.matchAll(/<(?:\w+:)?si\b[^>]*>([\s\S]*?)<\/(?:\w+:)?si>/g)) {
-      const texts: string[] = [];
-      for (const tMatch of siMatch[1].matchAll(/<(?:\w+:)?t\b[^>]*>([^<]*)<\/(?:\w+:)?t>/g)) {
-        texts.push(tMatch[1]);
-      }
-      sharedStrings.push(texts.join(""));
-    }
-  }
-
-  const sheetPath =
-    allFiles.find((f) => /xl\/worksheets\/sheet1\.xml$/i.test(f)) ||
-    allFiles.find((f) => /xl\/worksheets\/sheet\d+\.xml$/i.test(f));
-  if (!sheetPath) throw new Error("No se encontró ninguna hoja en el Excel");
-
-  const sheetXml = await zip.file(sheetPath)!.async("string");
-
-  const rows: Map<number, Map<string, string>> = new Map();
-  for (const cellMatch of sheetXml.matchAll(/<(?:\w+:)?c\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?c>/g)) {
-    const attrs = cellMatch[1];
-    const cellContent = cellMatch[2];
-    const rMatch = attrs.match(/\br="([A-Z]+)(\d+)"/);
-    if (!rMatch) continue;
-    const [, col, rowStr] = rMatch;
-    const rowNum = parseInt(rowStr, 10);
-
-    let value = "";
-    if (attrs.includes('t="s"')) {
-      const vMatch = cellContent.match(/<(?:\w+:)?v>(\d+)<\/(?:\w+:)?v>/);
-      if (vMatch) value = sharedStrings[parseInt(vMatch[1], 10)] || "";
-    } else if (attrs.includes('t="inlineStr"') || cellContent.includes(":is>") || cellContent.includes("<is>")) {
-      const tMatch = cellContent.match(/<(?:\w+:)?t\b[^>]*>([^<]*)<\/(?:\w+:)?t>/);
-      if (tMatch) value = tMatch[1];
-    } else {
-      const vMatch = cellContent.match(/<(?:\w+:)?v>([^<]*)<\/(?:\w+:)?v>/);
-      if (vMatch) value = vMatch[1];
-    }
-    value = value.trim();
-    if (!rows.has(rowNum)) rows.set(rowNum, new Map());
-    rows.get(rowNum)!.set(col, value);
-  }
-
-  // Detect "Grupo" column from header row 1
-  let grupoCol = "";
-  const headerRow = rows.get(1);
-  if (headerRow) {
-    for (const [col, val] of headerRow) {
-      if (/^grupo$/i.test(val)) { grupoCol = col; break; }
-    }
-  }
-
-  const sortedRows = [...rows.keys()].filter((r) => r > 1).sort((a, b) => a - b);
-
-  // Classify rows and detect direction (ignoring nomina/AR)
-  let detectedDirection: DocumentDirection | null = null;
-  let mixedDirections = false;
-  const dirSet = new Set<DocumentDirection>();
-  const rowClassMap = new Map<number, ReturnType<typeof classifyGrupo>>();
-  for (const rowNum of sortedRows) {
-    const grupoVal = grupoCol ? (rows.get(rowNum)?.get(grupoCol) || "") : "";
-    const cls = grupoVal ? classifyGrupo(grupoVal) : "unknown";
-    rowClassMap.set(rowNum, cls);
-    if (cls === "sent") dirSet.add("sent");
-    else if (cls === "received") dirSet.add("received");
-  }
-  if (dirSet.size === 1) detectedDirection = dirSet.has("sent") ? "sent" : "received";
-  else if (dirSet.size > 1) mixedDirections = true;
-
-  const sample = sortedRows.slice(0, 15);
-  let dateCol = "";
-  let bestScore = 0;
-  for (const col of DATE_SCAN_COLS) {
-    const hits = sample.filter((r) => DATE_RE.test(rows.get(r)?.get(col) || "")).length;
-    if (hits > bestScore) { bestScore = hits; dateCol = col; }
-  }
-  if (bestScore === 0) dateCol = "";
-
-  const cufes: string[] = [];
-  const dates: string[] = [];
-  let skippedCount = 0;
-  for (const rowNum of sortedRows) {
-    const cufe = rows.get(rowNum)?.get("B") || "";
-    if (!cufe) continue;
-    const cls = rowClassMap.get(rowNum) ?? "unknown";
-    if (cls === "nomina" || cls === "applicationResponse") { skippedCount++; continue; }
-    cufes.push(cufe);
-    dates.push(dateCol ? (rows.get(rowNum)?.get(dateCol) || "") : "");
-  }
-
-  if (skippedCount > 0) console.log(`[Mass DL] Omitidos ${skippedCount} documentos (nómina/AR) del Excel`);
-  return { cufes, dates, detectedDirection, mixedDirections, skippedCount };
 }
 
 export default router;

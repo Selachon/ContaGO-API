@@ -2,6 +2,7 @@ import { Request, Response, NextFunction, type CookieOptions } from "express";
 import jwt from "jsonwebtoken";
 import type { JWTPayload } from "../types/auth.js";
 import { getUserByIdStrict } from "../services/database.js";
+import { getCaPortalConfig, isEmailAllowed } from "../services/caPortalService.js";
 
 export const AUTH_COOKIE_NAME = "contago_auth";
 
@@ -51,7 +52,7 @@ export function getRequestToken(req: Request): string | null {
 declare global {
   namespace Express {
     interface Request {
-      user?: JWTPayload;
+      user?: JWTPayload & { isPortal?: boolean; caPortalCompanyId?: string };
     }
   }
 }
@@ -74,19 +75,45 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     return;
   }
 
-  let payload: JWTPayload;
+  let payload: any;
   try {
-    payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
+    payload = jwt.verify(token, JWT_SECRET);
   } catch {
     res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
     res.status(401).json({ ok: false, message: "Token inválido o expirado" });
     return;
   }
 
+  // ── Portal Castro Arroyave: JWT con purpose="ca-portal" ──────────────────
+  if (payload.purpose === "ca-portal") {
+    try {
+      const config = await getCaPortalConfig();
+      if (!config?.companyId) {
+        res.status(503).json({ ok: false, message: "Portal no configurado. Contacta al administrador." });
+        return;
+      }
+      if (!isEmailAllowed(payload.email || "", config)) {
+        res.status(403).json({ ok: false, message: `El correo ${payload.email} no tiene acceso al portal.` });
+        return;
+      }
+      req.user = {
+        userId: `ca-portal:${payload.email}`,
+        email: payload.email,
+        isAdmin: false,
+        isPortal: true,
+        caPortalCompanyId: config.companyId,
+      };
+      next();
+    } catch {
+      res.status(503).json({ ok: false, message: "Servicio temporalmente no disponible" });
+    }
+    return;
+  }
+
   try {
     // Revalidar usuario real en DB para evitar claims obsoletos en JWT
     // (ej. suspensión o revocación de rol admin durante una sesión activa).
-    const currentUser = await getUserByIdStrict(payload.userId);
+    const currentUser = await getUserByIdStrict((payload as JWTPayload).userId);
     if (!currentUser) {
       res.clearCookie(AUTH_COOKIE_NAME, getAuthCookieClearOptions());
       res.status(401).json({ ok: false, message: "Usuario no encontrado" });

@@ -21,7 +21,7 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import multer from "multer";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
-import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
+import { getAllowedNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import type { ExcelGenerateRequest, ExcelJobData, InvoiceData, GoogleDriveConfig } from "../types/dianExcel.js";
 import type { DocumentInfo } from "../types/dian.js";
 import { createGratisSession, downloadFromGratisAsZip, gratisFetch, gratisXmlUrl, type GratisSession } from "../services/gratisDownload.js";
@@ -189,11 +189,11 @@ router.post("/generate", upload.single("excel"), validateDianUrl, async (req: Re
 
   // Control de acceso por NIT usando rk del token_url.
   if (!req.user?.isAdmin) {
-    const allowedNits = await getUserNits(userId);
+    const allowedNits = await getAllowedNits(userId, DIAN_EXCEL_TOOL_ID);
     if (allowedNits.length === 0) {
       return res.status(403).json({
         status: "error",
-        detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
+        detalle: "No tienes NITs habilitados para esta herramienta. Contacta al administrador.",
       });
     }
 

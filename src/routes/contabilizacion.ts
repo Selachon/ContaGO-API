@@ -30,6 +30,7 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
+import { getAllowedNits } from "../services/database.js";
 import {
   ejecutarMotor,
   MotorError,
@@ -42,6 +43,7 @@ import {
   dataRoot,
   detectarConsecutivosDesdeAuxiliar,
   getComprobantesEmpresa,
+  getEmpresaNit,
   getPuc,
   getTabla,
   guardarConsecutivos,
@@ -131,6 +133,15 @@ async function resolverEmpresaId(req: Request): Promise<string> {
   if (!empresaId) throw new MotorError("empresa_no_indicada", "Falta el empresaId.", [], 400);
   const ok = await userCanAccessEmpresa(empresaId, req.user!.userId, req.user!.isAdmin);
   if (!ok) throw new MotorError("empresa_no_autorizada", "No tienes acceso a esta empresa.", [], 403);
+  if (!req.user!.isAdmin) {
+    const [empresaNit, allowed] = await Promise.all([
+      getEmpresaNit(empresaId),
+      getAllowedNits(req.user!.userId, CONTABILIZACION_TOOL_ID),
+    ]);
+    if (!empresaNit || !allowed.includes(empresaNit)) {
+      throw new MotorError("nit_no_habilitado", "El NIT de esta empresa no está habilitado para tu cuenta.", [], 403);
+    }
+  }
   return empresaId;
 }
 
@@ -247,7 +258,11 @@ function enviarError(res: Response, err: unknown): void {
 
 router.get("/empresas", async (req: Request, res: Response) => {
   try {
-    const empresas = await listEmpresasForUser(req.user!.userId, req.user!.isAdmin);
+    let empresas = await listEmpresasForUser(req.user!.userId, req.user!.isAdmin);
+    if (!req.user!.isAdmin) {
+      const allowed = await getAllowedNits(req.user!.userId, CONTABILIZACION_TOOL_ID);
+      empresas = empresas.filter((e) => allowed.includes(String(e.nit || "").split("-")[0].replace(/\D/g, "")));
+    }
     res.json({ status: "ok", empresas });
   } catch (err) {
     enviarError(res, err);

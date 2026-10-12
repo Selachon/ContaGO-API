@@ -2,8 +2,16 @@ import { Request, Response, NextFunction } from "express";
 
 const DIAN_ALLOWED_ORIGINS = [
   "https://catalogo-vpfe.dian.gov.co",
-  "https://catalogo-vpfe-hab.dian.gov.co", // ambiente de habilitación
 ];
+
+// catalogo-vpfe-hab es el ambiente de PRUEBAS/certificación de la DIAN (datos ficticios,
+// sesión propia): nunca tuvo soporte real — todo el scraper navega con el host de
+// producción ya fijo (RedirectToBiller, gratis-vpfe, Document/Received...), así que un
+// token de hab autentica pero falla justo después al pasar a producción con otra sesión.
+// Encontrado 2026-10-05: un usuario mandó un token de hab (vía un enlace de Outlook
+// SafeLinks) y el flujo fallaba en "Autenticando" sin explicación. Se rechaza aquí con un
+// mensaje claro en vez de dejarlo fallar más adelante.
+const DIAN_HAB_ORIGIN = "https://catalogo-vpfe-hab.dian.gov.co";
 
 function tryExtractDianUrlFromSafeLink(rawUrl: string): string {
   let parsed: URL;
@@ -56,6 +64,16 @@ export function validateDianUrl(req: Request, res: Response, next: NextFunction)
   }
 
   const origin = `${parsed.protocol}//${parsed.hostname}`;
+
+  if (origin === DIAN_HAB_ORIGIN) {
+    res.status(400).json({
+      status: "error",
+      detalle: "Este enlace es del ambiente de PRUEBAS de la DIAN (catalogo-vpfe-hab.dian.gov.co), no el de producción. " +
+        "Pide que generen el token desde https://catalogo-vpfe.dian.gov.co — el de pruebas no tiene las facturas reales y no funciona en esta herramienta.",
+    });
+    return;
+  }
+
   const allowed = DIAN_ALLOWED_ORIGINS.some((o) => origin === o);
 
   if (!allowed) {

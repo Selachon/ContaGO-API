@@ -98,7 +98,7 @@ export function matchesCaused(
 
 export interface CausadasSyncPlan {
   /** Registros existentes que pasan a "caused" (o completan su siigoId). */
-  updates: Array<{ cufe: string; set: Record<string, unknown> }>;
+  updates: Array<{ cufe: string; set: Record<string, unknown>; /** si el registro no existía (venía de un borrador): datos para crearlo */ base?: Partial<DianInvoiceRecord> }>;
   /** Compras de Siigo sin registro: se crean como "caused" con cufe sintético `siigo:<id>`. */
   inserts: DianInvoiceRecord[];
   updated: number;
@@ -113,9 +113,12 @@ export interface CausadasSyncPlan {
  * - Si no existe → se crea causado (cufe sintético), para que aparezca igual.
  * - Idempotente: correrlo dos veces con los mismos datos no cambia nada la segunda vez.
  */
+/** Registro reconstruido desde un borrador de la bandeja que aún no tiene registro en el servidor. */
+export type DraftDerivedRecord = DianInvoiceRecord & { fromDraft: true };
+
 export function planCausadasSync(
   companyId: string,
-  existing: DianInvoiceRecord[],
+  existing: Array<DianInvoiceRecord | DraftDerivedRecord>,
   purchases: SiigoPurchaseLite[],
   nowIso: string,
 ): CausadasSyncPlan {
@@ -146,9 +149,13 @@ export function planCausadasSync(
       .map((d) => ({ d, score: matchScore(d.docnum, p.prefix, p.number) }))
       .sort((a, b) => b.score - a.score)[0]?.d;
     if (target) {
+      const draftBase = (target as DraftDerivedRecord).fromDraft
+        ? { companyId, cufe: target.cufe, docnum: target.docnum, supplierNit: target.supplierNit, supplierName: target.supplierName, issueDate: target.issueDate, total: p.total || target.total, ingestedAt: nowIso, fetchedAt: nowIso }
+        : undefined;
       plan.updates.push({
         cufe: target.cufe,
-        set: { status: "caused", siigoId: p.id, siigoName: p.name, siigoNumber: p.siigoNumber, siigoDocumentId: p.documentId, siigoDate: p.date, siigoTotal: p.total, causedAt: p.created || nowIso },
+        ...(draftBase ? { base: draftBase } : {}),
+        set: { status: "caused", siigoId: p.id, siigoName: p.name, siigoNumber: p.siigoNumber, siigoDocumentId: p.documentId, siigoDate: p.date, siigoTotal: p.total, causedAt: p.created || (p.date ? `${p.date}T00:00:00.000Z` : nowIso) },
       });
       target.status = "caused";       // no reutilizar el mismo registro con otra compra
       target.siigoId = p.id;
@@ -170,7 +177,7 @@ export function planCausadasSync(
       total: p.total,
       ingestedAt: nowIso,
       fetchedAt: nowIso,
-      causedAt: p.created || nowIso,
+      causedAt: p.created || (p.date ? `${p.date}T00:00:00.000Z` : nowIso),
       siigoId: p.id,
       siigoName: p.name,
       siigoNumber: p.siigoNumber,

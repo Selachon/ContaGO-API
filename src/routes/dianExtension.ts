@@ -26,7 +26,7 @@ import { extractInvoiceDataFromXml, extractThirdPartyDataFromXml } from "../serv
 import { generateExcelFile, generateThirdPartiesExcelFile } from "../services/excelGenerator.js";
 import { extractCufesFromExcel, extractFilesFromZip, resolveExcelBuffer } from "./dianCufeDownload.js";
 import { rejectIfWrongDemoNit, getDemoLimit, buildDemoLimitInfo, type DemoLimitInfo } from "../utils/demoLimit.js";
-import { getUserNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
+import { getAllowedNits, getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import { getOrCreateRootFolder, uploadInvoiceFilesToDrive } from "../services/googleDrive.js";
 import { encryptToken } from "../utils/encryption.js";
 import type { ListingRecord } from "../services/dianScraper.js";
@@ -40,7 +40,7 @@ const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 850);
 
 type DriveConfig = NonNullable<Awaited<ReturnType<typeof getUserGoogleDriveById>>>;
 
-const normalizeNit = (nit: string) => (nit || "").replace(/[-\s]/g, "").trim();
+const normalizeNit = (nit: string) => String(nit || "").split("-")[0].replace(/\D/g, "").trim();
 
 // Nombre del Excel idéntico a las herramientas internas (/dian-cufe y terceros).
 const ES_MONTHS = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
@@ -210,9 +210,10 @@ router.post("/job", upload.single("excel"), async (req: Request, res: Response) 
   // admin); el NIT real del job se verifica al recibir el primer documento.
   let allowedNits: string[] | null = null;
   if (!req.user?.isAdmin) {
-    const nits = await getUserNits(req.user!.userId);
+    const scopedToolId = mode === "terceros" ? TERCEROS_TOOL_ID : TOOL_ID;
+    const nits = await getAllowedNits(req.user!.userId, scopedToolId);
     if (nits.length === 0) {
-      return res.status(403).json({ status: "error", detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador." });
+      return res.status(403).json({ status: "error", detalle: "No tienes NITs habilitados para esta herramienta. Contacta al administrador." });
     }
     allowedNits = nits.map(normalizeNit);
   }

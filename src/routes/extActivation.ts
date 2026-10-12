@@ -187,7 +187,7 @@ router.post("/activate", rateLimit(20, 15 * 60 * 1000), async (req: Request, res
     ok: true,
     token,
     deviceId,
-    user: { email: user.email, name: user.name, purchasedTools, nits },
+    user: { email: user.email, name: user.name, purchasedTools, nits, toolNits: user.toolNits || {} },
   });
 });
 

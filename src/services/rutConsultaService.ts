@@ -1,5 +1,6 @@
 import puppeteer, { Browser, Page } from "puppeteer";
 import fs from "fs";
+import { closeBrowserSafely } from "./dianScraper.js";
 
 const DIAN_RUT_URL = "https://muisca.dian.gov.co/WebRutMuisca/DefConsultaEstadoRUT.faces";
 const DIAN_SITEKEY = "0x4AAAAAAAg1YFKr1lxPdUIL"; // Cloudflare Turnstile sitekey de DIAN MUISCA
@@ -148,6 +149,12 @@ function resolveChromePath(): string | undefined {
   return undefined;
 }
 
+// Evita que dos consultas concurrentes que ven el singleton nulo/muerto lancen
+// dos Chromium en paralelo: la segunda perdía la referencia del primero sin
+// cerrarlo jamás (fuga silenciosa, invisible al barrido de huérfanos porque
+// el proceso seguía siendo hijo de este mismo node vivo).
+let launchInFlight: Promise<Browser> | null = null;
+
 async function getBrowser(): Promise<Browser> {
   const tooOld = Date.now() - browserInitTime > BROWSER_MAX_AGE_MS;
 
@@ -161,25 +168,38 @@ async function getBrowser(): Promise<Browser> {
     }
   }
 
-  if (rutBrowser) {
-    try { await rutBrowser.close(); } catch {}
-    rutBrowser = null;
-  }
+  if (launchInFlight) return launchInFlight;
 
-  rutBrowser = await puppeteer.launch({
-    headless: true,
-    args: BROWSER_ARGS,
-    executablePath: resolveChromePath(),
-    timeout: 60000,
-  });
-  browserInitTime = Date.now();
-  return rutBrowser;
+  launchInFlight = (async () => {
+    if (rutBrowser) {
+      // closeBrowserSafely mata el árbol de proceso por PID si .close() falla
+      // o se cuelga (típico bajo presión de recursos), en vez de solo
+      // descartar la referencia y dejar el Chromium vivo sin dueño.
+      await closeBrowserSafely(rutBrowser).catch(() => undefined);
+      rutBrowser = null;
+    }
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: BROWSER_ARGS,
+      executablePath: resolveChromePath(),
+      timeout: 60000,
+    });
+    rutBrowser = browser;
+    browserInitTime = Date.now();
+    return browser;
+  })();
+
+  try {
+    return await launchInFlight;
+  } finally {
+    launchInFlight = null;
+  }
 }
 
 /** Cierra el navegador singleton de RUT (apagado ordenado). */
 export async function closeRutBrowser(): Promise<void> {
   if (rutBrowser) {
-    try { await rutBrowser.close(); } catch { /* ignore */ }
+    await closeBrowserSafely(rutBrowser).catch(() => undefined);
     rutBrowser = null;
   }
 }

@@ -13,7 +13,7 @@ import { buildDemoLimitInfo, getDemoLimit, type DemoLimitInfo } from "../utils/d
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
-import { getUserNits } from "../services/database.js";
+import { getAllowedNits } from "../services/database.js";
 import type { DownloadRequest, ProgressData } from "../types/dian.js";
 
 import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
@@ -335,11 +335,11 @@ router.post("/download-documents", validateDianUrl, async (req: Request, res: Re
   
   // Control de acceso por NIT: se valida rk del token_url contra NITs autorizados.
   if (!req.user?.isAdmin) {
-    const allowedNits = await getUserNits(req.user!.userId);
+    const allowedNits = await getAllowedNits(req.user!.userId, DIAN_DOWNLOADER_TOOL_ID);
     if (allowedNits.length === 0) {
       return res.status(403).json({
         status: "error",
-        detalle: "Tu cuenta no tiene NITs autorizados. Contacta al administrador.",
+        detalle: "No tienes NITs habilitados para esta herramienta. Contacta al administrador.",
       });
     }
 

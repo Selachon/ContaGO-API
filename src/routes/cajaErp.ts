@@ -240,6 +240,12 @@ async function resolveCompanyDrive(companyId: string) {
 }
 
 async function resolveCompany(req: Request, res: Response): Promise<string | null> {
+  // Usuarios del portal de cliente: empresa fija desde la config del portal.
+  if ((req.user as any)?.isPortal) {
+    const id = (req.user as any).caPortalCompanyId as string | undefined;
+    if (!id) { res.status(503).json({ ok: false, message: "Portal sin empresa configurada." }); return null; }
+    return id;
+  }
   const companyId = req.header("X-Siigo-Company");
   if (!companyId) {
     res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });
@@ -258,6 +264,11 @@ async function resolveCompany(req: Request, res: Response): Promise<string | nul
 // de borradores de cualquier empresa cliente (solo lectura/escritura de drafts,
 // no da acceso a las rutas de causación ni a Siigo).
 async function resolveCompanyForDrafts(req: Request, res: Response): Promise<string | null> {
+  if ((req.user as any)?.isPortal) {
+    const id = (req.user as any).caPortalCompanyId as string | undefined;
+    if (!id) { res.status(503).json({ ok: false, message: "Portal sin empresa configurada." }); return null; }
+    return id;
+  }
   const companyId = req.header("X-Siigo-Company");
   if (!companyId) {
     res.status(400).json({ ok: false, message: "Falta la empresa (X-Siigo-Company)." });

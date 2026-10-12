@@ -195,7 +195,18 @@ router.get("/callback", async (req: Request, res: Response) => {
 
   try {
     // Recupera el userId y purpose enviados al iniciar OAuth.
-    const stateData = JSON.parse(Buffer.from(state, "base64").toString("utf8"));
+    // El ERP usa un state FIRMADO con formato "payload.firma"; el resto de
+    // flujos usa base64(JSON). Se distinguen por el punto separador.
+    let stateData: any;
+    if (state.includes(".")) {
+      const { decodeState } = await import("../erp/oauthState.js");
+      stateData = decodeState(state);
+      if (!stateData) {
+        return sendResponse(false, "La solicitud de autorización expiró o no es válida. Inténtalo de nuevo.");
+      }
+    } else {
+      stateData = JSON.parse(Buffer.from(state, "base64").toString("utf8"));
+    }
 
     // ── Castro Portal: autenticación de empleados con Google ─────────────────
     if (stateData.purpose === "castro-portal") {
@@ -230,6 +241,41 @@ router.get("/callback", async (req: Request, res: Response) => {
       return res.redirect(302, redirectTo.toString());
     }
 
+    // ── CA Portal: autenticación de empleados de Castro Arroyave SAS BIC ────
+    if (stateData.purpose === "ca-portal") {
+      const { accessToken } = await exchangeCodeForTokens(code);
+      const userEmail = (await getGoogleUserEmail(accessToken)).toLowerCase();
+
+      const { getCaPortalConfig, isEmailAllowed } = await import("../services/caPortalService.js");
+      const config = await getCaPortalConfig();
+
+      if (!config?.companyId) {
+        return sendResponse(false, "Portal no configurado. Contacta al administrador de ContaGO.");
+      }
+      if (!isEmailAllowed(userEmail, config)) {
+        return sendResponse(false, `El correo ${userEmail} no tiene acceso al portal. Contacta al administrador.`);
+      }
+
+      const token = (await import("jsonwebtoken")).default.sign(
+        { email: userEmail, purpose: "ca-portal" },
+        process.env.JWT_SECRET!,
+        { expiresIn: "8h" }
+      );
+
+      const returnUrl = stateData.returnUrl || "";
+      const allowed_origins = (process.env.CORS_ORIGIN || "").split(",").map((s: string) => s.trim());
+      let redirectTo: URL;
+      try {
+        redirectTo = new URL(returnUrl);
+        if (!allowed_origins.some((o: string) => returnUrl.startsWith(o))) throw new Error("origen no permitido");
+      } catch {
+        redirectTo = new URL("https://contago.com.co/public/castro-arroyave-caja");
+      }
+      redirectTo.searchParams.set("portal_token", token);
+      console.log(`[CA Portal] Acceso concedido: ${userEmail}`);
+      return res.redirect(302, redirectTo.toString());
+    }
+
     // ── Castro Arroyave: conexión específica para Drive + Sheets ─────────────
     if (stateData.purpose === "castro") {
       const { accessToken, refreshToken, expiryDate } = await exchangeCodeForTokens(code);
@@ -254,6 +300,21 @@ router.get("/callback", async (req: Request, res: Response) => {
 
       console.log(`[Castro] Google conectado: ${userEmail}, carpeta Drive: ${driveFolderId}`);
       return sendResponse(true, `Cuenta de Google vinculada (${userEmail}). Los PDFs se guardarán en la carpeta "Castro Arroyave - Facturas ContaGO" de Drive.`);
+    }
+
+    // ── ContaGO ERP: login con Google en el portal de una empresa ───────────
+    if (stateData.purpose === "erp-login") {
+      const { handleErpLoginCallback } = await import("../erp/auth.js");
+      const result = await handleErpLoginCallback(String(state), code);
+      if (!result.ok) return sendResponse(false, result.message);
+      return res.redirect(302, result.redirectTo);
+    }
+
+    // ── ContaGO ERP: conexión de Google Drive de una empresa ────────────────
+    if (stateData.purpose === "erp-drive") {
+      const { handleErpDriveCallback } = await import("../erp/auth.js");
+      const result = await handleErpDriveCallback(String(state), code);
+      return sendResponse(result.ok, result.message);
     }
 
     // ── Flujo estándar: Drive por usuario ────────────────────────────────────

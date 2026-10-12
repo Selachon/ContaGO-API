@@ -311,6 +311,14 @@ export async function listEmpresasForUser(userId: string, isAdmin: boolean): Pro
   return docs.map(toPublic);
 }
 
+/** NIT normalizado (solo dígitos) de la empresa. "" si no existe. */
+export async function getEmpresaNit(empresaId: string): Promise<string> {
+  const oid = toObjectId(empresaId);
+  if (!oid) return "";
+  const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { nit: 1 } });
+  return normalizeNit(doc?.nit);
+}
+
 /** True si el usuario puede usar la empresa (dueño, compartida o admin). */
 export async function userCanAccessEmpresa(empresaId: string, userId: string, isAdmin: boolean): Promise<boolean> {
   const oid = toObjectId(empresaId);
