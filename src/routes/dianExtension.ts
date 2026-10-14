@@ -208,10 +208,10 @@ router.post("/job", upload.single("excel"), async (req: Request, res: Response) 
   // Control de acceso por NIT contratado. El NIT propio no se conoce hasta parsear
   // el primer XML, así que aquí solo se valida que la cuenta tenga NITs (salvo
   // admin); el NIT real del job se verifica al recibir el primer documento.
+  // Terceros es una herramienta libre: no se restringe por NIT.
   let allowedNits: string[] | null = null;
-  if (!req.user?.isAdmin) {
-    const scopedToolId = mode === "terceros" ? TERCEROS_TOOL_ID : TOOL_ID;
-    const nits = await getAllowedNits(req.user!.userId, scopedToolId);
+  if (!req.user?.isAdmin && mode !== "terceros") {
+    const nits = await getAllowedNits(req.user!.userId, TOOL_ID);
     if (nits.length === 0) {
       return res.status(403).json({ status: "error", detalle: "No tienes NITs habilitados para esta herramienta. Contacta al administrador." });
     }

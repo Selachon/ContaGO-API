@@ -1,4 +1,5 @@
 import { clearSuspensionCache } from "./subscriptionExpiry.js";
+import { NIT_SCOPED_TOOLS, nitToolAliases } from "./database.js";
 import { ObjectId, type Collection } from "mongodb";
 import { randomUUID } from "crypto";
 import type { BillingInfo, DemoAccess, UserRole } from "../types/auth.js";
@@ -787,7 +788,18 @@ export async function addToolPayment(id: string, toolId: string, input: NewToolP
   const companiesAfter = ($set[`toolCompanyLimits.${toolId}`] as number | undefined)
     ?? ($set.companiesInPlan as number | undefined)
     ?? rec.toolCompanyLimits?.[toolId] ?? rec.companiesInPlan;
-  const nitsAfter = [...new Set([...(rec.toolNits?.[toolId] || []), ...(payment.addNits || [])])];
+  let nitsAfter = [...new Set([...(rec.toolNits?.[toolId] || []), ...(payment.addNits || [])])];
+  // Herramienta por NIT: nunca queda sin NITs habilitados (sin ellos el cliente ve "no cuenta con NITs vinculados").
+  // Si no se indicó ninguno, se toman los de su lista global; si tampoco hay, se pide explícitamente.
+  if (NIT_SCOPED_TOOLS.has(toolId)) {
+    const enabled = nitToolAliases(toolId).some((a) => (rec.toolNits?.[a] || []).length) || nitsAfter.length > 0;
+    if (!enabled) {
+      const global: string[] = (rec.nits || []).map((n: string) => String(n).trim()).filter(Boolean);
+      if (!global.length) throw new Error("Esta herramienta se habilita por NIT: indique al menos un NIT para el cliente.");
+      $set[`toolNits.${toolId}`] = global;
+      nitsAfter = global;
+    }
+  }
   payment.planAfter = { ...(companiesAfter != null && { companies: Number(companiesAfter) }), nits: nitsAfter };
 
   $push[`${base}.payments`] = { $each: [...prior, payment] };

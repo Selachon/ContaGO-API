@@ -37,7 +37,6 @@ const ALLOW_PUBLIC_REGISTER = process.env.ALLOW_PUBLIC_REGISTER === "true";
 const NIT_SCOPED_TOOL_LABELS: Record<string, string> = {
   "dian-recibidos": "Descarga Masiva DIAN",
   "dian-cufe-downloader": "Descarga masiva + Excel DIAN",
-  "dian-third-parties-excel": "Terceros DIAN a Excel",
   "dian-mass-download": "Descarga Masiva (Legacy)",
   "contabilizacion-dian-siigo": "Causación Siigo (Interfaces)",
 };

@@ -603,11 +603,11 @@ export async function getUserNits(userId: string): Promise<string[]> {
 }
 
 // Herramientas cuyo acceso se restringe por NIT habilitado (no por la lista global).
+// "dian-third-parties-excel" (Terceros DIAN a Excel) es libre: sin NITs.
 // Incluye ids vigentes y legacy (mismo cliente, mismo alcance de NITs).
 export const NIT_SCOPED_TOOLS = new Set<string>([
   "dian-recibidos",
   "dian-cufe-downloader",
-  "dian-third-parties-excel",
   "dian-mass-download",
   "dian-downloader",
   "dian-excel-exporter",
@@ -620,7 +620,7 @@ const NIT_ALIAS_GROUPS: string[][] = [
   ["dian-cufe-downloader", "dian-excel-exporter"],
 ];
 
-function nitToolAliases(toolId: string): string[] {
+export function nitToolAliases(toolId: string): string[] {
   const group = NIT_ALIAS_GROUPS.find((g) => g.includes(toolId));
   return group ? group : [toolId];
 }
