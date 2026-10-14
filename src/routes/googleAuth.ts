@@ -197,6 +197,16 @@ router.get("/callback", async (req: Request, res: Response) => {
     // Recupera el userId y purpose enviados al iniciar OAuth.
     // El ERP usa un state FIRMADO con formato "payload.firma"; el resto de
     // flujos usa base64(JSON). Se distinguen por el punto separador.
+    // ── Caja: Google Sheets de la empresa (state firmado propio) ────────────
+    if (state.includes(".")) {
+      const { decodeSheetsState, saveSheetsConnection } = await import("../services/cajaSheetsAuth.js");
+      const sheetsState = decodeSheetsState(state);
+      if (sheetsState) {
+        const { email } = await saveSheetsConnection(sheetsState.companyId, sheetsState.userId, code);
+        return sendResponse(true, `Google Sheets autorizado con ${email}.`);
+      }
+    }
+
     let stateData: any;
     if (state.includes(".")) {
       const { decodeState } = await import("../erp/oauthState.js");

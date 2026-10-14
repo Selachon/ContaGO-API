@@ -14,7 +14,6 @@ const ENTRIES = "cajaErpEntries";
 const INVOICES = "cajaErpInvoices";
 const PAYMENTS = "cajaErpPayments";
 const BANCOS = "cajaErpBancos";
-const PUBLIC_TOKENS = "cajaPublicTokens";
 // Bandeja de facturas PENDIENTES (importadas, aún no causadas) compartida por
 // empresa: vive en el servidor para que el trabajo sobreviva al cambio de PC y lo
 // vean todos los usuarios de una empresa compartida. Una fila = un doc.
@@ -134,6 +133,7 @@ export interface Entry {
   direction: "in" | "out"; // out = gasto, in = ingreso
   categoria: string;
   soporteUrl: string;
+  proyectado: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -149,6 +149,7 @@ function mapEntry(d: any): Entry {
     direction: d.direction === "in" ? "in" : "out",
     categoria: d.categoria || "",
     soporteUrl: d.soporteUrl || "",
+    proyectado: d.proyectado === true,
     createdAt: d.createdAt || "",
     updatedAt: d.updatedAt || "",
   };
@@ -162,6 +163,7 @@ export interface NewEntryInput {
   direction?: "in" | "out";
   categoria?: string;
   soporteUrl?: string;
+  proyectado?: boolean;
 }
 
 export async function listEntries(companyId: string, proyectoId?: string, month?: string): Promise<Entry[]> {
@@ -186,6 +188,7 @@ export async function createEntry(companyId: string, input: NewEntryInput): Prom
     direction: input.direction === "in" ? "in" : "out",
     categoria: String(input.categoria || "").trim(),
     soporteUrl: String(input.soporteUrl || "").trim(),
+    proyectado: input.proyectado === true,
     createdAt: ts,
     updatedAt: ts,
   };
@@ -197,6 +200,7 @@ export async function createEntry(companyId: string, input: NewEntryInput): Prom
     valor: doc.valor,
     direction: doc.direction,
     descripcion: doc.descripcion,
+    proyectado: doc.proyectado,
   });
   if (existing) return mapEntry(existing);
   const res = await getDb().collection<any>(ENTRIES).insertOne(doc);
@@ -212,6 +216,7 @@ export async function updateEntry(companyId: string, id: string, patch: Partial<
   if (patch.direction != null) updates.direction = patch.direction === "in" ? "in" : "out";
   if (patch.categoria != null) updates.categoria = String(patch.categoria).trim();
   if (patch.soporteUrl != null) updates.soporteUrl = String(patch.soporteUrl).trim();
+  if (patch.proyectado != null) updates.proyectado = patch.proyectado === true;
   let oid: ObjectId;
   try { oid = new ObjectId(id); } catch { return null; }
   const res = await getDb().collection<any>(ENTRIES).findOneAndUpdate(
@@ -1302,31 +1307,4 @@ export async function computeFlujoEditable(companyId: string, numMeses: number):
       totalGastos, ingresos, totalIngresos, resultado, saldoAcumulado: saldo,
     };
   });
-}
-
-// ── Token público de acceso de solo lectura ───────────────────────────────────
-import { randomBytes } from "crypto";
-
-export async function getPublicToken(companyId: string): Promise<string | null> {
-  const doc = await getDb().collection<any>(PUBLIC_TOKENS).findOne({ companyId });
-  return doc?.token || null;
-}
-
-export async function generatePublicToken(companyId: string): Promise<string> {
-  const token = randomBytes(24).toString("hex");
-  await getDb().collection<any>(PUBLIC_TOKENS).updateOne(
-    { companyId },
-    { $set: { companyId, token, createdAt: now() } },
-    { upsert: true },
-  );
-  return token;
-}
-
-export async function revokePublicToken(companyId: string): Promise<void> {
-  await getDb().collection<any>(PUBLIC_TOKENS).deleteOne({ companyId });
-}
-
-export async function resolveCompanyByToken(token: string): Promise<string | null> {
-  const doc = await getDb().collection<any>(PUBLIC_TOKENS).findOne({ token });
-  return doc?.companyId || null;
 }

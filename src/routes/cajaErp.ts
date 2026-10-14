@@ -78,134 +78,14 @@ import {
   listProvDinamica,
   upsertProvDinamica,
   type TagKind,
-  getPublicToken,
-  generatePublicToken,
-  revokePublicToken,
-  resolveCompanyByToken,
 } from "../services/cajaErpStore.js";
 import ExcelJS from "exceljs";
 import { listMovements, getMovement, updateMovement as updateBankMov } from "../services/siigoEgresosStoreService.js";
 import { generarCajaPdf } from "../services/cajaPdf.js";
 
 import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
+import { buildSheetsAuthUrl, getSheetsStatus, removeSheetsConnection, setSpreadsheet } from "../services/cajaSheetsAuth.js";
 export const CAJA_ERP_TOOL_ID = "causacion-caja";
-
-// ── Router público (sin auth) — solo lectura vía token ────────────────────────
-export const publicCajaRouter = Router();
-
-publicCajaRouter.get("/public/:token/report", async (req, res) => {
-  const companyId = await resolveCompanyByToken(req.params.token);
-  if (!companyId) return res.status(404).json({ ok: false, message: "Token inválido." });
-  const { rows, bancos, totalCaja, totalBancos } = await buildCajaData(companyId);
-  const round = (n: number) => Math.round(Number(n) || 0);
-  const totalSaldoInicial = rows.reduce((a, r) => a + (r.proyecto.saldoInicial || 0), 0);
-  const totalIngresos = rows.reduce((a, r) => a + r.ingresos, 0);
-  const totalEgresos = rows.reduce((a, r) => a + r.egresos, 0);
-  res.json({ ok: true, data: {
-    generadoEn: new Date().toISOString(),
-    kpis: {
-      totalSaldoInicial: round(totalSaldoInicial),
-      totalIngresos: round(totalIngresos),
-      totalEgresos: round(totalEgresos),
-      totalCaja: round(totalCaja),
-      totalBancos: round(totalBancos),
-    },
-    proyectos: rows
-      .filter((r) => r.saldo !== 0 || r.items.length > 0)
-      .map((r) => ({
-        id: r.proyecto.id,
-        nombre: r.proyecto.nombre,
-        esTransversal: r.proyecto.esTransversal,
-        saldoInicial: round(r.proyecto.saldoInicial || 0),
-        ingresos: round(r.ingresos),
-        egresos: round(r.egresos),
-        saldo: round(r.saldo),
-        items: (r.items || []).map((it: any) => ({
-          fecha: it.fecha,
-          descripcion: it.descripcion,
-          valor: round(it.valor),
-          direction: it.direction,
-          origen: it.origen || it.source || "",
-          categoria: it.categoria || "",
-        })),
-      })),
-    bancos,
-  }});
-});
-
-publicCajaRouter.get("/public/:token/flujo", async (req, res) => {
-  const companyId = await resolveCompanyByToken(req.params.token);
-  if (!companyId) return res.status(404).json({ ok: false, message: "Token inválido." });
-  const meses = Math.min(12, Math.max(1, Number(req.query.meses) || 6));
-  const [flujo, config] = await Promise.all([
-    computeFlujoEditable(companyId, meses),
-    getCajaConfig(companyId),
-  ]);
-  res.json({ ok: true, data: { flujo, config } });
-});
-
-publicCajaRouter.get("/public/:token/excel", async (req, res) => {
-  const companyId = await resolveCompanyByToken(req.params.token);
-  if (!companyId) return res.status(404).json({ ok: false, message: "Token inválido." });
-  const { rows, bancos: _bancos, totalCaja, totalBancos: _tb } = await buildCajaData(companyId);
-  const round = (n: number) => Math.round(Number(n) || 0);
-  const wb = new ExcelJS.Workbook();
-  wb.creator = "ContaGO"; wb.created = new Date();
-  const BLUE = "1E3A5F"; const WHITE = "FFFFFF";
-  const HEAD_FILL = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FF" + BLUE } };
-  const ALT_FILL  = { type: "pattern" as const, pattern: "solid" as const, fgColor: { argb: "FFF5F5F5" } };
-
-  const { proyectoId } = req.query as { proyectoId?: string };
-
-  function addMovSheet(ws: ExcelJS.Worksheet, items: any[], proyNombre: string) {
-    const hRow = ws.addRow(["Fecha", "Mes", "Proyecto", "Descripción", "Categoría", "Valor"]);
-    hRow.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
-    const sorted = [...items].sort((a, b) => String(a.fecha).localeCompare(String(b.fecha)));
-    let ri = 2;
-    for (const it of sorted) {
-      const val = round(it.valor) * (it.direction === "in" ? 1 : -1);
-      const dRow = ws.addRow([it.fecha, String(it.fecha || "").slice(0, 7), proyNombre, it.descripcion, it.categoria || it.origen || "", val]);
-      dRow.getCell(6).numFmt = "#,##0";
-      dRow.getCell(6).font = { color: { argb: val >= 0 ? "FF1B5E20" : "FFB71C1C" } };
-      if (ri % 2 === 0) dRow.eachCell((c) => { c.fill = ALT_FILL; });
-      ri++;
-    }
-    ws.columns = [{ width: 12 }, { width: 10 }, { width: 28 }, { width: 50 }, { width: 26 }, { width: 18 }];
-    ws.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: 6 } };
-    ws.views = [{ state: "frozen", ySplit: 1 }];
-  }
-
-  let fname: string;
-
-  if (proyectoId) {
-    // Descarga de un solo proyecto
-    const row = rows.find((r) => r.proyecto.id === proyectoId);
-    if (!row) return res.status(404).json({ ok: false, message: "Proyecto no encontrado." });
-    const ws = wb.addWorksheet(row.proyecto.nombre.slice(0, 31));
-    addMovSheet(ws, row.items || [], row.proyecto.nombre);
-    fname = `caja_${row.proyecto.nombre.replace(/\s+/g, "_").slice(0, 30)}_${new Date().toISOString().slice(0, 10)}.xlsx`;
-  } else {
-    // Descarga consolidada (todos)
-    const wsTodos = wb.addWorksheet("Todos los movimientos");
-    const allItems: any[] = [];
-    for (const r of rows) for (const it of r.items || []) allItems.push({ ...it, proyNombre: r.proyecto.nombre });
-    addMovSheet(wsTodos, allItems.map((it) => ({ ...it, descripcion: it.descripcion })), "");
-    // Overwrite column 3 with proyNombre per row already included via the addMovSheet loop
-    // Hoja resumen
-    const wsRes = wb.addWorksheet("Resumen");
-    const rh = wsRes.addRow(["Proyecto", "Saldo inicial", "Ingresos", "Egresos", "Saldo"]);
-    rh.eachCell((c) => { c.fill = HEAD_FILL; c.font = { bold: true, color: { argb: "FF" + WHITE } }; });
-    for (const r of rows.slice().sort((a, b) => b.saldo - a.saldo))
-      wsRes.addRow([r.proyecto.nombre, round(r.proyecto.saldoInicial || 0), round(r.ingresos), round(r.egresos), round(r.saldo)]);
-    wsRes.addRow(["TOTAL CAJA", "", "", "", round(totalCaja)]).font = { bold: true };
-    wsRes.columns = [{ width: 32 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 16 }];
-    fname = `caja_${new Date().toISOString().slice(0, 10)}.xlsx`;
-  }
-
-  res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  res.setHeader("Content-Disposition", `attachment; filename="${fname}"`);
-  await wb.xlsx.write(res); res.end();
-});
 
 // Router principal: requiere tool causacion-caja (para Caja ERP).
 const router = Router();
@@ -726,8 +606,8 @@ async function buildCajaData(companyId: string) {
     listEntries(companyId),
     listBancos(companyId),
   ]);
-  const byProj = new Map<string, { items: any[]; in: number; out: number }>();
-  const ensure = (pid: string) => { if (!byProj.has(pid)) byProj.set(pid, { items: [], in: 0, out: 0 }); return byProj.get(pid)!; };
+  const byProj = new Map<string, { items: any[]; in: number; out: number; proyIn: number; proyOut: number }>();
+  const ensure = (pid: string) => { if (!byProj.has(pid)) byProj.set(pid, { items: [], in: 0, out: 0, proyIn: 0, proyOut: 0 }); return byProj.get(pid)!; };
   for (const m of movs as any[]) {
     const pid = (tagsMap as any)[m.id]; if (!pid) continue;
     if (m.cajaEntryId) continue; // ya representado como entry manual — evitar doble conteo
@@ -738,12 +618,15 @@ async function buildCajaData(companyId: string) {
   for (const en of entries as any[]) {
     if (!en.proyectoId) continue;
     const e = ensure(en.proyectoId); const v = Number(en.valor) || 0;
+    // Proyecciones: simulación para reuniones; nunca tocan el saldo real ni los reportes.
+    if (en.proyectado) { if (en.direction === "in") e.proyIn += v; else e.proyOut += v; continue; }
     if (en.direction === "in") e.in += v; else e.out += v;
     e.items.push({ fecha: en.fecha, descripcion: en.descripcion, valor: v, direction: en.direction, origen: "Manual", categoria: en.categoria });
   }
   const rows = proyectos.map((p) => {
-    const e = byProj.get(p.id) || { items: [], in: 0, out: 0 };
-    return { proyecto: p, ingresos: e.in, egresos: e.out, saldo: (p.saldoInicial || 0) + e.in - e.out, items: e.items };
+    const e = byProj.get(p.id) || { items: [], in: 0, out: 0, proyIn: 0, proyOut: 0 };
+    const saldo = (p.saldoInicial || 0) + e.in - e.out;
+    return { proyecto: p, ingresos: e.in, egresos: e.out, saldo, saldoProyectado: saldo + e.proyIn - e.proyOut, items: e.items };
   });
   const totalCaja = rows.reduce((a, r) => a + r.saldo, 0);
   const totalBancos = bancos.reduce((a, b) => a + b.saldo, 0);
@@ -1294,20 +1177,31 @@ router.patch("/plan/prov-dinamica", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// ── Gestión del token público (autenticado) ───────────────────────────────────
-router.get("/public-token", async (req, res) => {
+// ── Conexión de Google Sheets de la empresa (sincronización portal → Sheet) ──
+// Solo el dueño de la empresa (o admin) autoriza/desconecta/elige el Sheet.
+async function sheetsAdminCompany(req: Request, res: Response): Promise<string | null> {
+  const companyId = await resolveCompany(req, res); if (!companyId) return null;
+  const canManage = req.user!.isAdmin || (await userOwnsCompany(companyId, req.user!.userId));
+  if (!canManage) { res.status(403).json({ ok: false, message: "Solo el administrador de la empresa puede gestionar Google Sheets." }); return null; }
+  return companyId;
+}
+router.get("/sheets/status", async (req, res) => {
   const companyId = await resolveCompany(req, res); if (!companyId) return;
-  const token = await getPublicToken(companyId);
-  res.json({ ok: true, data: { token } });
+  const canManage = req.user!.isAdmin || (await userOwnsCompany(companyId, req.user!.userId));
+  res.json({ ok: true, data: { ...(await getSheetsStatus(companyId)), isOwner: canManage } });
 });
-router.post("/public-token", async (req, res) => {
-  const companyId = await resolveCompany(req, res); if (!companyId) return;
-  const token = await generatePublicToken(companyId);
-  res.json({ ok: true, data: { token } });
+router.post("/sheets/authorize-url", async (req, res) => {
+  const companyId = await sheetsAdminCompany(req, res); if (!companyId) return;
+  res.json({ ok: true, authUrl: buildSheetsAuthUrl(companyId, req.user!.userId) });
 });
-router.delete("/public-token", async (req, res) => {
-  const companyId = await resolveCompany(req, res); if (!companyId) return;
-  await revokePublicToken(companyId);
+router.put("/sheets/spreadsheet", async (req, res) => {
+  const companyId = await sheetsAdminCompany(req, res); if (!companyId) return;
+  try { res.json({ ok: true, data: await setSpreadsheet(companyId, String(req.body?.url || "")) }); }
+  catch (e: any) { res.status(400).json({ ok: false, message: e?.message || "No se pudo abrir el Sheet con esa cuenta." }); }
+});
+router.delete("/sheets", async (req, res) => {
+  const companyId = await sheetsAdminCompany(req, res); if (!companyId) return;
+  await removeSheetsConnection(companyId);
   res.json({ ok: true });
 });
 
