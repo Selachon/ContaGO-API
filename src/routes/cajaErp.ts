@@ -84,6 +84,9 @@ import { listMovements, getMovement, updateMovement as updateBankMov } from "../
 import { generarCajaPdf } from "../services/cajaPdf.js";
 
 import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
+import { syncGastosOficina } from "../services/cajaSheetsGastos.js";
+import { syncHonorariosSocias } from "../services/cajaSheetsHonorarios.js";
+import { syncCajaToSheet, markSyncError } from "../services/cajaSheetsSync.js";
 import { buildSheetsAuthUrl, getSheetsStatus, removeSheetsConnection, setSpreadsheet } from "../services/cajaSheetsAuth.js";
 export const CAJA_ERP_TOOL_ID = "causacion-caja";
 
@@ -91,6 +94,18 @@ export const CAJA_ERP_TOOL_ID = "causacion-caja";
 const router = Router();
 router.use(requireAuth);
 router.use(requireToolAccess(CAJA_ERP_TOOL_ID));
+// Cualquier cambio que afecte la caja dispara una sincronización diferida al Sheet.
+router.use(["/proyectos", "/tags", "/entries", "/bancos", "/payments"], (req, res, next) => {
+  if (req.method !== "GET") {
+    res.on("finish", () => {
+      if (res.statusCode < 400) {
+        const cid = req.header("X-Siigo-Company");
+        if (cid) scheduleSheetsSync(cid);
+      }
+    });
+  }
+  next();
+});
 // Control de jobs de descarga DIAN: actividad del cliente + respuesta clara tras un reinicio.
 router.use(jobGuardMiddleware("caja-dian-fetch", {
   pollPath: /^\/dian\/fetch-new\/(?:status|result)\/([A-Za-z0-9_-]+)/,
@@ -598,7 +613,7 @@ router.delete("/bancos/:id", async (req, res) => {
 // ── Reporte de caja en Excel (total o por proyecto) ────────────────────
 // Reconstruye los saldos por proyecto = saldoInicial + ingresos − egresos
 // (movimientos de banco etiquetados + entradas manuales).
-async function buildCajaData(companyId: string) {
+export async function buildCajaData(companyId: string) {
   const [proyectos, tagsMap, movs, entries, bancos] = await Promise.all([
     listProyectos(companyId),
     getTags(companyId, "mov"),
@@ -1198,6 +1213,38 @@ router.put("/sheets/spreadsheet", async (req, res) => {
   const companyId = await sheetsAdminCompany(req, res); if (!companyId) return;
   try { res.json({ ok: true, data: await setSpreadsheet(companyId, String(req.body?.url || "")) }); }
   catch (e: any) { res.status(400).json({ ok: false, message: e?.message || "No se pudo abrir el Sheet con esa cuenta." }); }
+});
+// Sincroniza la caja al Sheet del portal (una vía). Con debounce para agrupar ráfagas de cambios.
+async function runSheetsSync(companyId: string) {
+  const { rows, bancos } = await buildCajaData(companyId);
+  const r = await syncCajaToSheet(companyId, rows as any, bancos as any);
+  await syncGastosOficina(companyId, rows as any); // pestaña "Gastos Oficina" (categoría × mes)
+  await syncHonorariosSocias(companyId, rows as any); // pestaña "Honorarios Socias" (proyecto × socia)
+  return r;
+}
+const sheetsTimers = new Map<string, NodeJS.Timeout>();
+function scheduleSheetsSync(companyId: string) {
+  clearTimeout(sheetsTimers.get(companyId));
+  sheetsTimers.set(companyId, setTimeout(async () => {
+    sheetsTimers.delete(companyId);
+    try {
+      const st = await getSheetsStatus(companyId);
+      if (!st.connected || !st.syncUrl) return; // sin Sheet de sincronización: nada que hacer
+      await runSheetsSync(companyId);
+    } catch (e: any) { await markSyncError(companyId, e?.message || "Error sincronizando"); }
+  }, 8000));
+}
+router.post("/sheets/create-copy", async (req, res) => {
+  const companyId = await sheetsAdminCompany(req, res); if (!companyId) return;
+  try {
+    const r = await runSheetsSync(companyId);
+    res.json({ ok: true, data: r });
+  } catch (e: any) { res.status(400).json({ ok: false, message: e?.message || "No se pudo crear/sincronizar." }); }
+});
+router.post("/sheets/sync", async (req, res) => {
+  const companyId = await sheetsAdminCompany(req, res); if (!companyId) return;
+  try { res.json({ ok: true, data: await runSheetsSync(companyId) }); }
+  catch (e: any) { await markSyncError(companyId, e?.message || ""); res.status(400).json({ ok: false, message: e?.message || "No se pudo sincronizar." }); }
 });
 router.delete("/sheets", async (req, res) => {
   const companyId = await sheetsAdminCompany(req, res); if (!companyId) return;

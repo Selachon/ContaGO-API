@@ -64,7 +64,10 @@ export async function saveSheetsConnection(companyId: string, userId: string, co
 
 export async function getSheetsStatus(companyId: string) {
   const d = await getDb().collection<any>(COL).findOne({ companyId });
-  return { connected: !!d?.refreshToken, email: d?.email || "", spreadsheetId: d?.spreadsheetId || "", spreadsheetTitle: d?.spreadsheetTitle || "" };
+  return {
+    connected: !!d?.refreshToken, email: d?.email || "", spreadsheetId: d?.spreadsheetId || "", spreadsheetTitle: d?.spreadsheetTitle || "",
+    syncUrl: d?.syncEnabled && d?.spreadsheetId ? `https://docs.google.com/spreadsheets/d/${d.spreadsheetId}/edit#gid=${d.syncSheetGid ?? 0}` : "", lastSyncAt: d?.lastSyncAt || "", lastSyncError: d?.lastSyncError || "",
+  };
 }
 
 export async function removeSheetsConnection(companyId: string): Promise<void> {
