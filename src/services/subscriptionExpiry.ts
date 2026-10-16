@@ -52,6 +52,9 @@ export function toolEnd(user: any, toolId: string, companies: any[], depth = 0):
       const e = resolveEnd(s.licenseStartDate, s.licenseEndDate, s.paymentHistory);
       if (e) ends.push(e);
     }
+    // Las ventas del libro (Añadir venta) no actualizan la suscripción de la empresa: también cuentan
+    const saleEnd = (ts.payments || []).filter((p: any) => p.type !== "mejora" && p.type !== "devolucion" && p.periodEnd).map((p: any) => String(p.periodEnd)).sort().pop();
+    if (saleEnd) ends.push(saleEnd);
     // Con varias empresas se toma la más lejana: el acceso es del usuario, no de una empresa
     if (ends.length) return ends.sort().pop()!;
   }
