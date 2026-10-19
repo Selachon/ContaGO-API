@@ -72,6 +72,9 @@ export interface XmlCausacionData {
   date: string; // YYYY-MM-DD ("" si no se pudo leer)
   supplierNit: string;
   supplierName: string;
+  /** Receptor del documento (el cliente, en facturas emitidas). */
+  receiverNit?: string;
+  receiverName?: string;
   providerInvoicePrefix: string;
   providerInvoiceNumber: string;
   docNumberRaw: string;
@@ -347,6 +350,8 @@ export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean
     date: validDate,
     supplierNit: xmlData.issuerNit || "",
     supplierName: xmlData.issuerName || "",
+    receiverNit: xmlData.receiverNit || "",
+    receiverName: xmlData.receiverName || "",
     providerInvoicePrefix: prefix,
     providerInvoiceNumber: number,
     docNumberRaw: xmlData.docNumber || "",
