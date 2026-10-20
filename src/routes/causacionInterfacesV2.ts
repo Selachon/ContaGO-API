@@ -156,17 +156,30 @@ async function sugerenciasPorNit(empresaId: string, tipo: Ci2Tipo = "compra"): P
   return mapa;
 }
 
+/** Retenciones configuradas que el motor no causa porque la base de la factura no alcanza la base mínima de la tabla. */
+function retencionesNoAplican(items: any[], ef: any, op: ReturnType<typeof opcionesRetencion>) {
+  const normales = (items || []).filter((i) => !i.isGift && !i.isSurcharge);
+  const base = normales.reduce((t, i) => t + (i.base || 0), 0);
+  const iva = normales.reduce((t, i) => t + ((i.base || 0) * (i.ivaPercent || 0)) / 100, 0);
+  const baseMin = (lista: { tarifa: number; baseMinima: number }[], tarifa: number) => lista.find((o) => o.tarifa === tarifa)?.baseMinima ?? 0;
+  return {
+    tarifaRetefuente: ef.tarifaRetefuente > 0 && base < baseMin(op.retefuente, ef.tarifaRetefuente),
+    tarifaReteica: ef.tarifaReteica > 0 && base < (Number(ef.baseMinimaReteicaEspecial) || baseMin(op.reteica, ef.tarifaReteica)),
+    tarifaReteiva: ef.tarifaReteiva > 0 && iva < baseMin(op.reteiva, ef.tarifaReteiva),
+  };
+}
+
 /** Tarifas de retención disponibles en la tabla de impuestos de la empresa. */
 function opcionesRetencion(rows: Record<string, unknown>[]) {
   const por = (tipo: string) => {
     const vistos = new Set<number>();
-    const out: { tarifa: number; nombre: string }[] = [];
+    const out: { tarifa: number; nombre: string; baseMinima: number }[] = [];
     for (const r of rows) {
       if (!String(r["Tipo de impuesto"] ?? "").toUpperCase().includes(tipo)) continue;
       const tarifa = toNumero(r["Tarifa"]);
       if (!(tarifa > 0) || vistos.has(tarifa)) continue;
       vistos.add(tarifa);
-      out.push({ tarifa, nombre: String(r["Nombre"] ?? "").trim() });
+      out.push({ tarifa, nombre: String(r["Nombre"] ?? "").trim(), baseMinima: toNumero(r["Base"]) });
     }
     return out.sort((a, b) => a.tarifa - b.tarifa);
   };
@@ -399,14 +412,15 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
     const tipo = tipoDe(req);
     const [facturas, sugs, impuestos, glob] = await Promise.all([listarFacturas(empresaId, estado, tipo), sugerenciasPorNit(empresaId, tipo), getTabla(empresaId, "impuestos"), getCuentasGlobales(empresaId, tipo)]);
     const tarifasInc = tarifasIncDe(impuestos?.rows);
+    const opciones = opcionesRetencion(impuestos?.rows || []);
     res.json({
       status: "ok",
       cuentasGlobales: glob,
-      opcionesRetencion: opcionesRetencion(impuestos?.rows || []),
+      opcionesRetencion: opciones,
       facturas: facturas.map((f) => {
         const sug = sugs.get(f.nit);
         const ef = efectiva(f, sug, glob);
-        return { ...f, categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc), sinParametros: !sug };
+        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc), sinParametros: !sug };
       }),
     });
   } catch (e) {
