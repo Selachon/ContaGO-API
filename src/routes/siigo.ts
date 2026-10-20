@@ -156,8 +156,23 @@ setInterval(() => {
 
 type BinaryKind = "pdf" | "xml";
 
+/** Traduce errores de validación conocidos de Siigo a un mensaje que el usuario pueda accionar. */
+function friendlySiigoMessage(details: unknown): string | null {
+  const errs = ((details as any)?.errors ?? (details as any)?.Errors) as Array<Record<string, unknown>> | undefined;
+  if (!Array.isArray(errs)) return null;
+  for (const e of errs) {
+    const params = ((e?.params ?? e?.Params) as unknown[] | undefined) ?? [];
+    if (params.some((p) => /basicdata\.phone$/i.test(String(p)))) return "Falta el teléfono del tercero (o no es válido). Agrégalo y vuelve a intentar.";
+  }
+  return null;
+}
+
 function handleSiigoError(res: Response, error: unknown): Response {
   if (error instanceof SiigoError) {
+    const friendly = friendlySiigoMessage(error.details);
+    if (friendly) {
+      return res.status(error.status).json({ ok: false, source: "siigo", code: error.code, message: friendly });
+    }
     return res.status(error.status).json({
       ok: false,
       source: "siigo",
