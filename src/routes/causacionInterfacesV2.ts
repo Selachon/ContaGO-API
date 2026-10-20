@@ -448,7 +448,7 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
     if (!empresaId) return;
     let f = await editarAsignacion(empresaId, req.params.fid, req.body || {});
     if (!f) return res.status(404).json({ status: "error", mensaje: "Factura no encontrada o ya incluida en una interfaz." });
-    // Cuentas y retenciones editadas pasan a ser el parámetro del proveedor (así las demás facturas lo sugieren) y la factura vuelve a seguir la sugerencia.
+    // Cuentas y retenciones editadas en una factura de un proveedor nuevo pasan a ser su parámetro (así las demás facturas lo sugieren); en uno que ya tiene parámetros solo cambian esa factura.
     const editados = (ks: readonly (keyof Ci2Asignacion)[]) => ks.filter((k) => req.body && k in req.body && req.body[k] !== null && k in f!.asignacion);
     // Descuento, recargo y otros impuestos son cuentas de la empresa, no del proveedor.
     const tipo = f.tipo;
@@ -458,7 +458,9 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
       f = (await editarAsignacion(empresaId, req.params.fid, Object.fromEntries(aGlobal.map((k) => [k, null])))) || f;
     }
     const aParametro = editados((Object.keys(columnasParam(tipo)) as (keyof Ci2Asignacion)[]).filter((k) => !(CAMPOS_GLOBALES as readonly string[]).includes(k)));
-    if (aParametro.length && f.nit) {
+    // Solo un proveedor sin parámetros guarda lo editado; si ya tiene fila, el cambio aplica únicamente a esta factura.
+    const proveedorNuevo = !(await sugerenciasPorNit(empresaId, tipo)).has(f.nit);
+    if (aParametro.length && f.nit && proveedorNuevo) {
       await guardarParametroProveedor(empresaId, tipo, f.nit, f.proveedor, Object.fromEntries(aParametro.map((k) => [k, (f!.asignacion as any)[k]])));
       f = (await editarAsignacion(empresaId, req.params.fid, Object.fromEntries(aParametro.map((k) => [k, null])))) || f;
     }
