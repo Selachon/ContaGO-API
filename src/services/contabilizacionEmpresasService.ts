@@ -200,6 +200,9 @@ export interface PucResumen {
   cuentas: number;
 }
 
+export type SistemaContable = "siigo" | "syscafe";
+const normSistema = (v: unknown): SistemaContable => (v === "syscafe" ? "syscafe" : "siigo");
+
 export interface EmpresaPublic {
   id: string;
   nombre: string;
@@ -212,6 +215,8 @@ export interface EmpresaPublic {
    * cuenta resuelta es de clase 5. Default false para no afectar a nadie más.
    */
   cuentaGastoPorTarifaIva: boolean;
+  /** Programa contable al que va dirigida la interfaz que genera Causación Interfaces 2.0. */
+  sistemaContable: SistemaContable;
   comprobantes: Comprobantes;
   /** Siguiente consecutivo recordado por tipo de comprobante. */
   consecutivos: Consecutivos;
@@ -292,6 +297,7 @@ function toPublic(doc: any): EmpresaPublic {
     nit: doc.nit || "",
     obsequiosMode: doc.obsequiosMode === "contabilizar" ? "contabilizar" : "error",
     cuentaGastoPorTarifaIva: !!doc.cuentaGastoPorTarifaIva,
+    sistemaContable: normSistema(doc.sistemaContable),
     comprobantes: normComprobantes(doc.comprobantes),
     consecutivos: (doc.consecutivos && typeof doc.consecutivos === "object" ? doc.consecutivos : {}) as Consecutivos,
     tablas,
@@ -305,13 +311,21 @@ function toPublic(doc: any): EmpresaPublic {
 }
 
 /** Empresas visibles para un usuario (las que posee o le comparten). Admin ve todas. */
-export async function listEmpresasForUser(userId: string, isAdmin: boolean): Promise<EmpresaPublic[]> {
-  const filter = isAdmin ? {} : { $or: [{ ownerUserId: userId }, { sharedWith: userId }] };
+// Cada usuario ve solo sus empresas (propias o compartidas), también el administrador.
+export async function listEmpresasForUser(userId: string, _isAdmin?: boolean): Promise<EmpresaPublic[]> {
+  const filter = { $or: [{ ownerUserId: userId }, { sharedWith: userId }] };
   const docs = await getDb().collection<any>(EMPRESAS).find(filter).sort({ nombre: 1 }).toArray();
   return docs.map(toPublic);
 }
 
 /** NIT normalizado (solo dígitos) de la empresa. "" si no existe. */
+export async function getSistemaContable(empresaId: string): Promise<SistemaContable> {
+  const oid = toObjectId(empresaId);
+  if (!oid) return "siigo";
+  const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { sistemaContable: 1 } });
+  return normSistema(doc?.sistemaContable);
+}
+
 export async function getEmpresaNit(empresaId: string): Promise<string> {
   const oid = toObjectId(empresaId);
   if (!oid) return "";
@@ -319,13 +333,10 @@ export async function getEmpresaNit(empresaId: string): Promise<string> {
   return normalizeNit(doc?.nit);
 }
 
-/** True si el usuario puede usar la empresa (dueño, compartida o admin). */
-export async function userCanAccessEmpresa(empresaId: string, userId: string, isAdmin: boolean): Promise<boolean> {
+/** True si el usuario puede usar la empresa (dueño o compartida); el administrador no es excepción. */
+export async function userCanAccessEmpresa(empresaId: string, userId: string, _isAdmin?: boolean): Promise<boolean> {
   const oid = toObjectId(empresaId);
   if (!oid) return false;
-  if (isAdmin) {
-    return !!(await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { _id: 1 } }));
-  }
   const doc = await getDb()
     .collection<any>(EMPRESAS)
     .findOne({ _id: oid, $or: [{ ownerUserId: userId }, { sharedWith: userId }] }, { projection: { _id: 1 } });
@@ -339,7 +350,8 @@ export async function createEmpresa(
   obsequiosMode: ObsequiosMode,
   ownerUserId: string,
   comprobantes?: Partial<Comprobantes>,
-  cuentaGastoPorTarifaIva?: boolean
+  cuentaGastoPorTarifaIva?: boolean,
+  sistemaContable?: string
 ): Promise<EmpresaPublic> {
   const cleanNombre = String(nombre || "").trim();
   if (!cleanNombre) throw new Error("El nombre de la empresa es obligatorio.");
@@ -352,6 +364,7 @@ export async function createEmpresa(
     nit: normalizeNit(nit),
     obsequiosMode: mode,
     cuentaGastoPorTarifaIva: !!cuentaGastoPorTarifaIva,
+    sistemaContable: normSistema(sistemaContable),
     comprobantes: normComprobantes(comprobantes),
     consecutivos: {},
     ownerUserId,
@@ -382,6 +395,7 @@ export async function updateEmpresa(
     nit?: string;
     obsequiosMode?: ObsequiosMode;
     cuentaGastoPorTarifaIva?: boolean;
+    sistemaContable?: string;
     comprobantes?: Partial<Comprobantes>;
     consecutivos?: Consecutivos;
   }
@@ -405,6 +419,7 @@ export async function updateEmpresa(
       set["tables.paramCompras"] = conColumnasTarifaIva(actual?.tables?.paramCompras);
     }
   }
+  if (patch.sistemaContable !== undefined) set.sistemaContable = normSistema(patch.sistemaContable);
   if (patch.comprobantes !== undefined) set.comprobantes = normComprobantes(patch.comprobantes);
   if (patch.consecutivos !== undefined && patch.consecutivos && typeof patch.consecutivos === "object") {
     const limpio: Consecutivos = {};

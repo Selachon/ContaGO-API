@@ -273,8 +273,8 @@ router.get("/empresas", async (req: Request, res: Response) => {
 
 router.post("/empresas", async (req: Request, res: Response) => {
   try {
-    const { nombre, nit, obsequiosMode, comprobantes, cuentaGastoPorTarifaIva } = req.body || {};
-    const empresa = await createEmpresa(nombre, nit, obsequiosMode, req.user!.userId, comprobantes, cuentaGastoPorTarifaIva);
+    const { nombre, nit, obsequiosMode, comprobantes, cuentaGastoPorTarifaIva, sistemaContable } = req.body || {};
+    const empresa = await createEmpresa(nombre, nit, obsequiosMode, req.user!.userId, comprobantes, cuentaGastoPorTarifaIva, sistemaContable);
     res.status(201).json({ status: "ok", empresa });
   } catch (err) {
     enviarError(res, err);

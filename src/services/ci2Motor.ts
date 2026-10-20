@@ -34,6 +34,8 @@ export interface Ci2Asignacion {
   tarifaReteica: number; // por mil
   tarifaReteiva: number;
   baseMinimaReteicaEspecial: number;
+  /** Retenciones puestas a mano en la factura: se causan aunque la base no alcance la base mínima. */
+  retForzadas?: string[];
   /** Cuenta de gasto por ítem (índice en `items`) cuando difiere de `cuentaGasto`. */
   cuentasItems?: Record<string, string>;
 }
@@ -195,7 +197,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   const descripcion = `${tipoDocAbrev} ${f.docNumber} ${f.proveedor}`;
   const lineas: FilaSiigo[] = [];
 
-  const crear = (cuenta: unknown, debito: number, credito: number, desc: string, codImp: CeldaValor = "", centro = "") => {
+  const crear = (cuenta: unknown, debito: number, credito: number, desc: string, codImp: CeldaValor = "", centro = "", baseRet?: number) => {
     const l: FilaSiigo = {};
     for (const c of COLUMNAS_SIIGO) l[c] = "";
     l["Tipo de comprobante"] = tipo;
@@ -208,14 +210,16 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     l["Código centro/subcentro de costos"] = centro;
     l["Débito"] = debito;
     l["Crédito"] = credito;
+    // Base de la retención: no es columna de Siigo, la usan los formatos que la piden (Syscafe).
+    if (baseRet !== undefined) l["Base retención"] = redondear(baseRet);
     lineas.push(l);
   };
-  const agregarLinea = (cuenta: unknown, valor: number, nat: "D" | "C", desc: string, codImp: CeldaValor = "", centro = "") => {
+  const agregarLinea = (cuenta: unknown, valor: number, nat: "D" | "C", desc: string, codImp: CeldaValor = "", centro = "", baseRet?: number) => {
     const v = redondear(valor);
     if (v === 0) return;
     const debito = nat === "D" ? (esNc ? 0 : v) : esNc ? v : 0;
     const credito = nat === "D" ? (esNc ? v : 0) : esNc ? 0 : v;
-    crear(cuenta, debito, credito, desc, codImp, centro);
+    crear(cuenta, debito, credito, desc, codImp, centro, baseRet);
   };
 
   const baseGasto = ag.baseGasto;
@@ -238,8 +242,8 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     agregarLinea(imp.cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`, imp.codigo);
   }
   for (const t of [...ag.inc.keys()].sort((x, y) => y - x)) {
-    // En ventas, si la tabla no tiene el impoconsumo de esa tarifa, se pide su cuenta aparte ("INC 8%").
-    const cuentaAparte = venta ? limpiarCuenta(as.cuentasImpuestos?.[`INC ${t}%`] ?? "") : "";
+    // Si la tabla no tiene el impoconsumo de esa tarifa, se pide su cuenta aparte ("INC 8%").
+    const cuentaAparte = limpiarCuenta(as.cuentasImpuestos?.[`INC ${t}%`] ?? "");
     const imp = cuentaAparte ? { cuenta: cuentaAparte, codigo: "" as CeldaValor, baseMinima: 0 } : impuesto("INC", t);
     agregarLinea(imp.cuenta, ag.inc.get(t)!, natBase, `IMPOCONSUMO ${descripcion}`, imp.codigo);
   }
@@ -275,29 +279,30 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   }
 
   // Retenciones (misma base y fórmulas que el motor actual).
+  const forzada = (k: string) => !!as.retForzadas?.includes(k);
   let baseMinRf = 0, baseMinRica = 0, baseMinRiva = 0, rf = 0, rica = 0, riva = 0;
   if (as.tarifaRetefuente > 0) {
     const imp = impuesto("RETEFUENTE", as.tarifaRetefuente);
     baseMinRf = imp.baseMinima;
-    if (baseGasto >= baseMinRf) {
+    if (forzada("tarifaRetefuente") || baseGasto >= baseMinRf) {
       rf = (baseGasto * as.tarifaRetefuente) / 100;
-      agregarLinea(imp.cuenta, rf, natRet, `RF ${descripcion}`, imp.codigo);
+      agregarLinea(imp.cuenta, rf, natRet, `RF ${descripcion}`, imp.codigo, "", baseGasto);
     }
   }
   if (as.tarifaReteica > 0) {
     const imp = impuesto("RETEICA", as.tarifaReteica);
     baseMinRica = as.baseMinimaReteicaEspecial || imp.baseMinima;
-    if (baseGasto >= baseMinRica) {
+    if (forzada("tarifaReteica") || baseGasto >= baseMinRica) {
       rica = (baseGasto * as.tarifaReteica) / 1000;
-      agregarLinea(imp.cuenta, rica, natRet, `RICA ${descripcion}`, imp.codigo);
+      agregarLinea(imp.cuenta, rica, natRet, `RICA ${descripcion}`, imp.codigo, "", baseGasto);
     }
   }
   if (as.tarifaReteiva > 0 && ivaTotal > 0) {
     const imp = impuesto("RETEIVA", as.tarifaReteiva);
     baseMinRiva = imp.baseMinima;
-    if (ivaTotal >= baseMinRiva) {
+    if (forzada("tarifaReteiva") || ivaTotal >= baseMinRiva) {
       riva = (ivaTotal * as.tarifaReteiva) / 100;
-      agregarLinea(imp.cuenta, riva, natRet, `RIVA ${descripcion}`, imp.codigo);
+      agregarLinea(imp.cuenta, riva, natRet, `RIVA ${descripcion}`, imp.codigo, "", ivaTotal);
     }
   }
 

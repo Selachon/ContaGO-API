@@ -34,6 +34,7 @@ import type { ProgressData } from "../types/dian.js";
 import {
   detectarConsecutivosDesdeAuxiliar,
   getComprobantesEmpresa,
+  getSistemaContable,
   getEmpresaNit,
   getTabla,
   guardarConsecutivos,
@@ -72,6 +73,7 @@ import {
   type Ci2Factura,
 } from "../services/ci2Store.js";
 import { escribirInformeRetenciones, escribirInterfazSiigo } from "../services/causacionInterfaces/excelWriter.js";
+import { escribirInterfazSyscafe } from "../services/causacionInterfaces/syscafeWriter.js";
 import { limpiarCuenta, toNumero } from "../services/causacionInterfaces/normalize.js";
 
 export const CI2_TOOL_ID = "causacion-interfaces-v2";
@@ -162,10 +164,11 @@ function retencionesNoAplican(items: any[], ef: any, op: ReturnType<typeof opcio
   const base = normales.reduce((t, i) => t + (i.base || 0), 0);
   const iva = normales.reduce((t, i) => t + ((i.base || 0) * (i.ivaPercent || 0)) / 100, 0);
   const baseMin = (lista: { tarifa: number; baseMinima: number }[], tarifa: number) => lista.find((o) => o.tarifa === tarifa)?.baseMinima ?? 0;
+  const libre = (k: string) => !ef.retForzadas?.includes(k);
   return {
-    tarifaRetefuente: ef.tarifaRetefuente > 0 && base < baseMin(op.retefuente, ef.tarifaRetefuente),
-    tarifaReteica: ef.tarifaReteica > 0 && base < (Number(ef.baseMinimaReteicaEspecial) || baseMin(op.reteica, ef.tarifaReteica)),
-    tarifaReteiva: ef.tarifaReteiva > 0 && iva < baseMin(op.reteiva, ef.tarifaReteiva),
+    tarifaRetefuente: libre("tarifaRetefuente") && ef.tarifaRetefuente > 0 && base < baseMin(op.retefuente, ef.tarifaRetefuente),
+    tarifaReteica: libre("tarifaReteica") && ef.tarifaReteica > 0 && base < (Number(ef.baseMinimaReteicaEspecial) || baseMin(op.reteica, ef.tarifaReteica)),
+    tarifaReteiva: libre("tarifaReteiva") && ef.tarifaReteiva > 0 && iva < baseMin(op.reteiva, ef.tarifaReteiva),
   };
 }
 
@@ -189,6 +192,7 @@ function opcionesRetencion(rows: Record<string, unknown>[]) {
 /** Sugerencia del proveedor + lo editado en la factura; las cuentas globales de la empresa rellenan lo que siga vacío. */
 function efectiva(f: Ci2Factura, sug?: Ci2Asignacion, glob: Ci2CuentasGlobales = {}): Ci2Asignacion {
   const a: Ci2Asignacion = { ...ASIG_VACIA, ...(sug || {}), ...f.asignacion };
+  a.retForzadas = (["tarifaRetefuente", "tarifaReteica", "tarifaReteiva"] as const).filter((k) => k in f.asignacion && Number((f.asignacion as any)[k]) > 0);
   for (const k of CAMPOS_GLOBALES) if (!limpiarCuenta(a[k])) a[k] = glob[k] || "";
   a.cuentasImpuestos = { ...(glob.cuentasImpuestos || {}) };
   return a;
@@ -210,11 +214,12 @@ function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo
   if (items.some((it) => it.isSurcharge && extra(it).some((e) => e.taxName === "Recargo" && e.amount !== 0)) && !limpiarCuenta(a.cuentaRecargo)) out.push("cuentaRecargo");
   if (items.some((it) => it.isGift && extra(it).some((e) => e.taxName === "IVA Obsequio" && e.amount !== 0)) && !limpiarCuenta(a.cuentaIngresoObsequios)) out.push("cuentaIngresoObsequios");
   const nombres = nombresImpuestosExtra(items);
+  // El impoconsumo cuya tarifa no está en la tabla de impuestos pide su propia cuenta ("INC 4%"), en compras y en ventas.
+  const incs = new Set(items.filter((it) => !it.isGift && !it.isSurcharge && it.incPercent > 0).map((it) => Math.round(it.incPercent * 10000) / 10000));
+  for (const t of incs) if (!tarifasInc.has(t) && !limpiarCuenta(a.cuentasImpuestos?.[`INC ${t}%`] ?? "")) out.push(`imp:INC ${t}%`);
   if (tipo === "venta") {
-    // Cada impuesto pide su propia cuenta; el impoconsumo también cuando la tabla no tiene su tarifa.
+    // Cada impuesto pide su propia cuenta.
     for (const n of nombres) if (!limpiarCuenta(a.cuentasImpuestos?.[n] ?? "")) out.push(`imp:${n}`);
-    const incs = new Set(items.filter((it) => !it.isGift && !it.isSurcharge && it.incPercent > 0).map((it) => Math.round(it.incPercent * 10000) / 10000));
-    for (const t of incs) if (!tarifasInc.has(t) && !limpiarCuenta(a.cuentasImpuestos?.[`INC ${t}%`] ?? "")) out.push(`imp:INC ${t}%`);
   } else if (nombres.length && !limpiarCuenta(a.cuentaOtrosImpuestos)) out.push("cuentaOtrosImpuestos");
   return out;
 }
@@ -462,12 +467,11 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
     const proveedorNuevo = !(await sugerenciasPorNit(empresaId, tipo)).has(f.nit);
     if (aParametro.length && f.nit && proveedorNuevo) {
       await guardarParametroProveedor(empresaId, tipo, f.nit, f.proveedor, Object.fromEntries(aParametro.map((k) => [k, (f!.asignacion as any)[k]])));
-      f = (await editarAsignacion(empresaId, req.params.fid, Object.fromEntries(aParametro.map((k) => [k, null])))) || f;
     }
     const sug = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
     const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo));
     const tarifasInc = tarifasIncDe((await getTabla(empresaId, "impuestos"))?.rows);
-    res.json({ status: "ok", factura: { ...f, sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc), sinParametros: !sug } });
+    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc), sinParametros: !sug } });
   } catch (e) {
     err(res, e);
   }
@@ -665,13 +669,18 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     }
 
     const sufijo = venta ? "Ventas" : "Compras";
+    // Mismas líneas contables; cambia solo el archivo según el programa contable de la empresa.
+    const syscafe = (await getSistemaContable(empresaId)) === "syscafe";
+    const sistema = syscafe ? "Syscafe" : "Siigo";
+    const ext = syscafe ? "xls" : "xlsx";
+    const escribir = async (filas: typeof r.salida) => (syscafe ? escribirInterfazSyscafe(filas) : await escribirInterfazSiigo(filas));
     const archivos = [
-      { nombre: `Salida_Siigo_${sufijo}.xlsx`, tipo: "interfaz" as const, data: await escribirInterfazSiigo(r.salida) },
+      { nombre: `Salida_${sistema}_${sufijo}.${ext}`, tipo: "interfaz" as const, data: await escribir(r.salida) },
       { nombre: `Informe_Retenciones_${sufijo}.xlsx`, tipo: "informe" as const, data: await escribirInformeRetenciones(r.informe) },
     ];
     if (r.partes.length > 1) {
       for (let i = 0; i < r.partes.length; i++) {
-        archivos.push({ nombre: `Salida_Siigo_${sufijo}_Parte_${String(i + 1).padStart(3, "0")}.xlsx`, tipo: "interfaz", data: await escribirInterfazSiigo(r.partes[i]) });
+        archivos.push({ nombre: `Salida_${sistema}_${sufijo}_Parte_${String(i + 1).padStart(3, "0")}.${ext}`, tipo: "interfaz", data: await escribir(r.partes[i]) });
       }
     }
 
@@ -734,7 +743,7 @@ router.get("/interfaces/:iid/archivos/:nombre", async (req: Request, res: Respon
     if (!(await interfazAutorizada(req, res))) return;
     const a = await getArchivoInterfaz(req.params.iid, req.params.nombre);
     if (!a) return res.status(404).json({ status: "error", mensaje: "Archivo no encontrado." });
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Type", a.nombre.endsWith(".xls") ? "application/vnd.ms-excel" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${a.nombre.replace(/[^\w.\-]/g, "_")}"`);
     res.send(a.data);
   } catch (e) {
