@@ -44,6 +44,8 @@ export interface CompanySettings {
   defaultItemMode?: "product" | "account";
   /** Si true, los ítems con impuesto al consumo (INC) se consolidan en una sola línea por tarifa. */
   consolidateInc?: boolean;
+  /** Si true, cada factura muestra un checkbox para activar IVA mayor valor de forma esporádica (en vez de aplicar a todas). */
+  ivaEsporadico?: boolean;
 }
 
 export interface PaymentRecord {
@@ -421,6 +423,7 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.causacionMode !== undefined) patch["settings.causacionMode"] = ["puc", "products", "both"].includes(settings.causacionMode as string) ? settings.causacionMode : "puc";
   if (settings.defaultItemMode !== undefined) patch["settings.defaultItemMode"] = settings.defaultItemMode === "product" ? "product" : "account";
   if (settings.consolidateInc !== undefined) patch["settings.consolidateInc"] = Boolean(settings.consolidateInc);
+  if (settings.ivaEsporadico !== undefined) patch["settings.ivaEsporadico"] = Boolean(settings.ivaEsporadico);
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
