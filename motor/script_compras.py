@@ -118,7 +118,12 @@ if WEB:
     consecutivo_inicial_compras = int(PARAMS.get("consecutivo_inicial", 1))
     tipo_comprobante_nc = str(PARAMS.get("tipo_comprobante_nc", ""))
     consecutivo_inicial_nc = int(PARAMS.get("consecutivo_inicial_nc", 1))
+    # Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS...) y consecutivo inicial por comprobante.
+    TIPOS_DOCUMENTO = {str(k).upper(): str(v).strip() for k, v in (PARAMS.get("tipos_documento") or {}).items() if str(v).strip()}
+    CONSECUTIVOS_INICIALES = {str(k): int(v) for k, v in (PARAMS.get("consecutivos") or {}).items() if str(v).strip()}
 else:
+    TIPOS_DOCUMENTO = {}
+    CONSECUTIVOS_INICIALES = {}
     archivo_sugerido = str(sys.argv[1]).strip() if len(sys.argv) > 1 else ""
     archivo_dian = seleccionar_archivo_entrada(archivo_sugerido)
     archivo_param = "Parametrizacion_Siigo_Compras.xlsx"
@@ -259,6 +264,25 @@ def limpiar_cuenta(valor):
         texto = texto[:-2]
 
     return texto
+
+
+def categoria_documento(tipo_documento, es_nc):
+    """Clase de documento DIAN (misma lógica que categoriaDocumento en ci2Motor.ts)."""
+    t = normalizar_texto(tipo_documento)
+    if es_nc or "nota de credito" in t or "nota credito" in t:
+        return "NC", "Nota crédito"
+    if "nota de debito" in t or "nota debito" in t:
+        return "ND", "Nota débito"
+    if "documento soporte" in t:
+        return "DS", "Documento soporte"
+    if "equivalente" in t and "pos" in t:
+        return "DEPOS", "Documento equivalente POS"
+    if "equivalente" in t and "transporte" in t:
+        return "DET", "Documento equivalente transporte"
+    if not t or "factura" in t:
+        return "FE", "Factura electrónica"
+    original = str(tipo_documento).strip()
+    return "OTRO " + original.replace(".", "").replace("$", "").upper(), original
 
 
 def es_nota_credito(tipo_documento):
@@ -811,21 +835,44 @@ if errores_obsequios:
 
 df["Es_Nota_Credito"] = df[col_tipo_documento].apply(es_nota_credito)
 
-contador_compras = consecutivo_inicial_compras
-contador_nc = consecutivo_inicial_nc
+contadores = {}
+
+
+def siguiente_consecutivo(tipo):
+    """Un contador por comprobante: si varias clases de documento comparten comprobante, comparten consecutivo."""
+    if tipo not in contadores:
+        ini = CONSECUTIVOS_INICIALES.get(tipo)
+        if ini is None:
+            if tipo == tipo_comprobante_compras:
+                ini = consecutivo_inicial_compras
+            elif tipo == tipo_comprobante_nc:
+                ini = consecutivo_inicial_nc
+            else:
+                ini = 1
+        contadores[tipo] = ini
+    n = contadores[tipo]
+    contadores[tipo] += 1
+    return n
+
 
 tipos_siigo = []
 consecutivos_siigo = []
+sin_tipo = {}
 
 for _, row in df.iterrows():
-    if row["Es_Nota_Credito"]:
-        tipos_siigo.append(tipo_comprobante_nc)
-        consecutivos_siigo.append(contador_nc)
-        contador_nc += 1
-    else:
-        tipos_siigo.append(tipo_comprobante_compras)
-        consecutivos_siigo.append(contador_compras)
-        contador_compras += 1
+    clave, etiqueta = categoria_documento(row[col_tipo_documento], row["Es_Nota_Credito"])
+    tipo = TIPOS_DOCUMENTO.get(clave) or (
+        tipo_comprobante_nc if clave == "NC" else tipo_comprobante_compras
+    )
+    if not tipo:
+        sin_tipo[etiqueta] = sin_tipo.get(etiqueta, 0) + 1
+    tipos_siigo.append(tipo)
+    consecutivos_siigo.append(siguiente_consecutivo(tipo) if tipo else 0)
+
+if sin_tipo and WEB:
+    web_io.error("tipos_documento_faltantes",
+                 "Falta el tipo de comprobante de algunos tipos de documento.",
+                 [f"{k}: {v} documento(s)" for k, v in sin_tipo.items()])
 
 df["Tipo_Comprobante_Siigo"] = tipos_siigo
 df["Consecutivo_Siigo"] = consecutivos_siigo

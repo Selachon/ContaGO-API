@@ -43,7 +43,7 @@ import {
   userCanAccessEmpresa,
 } from "../services/contabilizacionEmpresasService.js";
 import JSZip from "jszip";
-import { descuentoNeto, generarInterfaz, nombresImpuestosExtra, type Ci2Asignacion, type Ci2FacturaInput } from "../services/ci2Motor.js";
+import { categoriaDocumento, descuentoNeto, generarInterfaz, nombresImpuestosExtra, type Ci2Asignacion, type Ci2FacturaInput } from "../services/ci2Motor.js";
 import { extractCufesFromExcel, resolveExcelBuffer } from "../services/dianExcelCufes.js";
 import {
   cufesRegistrados,
@@ -55,6 +55,8 @@ import {
   type Ci2CuentasGlobales,
   type Ci2Tipo,
   getPrefijos,
+  getTiposDocumento,
+  setTiposDocumento,
   setPrefijos,
   ensureCi2Indexes,
   facturasPorIds,
@@ -403,7 +405,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
       facturas: facturas.map((f) => {
         const sug = sugs.get(f.nit);
         const ef = efectiva(f, sug, glob);
-        return { ...f, sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc), sinParametros: !sug };
+        return { ...f, categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc), sinParametros: !sug };
       }),
     });
   } catch (e) {
@@ -536,8 +538,24 @@ router.post("/empresas/:id/consecutivos/detectar", upload.single("auxiliar"), as
     const f = req.file as Express.Multer.File | undefined;
     if (!f) return err(res, new Error("Debes subir el movimiento auxiliar de Siigo."));
     const comp = await getComprobantesEmpresa(empresaId);
-    const tipos = [comp.tipoCompras, comp.tipoComprasNc].filter(Boolean);
+    // El lote puede usar más comprobantes que los dos de la empresa (documento soporte, POS…): llegan en `tipos`.
+    const pedidos = String(req.body?.tipos ?? "").split(",").map((t) => t.trim()).filter(Boolean);
+    const tipos = pedidos.length ? pedidos : [comp.tipoCompras, comp.tipoComprasNc].filter(Boolean);
     res.json({ status: "ok", consecutivos: await detectarConsecutivosDesdeAuxiliar(f.buffer, tipos) });
+  } catch (e) {
+    err(res, e, 500);
+  }
+});
+
+// Tipo de comprobante recordado por clase de documento, con los de la empresa como valor inicial de FE y NC (compras).
+router.get("/empresas/:id/tipos-documento", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    const tipo = tipoDe(req);
+    const [guardados, comp] = await Promise.all([getTiposDocumento(empresaId, tipo), getComprobantesEmpresa(empresaId)]);
+    const porDefecto: Record<string, string> = tipo === "venta" ? {} : { FE: comp.tipoCompras, NC: comp.tipoComprasNc };
+    res.json({ status: "ok", tipos: { ...Object.fromEntries(Object.entries(porDefecto).filter(([, v]) => v)), ...guardados } });
   } catch (e) {
     err(res, e, 500);
   }
@@ -565,7 +583,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
 
     const tipo = tipoDe(req);
     const venta = tipo === "venta";
-    const [facturas, sugs, impuestos, comp, empresas, glob, prefijosGuardados] = await Promise.all([
+    const [facturas, sugs, impuestos, comp, empresas, glob, prefijosGuardados, tiposGuardados] = await Promise.all([
       facturasPorIds(empresaId, ids),
       sugerenciasPorNit(empresaId, tipo),
       getTabla(empresaId, "impuestos"),
@@ -573,6 +591,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       listEmpresasForUser(req.user!.userId, req.user!.isAdmin),
       getCuentasGlobales(empresaId, tipo),
       getPrefijos(empresaId),
+      getTiposDocumento(empresaId, tipo),
     ]);
     if (!impuestos?.rows?.length) return err(res, new Error("La empresa no tiene tabla de impuestos cargada (Configuración)."));
     const pendientes = facturas.filter((f) => f.estado === "pendiente" && f.tipo === tipo);
@@ -592,6 +611,9 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       notaCredito: { ...prefijosGuardados.notaCredito, ...limpiarMapa(req.body?.prefijos?.notaCredito) },
     };
 
+    // Tipo de comprobante por clase de documento (lo guardado, más lo que el usuario indique en este lote).
+    const tipoPorDocumento = { ...tiposGuardados, ...limpiarMapa(req.body?.tiposDocumento) };
+
     const entradas: Ci2FacturaInput[] = pendientes.map((f) => ({
       id: f.id,
       fecha: fechaSiigo(f.fecha),
@@ -608,6 +630,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     const r = generarInterfaz(entradas, {
       modo: tipo,
       tipoPorPrefijo: prefijos,
+      tipoPorDocumento,
       impuestos: impuestos.rows as Record<string, unknown>[],
       tipoCompras: comp.tipoCompras,
       tipoComprasNc: comp.tipoComprasNc,
@@ -639,6 +662,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       archivos,
       r.asignados
     );
+    await setTiposDocumento(empresaId, tipo, limpiarMapa(req.body?.tiposDocumento));
     if (venta) await setPrefijos(empresaId, prefijos);
     else await guardarConsecutivos(empresaId, r.siguientes);
 

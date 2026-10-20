@@ -328,6 +328,28 @@ export async function setCuentasGlobales(empresaId: string, cambios: Ci2CuentasG
   if (Object.keys(set).length) await getDb().collection<any>("contabilizacionEmpresas").updateOne({ _id }, { $set: set });
 }
 
+// ── Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS…) ─────────
+
+export async function getTiposDocumento(empresaId: string, tipo: Ci2Tipo = "compra"): Promise<Record<string, string>> {
+  const _id = oid(empresaId);
+  if (!_id) return {};
+  const d = await getDb().collection<any>("contabilizacionEmpresas").findOne({ _id }, { projection: { ci2TiposDocumento: 1 } });
+  return d?.ci2TiposDocumento?.[tipo === "venta" ? "venta" : "compra"] || {};
+}
+
+/** Mezcla por clave: lo no enviado queda como estaba. */
+export async function setTiposDocumento(empresaId: string, tipo: Ci2Tipo, nuevos: Record<string, string>): Promise<void> {
+  const _id = oid(empresaId);
+  if (!_id) throw new Error("Empresa inválida.");
+  const set: Record<string, string> = {};
+  for (const [k, v] of Object.entries(nuevos)) {
+    const clave = k.replace(/[.$]/g, "").trim();
+    const valor = String(v ?? "").trim();
+    if (clave && valor) set[`ci2TiposDocumento.${tipo === "venta" ? "venta" : "compra"}.${clave}`] = valor;
+  }
+  if (Object.keys(set).length) await getDb().collection<any>("contabilizacionEmpresas").updateOne({ _id }, { $set: set });
+}
+
 // ── Tipo de comprobante por prefijo de la factura emitida (ventas) ──────────
 
 export interface Ci2Prefijos {

@@ -61,8 +61,13 @@ export interface Ci2Impuesto {
 /** Fila de la tabla maestra de impuestos tal como se guarda en la empresa. */
 type FilaImpuesto = Record<string, unknown>;
 
+import { categoriaDocumento } from "./tipoDocumento.js";
+export { categoriaDocumento, type Ci2Categoria } from "./tipoDocumento.js";
+
 export interface Ci2Opciones {
   modo?: "compra" | "venta";
+  /** Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS…); FE y NC caen a los de la empresa si faltan. */
+  tipoPorDocumento?: Record<string, string>;
   impuestos: FilaImpuesto[];
   tipoCompras: string;
   tipoComprasNc: string;
@@ -355,14 +360,17 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
   for (const f of facturas) {
     let tipo: string;
     let consecutivo: number;
+    const cat = categoriaDocumento(f.documentType, f.isCreditNote);
+    const porDocumento = (opts.tipoPorDocumento || {})[cat.clave] || "";
     if (venta) {
-      // El comprobante sale del prefijo de la factura y su consecutivo es el número de la factura.
+      // El comprobante sale del prefijo de la factura (o, en otros documentos, de su clase) y su consecutivo es el número del documento.
       const { prefijo, consecutivo: num } = extraerPrefijoConsecutivo(f.docNumber);
       const mapas = opts.tipoPorPrefijo || { factura: {}, notaCredito: {} };
-      tipo = (f.isCreditNote ? mapas.notaCredito[prefijo] : "") || mapas.factura[prefijo] || "";
+      const esFacturaONc = cat.clave === "FE" || cat.clave === "NC";
+      tipo = (esFacturaONc ? (f.isCreditNote ? mapas.notaCredito[prefijo] : "") || mapas.factura[prefijo] : "") || porDocumento;
       consecutivo = num;
       if (!tipo) {
-        errores.push({ id: f.id, docNumber: f.docNumber, proveedor: f.proveedor, mensaje: `No hay tipo de comprobante para el prefijo "${prefijo}".` });
+        errores.push({ id: f.id, docNumber: f.docNumber, proveedor: f.proveedor, mensaje: esFacturaONc ? `No hay tipo de comprobante para el prefijo "${prefijo}".` : `No hay tipo de comprobante para «${cat.etiqueta}».` });
         continue;
       }
       if (!(consecutivo > 0)) {
@@ -370,9 +378,9 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
         continue;
       }
     } else {
-      tipo = f.isCreditNote ? opts.tipoComprasNc : opts.tipoCompras;
+      tipo = porDocumento || (cat.clave === "NC" ? opts.tipoComprasNc : cat.clave === "FE" ? opts.tipoCompras : "");
       if (!tipo) {
-        errores.push({ id: f.id, docNumber: f.docNumber, proveedor: f.proveedor, mensaje: "La empresa no tiene configurado el tipo de comprobante (Configuración → Comprobantes)." });
+        errores.push({ id: f.id, docNumber: f.docNumber, proveedor: f.proveedor, mensaje: `No hay tipo de comprobante para «${cat.etiqueta}».` });
         continue;
       }
       consecutivo = contador[tipo] ?? 1;

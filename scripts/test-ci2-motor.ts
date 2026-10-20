@@ -86,4 +86,14 @@ assert.deepEqual(o1.errores, []);
 assert.deepEqual(o1.salida.map((l) => [l["Código cuenta contable"], l["Débito"], l["Crédito"]]), [
   ["51952501", 1000, 0], ["24081001", 190, 0], ["24081001", 19, 0], ["41350102", 0, 19], ["23359502", 0, 1190],
 ]);
+// Tipo de comprobante por clase de documento: DS con su propio comprobante (consecutivo aparte) y sin él → error.
+const ds = { ...base, documentType: "Documento soporte en adquisiciones efectuadas a sujetos no obligados a facturar", isCreditNote: false, items, asignacion: as };
+const d1 = generarInterfaz([{ ...ds, id: "d1", docNumber: "DS1" }, { ...base, id: "d2", isCreditNote: false, docNumber: "F9", items, asignacion: as }], { ...opts, tipoPorDocumento: { DS: "12" }, consecutivoInicial: { "9": 131, "12": 7 } });
+assert.deepEqual(d1.errores, []);
+assert.deepEqual(d1.asignados, [{ id: "d1", tipo: "12", consecutivo: 7 }, { id: "d2", tipo: "9", consecutivo: 131 }]);
+const d2 = generarInterfaz([{ ...ds, id: "d3", docNumber: "DS2" }], opts);
+assert.match(d2.errores[0].mensaje, /Documento soporte/);
+// Mismo comprobante para todo: DS y FE comparten contador.
+const d3 = generarInterfaz([{ ...ds, id: "d4", docNumber: "DS3" }, { ...base, id: "d5", isCreditNote: false, docNumber: "F10", items, asignacion: as }], { ...opts, tipoPorDocumento: { DS: "9" } });
+assert.deepEqual(d3.asignados.map((a) => a.consecutivo), [131, 132]);
 console.log("ci2Motor OK");

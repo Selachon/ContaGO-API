@@ -64,7 +64,9 @@ import {
   type TablaSlot,
 } from "../services/contabilizacionEmpresasService.js";
 import { siguientesConsecutivos, tablaABuffer } from "../services/contabilizacionTablasIO.js";
-import { extraerNitsDian, extraerTercerosDian } from "../services/contabilizacionDianTerceros.js";
+import { categoriaDocumento } from "../services/tipoDocumento.js";
+import { getTiposDocumento, setTiposDocumento } from "../services/ci2Store.js";
+import { extraerNitsDian, extraerTercerosDian, extraerTiposDocumentoDian } from "../services/contabilizacionDianTerceros.js";
 
 const TABLA_SLOTS: TablaSlot[] = ["paramCompras", "paramVentas", "impuestos"];
 function esTablaSlot(s: string): s is TablaSlot {
@@ -447,9 +449,22 @@ router.post("/empresas/:id/plantilla", upload.single("plantillaTerceros"), async
  * empresa (parámetro estable); el consecutivo viene del request (autocompletado
  * con memoria, pero editable).
  */
-function paramsCompras(config: ConfigEmpresa, reqParams: Record<string, unknown>): Record<string, unknown> {
-  const { tipoCompras, tipoComprasNc } = config.comprobantes;
-  if (!tipoCompras || !tipoComprasNc) {
+/** Tipo de comprobante por clase de documento: los de la empresa para FE/NC, lo recordado y lo que indique la petición. */
+function tiposDocumentoCompras(comp: { tipoCompras: string; tipoComprasNc: string }, guardados: Record<string, string>, reqParams: Record<string, unknown>): Record<string, string> {
+  const pedido = Object.fromEntries(
+    Object.entries((reqParams.tipos_documento && typeof reqParams.tipos_documento === "object" ? reqParams.tipos_documento : {}) as Record<string, unknown>)
+      .map(([k, v]) => [k.trim().toUpperCase(), String(v ?? "").trim()])
+      .filter(([k, v]) => k && v)
+  );
+  const base: Record<string, string> = {};
+  if (comp.tipoCompras) base.FE = comp.tipoCompras;
+  if (comp.tipoComprasNc) base.NC = comp.tipoComprasNc;
+  return { ...base, ...guardados, ...pedido };
+}
+
+function paramsCompras(config: ConfigEmpresa, reqParams: Record<string, unknown>, guardados: Record<string, string> = {}): Record<string, unknown> {
+  const tipos = tiposDocumentoCompras(config.comprobantes, guardados, reqParams);
+  if (!tipos.FE) {
     throw new MotorError(
       "config_incompleta",
       "Falta el tipo de comprobante de compras. Defínelo en Parametrización → Comprobantes.",
@@ -457,9 +472,16 @@ function paramsCompras(config: ConfigEmpresa, reqParams: Record<string, unknown>
       422
     );
   }
+  const consecutivos = Object.fromEntries(
+    Object.entries((reqParams.consecutivos && typeof reqParams.consecutivos === "object" ? reqParams.consecutivos : {}) as Record<string, unknown>)
+      .map(([t, n]) => [t, Math.trunc(Number(n))])
+      .filter(([, n]) => Number.isFinite(n) && (n as number) > 0)
+  );
   return {
-    tipo_comprobante: tipoCompras,
-    tipo_comprobante_nc: tipoComprasNc,
+    tipo_comprobante: tipos.FE,
+    tipo_comprobante_nc: tipos.NC || tipos.FE,
+    tipos_documento: tipos,
+    consecutivos,
     consecutivo_inicial: Number(reqParams.consecutivo_inicial) || 1,
     consecutivo_inicial_nc: Number(reqParams.consecutivo_inicial_nc) || 1,
   };
@@ -572,9 +594,32 @@ router.post("/compras/consecutivos/detectar", upload.single("auxiliar"), async (
     const f = req.file as Express.Multer.File | undefined;
     if (!f) throw new MotorError("sin_archivos", "Debe subir el movimiento auxiliar.", [], 400);
     const comprobantes = await getComprobantesEmpresa(empresaId);
-    const tipos = [comprobantes.tipoCompras, comprobantes.tipoComprasNc].filter(Boolean);
+    // El lote puede usar más comprobantes que los dos de la empresa (documento soporte, POS…): llegan en `tipos`.
+    const pedidos = String(req.body?.tipos ?? "").split(",").map((t) => t.trim()).filter(Boolean);
+    const tipos = pedidos.length ? pedidos : [comprobantes.tipoCompras, comprobantes.tipoComprasNc].filter(Boolean);
     const consecutivos = await detectarConsecutivosDesdeAuxiliar(f.buffer, tipos);
     res.json({ ok: true, consecutivos });
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
+// Clases de documento que trae el DIAN (con cantidad) y el comprobante recordado para cada una.
+router.post("/compras/tipos-documento", upload.array("dian"), async (req: Request, res: Response) => {
+  try {
+    const empresaId = await resolverEmpresaId(req);
+    const dianFiles = getDians(req);
+    const { inDir } = nuevoJob(req.user!.userId, empresaId);
+    const dians = guardarDians(inDir, dianFiles);
+    const comprobantes = await getComprobantesEmpresa(empresaId);
+    const guardados = await getTiposDocumento(empresaId, "compra");
+    const porClase = new Map<string, { clave: string; etiqueta: string; cantidad: number }>();
+    for (const [texto, n] of await extraerTiposDocumentoDian(dians)) {
+      const c = categoriaDocumento(texto, false);
+      const prev = porClase.get(c.clave);
+      porClase.set(c.clave, { ...c, cantidad: (prev?.cantidad ?? 0) + n });
+    }
+    res.json({ ok: true, categorias: [...porClase.values()], tipos: tiposDocumentoCompras(comprobantes, guardados, {}) });
   } catch (err) {
     enviarError(res, err);
   }
@@ -588,7 +633,7 @@ router.post("/compras/validar", upload.array("dian"), async (req: Request, res: 
     const { out, inDir } = nuevoJob(req.user!.userId, empresaId);
     const config = await materializarEnJob(empresaId, out);
     exigirArchivos(config, ["paramCompras", "impuestos"]);
-    const params = paramsCompras(config, reqParams);
+    const params = paramsCompras(config, reqParams, await getTiposDocumento(empresaId, "compra"));
     const dians = guardarDians(inDir, dianFiles);
 
     // Terceros presentes pero incompletos (cuentas vacías).
@@ -629,7 +674,7 @@ router.post("/compras", upload.array("dian"), async (req: Request, res: Response
     const { jobId, out, inDir } = nuevoJob(req.user!.userId, empresaId);
     const config = await materializarEnJob(empresaId, out);
     exigirArchivos(config, ["paramCompras", "impuestos"]);
-    const params = paramsCompras(config, reqParams);
+    const params = paramsCompras(config, reqParams, await getTiposDocumento(empresaId, "compra"));
     const dians = guardarDians(inDir, dianFiles);
 
     // Bloquea si hay terceros del DIAN incompletos en la parametrización.
@@ -648,6 +693,9 @@ router.post("/compras", upload.array("dian"), async (req: Request, res: Response
       throw err;
     }
     if (result.status !== "ok") throw new MotorError("inesperado", "Respuesta inesperada del motor.", [], 500);
+
+    // Recuerda el comprobante elegido para cada clase de documento.
+    await setTiposDocumento(empresaId, "compra", (params.tipos_documento || {}) as Record<string, string>).catch(() => undefined);
 
     // Memoria de consecutivos: lee la salida y recuerda el siguiente por tipo.
     let consecutivos: Record<string, number> | undefined;

@@ -114,6 +114,24 @@ export async function extraerNitsDian(paths: string[]): Promise<Set<string>> {
   return set;
 }
 
+/** Tipos de documento presentes en uno o varios DIAN, con su cantidad. Best-effort: ignora archivos ilegibles. */
+export async function extraerTiposDocumentoDian(paths: string[]): Promise<Map<string, number>> {
+  const mapa = new Map<string, number>();
+  for (const p of paths) {
+    let rows: Record<string, string>[];
+    try {
+      rows = await leerFacturasDian(p);
+    } catch {
+      continue;
+    }
+    for (const row of rows) {
+      const t = get(row, ["tipo de documento", "tipo documento"]).trim();
+      mapa.set(t, (mapa.get(t) ?? 0) + 1);
+    }
+  }
+  return mapa;
+}
+
 /**
  * Mapa NIT (limpio) → nombre del tercero, tomando emisor y receptor de uno o
  * varios DIAN. Best-effort: si un archivo no se puede leer, lo ignora.
