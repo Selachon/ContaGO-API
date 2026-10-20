@@ -38,6 +38,12 @@ export interface CompanySettings {
   retefuenteMinBases?: Record<string, number>;
   /** Fecha mínima de emisión (yyyy-mm-dd) para importar facturas DIAN. Facturas anteriores se ignoran. */
   minFechaIngesta?: string;
+  /** Modo de causación: "puc" (solo cuentas), "products" (solo productos), "both" (mixto). Reemplaza useProducts. */
+  causacionMode?: "puc" | "products" | "both";
+  /** En modo "both": qué tipo de ítem se crea por defecto. */
+  defaultItemMode?: "product" | "account";
+  /** Si true, los ítems con impuesto al consumo (INC) se consolidan en una sola línea por tarifa. */
+  consolidateInc?: boolean;
 }
 
 export interface PaymentRecord {
@@ -412,6 +418,9 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.ivaMayorValor19Accounts !== undefined) patch["settings.ivaMayorValor19Accounts"] = Array.isArray(settings.ivaMayorValor19Accounts) ? settings.ivaMayorValor19Accounts : [];
   if (settings.retefuenteMinBases !== undefined) patch["settings.retefuenteMinBases"] = settings.retefuenteMinBases || {};
   if (settings.minFechaIngesta !== undefined) patch["settings.minFechaIngesta"] = settings.minFechaIngesta || null;
+  if (settings.causacionMode !== undefined) patch["settings.causacionMode"] = ["puc", "products", "both"].includes(settings.causacionMode as string) ? settings.causacionMode : "puc";
+  if (settings.defaultItemMode !== undefined) patch["settings.defaultItemMode"] = settings.defaultItemMode === "product" ? "product" : "account";
+  if (settings.consolidateInc !== undefined) patch["settings.consolidateInc"] = Boolean(settings.consolidateInc);
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
