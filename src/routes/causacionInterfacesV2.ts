@@ -1,5 +1,5 @@
 /**
- * Causación Interfaces v2.
+ * Causación Interfaces 2.0.
  *
  * Dos módulos con el mismo flujo: compras (facturas recibidas, por mes) y ventas
  * (facturas emitidas, desde el listado de la DIAN). Las rutas que sirven a ambos
@@ -56,6 +56,7 @@ import {
   type Ci2Tipo,
   getPrefijos,
   getTiposDocumento,
+  getAutorretencion,
   setTiposDocumento,
   setPrefijos,
   ensureCi2Indexes,
@@ -583,7 +584,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
 
     const tipo = tipoDe(req);
     const venta = tipo === "venta";
-    const [facturas, sugs, impuestos, comp, empresas, glob, prefijosGuardados, tiposGuardados] = await Promise.all([
+    const [facturas, sugs, impuestos, comp, empresas, glob, prefijosGuardados, tiposGuardados, autorretencion] = await Promise.all([
       facturasPorIds(empresaId, ids),
       sugerenciasPorNit(empresaId, tipo),
       getTabla(empresaId, "impuestos"),
@@ -592,6 +593,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       getCuentasGlobales(empresaId, tipo),
       getPrefijos(empresaId),
       getTiposDocumento(empresaId, tipo),
+      getAutorretencion(empresaId),
     ]);
     if (!impuestos?.rows?.length) return err(res, new Error("La empresa no tiene tabla de impuestos cargada (Configuración)."));
     const pendientes = facturas.filter((f) => f.estado === "pendiente" && f.tipo === tipo);
@@ -631,6 +633,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       modo: tipo,
       tipoPorPrefijo: prefijos,
       tipoPorDocumento,
+      autorretencion: venta ? autorretencion : undefined,
       impuestos: impuestos.rows as Record<string, unknown>[],
       tipoCompras: comp.tipoCompras,
       tipoComprasNc: comp.tipoComprasNc,

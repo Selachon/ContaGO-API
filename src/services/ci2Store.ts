@@ -1,5 +1,5 @@
 /**
- * Persistencia de "Causación Interfaces v2" (admin).
+ * Persistencia de "Causación Interfaces 2.0" (admin).
  *
  * Colecciones propias (la parametrización de la empresa —tabla de impuestos,
  * parámetros por proveedor, comprobantes y consecutivos— se comparte con
@@ -326,6 +326,47 @@ export async function setCuentasGlobales(empresaId: string, cambios: Ci2CuentasG
     if (clave) set[`${campo}.cuentasImpuestos.${clave}`] = String(cuenta ?? "").trim();
   }
   if (Object.keys(set).length) await getDb().collection<any>("contabilizacionEmpresas").updateOne({ _id }, { $set: set });
+}
+
+// ── Autorretención de ventas (por empresa; la usan ambas herramientas) ──────
+
+export interface Autorretencion {
+  habilitada: boolean;
+  /** % sobre la base de la factura antes de impuestos. */
+  porcentaje: number;
+  /** Activo 1355… (débito). */
+  cuentaActivo: string;
+  /** Pasivo 2365… (crédito). */
+  cuentaPasivo: string;
+}
+
+const AUTORRETENCION_VACIA: Autorretencion = { habilitada: false, porcentaje: 0, cuentaActivo: "", cuentaPasivo: "" };
+
+export async function getAutorretencion(empresaId: string): Promise<Autorretencion> {
+  const _id = oid(empresaId);
+  if (!_id) return { ...AUTORRETENCION_VACIA };
+  const d = await getDb().collection<any>("contabilizacionEmpresas").findOne({ _id }, { projection: { autorretencionVentas: 1 } });
+  return { ...AUTORRETENCION_VACIA, ...(d?.autorretencionVentas || {}) };
+}
+
+/** Valida y guarda; si está habilitada exige porcentaje y las dos cuentas. */
+export async function setAutorretencion(empresaId: string, a: Partial<Autorretencion>): Promise<Autorretencion> {
+  const _id = oid(empresaId);
+  if (!_id) throw new Error("Empresa inválida.");
+  const cuenta = (v: unknown) => String(v ?? "").trim().split(/\s|-/)[0].replace(/\D/g, "");
+  const limpia: Autorretencion = {
+    habilitada: !!a.habilitada,
+    porcentaje: Math.round((Number(a.porcentaje) || 0) * 10000) / 10000,
+    cuentaActivo: cuenta(a.cuentaActivo),
+    cuentaPasivo: cuenta(a.cuentaPasivo),
+  };
+  if (limpia.habilitada) {
+    if (!(limpia.porcentaje > 0 && limpia.porcentaje <= 100)) throw new Error("Indica el porcentaje de la autorretención (mayor que 0 y hasta 100).");
+    if (!limpia.cuentaActivo) throw new Error("Falta la cuenta de activo de la autorretención (1355…).");
+    if (!limpia.cuentaPasivo) throw new Error("Falta la cuenta de pasivo de la autorretención (2365…).");
+  }
+  await getDb().collection<any>("contabilizacionEmpresas").updateOne({ _id }, { $set: { autorretencionVentas: limpia } });
+  return limpia;
 }
 
 // ── Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS…) ─────────

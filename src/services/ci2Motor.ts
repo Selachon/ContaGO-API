@@ -1,5 +1,5 @@
 /**
- * Motor de la herramienta "Causación Interfaces v2" (admin).
+ * Motor de la herramienta "Causación Interfaces 2.0" (admin).
  *
  * A diferencia del motor Python/TS de `causacionInterfaces` (que parte de los
  * Excel de la DIAN + parametrización), éste parte de las facturas ya leídas del
@@ -68,6 +68,8 @@ export interface Ci2Opciones {
   modo?: "compra" | "venta";
   /** Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS…); FE y NC caen a los de la empresa si faltan. */
   tipoPorDocumento?: Record<string, string>;
+  /** Ventas: autorretención sobre la base antes de impuestos de facturas y notas crédito. */
+  autorretencion?: { habilitada: boolean; porcentaje: number; cuentaActivo: string; cuentaPasivo: string };
   impuestos: FilaImpuesto[];
   tipoCompras: string;
   tipoComprasNc: string;
@@ -296,6 +298,17 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     if (ivaTotal >= baseMinRiva) {
       riva = (ivaTotal * as.tarifaReteiva) / 100;
       agregarLinea(imp.cuenta, riva, natRet, `RIVA ${descripcion}`, imp.codigo);
+    }
+  }
+
+  // Autorretención (solo ventas, facturas y notas crédito): activo 1355 al débito y pasivo 2365 al crédito; la nota crédito invierte ambos.
+  const auto = opts.autorretencion;
+  const catDoc = categoriaDocumento(f.documentType, f.isCreditNote).clave;
+  if (venta && auto?.habilitada && auto.porcentaje > 0 && (catDoc === "FE" || catDoc === "NC")) {
+    const valor = redondear((baseGasto * auto.porcentaje) / 100);
+    if (valor !== 0) {
+      agregarLinea(exigirCuenta(auto.cuentaActivo, "Cuenta de activo de la autorretención", "Hay autorretención."), valor, "D", `AUTORRET ${descripcion}`);
+      agregarLinea(exigirCuenta(auto.cuentaPasivo, "Cuenta de pasivo de la autorretención", "Hay autorretención."), valor, "C", `AUTORRET ${descripcion}`);
     }
   }
 

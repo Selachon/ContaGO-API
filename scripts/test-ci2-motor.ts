@@ -96,4 +96,16 @@ assert.match(d2.errores[0].mensaje, /Documento soporte/);
 // Mismo comprobante para todo: DS y FE comparten contador.
 const d3 = generarInterfaz([{ ...ds, id: "d4", docNumber: "DS3" }, { ...base, id: "d5", isCreditNote: false, docNumber: "F10", items, asignacion: as }], { ...opts, tipoPorDocumento: { DS: "9" } });
 assert.deepEqual(d3.asignados.map((a) => a.consecutivo), [131, 132]);
+// Autorretención en ventas: % de la base antes de impuestos; activo al débito y pasivo al crédito; NC invierte; DS/compras no aplican.
+const auto = { habilitada: true, porcentaje: 0.8, cuentaActivo: "13551901", cuentaPasivo: "23657501" };
+const sinRet = { ...asV, tarifaRetefuente: 0, tarifaReteica: 0 };
+const a1 = generarInterfaz([{ ...base, id: "a1", isCreditNote: false, docNumber: "SETT-20", items: itV, totalIva: 190000, asignacion: sinRet }], { ...optsV, autorretencion: auto });
+assert.deepEqual(a1.errores, []);
+assert.deepEqual(a1.salida.map((l) => [l["Código cuenta contable"], l["Débito"], l["Crédito"]]), [
+  ["41350501", 0, 1000000], ["24081001", 0, 190000], ["13551901", 8000, 0], ["23657501", 0, 8000], ["13050501", 1190000, 0],
+]);
+const a2 = generarInterfaz([{ ...base, id: "a2", isCreditNote: true, docNumber: "NC-8", items: itV, totalIva: 190000, asignacion: sinRet }], { ...optsV, autorretencion: auto });
+assert.deepEqual(a2.salida.filter((l) => String(l["Código cuenta contable"]).startsWith("13551901") || String(l["Código cuenta contable"]).startsWith("23657501")).map((l) => [l["Débito"], l["Crédito"]]), [[0, 8000], [8000, 0]]);
+const a3 = generarInterfaz([{ ...base, id: "a3", isCreditNote: false, docNumber: "SETT-21", items: itV, totalIva: 190000, asignacion: sinRet }], { ...optsV, autorretencion: { ...auto, habilitada: false } });
+assert.equal(a3.salida.length, 3);
 console.log("ci2Motor OK");

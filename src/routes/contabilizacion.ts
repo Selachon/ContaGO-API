@@ -65,7 +65,7 @@ import {
 } from "../services/contabilizacionEmpresasService.js";
 import { siguientesConsecutivos, tablaABuffer } from "../services/contabilizacionTablasIO.js";
 import { categoriaDocumento } from "../services/tipoDocumento.js";
-import { getTiposDocumento, setTiposDocumento } from "../services/ci2Store.js";
+import { getAutorretencion, getTiposDocumento, setAutorretencion, setTiposDocumento } from "../services/ci2Store.js";
 import { extraerNitsDian, extraerTercerosDian, extraerTiposDocumentoDian } from "../services/contabilizacionDianTerceros.js";
 
 const TABLA_SLOTS: TablaSlot[] = ["paramCompras", "paramVentas", "impuestos"];
@@ -352,6 +352,29 @@ router.get("/empresas/:id/tablas/:slot", async (req: Request, res: Response) => 
   }
 });
 
+// Autorretención de ventas (habilitada, %, cuenta de activo y de pasivo): la usan esta herramienta y Interfaces 2.0.
+router.get("/empresas/:id/autorretencion", async (req: Request, res: Response) => {
+  try {
+    await exigirAcceso(req);
+    res.json({ status: "ok", autorretencion: await getAutorretencion(req.params.id) });
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
+router.put("/empresas/:id/autorretencion", async (req: Request, res: Response) => {
+  try {
+    await exigirAcceso(req);
+    try {
+      res.json({ status: "ok", autorretencion: await setAutorretencion(req.params.id, req.body || {}) });
+    } catch (e) {
+      throw new MotorError("autorretencion_invalida", e instanceof Error ? e.message : "Autorretención inválida.", [], 400);
+    }
+  } catch (err) {
+    enviarError(res, err);
+  }
+});
+
 // Descarga una plantilla .xlsx en blanco (solo encabezados) para un slot dado.
 // No depende de ninguna empresa: mismas columnas de fábrica para todas.
 router.get("/tablas/:slot/plantilla", async (req: Request, res: Response) => {
@@ -554,7 +577,7 @@ router.post("/ventas/prefijos", upload.array("dian"), async (req: Request, res: 
 router.post("/ventas", upload.array("dian"), async (req: Request, res: Response) => {
   try {
     const empresaId = await resolverEmpresaId(req);
-    const params = parseParams(req);
+    const params = { ...parseParams(req), autorretencion: await getAutorretencion(empresaId) };
     const dianFiles = getDians(req);
     const { jobId, out, inDir } = nuevoJob(req.user!.userId, empresaId);
     const config = await materializarEnJob(empresaId, out);

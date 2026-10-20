@@ -630,6 +630,13 @@ columnas_siigo = [
 lineas = []
 informe_retenciones = []
 
+# Autorretención de la empresa (la envía el portal): habilitada, %, cuenta de activo y de pasivo.
+_AUTORRET = (PARAMS.get("autorretencion") or {}) if WEB else {}
+AUTORRETENCION_ON = bool(_AUTORRET.get("habilitada")) and float(_AUTORRET.get("porcentaje") or 0) > 0
+AUTORRETENCION_PCT = float(_AUTORRET.get("porcentaje") or 0)
+AUTORRETENCION_ACTIVO = str(_AUTORRET.get("cuentaActivo") or "")
+AUTORRETENCION_PASIVO = str(_AUTORRET.get("cuentaPasivo") or "")
+
 
 def agregar_linea(row, cuenta, valor, naturaleza_compra, descripcion, codigo_impuesto=""):
     valor = redondear(valor)
@@ -1045,6 +1052,14 @@ for _, row in df.iterrows():
         if base_reteiva >= base_minima_reteiva:
             reteiva_valor = base_reteiva * tarifa_reteiva / 100
             agregar_linea(row, imp["cuenta"], reteiva_valor, "C", f"RIVA {descripcion}", imp["codigo"])
+
+    # Autorretención (solo facturas y notas crédito de venta): % de la base antes de impuestos,
+    # activo 1355 al débito y pasivo 2365 al crédito (la nota crédito invierte ambos).
+    if AUTORRETENCION_ON and not row.get("Es_Documento_Soporte", False):
+        autorretencion_valor = redondear(base_gasto * AUTORRETENCION_PCT / 100)
+        if autorretencion_valor > 0:
+            agregar_linea(row, AUTORRETENCION_ACTIVO, autorretencion_valor, "D", f"AUTORRET {descripcion}")
+            agregar_linea(row, AUTORRETENCION_PASIVO, autorretencion_valor, "C", f"AUTORRET {descripcion}")
 
     debito_actual = 0
     credito_actual = 0
