@@ -672,6 +672,8 @@ async function addToolRefund(id: string, toolId: string, rec: any, input: NewToo
  * - activacion / renovacion: fijan el periodo vigente (renovacion extiende desde el vencimiento si aún rige).
  * - mejora: suma empresas y/o NITs; no toca las fechas ni el valor del plan base.
  */
+const LEGACY_INTERFACES_TOOL = "contabilizacion-dian-siigo";
+
 export async function addToolPayment(id: string, toolId: string, input: NewToolPaymentInput): Promise<AdminUser | null> {
   if (!TOOL_ID_RE.test(toolId)) throw new Error("Servicio inválido.");
   const oid = new ObjectId(id);
@@ -688,6 +690,10 @@ export async function addToolPayment(id: string, toolId: string, input: NewToolP
   const amount = gift ? 0 : Number(input.amount);
   if (!gift && (input.amount === "" || input.amount == null || isNaN(amount) || amount < 0)) throw new Error("Valor inválido.");
 
+  // Causación Siigo (Interfaces) quedó reemplazada por Interfaces 2.0: solo la conservan quienes ya la tenían
+  if (toolId === LEGACY_INTERFACES_TOOL && type === "activacion" && !(rec.purchasedTools || []).includes(toolId)) {
+    throw new Error("Causación Siigo (Interfaces) ya no se vende: active Causación Interfaces 2.0.");
+  }
   const sub: any = rec.toolSubscriptions?.[toolId] || {};
   const base = `toolSubscriptions.${toolId}`;
   const baseStart: string | undefined = sub.licenseStartDate ?? rec.licenseStartDate;
