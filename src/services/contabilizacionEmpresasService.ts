@@ -342,6 +342,46 @@ export async function getSistemaContable(empresaId: string): Promise<SistemaCont
   return normSistema(doc?.sistemaContable);
 }
 
+/** Producto del maestro de World Office: su descripción debe coincidir con la creada en el programa. */
+export interface ProductoWo {
+  codigo: string;
+  descripcion: string;
+  /** Tarifa de IVA en fracción (0, 0.05, 0.19) a la que se asigna automáticamente. */
+  iva: number;
+}
+
+/** Maestro con el que arranca toda empresa de World Office. */
+export const PRODUCTOS_WO_BASE: ProductoWo[] = [
+  { codigo: "62", descripcion: "COMPRAS NO GRAVADAS", iva: 0 },
+  { codigo: "620501", descripcion: "COMPRAS GRAVADAS AL 19%", iva: 0.19 },
+  { codigo: "0018", descripcion: "COMPRAS GRAVADAS AL 5%", iva: 0.05 },
+];
+
+export async function getProductosWo(empresaId: string): Promise<ProductoWo[]> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { productosWo: 1 } }) : null;
+  return Array.isArray(doc?.productosWo) ? doc.productosWo : PRODUCTOS_WO_BASE;
+}
+
+export async function setProductosWo(empresaId: string, productos: unknown): Promise<ProductoWo[]> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  if (!Array.isArray(productos)) throw new Error("Lista de productos inválida.");
+  const limpio: ProductoWo[] = [];
+  for (const p of productos as any[]) {
+    const codigo = String(p?.codigo ?? "").trim();
+    const descripcion = String(p?.descripcion ?? "").trim();
+    if (!codigo && !descripcion) continue;
+    if (!codigo || !descripcion) throw new Error("Cada producto necesita código y descripción.");
+    const iva = Number(String(p?.iva ?? 0).replace(",", "."));
+    if (!Number.isFinite(iva) || iva < 0 || iva >= 1) throw new Error(`IVA inválido en el producto ${codigo}: use una fracción (0, 0.05, 0.19).`);
+    if (limpio.some((x) => x.codigo === codigo)) throw new Error(`El producto ${codigo} está repetido.`);
+    limpio.push({ codigo, descripcion, iva: Math.round(iva * 10000) / 10000 });
+  }
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { productosWo: limpio, updatedAt: new Date() } });
+  return limpio;
+}
+
 export async function getConfigWorldOffice(empresaId: string): Promise<ConfigWorldOffice> {
   const oid = toObjectId(empresaId);
   const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { worldOffice: 1 } }) : null;

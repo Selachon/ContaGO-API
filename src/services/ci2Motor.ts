@@ -79,6 +79,8 @@ export interface Ci2Opciones {
   modo?: "compra" | "venta";
   /** Compras para World Office: en vez de líneas contables se arma el contenido de sus dos archivos (producto + IVA + valor). */
   worldoffice?: boolean;
+  /** World Office: maestro de productos; cada ítem toma el de su tarifa de IVA. */
+  productosWo?: { codigo: string; iva: number }[];
   /** Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS…); FE y NC caen a los de la empresa si faltan. */
   tipoPorDocumento?: Record<string, string>;
   /** Ventas: autorretención sobre la base antes de impuestos de facturas y notas crédito. */
@@ -383,15 +385,16 @@ const aDdMmYyyy = (v: string) => {
 };
 
 /** World Office (compras): un renglón por producto y tarifa de IVA, con la base como valor; los impuestos los calcula el programa. */
-function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number): { doc: WoDocumento; avisos: string[] } {
+function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, productos: { codigo: string; iva: number }[]): { doc: WoDocumento; avisos: string[] } {
   const as = f.asignacion;
   const descripcion = `${abreviarTipoDocumento(f.documentType)} ${f.docNumber} ${f.proveedor}`;
   const grupos = new Map<string, { producto: string; iva: number; valor: number }>();
   for (const [idx, it] of f.items.entries()) {
     if (it.isGift || it.isSurcharge || !(it.base > 0)) continue;
-    const producto = limpiarCuenta(as.cuentasItems?.[String(idx)] ?? "") || limpiarCuenta(as.cuentaGasto);
-    if (!producto || producto === "0") throw new Ci2Error('Falta asignar el producto de World Office ("Cuenta de gasto").');
     const iva = redondear4(it.ivaPercent / 100);
+    // El producto sale de la tarifa de IVA del ítem, salvo que se haya fijado uno a mano.
+    const producto = limpiarCuenta(as.cuentasItems?.[String(idx)] ?? "") || productos.find((p) => redondear4(p.iva) === iva)?.codigo || "";
+    if (!producto) throw new Ci2Error(`No hay un producto de World Office para IVA ${redondear4(iva * 100)}% en el maestro de productos.`);
     const k = `${producto}|${iva}`;
     const g = grupos.get(k) ?? { producto, iva, valor: 0 };
     g.valor += it.base;
@@ -467,7 +470,7 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
     try {
       if (opts.worldoffice) {
         if (cat.clave !== "FE") throw new Ci2Error(`World Office solo admite facturas electrónicas por ahora («${cat.etiqueta}» no).`);
-        const r = armarFacturaWo(f, tipo, consecutivo);
+        const r = armarFacturaWo(f, tipo, consecutivo, opts.productosWo || []);
         wo.push(r.doc);
         advertencias.push(...r.avisos);
         asignados.push({ id: f.id, tipo, consecutivo });

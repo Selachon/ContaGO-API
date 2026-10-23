@@ -36,6 +36,8 @@ import {
   getComprobantesEmpresa,
   getSistemaContable,
   getConfigWorldOffice,
+  getProductosWo,
+  setProductosWo,
   getEmpresaNit,
   getTabla,
   guardarConsecutivos,
@@ -206,11 +208,11 @@ const tarifasIncDe = (rows: Record<string, any>[] = []) =>
 
 function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo = "compra", tarifasInc: Set<number> = new Set(), worldOffice = false): string[] {
   const out: string[] = [];
+  // World Office: el producto sale de la tarifa de IVA (maestro de productos), no de la cuenta del proveedor.
+  if (worldOffice) return out;
   // La cuenta del proveedor solo hace falta si algún ítem con base no tiene cuenta propia.
   const sinCuentaPropia = items.some((it, i) => !it.isGift && !it.isSurcharge && it.base > 0 && !limpiarCuenta(a.cuentasItems?.[String(i)] ?? ""));
   if (sinCuentaPropia && !limpiarCuenta(a.cuentaGasto)) out.push("cuentaGasto");
-  // World Office solo lleva el producto y calcula el resto (cuenta por pagar, impuestos) por su cuenta.
-  if (worldOffice) return out;
   if (!limpiarCuenta(a.cuentaPorPagar)) out.push("cuentaPorPagar");
   // Cuentas adicionales que el motor exige según lo que traiga la factura (descuento/recargo del documento, obsequios, otros impuestos).
   const extra = (it: Ci2Factura["items"][number]) => it.extraTaxes || [];
@@ -529,6 +531,28 @@ router.put("/empresas/:id/proveedores/:nit", async (req: Request, res: Response)
 });
 
 // Cuentas globales de la empresa (descuento, recargo, otros impuestos).
+// ── Maestro de productos de World Office ────────────────────────────────────
+
+router.get("/empresas/:id/productos-wo", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    res.json({ status: "ok", productos: await getProductosWo(empresaId) });
+  } catch (e) {
+    err(res, e, 500);
+  }
+});
+
+router.put("/empresas/:id/productos-wo", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    res.json({ status: "ok", productos: await setProductosWo(empresaId, req.body?.productos) });
+  } catch (e) {
+    err(res, e);
+  }
+});
+
 router.get("/empresas/:id/cuentas-globales", async (req: Request, res: Response) => {
   try {
     const empresaId = await exigirEmpresa(req, res);
@@ -665,6 +689,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     const r = generarInterfaz(entradas, {
       modo: tipo,
       worldoffice,
+      productosWo: worldoffice ? await getProductosWo(empresaId) : undefined,
       tipoPorPrefijo: prefijos,
       tipoPorDocumento,
       autorretencion: venta ? autorretencion : undefined,
