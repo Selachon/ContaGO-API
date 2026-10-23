@@ -44,6 +44,12 @@ export interface Ci2Asignacion {
   fechaVencimiento?: string;
   prefijoExterno?: string;
   numeroExterno?: string;
+  /** Empresas que clasifican las compras: a dónde va la factura (decisión manual de cada una). */
+  destino?: "inventario" | "gasto";
+  /** Inventario: cuenta elegida para la base de cada tarifa de IVA ("0", "5", "19") cuando hay varias posibles. */
+  cuentasInventario?: Record<string, string>;
+  /** Inventario: cuenta de IVA mayor valor elegida por tarifa ("5", "19") cuando hay varias posibles. */
+  cuentasIvaMayor?: Record<string, string>;
 }
 
 export interface Ci2FacturaInput {
@@ -81,6 +87,8 @@ export interface Ci2Opciones {
   worldoffice?: boolean;
   /** World Office: maestro de productos; cada ítem toma el de su tarifa de IVA. */
   productosWo?: { codigo: string; iva: number }[];
+  /** Compras que se clasifican como inventario o gasto; en ambos casos el IVA es mayor valor (no hay IVA descontable). */
+  inventario?: { base: Record<string, string[]>; ivaMayorValor: Record<string, string[]>; impuestos: Record<string, string> };
   /** Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS…); FE y NC caen a los de la empresa si faltan. */
   tipoPorDocumento?: Record<string, string>;
   /** Ventas: autorretención sobre la base antes de impuestos de facturas y notas crédito. */
@@ -111,6 +119,25 @@ export interface Ci2Resultado {
 }
 
 class Ci2Error extends Error {}
+
+/** Cuenta de inventario de la base de una tarifa: la elegida en la factura, o la única posible. "" si falta elegir. */
+export function cuentaBaseInventario(as: Pick<Ci2Asignacion, "cuentasInventario">, posibles: string[], tarifa: string): string {
+  const elegida = limpiarCuenta(as.cuentasInventario?.[tarifa] ?? "");
+  if (elegida && (!posibles.length || posibles.includes(elegida))) return elegida;
+  return posibles.length === 1 ? posibles[0] : "";
+}
+
+/** Cuenta de IVA mayor valor de una tarifa: la elegida, la única posible, o la de la misma rama que la cuenta de la base (mayor prefijo común, mínimo 4 dígitos y sin empate). */
+export function cuentaIvaMayor(as: Pick<Ci2Asignacion, "cuentasIvaMayor">, posibles: string[], tarifa: string, cuentaBase: string): string {
+  const elegida = limpiarCuenta(as.cuentasIvaMayor?.[tarifa] ?? "");
+  if (elegida && (!posibles.length || posibles.includes(elegida))) return elegida;
+  if (posibles.length === 1) return posibles[0];
+  const base = limpiarCuenta(cuentaBase);
+  if (!base) return "";
+  const comun = (c: string) => { let n = 0; while (n < c.length && n < base.length && c[n] === base[n]) n++; return n; };
+  const puntajes = posibles.map((c) => ({ c, n: comun(limpiarCuenta(c)) })).sort((x, y) => y.n - x.n);
+  return puntajes.length > 1 && puntajes[0].n >= 4 && puntajes[0].n > puntajes[1].n ? puntajes[0].c : "";
+}
 
 const texto = (v: unknown) => (v === null || v === undefined ? "" : String(v));
 
@@ -241,22 +268,62 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   const tarifasIva = [...ag.iva.keys()].sort((x, y) => y - x);
   const ivaTotal = tarifasIva.reduce((s, t) => s + redondear(ag.iva.get(t)!), 0);
 
-  if (baseGasto > 0) {
+  const clasifica = !venta && !esNc && !!opts.inventario;
+  if (clasifica && as.destino !== "inventario" && as.destino !== "gasto") throw new Ci2Error("Marca si la factura va a inventario o a gasto.");
+  const inventario = clasifica && as.destino === "inventario" ? opts.inventario! : null;
+  const ivaMayorGasto = clasifica && as.destino === "gasto";
+  const cuentaInv = (mapa: Record<string, string>, clave: string, que: string) => {
+    const c = limpiarCuenta(mapa[clave] ?? "");
+    if (!c || c === "0") throw new Ci2Error(`Falta la cuenta de inventario para ${que}. Configúrala en Parámetros → Inventario y gasto.`);
+    return c;
+  };
+
+  const cuentasBase = new Map<string, string>();
+  if (baseGasto > 0 && inventario) {
+    // Inventario: la base va a la cuenta 14 de su tarifa de IVA.
+    const porTarifa = new Map<number, number>();
+    for (const [idx, base] of ag.basesItem) {
+      const t = redondear4(f.items[idx].ivaPercent);
+      porTarifa.set(t, (porTarifa.get(t) ?? 0) + base);
+    }
+    for (const [t, base] of [...porTarifa].sort((x, y) => y[0] - x[0])) {
+      const clave = String(t > 0 ? t : 0);
+      const que = t > 0 ? `la base con IVA ${t}%` : "la base no gravada";
+      const posibles = inventario.base[clave] || [];
+      const cuenta = cuentaBaseInventario(as, posibles, clave);
+      cuentasBase.set(clave, cuenta);
+      if (!cuenta) throw new Ci2Error(posibles.length ? `Elige la cuenta de inventario para ${que}.` : `Falta la cuenta de inventario para ${que}. Configúrala en Parámetros → Inventario y gasto.`);
+      agregarLinea(cuenta, base, natBase, descripcion, "", as.centroCostos);
+    }
+  } else if (baseGasto > 0) {
     // Un renglón de gasto por cuenta distinta (en orden de aparición); los ítems sin cuenta propia van a la del proveedor.
+    // Con IVA mayor valor, el IVA de cada ítem se suma a la cuenta de su gasto.
     const porCuenta = new Map<string, number>();
     for (const [idx, base] of ag.basesItem) {
       const propia = limpiarCuenta(as.cuentasItems?.[String(idx)] ?? "");
       const cuenta = exigirCuenta(propia || as.cuentaGasto, venta ? "Cuenta de ingreso" : "Cuenta de gasto", venta ? "Hay base de ingreso." : "Hay base de gasto.");
-      porCuenta.set(cuenta, (porCuenta.get(cuenta) ?? 0) + base);
+      const iva = ivaMayorGasto ? (base * f.items[idx].ivaPercent) / 100 : 0;
+      porCuenta.set(cuenta, (porCuenta.get(cuenta) ?? 0) + base + iva);
     }
     for (const [cuenta, base] of porCuenta) agregarLinea(cuenta, base, natBase, descripcion, "", as.centroCostos);
   }
   for (const t of tarifasIva) {
-    if (t <= 0) continue;
+    if (t <= 0 || ivaMayorGasto) continue;
+    if (inventario) {
+      const posibles = inventario.ivaMayorValor[String(t)] || [];
+      const cuenta = cuentaIvaMayor(as, posibles, String(t), cuentasBase.get(String(t)) ?? "");
+      if (!cuenta) throw new Ci2Error(posibles.length ? `Elige la cuenta de IVA mayor valor al ${t}%.` : `Falta la cuenta de IVA mayor valor al ${t}%. Configúrala en Parámetros → Inventario y gasto.`);
+      agregarLinea(cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`);
+      continue;
+    }
     const imp = impuesto("IVA", t);
     agregarLinea(imp.cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`, imp.codigo);
   }
   for (const t of [...ag.inc.keys()].sort((x, y) => y - x)) {
+    if (inventario) {
+      agregarLinea(cuentaInv(inventario.impuestos, "INC", "el impoconsumo"), ag.inc.get(t)!, natBase, `IMPOCONSUMO ${descripcion}`);
+      continue;
+    }
     // Si la tabla no tiene el impoconsumo de esa tarifa, se pide su cuenta aparte ("INC 8%").
     const cuentaAparte = limpiarCuenta(as.cuentasImpuestos?.[`INC ${t}%`] ?? "");
     const imp = cuentaAparte ? { cuenta: cuentaAparte, codigo: "" as CeldaValor, baseMinima: 0 } : impuesto("INC", t);
@@ -268,6 +335,12 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
       if (redondear(valor) === 0) continue;
       const cuenta = exigirCuenta(as.cuentasImpuestos?.[nombre] ?? "", `Cuenta de ${nombre}`, `Hay ${nombre}.`);
       agregarLinea(cuenta, valor, natBase, `${nombre} ${descripcion}`);
+    }
+  } else if (inventario) {
+    // Inventario: cada impuesto (IBUA, ICUI…) a su propia cuenta 14.
+    for (const [nombre, valor] of ag.otros) {
+      if (redondear(valor) === 0) continue;
+      agregarLinea(cuentaInv(inventario.impuestos, nombre, `el impuesto ${nombre}`), valor, natBase, `${nombre} ${descripcion}`);
     }
   } else {
     const otros = [...ag.otros.values()].reduce((x, y) => x + y, 0);

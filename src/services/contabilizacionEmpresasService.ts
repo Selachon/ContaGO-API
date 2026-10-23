@@ -232,6 +232,8 @@ export interface EmpresaPublic {
   /** Programa contable al que va dirigida la interfaz que genera Causación Interfaces 2.0. */
   sistemaContable: SistemaContable;
   worldOffice: ConfigWorldOffice;
+  /** Compras clasificadas como inventario o gasto por factura (ver ConfigInventario). */
+  clasificarCompras: boolean;
   comprobantes: Comprobantes;
   /** Siguiente consecutivo recordado por tipo de comprobante. */
   consecutivos: Consecutivos;
@@ -314,6 +316,7 @@ function toPublic(doc: any): EmpresaPublic {
     cuentaGastoPorTarifaIva: !!doc.cuentaGastoPorTarifaIva,
     sistemaContable: normSistema(doc.sistemaContable),
     worldOffice: normWo(doc.worldOffice),
+    clasificarCompras: !!doc.inventario?.activo,
     comprobantes: normComprobantes(doc.comprobantes),
     consecutivos: (doc.consecutivos && typeof doc.consecutivos === "object" ? doc.consecutivos : {}) as Consecutivos,
     tablas,
@@ -340,6 +343,58 @@ export async function getSistemaContable(empresaId: string): Promise<SistemaCont
   if (!oid) return "siigo";
   const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { sistemaContable: 1 } });
   return normSistema(doc?.sistemaContable);
+}
+
+/**
+ * Compras clasificadas por factura como inventario o gasto (Siigo): el inventario va a cuentas 14 según la tarifa de IVA,
+ * el IVA va como mayor valor (de la cuenta 14 de IVA, o de la misma cuenta del gasto).
+ */
+export interface ConfigInventario {
+  activo: boolean;
+  /** Cuentas de inventario que admite cada tarifa de IVA de la base: "0" (no gravado), "5", "19". Puede haber varias por tarifa. */
+  base: Record<string, string[]>;
+  /** Cuentas de IVA mayor valor del inventario que admite cada tarifa: "5", "19". Puede haber varias por tarifa. */
+  ivaMayorValor: Record<string, string[]>;
+  /** Cuenta de inventario de los otros impuestos por nombre (IBUA, ICUI, INC…). */
+  impuestos: Record<string, string>;
+}
+const mapaCuentas = (v: any): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const [k, c] of Object.entries(v && typeof v === "object" ? v : {})) {
+    const clave = String(k).replace(/[.$]/g, "").trim();
+    const cuenta = String(c ?? "").trim();
+    if (clave && cuenta) out[clave] = cuenta;
+  }
+  return out;
+};
+const listasCuentas = (v: any): Record<string, string[]> => {
+  const out: Record<string, string[]> = {};
+  for (const [k, c] of Object.entries(v && typeof v === "object" ? v : {})) {
+    const lista = [...new Set((Array.isArray(c) ? c : [c]).map((x) => String(x ?? "").trim()).filter(Boolean))];
+    const clave = String(k).replace(/[.$]/g, "").trim();
+    if (clave && lista.length) out[clave] = lista;
+  }
+  return out;
+};
+const normInventario = (v: any): ConfigInventario => ({
+  activo: !!v?.activo,
+  base: listasCuentas(v?.base),
+  ivaMayorValor: listasCuentas(v?.ivaMayorValor),
+  impuestos: mapaCuentas(v?.impuestos),
+});
+
+export async function getConfigInventario(empresaId: string): Promise<ConfigInventario> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { inventario: 1 } }) : null;
+  return normInventario(doc?.inventario);
+}
+
+export async function setConfigInventario(empresaId: string, cfg: unknown): Promise<ConfigInventario> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const limpio = normInventario(cfg);
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { inventario: limpio, updatedAt: new Date() } });
+  return limpio;
 }
 
 /** Producto del maestro de World Office: su descripción debe coincidir con la creada en el programa. */

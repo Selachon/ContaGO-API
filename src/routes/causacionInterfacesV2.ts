@@ -37,6 +37,9 @@ import {
   getSistemaContable,
   getConfigWorldOffice,
   getProductosWo,
+  getConfigInventario,
+  type ConfigInventario,
+  setConfigInventario,
   setProductosWo,
   getEmpresaNit,
   getTabla,
@@ -47,7 +50,7 @@ import {
   userCanAccessEmpresa,
 } from "../services/contabilizacionEmpresasService.js";
 import JSZip from "jszip";
-import { categoriaDocumento, descuentoNeto, generarInterfaz, nombresImpuestosExtra, type Ci2Asignacion, type Ci2FacturaInput } from "../services/ci2Motor.js";
+import { categoriaDocumento, cuentaBaseInventario, cuentaIvaMayor, descuentoNeto, generarInterfaz, nombresImpuestosExtra, type Ci2Asignacion, type Ci2FacturaInput } from "../services/ci2Motor.js";
 import { extractCufesFromExcel, resolveExcelBuffer } from "../services/dianExcelCufes.js";
 import {
   cufesRegistrados,
@@ -206,12 +209,25 @@ function efectiva(f: Ci2Factura, sug?: Ci2Asignacion, glob: Ci2CuentasGlobales =
 const tarifasIncDe = (rows: Record<string, any>[] = []) =>
   new Set(rows.filter((r) => String(r["Nombre"] ?? "").toUpperCase().includes("IMPOCONSUMO")).map((r) => Math.round(Number(r["Tarifa"]) * 10000) / 10000));
 
-function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo = "compra", tarifasInc: Set<number> = new Set(), worldOffice = false): string[] {
+/** IVA mayor valor que se sugiere por tarifa (misma rama que la cuenta de la base), para mostrarlo ya elegido. */
+function ivaMayorSugerido(a: Ci2Asignacion, cfgInv: ConfigInventario | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!cfgInv || a.destino !== "inventario") return out;
+  for (const [t, posibles] of Object.entries(cfgInv.ivaMayorValor)) {
+    const c = cuentaIvaMayor(a, posibles, t, cuentaBaseInventario(a, cfgInv.base[t] || [], t));
+    if (c) out[t] = c;
+  }
+  return out;
+}
+
+function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo = "compra", tarifasInc: Set<number> = new Set(), worldOffice = false, cfgInv: ConfigInventario | null = null): string[] {
+  const clasifica = !!cfgInv;
   const out: string[] = [];
+  if (clasifica && tipo === "compra" && a.destino !== "inventario" && a.destino !== "gasto") out.push("destino");
   // World Office: el producto sale de la tarifa de IVA (maestro de productos), no de la cuenta del proveedor.
   if (worldOffice) return out;
   // La cuenta del proveedor solo hace falta si algún ítem con base no tiene cuenta propia.
-  const sinCuentaPropia = items.some((it, i) => !it.isGift && !it.isSurcharge && it.base > 0 && !limpiarCuenta(a.cuentasItems?.[String(i)] ?? ""));
+  const sinCuentaPropia = !(clasifica && a.destino === "inventario") && items.some((it, i) => !it.isGift && !it.isSurcharge && it.base > 0 && !limpiarCuenta(a.cuentasItems?.[String(i)] ?? ""));
   if (sinCuentaPropia && !limpiarCuenta(a.cuentaGasto)) out.push("cuentaGasto");
   if (!limpiarCuenta(a.cuentaPorPagar)) out.push("cuentaPorPagar");
   // Cuentas adicionales que el motor exige según lo que traiga la factura (descuento/recargo del documento, obsequios, otros impuestos).
@@ -222,11 +238,22 @@ function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo
   const nombres = nombresImpuestosExtra(items);
   // El impoconsumo cuya tarifa no está en la tabla de impuestos pide su propia cuenta ("INC 4%"), en compras y en ventas.
   const incs = new Set(items.filter((it) => !it.isGift && !it.isSurcharge && it.incPercent > 0).map((it) => Math.round(it.incPercent * 10000) / 10000));
-  for (const t of incs) if (!tarifasInc.has(t) && !limpiarCuenta(a.cuentasImpuestos?.[`INC ${t}%`] ?? "")) out.push(`imp:INC ${t}%`);
+  const inv = clasifica && a.destino === "inventario";
+  if (inv) {
+    // Cada tarifa de IVA con varias cuentas de inventario posibles pide elegir una.
+    const tarifas = new Set(items.filter((it) => !it.isGift && !it.isSurcharge && it.base > 0).map((it) => String(it.ivaPercent > 0 ? Math.round(it.ivaPercent * 10000) / 10000 : 0)));
+    for (const t of tarifas) {
+      const posibles = cfgInv!.base[t] || [];
+      if (posibles.length > 1 && !posibles.includes(limpiarCuenta(a.cuentasInventario?.[t] ?? ""))) out.push(`inv:${t}`);
+      const iva = cfgInv!.ivaMayorValor[t] || [];
+      if (Number(t) > 0 && iva.length > 1 && !cuentaIvaMayor(a, iva, t, cuentaBaseInventario(a, posibles, t))) out.push(`iva:${t}`);
+    }
+  }
+  for (const t of incs) if (!inv && !tarifasInc.has(t) && !limpiarCuenta(a.cuentasImpuestos?.[`INC ${t}%`] ?? "")) out.push(`imp:INC ${t}%`);
   if (tipo === "venta") {
     // Cada impuesto pide su propia cuenta.
     for (const n of nombres) if (!limpiarCuenta(a.cuentasImpuestos?.[n] ?? "")) out.push(`imp:${n}`);
-  } else if (nombres.length && !limpiarCuenta(a.cuentaOtrosImpuestos)) out.push("cuentaOtrosImpuestos");
+  } else if (!inv && nombres.length && !limpiarCuenta(a.cuentaOtrosImpuestos)) out.push("cuentaOtrosImpuestos");
   return out;
 }
 
@@ -424,6 +451,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
     const [facturas, sugs, impuestos, glob] = await Promise.all([listarFacturas(empresaId, estado, tipo), sugerenciasPorNit(empresaId, tipo), getTabla(empresaId, "impuestos"), getCuentasGlobales(empresaId, tipo)]);
     const tarifasInc = tarifasIncDe(impuestos?.rows);
     const worldOffice = (await getSistemaContable(empresaId)) === "worldoffice";
+    const cfgInv = await getConfigInventario(empresaId);
     const opciones = opcionesRetencion(impuestos?.rows || []);
     res.json({
       status: "ok",
@@ -432,7 +460,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
       facturas: facturas.map((f) => {
         const sug = sugs.get(f.nit);
         const ef = efectiva(f, sug, glob);
-        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, worldOffice), sinParametros: !sug };
+        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, worldOffice, cfgInv.activo && !f.isCreditNote ? cfgInv : null), ivaMayorSugerido: ivaMayorSugerido(ef, cfgInv.activo ? cfgInv : null), sinParametros: !sug };
       }),
     });
   } catch (e) {
@@ -478,7 +506,7 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
     const sug = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
     const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo));
     const tarifasInc = tarifasIncDe((await getTabla(empresaId, "impuestos"))?.rows);
-    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice"), sinParametros: !sug } });
+    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote)), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
   } catch (e) {
     err(res, e);
   }
@@ -531,6 +559,33 @@ router.put("/empresas/:id/proveedores/:nit", async (req: Request, res: Response)
 });
 
 // Cuentas globales de la empresa (descuento, recargo, otros impuestos).
+const cfgInventarioDe = async (empresaId: string, esNc: boolean) => {
+  const c = await getConfigInventario(empresaId);
+  return c.activo && !esNc ? c : null;
+};
+
+// ── Inventario y gasto (compras de Siigo) ───────────────────────────────────
+
+router.get("/empresas/:id/inventario", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    res.json({ status: "ok", inventario: await getConfigInventario(empresaId) });
+  } catch (e) {
+    err(res, e, 500);
+  }
+});
+
+router.put("/empresas/:id/inventario", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    res.json({ status: "ok", inventario: await setConfigInventario(empresaId, req.body?.inventario) });
+  } catch (e) {
+    err(res, e);
+  }
+});
+
 // ── Maestro de productos de World Office ────────────────────────────────────
 
 router.get("/empresas/:id/productos-wo", async (req: Request, res: Response) => {
@@ -645,6 +700,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       getAutorretencion(empresaId),
     ]);
     const sistemaContable = await getSistemaContable(empresaId);
+    const cfgInventario = await getConfigInventario(empresaId);
     const worldoffice = sistemaContable === "worldoffice";
     const configWo = worldoffice ? await getConfigWorldOffice(empresaId) : null;
     if (worldoffice) {
@@ -688,6 +744,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
 
     const r = generarInterfaz(entradas, {
       modo: tipo,
+      inventario: !venta && !worldoffice && cfgInventario.activo ? cfgInventario : undefined,
       worldoffice,
       productosWo: worldoffice ? await getProductosWo(empresaId) : undefined,
       tipoPorPrefijo: prefijos,

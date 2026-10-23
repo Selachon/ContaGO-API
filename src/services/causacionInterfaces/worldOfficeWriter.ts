@@ -64,6 +64,9 @@ export function serialExcel(ddmmyyyy: string): number | "" {
   return Math.round(Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1])) / 86400000) + 25569;
 }
 
+/** Fecha de Excel con formato dd-mm-yy, como la muestra World Office. */
+const celdaFecha = (serial: number | "") => (serial === "" ? "" : { t: "n", v: serial, z: "dd-mm-yy" });
+
 const soloDigitos = (v: string) => String(v ?? "").replace(/\D/g, "");
 const numeroONada = (v: string) => (/^\d+$/.test(v) ? Number(v) : v);
 
@@ -82,7 +85,7 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
       "Encab: Tipo Documento": e.tipo,
       "Encab: Prefijo": "",
       "Encab: Documento Número": e.numero,
-      "Encab: Fecha": serialExcel(e.fecha),
+      "Encab: Fecha": celdaFecha(serialExcel(e.fecha)),
       "Encab: Tercero Interno": numeroONada(soloDigitos(cfg.terceroInterno)),
       "Encab: Tercero Externo": numeroONada(soloDigitos(e.terceroExterno)),
       "Encab: Pref Dto Ext": e.prefijoExterno,
@@ -91,7 +94,7 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
       "Encab: FormaPago": e.formaPago,
       "Encab: Verificado": 0,
       "Encab: Anulado": 0,
-      "Encab: Fecha Emision": emision,
+      "Encab: Fecha Emision": celdaFecha(emision),
     };
     return COLUMNAS_WO_ENCABEZADO.map((c) => f[c] ?? "");
   });
@@ -110,7 +113,7 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
         "Detalle: IVA": r.iva,
         "Detalle: Valor Unitario": r.valor,
         "Detalle: Descuento": 0,
-        "Detalle: Vencimiento": serialExcel(d.vencimiento),
+        "Detalle: Vencimiento": celdaFecha(serialExcel(d.vencimiento)),
         "Detalle: Centro costos": r.centroCostos,
       };
       filasMov.push(COLUMNAS_WO_MOVIMIENTO.map((c) => f[c] ?? ""));

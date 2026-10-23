@@ -176,9 +176,9 @@ export async function cufesRegistrados(empresaId: string): Promise<string[]> {
 const CAMPOS_ASIGNACION: (keyof Ci2Asignacion)[] = [
   "cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento",
   "cuentaRecargo", "centroCostos", "tarifaRetefuente", "tarifaReteica", "tarifaReteiva", "baseMinimaReteicaEspecial", "cuentasItems",
-  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno",
+  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor",
 ];
-const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno"]);
+const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino"]);
 
 /** Aplica ediciones manuales a una factura pendiente. `null` en un campo = volver a la sugerencia. */
 export async function editarAsignacion(empresaId: string, id: string, cambios: Record<string, unknown>): Promise<Ci2Factura | null> {
@@ -190,15 +190,15 @@ export async function editarAsignacion(empresaId: string, id: string, cambios: R
     if (!(k in cambios)) continue;
     const v = cambios[k];
     if (v === null) unset[`asignacion.${k}`] = "";
-    else if (k === "cuentasItems") {
-      // { índiceÍtem: cuenta }; un valor vacío quita la cuenta propia de ese ítem.
+    else if (k === "cuentasItems" || k === "cuentasInventario" || k === "cuentasIvaMayor") {
+      // { índiceÍtem | tarifa: cuenta }; un valor vacío quita la cuenta propia.
       const limpio: Record<string, string> = {};
       for (const [i, c] of Object.entries((v && typeof v === "object" ? v : {}) as Record<string, unknown>)) {
         const cuenta = String(c ?? "").trim();
         if (/^\d+$/.test(i) && cuenta) limpio[i] = cuenta;
       }
-      if (Object.keys(limpio).length) set["asignacion.cuentasItems"] = limpio;
-      else unset["asignacion.cuentasItems"] = "";
+      if (Object.keys(limpio).length) set[`asignacion.${k}`] = limpio;
+      else unset[`asignacion.${k}`] = "";
     }
     else if (CAMPOS_TEXTO.has(k)) set[`asignacion.${k}`] = String(v).trim();
     else {
