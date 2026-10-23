@@ -138,6 +138,7 @@ export async function extractInvoiceDataFromXml(
     const notes = extractNotes(invoice);
     const cufe = extractCUFE(invoice);
     const paymentMethod = extractPaymentMethod(invoice);
+    const { paymentForm, paymentDueDate } = extractPaymentForm(invoice);
 
     return {
       issuerNit,
@@ -184,6 +185,8 @@ export async function extractInvoiceDataFromXml(
       isDocumentoSoporte,
       cufe,
       paymentMethod,
+      paymentForm,
+      paymentDueDate,
       trackId: docInfo.id,
       docNumber: xmlDocNumber,
     };
@@ -860,6 +863,26 @@ function extractLineItems(invoice: any): InvoiceLineItem[] {
     });
   } catch {
     return [];
+  }
+}
+
+/**
+ * Contado/crédito (PaymentMeans > ID: 1 contado, 2 crédito) y fecha de vencimiento (PaymentDueDate, YYYY-MM-DD).
+ * "" si el XML no lo trae.
+ */
+function extractPaymentForm(invoice: any): { paymentForm: "contado" | "credito" | ""; paymentDueDate: string } {
+  try {
+    const pm = invoice.PaymentMeans;
+    const first = Array.isArray(pm) ? pm[0] : pm;
+    if (!first) return { paymentForm: "", paymentDueDate: "" };
+    const id = getText(first.ID).trim();
+    const due = getText(first.PaymentDueDate).trim().slice(0, 10);
+    return {
+      paymentForm: id === "1" ? "contado" : id === "2" ? "credito" : "",
+      paymentDueDate: /^\d{4}-\d{2}-\d{2}$/.test(due) ? due : "",
+    };
+  } catch {
+    return { paymentForm: "", paymentDueDate: "" };
   }
 }
 

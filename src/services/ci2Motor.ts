@@ -17,6 +17,7 @@ import type { XmlCausacionItem } from "./siigoAccountingService.js";
 import { COLUMNAS_SIIGO, COLUMNAS_INFORME, type FilaSiigo, type FilaInforme, type CeldaValor } from "./causacionInterfaces/types.js";
 import { dividirEnPartes } from "./causacionInterfaces/compras.js";
 import { extraerPrefijoConsecutivo } from "./causacionInterfaces/ventas.js";
+import { separarNumeroExterno, type WoDocumento } from "./causacionInterfaces/worldOfficeWriter.js";
 import { abreviarTipoDocumento, limpiarCuenta, redondear, redondear4, toNumero } from "./causacionInterfaces/normalize.js";
 
 /** Cuentas y retenciones efectivas de una factura (sugeridas + ediciones del usuario). */
@@ -38,6 +39,11 @@ export interface Ci2Asignacion {
   retForzadas?: string[];
   /** Cuenta de gasto por ítem (índice en `items`) cuando difiere de `cuentaGasto`. */
   cuentasItems?: Record<string, string>;
+  /** World Office: contado/crédito y vencimiento (dd/mm/yyyy o yyyy-mm-dd) puestos a mano, y prefijo/número del documento del proveedor. */
+  formaPago?: string;
+  fechaVencimiento?: string;
+  prefijoExterno?: string;
+  numeroExterno?: string;
 }
 
 export interface Ci2FacturaInput {
@@ -51,6 +57,9 @@ export interface Ci2FacturaInput {
   proveedor: string;
   items: XmlCausacionItem[];
   totalIva: number;
+  /** Lo que traía el XML: "contado" | "credito" | "" y vencimiento yyyy-mm-dd. */
+  formaPago?: string;
+  fechaVencimiento?: string;
   asignacion: Ci2Asignacion;
 }
 
@@ -68,6 +77,8 @@ export { categoriaDocumento, type Ci2Categoria } from "./tipoDocumento.js";
 
 export interface Ci2Opciones {
   modo?: "compra" | "venta";
+  /** Compras para World Office: en vez de líneas contables se arma el contenido de sus dos archivos (producto + IVA + valor). */
+  worldoffice?: boolean;
   /** Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS…); FE y NC caen a los de la empresa si faltan. */
   tipoPorDocumento?: Record<string, string>;
   /** Ventas: autorretención sobre la base antes de impuestos de facturas y notas crédito. */
@@ -85,6 +96,8 @@ export interface Ci2Resultado {
   salida: FilaSiigo[];
   partes: FilaSiigo[][];
   informe: FilaInforme[];
+  /** World Office: documentos para los archivos de encabezados y movimientos. */
+  wo?: WoDocumento[];
   advertencias: string[];
   /** Facturas que no se pudieron armar (no consumen consecutivo). */
   errores: { id: string; docNumber: string; proveedor: string; mensaje: string }[];
@@ -364,6 +377,53 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   return { lineas, inf, aviso };
 }
 
+const aDdMmYyyy = (v: string) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(v || "");
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : v || "";
+};
+
+/** World Office (compras): un renglón por producto y tarifa de IVA, con la base como valor; los impuestos los calcula el programa. */
+function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number): { doc: WoDocumento; avisos: string[] } {
+  const as = f.asignacion;
+  const descripcion = `${abreviarTipoDocumento(f.documentType)} ${f.docNumber} ${f.proveedor}`;
+  const grupos = new Map<string, { producto: string; iva: number; valor: number }>();
+  for (const [idx, it] of f.items.entries()) {
+    if (it.isGift || it.isSurcharge || !(it.base > 0)) continue;
+    const producto = limpiarCuenta(as.cuentasItems?.[String(idx)] ?? "") || limpiarCuenta(as.cuentaGasto);
+    if (!producto || producto === "0") throw new Ci2Error('Falta asignar el producto de World Office ("Cuenta de gasto").');
+    const iva = redondear4(it.ivaPercent / 100);
+    const k = `${producto}|${iva}`;
+    const g = grupos.get(k) ?? { producto, iva, valor: 0 };
+    g.valor += it.base;
+    grupos.set(k, g);
+  }
+  if (!grupos.size) throw new Ci2Error("La factura no tiene ítems con base para causar.");
+  const avisos: string[] = [];
+  const ag = agregar(f.items);
+  if (ag.inc.size || ag.otros.size) avisos.push(`${descripcion}: trae impoconsumo u otros impuestos que no van en la interfaz de World Office; revísalos en el documento.`);
+  if (redondear(descuentoNeto(f.items)) > 0 || redondear(ag.recargo) > 0) avisos.push(`${descripcion}: trae descuento o recargo a nivel documento que no va en la interfaz de World Office; revísalo en el documento.`);
+  if (ag.obsequios.size) avisos.push(`${descripcion}: trae obsequios que no van en la interfaz de World Office; revísalos en el documento.`);
+  const forma = String(as.formaPago || f.formaPago || "").toLowerCase();
+  const credito = forma === "credito";
+  const emision = f.fecha;
+  const venc = aDdMmYyyy(as.fechaVencimiento || f.fechaVencimiento || "");
+  const ext = separarNumeroExterno(f.docNumber);
+  const prefijoExterno = as.prefijoExterno !== undefined && as.prefijoExterno !== "" ? as.prefijoExterno : ext.prefijo;
+  const numeroExterno = as.numeroExterno || ext.numero;
+  return {
+    avisos,
+    doc: {
+      encabezado: {
+        tipo, numero: consecutivo, fecha: emision, terceroExterno: f.nit, prefijoExterno, numeroExterno,
+        nota: descripcion.slice(0, 50), formaPago: credito ? "Credito" : "Contado",
+      },
+      // Contado, o crédito sin fecha de vencimiento legible: vence el mismo día de la emisión.
+      vencimiento: credito && venc ? venc : emision,
+      renglones: [...grupos.values()].map((g) => ({ producto: g.producto, iva: g.iva, valor: redondear(g.valor), centroCostos: as.centroCostos || "" })),
+    },
+  };
+}
+
 /** Genera la interfaz Siigo + informe de retenciones para las facturas indicadas, en el orden dado. */
 export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones): Ci2Resultado {
   const salida: FilaSiigo[] = [];
@@ -372,6 +432,7 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
   const errores: Ci2Resultado["errores"] = [];
   const asignados: Ci2Resultado["asignados"] = [];
   const contador: Record<string, number> = { ...opts.consecutivoInicial };
+  const wo: WoDocumento[] = [];
   let notasCredito = 0;
 
   const venta = opts.modo === "venta";
@@ -404,6 +465,15 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
       consecutivo = contador[tipo] ?? 1;
     }
     try {
+      if (opts.worldoffice) {
+        if (cat.clave !== "FE") throw new Ci2Error(`World Office solo admite facturas electrónicas por ahora («${cat.etiqueta}» no).`);
+        const r = armarFacturaWo(f, tipo, consecutivo);
+        wo.push(r.doc);
+        advertencias.push(...r.avisos);
+        asignados.push({ id: f.id, tipo, consecutivo });
+        contador[tipo] = consecutivo + 1;
+        continue;
+      }
       const r = armarFactura(f, tipo, consecutivo, opts);
       salida.push(...r.lineas);
       informe.push(r.inf);
@@ -415,6 +485,15 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
       if (!(e instanceof Ci2Error)) throw e;
       errores.push({ id: f.id, docNumber: f.docNumber, proveedor: f.proveedor, mensaje: e.message });
     }
+  }
+
+  if (opts.worldoffice) {
+    const siguientesWo: Record<string, number> = {};
+    for (const a of asignados) siguientesWo[a.tipo] = contador[a.tipo];
+    return {
+      salida: [], partes: [], informe: [], wo, advertencias, errores, asignados, siguientes: siguientesWo,
+      resumen: { documentos: asignados.length, notasCredito: 0, lineas: wo.reduce((n, d) => n + d.renglones.length, 0), partes: 1 },
+    };
   }
 
   const balances = new Map<string, number>();

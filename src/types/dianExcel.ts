@@ -67,6 +67,9 @@ export interface InvoiceData {
   issueDate: string;
   issueDateISO: string;  // Fecha en formato ISO para ordenamiento (YYYY-MM-DD)
   paymentMethod: string;
+  /** Contado/crédito (PaymentMeans/ID) y vencimiento yyyy-mm-dd; "" si el XML no los trae. */
+  paymentForm?: "contado" | "credito" | "";
+  paymentDueDate?: string;
   subtotal: number;
   iva: number;
   total: number;

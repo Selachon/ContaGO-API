@@ -200,8 +200,22 @@ export interface PucResumen {
   cuentas: number;
 }
 
-export type SistemaContable = "siigo" | "syscafe";
-const normSistema = (v: unknown): SistemaContable => (v === "syscafe" ? "syscafe" : "siigo");
+export type SistemaContable = "siigo" | "syscafe" | "worldoffice";
+const normSistema = (v: unknown): SistemaContable => (v === "syscafe" || v === "worldoffice" ? v : "siigo");
+
+/** Parámetros de la empresa en World Office (solo si su sistema contable es World Office). */
+export interface ConfigWorldOffice {
+  /** Nombre de la empresa tal como está creada en World Office. */
+  empresa: string;
+  /** NIT de quien genera el documento dentro de la empresa (Tercero Interno). */
+  terceroInterno: string;
+  bodega: string;
+}
+const normWo = (v: any): ConfigWorldOffice => ({
+  empresa: String(v?.empresa ?? "").trim(),
+  terceroInterno: String(v?.terceroInterno ?? "").replace(/\D/g, ""),
+  bodega: String(v?.bodega ?? "").trim(),
+});
 
 export interface EmpresaPublic {
   id: string;
@@ -217,6 +231,7 @@ export interface EmpresaPublic {
   cuentaGastoPorTarifaIva: boolean;
   /** Programa contable al que va dirigida la interfaz que genera Causación Interfaces 2.0. */
   sistemaContable: SistemaContable;
+  worldOffice: ConfigWorldOffice;
   comprobantes: Comprobantes;
   /** Siguiente consecutivo recordado por tipo de comprobante. */
   consecutivos: Consecutivos;
@@ -298,6 +313,7 @@ function toPublic(doc: any): EmpresaPublic {
     obsequiosMode: doc.obsequiosMode === "contabilizar" ? "contabilizar" : "error",
     cuentaGastoPorTarifaIva: !!doc.cuentaGastoPorTarifaIva,
     sistemaContable: normSistema(doc.sistemaContable),
+    worldOffice: normWo(doc.worldOffice),
     comprobantes: normComprobantes(doc.comprobantes),
     consecutivos: (doc.consecutivos && typeof doc.consecutivos === "object" ? doc.consecutivos : {}) as Consecutivos,
     tablas,
@@ -326,6 +342,12 @@ export async function getSistemaContable(empresaId: string): Promise<SistemaCont
   return normSistema(doc?.sistemaContable);
 }
 
+export async function getConfigWorldOffice(empresaId: string): Promise<ConfigWorldOffice> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { worldOffice: 1 } }) : null;
+  return normWo(doc?.worldOffice);
+}
+
 export async function getEmpresaNit(empresaId: string): Promise<string> {
   const oid = toObjectId(empresaId);
   if (!oid) return "";
@@ -351,7 +373,8 @@ export async function createEmpresa(
   ownerUserId: string,
   comprobantes?: Partial<Comprobantes>,
   cuentaGastoPorTarifaIva?: boolean,
-  sistemaContable?: string
+  sistemaContable?: string,
+  worldOffice?: Partial<ConfigWorldOffice>
 ): Promise<EmpresaPublic> {
   const cleanNombre = String(nombre || "").trim();
   if (!cleanNombre) throw new Error("El nombre de la empresa es obligatorio.");
@@ -365,6 +388,7 @@ export async function createEmpresa(
     obsequiosMode: mode,
     cuentaGastoPorTarifaIva: !!cuentaGastoPorTarifaIva,
     sistemaContable: normSistema(sistemaContable),
+    worldOffice: normWo(worldOffice),
     comprobantes: normComprobantes(comprobantes),
     consecutivos: {},
     ownerUserId,
@@ -396,6 +420,7 @@ export async function updateEmpresa(
     obsequiosMode?: ObsequiosMode;
     cuentaGastoPorTarifaIva?: boolean;
     sistemaContable?: string;
+    worldOffice?: Partial<ConfigWorldOffice>;
     comprobantes?: Partial<Comprobantes>;
     consecutivos?: Consecutivos;
   }
@@ -420,6 +445,7 @@ export async function updateEmpresa(
     }
   }
   if (patch.sistemaContable !== undefined) set.sistemaContable = normSistema(patch.sistemaContable);
+  if (patch.worldOffice !== undefined) set.worldOffice = normWo(patch.worldOffice);
   if (patch.comprobantes !== undefined) set.comprobantes = normComprobantes(patch.comprobantes);
   if (patch.consecutivos !== undefined && patch.consecutivos && typeof patch.consecutivos === "object") {
     const limpio: Consecutivos = {};

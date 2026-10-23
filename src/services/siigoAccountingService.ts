@@ -79,6 +79,9 @@ export interface XmlCausacionData {
   providerInvoiceNumber: string;
   docNumberRaw: string;
   cufe: string;
+  /** Contado/crédito y vencimiento del XML ("" si no los trae). */
+  formaPago?: "contado" | "credito" | "";
+  fechaVencimiento?: string;
   items: XmlCausacionItem[];
   totals: { subtotal: number; iva: number; total: number };
   supplierDraft: SupplierDraft;
@@ -356,6 +359,8 @@ export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean
     providerInvoiceNumber: number,
     docNumberRaw: xmlData.docNumber || "",
     cufe: xmlData.cufe || "",
+    formaPago: xmlData.paymentForm || "",
+    fechaVencimiento: xmlData.paymentDueDate || "",
     items,
     totals: {
       subtotal: Number(xmlData.subtotal) || 0,

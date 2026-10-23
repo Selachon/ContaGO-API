@@ -33,6 +33,9 @@ export interface Ci2Factura {
   /** NIT y nombre de la contraparte: el proveedor en compras, el cliente en ventas. */
   nit: string;
   proveedor: string;
+  /** Contado/crédito y vencimiento que traía el XML ("" si no los traía). */
+  formaPago: "contado" | "credito" | "";
+  fechaVencimiento: string;
   items: XmlCausacionItem[];
   totals: { subtotal: number; iva: number; total: number };
   estado: Ci2Estado;
@@ -89,6 +92,8 @@ function toFactura(d: any): Ci2Factura {
     docNumber: d.docNumber,
     nit: d.nit,
     proveedor: d.proveedor,
+    formaPago: d.formaPago === "contado" || d.formaPago === "credito" ? d.formaPago : "",
+    fechaVencimiento: d.fechaVencimiento || "",
     items: d.items || [],
     totals: d.totals || { subtotal: 0, iva: 0, total: 0 },
     estado: d.estado,
@@ -122,6 +127,8 @@ export async function guardarFacturasTraidas(empresaId: string, items: BatchItem
               docNumber: x.docNumberRaw,
               nit: String(nitContraparte || "").split("-")[0].replace(/\D/g, ""),
               proveedor: tipo === "venta" ? x.receiverName || "" : x.supplierName,
+              formaPago: x.formaPago || "",
+              fechaVencimiento: x.fechaVencimiento || "",
               items: x.items,
               totals: x.totals,
               estado: "pendiente" as Ci2Estado,
@@ -169,8 +176,9 @@ export async function cufesRegistrados(empresaId: string): Promise<string[]> {
 const CAMPOS_ASIGNACION: (keyof Ci2Asignacion)[] = [
   "cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento",
   "cuentaRecargo", "centroCostos", "tarifaRetefuente", "tarifaReteica", "tarifaReteiva", "baseMinimaReteicaEspecial", "cuentasItems",
+  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno",
 ];
-const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos"]);
+const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno"]);
 
 /** Aplica ediciones manuales a una factura pendiente. `null` en un campo = volver a la sugerencia. */
 export async function editarAsignacion(empresaId: string, id: string, cambios: Record<string, unknown>): Promise<Ci2Factura | null> {

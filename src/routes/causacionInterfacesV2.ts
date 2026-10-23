@@ -35,6 +35,7 @@ import {
   detectarConsecutivosDesdeAuxiliar,
   getComprobantesEmpresa,
   getSistemaContable,
+  getConfigWorldOffice,
   getEmpresaNit,
   getTabla,
   guardarConsecutivos,
@@ -73,6 +74,7 @@ import {
   type Ci2Factura,
 } from "../services/ci2Store.js";
 import { escribirInformeRetenciones, escribirInterfazSiigo } from "../services/causacionInterfaces/excelWriter.js";
+import { escribirInterfazWo } from "../services/causacionInterfaces/worldOfficeWriter.js";
 import { escribirInterfazSyscafe } from "../services/causacionInterfaces/syscafeWriter.js";
 import { limpiarCuenta, toNumero } from "../services/causacionInterfaces/normalize.js";
 
@@ -202,11 +204,13 @@ function efectiva(f: Ci2Factura, sug?: Ci2Asignacion, glob: Ci2CuentasGlobales =
 const tarifasIncDe = (rows: Record<string, any>[] = []) =>
   new Set(rows.filter((r) => String(r["Nombre"] ?? "").toUpperCase().includes("IMPOCONSUMO")).map((r) => Math.round(Number(r["Tarifa"]) * 10000) / 10000));
 
-function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo = "compra", tarifasInc: Set<number> = new Set()): string[] {
+function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo = "compra", tarifasInc: Set<number> = new Set(), worldOffice = false): string[] {
   const out: string[] = [];
   // La cuenta del proveedor solo hace falta si algún ítem con base no tiene cuenta propia.
   const sinCuentaPropia = items.some((it, i) => !it.isGift && !it.isSurcharge && it.base > 0 && !limpiarCuenta(a.cuentasItems?.[String(i)] ?? ""));
   if (sinCuentaPropia && !limpiarCuenta(a.cuentaGasto)) out.push("cuentaGasto");
+  // World Office solo lleva el producto y calcula el resto (cuenta por pagar, impuestos) por su cuenta.
+  if (worldOffice) return out;
   if (!limpiarCuenta(a.cuentaPorPagar)) out.push("cuentaPorPagar");
   // Cuentas adicionales que el motor exige según lo que traiga la factura (descuento/recargo del documento, obsequios, otros impuestos).
   const extra = (it: Ci2Factura["items"][number]) => it.extraTaxes || [];
@@ -417,6 +421,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
     const tipo = tipoDe(req);
     const [facturas, sugs, impuestos, glob] = await Promise.all([listarFacturas(empresaId, estado, tipo), sugerenciasPorNit(empresaId, tipo), getTabla(empresaId, "impuestos"), getCuentasGlobales(empresaId, tipo)]);
     const tarifasInc = tarifasIncDe(impuestos?.rows);
+    const worldOffice = (await getSistemaContable(empresaId)) === "worldoffice";
     const opciones = opcionesRetencion(impuestos?.rows || []);
     res.json({
       status: "ok",
@@ -425,7 +430,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
       facturas: facturas.map((f) => {
         const sug = sugs.get(f.nit);
         const ef = efectiva(f, sug, glob);
-        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc), sinParametros: !sug };
+        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, worldOffice), sinParametros: !sug };
       }),
     });
   } catch (e) {
@@ -471,7 +476,7 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
     const sug = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
     const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo));
     const tarifasInc = tarifasIncDe((await getTabla(empresaId, "impuestos"))?.rows);
-    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc), sinParametros: !sug } });
+    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice"), sinParametros: !sug } });
   } catch (e) {
     err(res, e);
   }
@@ -615,7 +620,13 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       getTiposDocumento(empresaId, tipo),
       getAutorretencion(empresaId),
     ]);
-    if (!impuestos?.rows?.length) return err(res, new Error("La empresa no tiene tabla de impuestos cargada (Configuración)."));
+    const sistemaContable = await getSistemaContable(empresaId);
+    const worldoffice = sistemaContable === "worldoffice";
+    const configWo = worldoffice ? await getConfigWorldOffice(empresaId) : null;
+    if (worldoffice) {
+      if (venta) return err(res, new Error("World Office solo está habilitado para compras por ahora."));
+      if (!configWo!.empresa || !configWo!.terceroInterno || !configWo!.bodega) return err(res, new Error("Faltan los parámetros de World Office de la empresa (nombre en World Office, Tercero Interno y Bodega)."));
+    } else if (!impuestos?.rows?.length) return err(res, new Error("La empresa no tiene tabla de impuestos cargada (Configuración)."));
     const pendientes = facturas.filter((f) => f.estado === "pendiente" && f.tipo === tipo);
     if (!pendientes.length) return err(res, new Error("Ninguna de las facturas seleccionadas está pendiente."));
 
@@ -646,15 +657,18 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       proveedor: f.proveedor,
       items: f.items,
       totalIva: f.totals.iva,
+      formaPago: f.formaPago,
+      fechaVencimiento: f.fechaVencimiento,
       asignacion: efectiva(f, sugs.get(f.nit), glob),
     }));
 
     const r = generarInterfaz(entradas, {
       modo: tipo,
+      worldoffice,
       tipoPorPrefijo: prefijos,
       tipoPorDocumento,
       autorretencion: venta ? autorretencion : undefined,
-      impuestos: impuestos.rows as Record<string, unknown>[],
+      impuestos: (impuestos?.rows || []) as Record<string, unknown>[],
       tipoCompras: comp.tipoCompras,
       tipoComprasNc: comp.tipoComprasNc,
       consecutivoInicial,
@@ -670,17 +684,27 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
 
     const sufijo = venta ? "Ventas" : "Compras";
     // Mismas líneas contables; cambia solo el archivo según el programa contable de la empresa.
-    const syscafe = (await getSistemaContable(empresaId)) === "syscafe";
+    const syscafe = sistemaContable === "syscafe";
     const sistema = syscafe ? "Syscafe" : "Siigo";
     const ext = syscafe ? "xls" : "xlsx";
     const escribir = async (filas: typeof r.salida) => (syscafe ? escribirInterfazSyscafe(filas) : await escribirInterfazSiigo(filas));
-    const archivos = [
-      { nombre: `Salida_${sistema}_${sufijo}.${ext}`, tipo: "interfaz" as const, data: await escribir(r.salida) },
-      { nombre: `Informe_Retenciones_${sufijo}.xlsx`, tipo: "informe" as const, data: await escribirInformeRetenciones(r.informe) },
-    ];
-    if (r.partes.length > 1) {
-      for (let i = 0; i < r.partes.length; i++) {
-        archivos.push({ nombre: `Salida_${sistema}_${sufijo}_Parte_${String(i + 1).padStart(3, "0")}.${ext}`, tipo: "interfaz", data: await escribir(r.partes[i]) });
+    let archivos: { nombre: string; tipo: "interfaz" | "informe"; data: Buffer }[];
+    if (worldoffice) {
+      // World Office carga dos archivos: encabezados de los documentos y su contenido.
+      const wo = escribirInterfazWo(r.wo || [], configWo!);
+      archivos = [
+        { nombre: `Encabezados_WorldOffice_${sufijo}.xls`, tipo: "interfaz", data: wo.encabezados },
+        { nombre: `Movimientos_WorldOffice_${sufijo}.xls`, tipo: "interfaz", data: wo.movimientos },
+      ];
+    } else {
+      archivos = [
+        { nombre: `Salida_${sistema}_${sufijo}.${ext}`, tipo: "interfaz", data: await escribir(r.salida) },
+        { nombre: `Informe_Retenciones_${sufijo}.xlsx`, tipo: "informe", data: await escribirInformeRetenciones(r.informe) },
+      ];
+      if (r.partes.length > 1) {
+        for (let i = 0; i < r.partes.length; i++) {
+          archivos.push({ nombre: `Salida_${sistema}_${sufijo}_Parte_${String(i + 1).padStart(3, "0")}.${ext}`, tipo: "interfaz", data: await escribir(r.partes[i]) });
+        }
       }
     }
 
