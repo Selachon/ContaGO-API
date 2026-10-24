@@ -31,6 +31,7 @@ import erpRoutes from "./erp/routes/index.js";
 import supportDocsRoutes from "./routes/supportDocs.js";
 import supportDocsPublicRoutes from "./routes/supportDocsPublic.js";
 import billingRoutes from "./billing/routes.js";
+import { normalizarTokenSafeLinks } from "./middleware/validateDianUrl.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
 import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
 import { ensureErpIndexes } from "./erp/db.js";
@@ -75,6 +76,7 @@ app.use(
 // Body parsing (con límite de tamaño)
 // ============================================
 app.use(express.json({ limit: "5mb" }));
+app.use(normalizarTokenSafeLinks);
 
 // ============================================
 // Routes

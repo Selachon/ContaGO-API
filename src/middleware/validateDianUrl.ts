@@ -89,3 +89,16 @@ export function validateDianUrl(req: Request, res: Response, next: NextFunction)
 
   next();
 }
+
+const CAMPOS_TOKEN = ["token_url", "tokenUrl", "tokenDIAN"];
+
+/** Desenvuelve los enlaces de Outlook SafeLinks en cualquier campo de token del body JSON, para todas las rutas. */
+export function normalizarTokenSafeLinks(req: Request, _res: Response, next: NextFunction): void {
+  const body = req.body;
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    for (const k of CAMPOS_TOKEN) {
+      if (typeof body[k] === "string") body[k] = tryExtractDianUrlFromSafeLink(body[k].trim());
+    }
+  }
+  next();
+}
