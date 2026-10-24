@@ -119,9 +119,11 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
       filasMov.push(COLUMNAS_WO_MOVIMIENTO.map((c) => f[c] ?? ""));
     }
   }
+  // Las celdas vacías no se escriben: una celda de texto vacía hace fallar la importación de World Office.
+  const sinVacios = (filas: unknown[][]) => filas.map((fila) => fila.map((v) => (v === "" ? null : v)));
   const libro = (hoja: string, cols: readonly string[], filas: unknown[][]) => {
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([[...cols], ...filas]), hoja);
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet([[...cols], ...sinVacios(filas)]), hoja);
     return XLSX.write(wb, { bookType: "xls", type: "buffer" }) as Buffer;
   };
   return {
