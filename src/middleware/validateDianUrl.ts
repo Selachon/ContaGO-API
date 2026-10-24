@@ -13,7 +13,7 @@ const DIAN_ALLOWED_ORIGINS = [
 // mensaje claro en vez de dejarlo fallar más adelante.
 const DIAN_HAB_ORIGIN = "https://catalogo-vpfe-hab.dian.gov.co";
 
-function tryExtractDianUrlFromSafeLink(rawUrl: string): string {
+export function tryExtractDianUrlFromSafeLink(rawUrl: string): string {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);

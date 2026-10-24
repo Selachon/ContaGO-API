@@ -82,6 +82,7 @@ import { escribirInformeRetenciones, escribirInterfazSiigo } from "../services/c
 import { escribirInterfazWo } from "../services/causacionInterfaces/worldOfficeWriter.js";
 import { escribirInterfazSyscafe } from "../services/causacionInterfaces/syscafeWriter.js";
 import { limpiarCuenta, toNumero } from "../services/causacionInterfaces/normalize.js";
+import { tryExtractDianUrlFromSafeLink } from "../middleware/validateDianUrl.js";
 
 export const CI2_TOOL_ID = "causacion-interfaces-v2";
 
@@ -309,7 +310,7 @@ router.post("/empresas/:id/traer", async (req: Request, res: Response) => {
   try {
     const empresaId = await exigirEmpresa(req, res);
     if (!empresaId) return;
-    const tokenUrl = String(req.body?.tokenUrl || "");
+    const tokenUrl = tryExtractDianUrlFromSafeLink(String(req.body?.tokenUrl || "").trim());
     const month = String(req.body?.month || "").trim();
     if (!/^\d{4}-\d{2}$/.test(month)) return err(res, new Error("Selecciona el mes a traer."));
 
@@ -366,7 +367,7 @@ router.post("/empresas/:id/traer-ventas", upload.single("listado"), async (req: 
   try {
     const empresaId = await exigirEmpresa(req, res);
     if (!empresaId) return;
-    const tokenUrl = String(req.body?.tokenUrl || "");
+    const tokenUrl = tryExtractDianUrlFromSafeLink(String(req.body?.tokenUrl || "").trim());
     const archivo = req.file as Express.Multer.File | undefined;
     if (!archivo) return err(res, new Error("Sube el listado exportado desde la DIAN (.xlsx o .zip)."));
     if (!(await tokenDeLaEmpresa(res, empresaId, tokenUrl))) return;

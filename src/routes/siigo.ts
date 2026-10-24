@@ -1,3 +1,4 @@
+import { tryExtractDianUrlFromSafeLink } from "../middleware/validateDianUrl.js";
 import { Router, Request, Response, type NextFunction, type RequestHandler } from "express";
 import multer from "multer";
 import ExcelJS from "exceljs";
@@ -1929,7 +1930,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       return res.status(400).json({ ok: false, message: "Empresa Siigo no encontrada." });
     }
 
-    const tokenUrl = (req.body?.token_url || req.body?.tokenUrl) as string | undefined;
+    const tokenUrl = tryExtractDianUrlFromSafeLink(String(req.body?.token_url || req.body?.tokenUrl || "").trim()) || undefined;
     const forceRedownload = req.body?.forceRedownload === true || req.body?.forceRedownload === "true";
     // CUFEs a omitir (ya causados / ya en pantalla). "Causación + Caja" los envía
     // para que el dedup sea contra el buzón "Facturas", no contra el historial de
@@ -2135,7 +2136,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       return res.status(400).json({ ok: false, message: "Empresa Siigo no encontrada." });
     }
 
-    const tokenUrl = (req.body?.token_url || req.body?.tokenUrl) as string | undefined;
+    const tokenUrl = tryExtractDianUrlFromSafeLink(String(req.body?.token_url || req.body?.tokenUrl || "").trim()) || undefined;
     const month = String(req.body?.month || "").trim(); // "YYYY-MM"
     const forceRedownload = req.body?.forceRedownload === true || req.body?.forceRedownload === "true";
     let skipCufes: string[] = [];
