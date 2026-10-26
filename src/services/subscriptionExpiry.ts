@@ -74,7 +74,9 @@ export function suspendedToolsOf(user: any, companies: any[], today = new Date()
   if (user.suspensionExemptUntil && today <= String(user.suspensionExemptUntil).slice(0, 10)) return [];
   const out: SuspendedTool[] = [];
   for (const toolId of user.purchasedTools || []) {
-    const end = toolEnd(user, toolId, companies);
+    // Plan cerrado sin fecha de vencimiento: se corta desde el aviso del cliente
+    const closedAt = user.toolSubscriptions?.[toolId]?.closedAt ? String(user.toolSubscriptions[toolId].cancelledAt || user.toolSubscriptions[toolId].closedAt).slice(0, 10) : null;
+    const end = toolEnd(user, toolId, companies) ?? closedAt;
     if (!end) continue;
     const suspendedFrom = addDaysIso(end, GRACE_DAYS + 1); // el último día de acceso es vencimiento + gracia
     if (today >= suspendedFrom) out.push({ toolId, end: end.slice(0, 10), suspendedFrom });

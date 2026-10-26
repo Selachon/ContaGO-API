@@ -12,6 +12,8 @@ const TOOL_ALIASES: Record<string, string[]> = {
   // causación) y "siigo-egresos" (usa /integrations/siigo/egresos/* y /companies).
   // Tener cualquiera de ellas da acceso al router compartido.
   "siigo-xml-accounting": ["causacion-caja", "siigo-egresos"],
+  // Interfaces 2.0 usa las empresas y parámetros del router de Interfaces
+  "contabilizacion-dian-siigo": ["causacion-interfaces-v2"],
 };
 
 declare global {

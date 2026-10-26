@@ -31,6 +31,7 @@ import { randomUUID } from "crypto";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { getAllowedNits } from "../services/database.js";
+import { exigirNitParaEmpresa } from "../services/empresasNitGuard.js";
 import {
   ejecutarMotor,
   MotorError,
@@ -274,6 +275,7 @@ router.get("/empresas", async (req: Request, res: Response) => {
 router.post("/empresas", async (req: Request, res: Response) => {
   try {
     const { nombre, nit, obsequiosMode, comprobantes, cuentaGastoPorTarifaIva, sistemaContable, worldOffice } = req.body || {};
+    await exigirNitParaEmpresa(req.user!.userId, !!req.user!.isAdmin, nit);
     const empresa = await createEmpresa(nombre, nit, obsequiosMode, req.user!.userId, comprobantes, cuentaGastoPorTarifaIva, sistemaContable, worldOffice);
     res.status(201).json({ status: "ok", empresa });
   } catch (err) {
@@ -285,6 +287,7 @@ router.patch("/empresas/:id", async (req: Request, res: Response) => {
   try {
     const ok = await userCanAccessEmpresa(req.params.id, req.user!.userId, req.user!.isAdmin);
     if (!ok) throw new MotorError("empresa_no_autorizada", "No tienes acceso a esta empresa.", [], 403);
+    if (req.body?.nit !== undefined) await exigirNitParaEmpresa(req.user!.userId, !!req.user!.isAdmin, req.body.nit, req.params.id);
     const empresa = await updateEmpresa(req.params.id, req.body || {});
     res.json({ status: "ok", empresa });
   } catch (err) {

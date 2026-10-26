@@ -27,6 +27,7 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
+import { exigirEmpresaHabilitada } from "../services/empresasNitGuard.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ingestFromDian, ingestNewByDateRange, type IngestResult } from "../services/siigoDianIngestService.js";
 import { attachJobs, isJobAborted } from "../services/jobGuard.js";
@@ -113,6 +114,7 @@ async function exigirEmpresa(req: Request, res: Response): Promise<string | null
     res.status(403).json({ status: "error", mensaje: "No tienes acceso a esta empresa." });
     return null;
   }
+  try { await exigirEmpresaHabilitada(req.user!.userId, !!req.user!.isAdmin, id); } catch (e) { err(res, e, 403); return null; }
   return id;
 }
 
@@ -842,6 +844,7 @@ async function interfazAutorizada(req: Request, res: Response) {
     res.status(403).json({ status: "error", mensaje: "No tienes acceso a esta empresa." });
     return null;
   }
+  try { await exigirEmpresaHabilitada(req.user!.userId, !!req.user!.isAdmin, i.empresaId); } catch (e) { err(res, e, 403); return null; }
   return i;
 }
 

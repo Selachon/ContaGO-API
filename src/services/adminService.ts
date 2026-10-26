@@ -48,6 +48,10 @@ export interface UserToolSubscription {
   paidAt?: string;
   status?: "active" | "cancelled";
   cancelledAt?: string;
+  /** Cierre del vencimiento: el cliente avisó que no continúa (cancelledAt = fecha del aviso). */
+  closedAt?: string;
+  closeReason?: string;
+  closeNote?: string;
   skippedPeriods?: string[];
   paymentHistory?: Array<{ period: string; paidAt: string; amount?: number }>;
   invoiceHistory?: Array<{ period: string; invoicedAt: string; invoiceRef?: string }>;
@@ -811,8 +815,61 @@ export async function addToolPayment(id: string, toolId: string, input: NewToolP
   $push[`${base}.payments`] = { $each: [...prior, payment] };
   const ops: Record<string, unknown> = { $set, $push };
   if (Object.keys($addToSet).length) ops.$addToSet = $addToSet;
-  if (type !== "mejora") ops.$unset = { [`${base}.cancelledAt`]: "" };
+  if (type !== "mejora") ops.$unset = { [`${base}.cancelledAt`]: "", [`${base}.closedAt`]: "", [`${base}.closeReason`]: "", [`${base}.closeNote`]: "" };
   await usersCollection().updateOne({ _id: oid }, ops as any);
+  clearSuspensionCache();
+  return getUserById(id);
+}
+
+export const CLOSE_REASONS = ["precio", "no_lo_usa", "otra_herramienta", "cierra_empresa", "otro"] as const;
+
+export interface CloseSubscriptionInput { toolId: string; companyId?: string; reason: string; note?: string; noticedAt?: string }
+
+/**
+ * Cierra el vencimiento: el cliente avisó que no continúa. Marca la herramienta como cancelada (con motivo y fecha de aviso),
+ * junto con los obsequios que dependen de ella. No borra pagos ni NITs: reactivar es una nueva activación.
+ */
+export async function closeToolSubscription(id: string, input: CloseSubscriptionInput): Promise<AdminUser | null> {
+  const toolId = String(input.toolId || "");
+  if (!TOOL_ID_RE.test(toolId)) throw new Error("Servicio inválido.");
+  if (!(CLOSE_REASONS as readonly string[]).includes(input.reason)) throw new Error("Indique el motivo del cierre.");
+  const now = new Date().toISOString();
+  const noticedAt = input.noticedAt || now.slice(0, 10);
+  if (!DATE_RE.test(noticedAt)) throw new Error("Fecha de aviso inválida (use AAAA-MM-DD).");
+  const note = String(input.note || "").trim().slice(0, 500);
+  const oid = new ObjectId(id);
+  const rec: any = await usersCollection().findOne({ _id: oid }, { projection: { toolSubscriptions: 1, purchasedTools: 1 } });
+  if (!rec) return null;
+  const closing = (prefix: string, reason: string, text: string) => ({
+    [`${prefix}.status`]: "cancelled", [`${prefix}.cancelledAt`]: noticedAt, [`${prefix}.closedAt`]: now,
+    [`${prefix}.closeReason`]: reason, ...(text && { [`${prefix}.closeNote`]: text }),
+  });
+
+  // Cierre de una empresa Siigo: su suscripción y los obsequios de esa misma empresa
+  let userLevel = true;
+  if (input.companyId) {
+    let coid: ObjectId;
+    try { coid = new ObjectId(input.companyId); } catch { throw new Error("Empresa inválida."); }
+    if (!db) throw new Error("MongoDB no conectado");
+    const companies = db.collection<any>("siigoCompanies");
+    const company = await companies.findOne({ _id: coid, ownerUserId: id });
+    if (!company) throw new Error("La empresa no pertenece a este cliente.");
+    const patch: Record<string, unknown> = { ...closing(`subscriptions.${toolId}`, input.reason, note) };
+    for (const [t, sub] of Object.entries<any>(company.subscriptions || {})) {
+      if (t !== toolId && sub?.gift && sub.status !== "cancelled") Object.assign(patch, closing(`subscriptions.${t}`, input.reason, "Obsequio ligado al plan cerrado"));
+    }
+    await companies.updateOne({ _id: coid }, { $set: patch });
+    // El cierre llega al cliente solo si no le quedan otras empresas activas con esa herramienta
+    const others = await companies.find({ ownerUserId: id, _id: { $ne: coid } }).toArray();
+    userLevel = !others.some((c: any) => c.subscriptions?.[toolId] && c.subscriptions[toolId].status !== "cancelled");
+  }
+  if (userLevel) {
+    const $set: Record<string, unknown> = { updated_at: now, ...closing(`toolSubscriptions.${toolId}`, input.reason, note) };
+    for (const [t, sub] of Object.entries<any>(rec.toolSubscriptions || {})) {
+      if (sub?.followsTool === toolId && sub.status !== "cancelled") Object.assign($set, closing(`toolSubscriptions.${t}`, input.reason, "Obsequio ligado al plan cerrado"));
+    }
+    await usersCollection().updateOne({ _id: oid }, { $set } as any);
+  }
   clearSuspensionCache();
   return getUserById(id);
 }

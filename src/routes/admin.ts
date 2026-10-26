@@ -12,6 +12,7 @@ import {
   listAllUsersForSubscriptions,
   updateUserToolSubscription,
   addToolPayment,
+  closeToolSubscription,
   updateToolPayment,
   deleteToolPayment,
   getUserById,
@@ -1253,6 +1254,24 @@ router.patch("/users/:id/tool-subscriptions/:toolId", requireAuth, async (req: R
 });
 
 // Libro de pagos de un servicio: activación, renovación y mejora (cada pago es un movimiento propio)
+// Cierra el vencimiento: el cliente avisó que no continúa con la herramienta
+router.post("/users/:id/close-subscription", requireAuth, async (req: Request, res: Response) => {
+  if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
+  try {
+    const user = await closeToolSubscription(id, req.body || {});
+    if (!user) return res.status(404).json({ ok: false, message: "Usuario no encontrado" });
+    await logAdminAction({
+      actorId: req.user.userId, action: "close_tool_subscription", targetUserId: id,
+      after: { ...(req.body || {}) }, ip: req.ip, userAgent: req.get("user-agent"),
+    });
+    res.json({ ok: true, user });
+  } catch (err: any) {
+    res.status(400).json({ ok: false, message: err.message || "Error cerrando la suscripción" });
+  }
+});
+
 router.post("/users/:id/tool-subscriptions/:toolId/payments", requireAuth, async (req: Request, res: Response) => {
   if (!req.user?.isAdmin) return res.status(403).json({ ok: false, message: "Acceso denegado" });
   const { id, toolId } = req.params;

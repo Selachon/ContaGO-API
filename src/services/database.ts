@@ -612,12 +612,14 @@ export const NIT_SCOPED_TOOLS = new Set<string>([
   "dian-downloader",
   "dian-excel-exporter",
   "contabilizacion-dian-siigo",
+  "causacion-interfaces-v2",
 ]);
 
 // Grupos de herramientas que comparten la misma lista de NITs (vigente + legacy).
 const NIT_ALIAS_GROUPS: string[][] = [
   ["dian-recibidos", "dian-mass-download", "dian-downloader"],
   ["dian-cufe-downloader", "dian-excel-exporter"],
+  ["contabilizacion-dian-siigo", "causacion-interfaces-v2"],
 ];
 
 export function nitToolAliases(toolId: string): string[] {
