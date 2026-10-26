@@ -273,7 +273,10 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   const inventario = clasifica && as.destino === "inventario" ? opts.inventario! : null;
   const ivaMayorGasto = clasifica && as.destino === "gasto";
   const cuentaInv = (mapa: Record<string, string>, clave: string, que: string) => {
-    const c = limpiarCuenta(mapa[clave] ?? "");
+    // El nombre del impuesto llega como lo escribe el XML ("IC Porcentual"); se compara sin mayúsculas ni acentos.
+    const norm = (x: string) => x.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim().toUpperCase();
+    const k = Object.keys(mapa).find((x) => x === clave) ?? Object.keys(mapa).find((x) => norm(x) === norm(clave));
+    const c = limpiarCuenta(k ? mapa[k] : "");
     if (!c || c === "0") throw new Ci2Error(`Falta la cuenta de inventario para ${que}. Configúrala en Parámetros → Inventario y gasto.`);
     return c;
   };
