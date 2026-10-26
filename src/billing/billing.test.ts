@@ -73,11 +73,11 @@ test("resolución: valida prefijo, rango, fechas y llave técnica", () => {
 });
 
 test("avance de la empresa: creada → habilitada → con numeración → lista", () => {
-  assert.deepEqual(readiness({}), { created: false, authorized: false, hasRange: false, ready: false, supportReady: false });
+  assert.deepEqual(readiness({}), { created: false, authorized: false, hasRange: false, ready: false, supportReady: false, production: false });
   assert.equal(readiness({ alanube: { companyId: "A" } }).ready, false);
   assert.equal(readiness({ alanube: { companyId: "A" }, governmentStatus: { invoices: "AUTHORIZED" } }).ready, false);
   const r = readiness({ alanube: { companyId: "A" }, governmentStatus: { invoices: "AUTHORIZED" }, resolutions: [{ docType: "invoice", active: true }] });
-  assert.deepEqual(r, { created: true, authorized: true, hasRange: true, ready: true, supportReady: false });
+  assert.deepEqual(r, { created: true, authorized: true, hasRange: true, ready: true, supportReady: false, production: false });
   assert.equal(readiness({ alanube: { companyId: "A" }, governmentStatus: { invoices: "AUTHORIZED" }, resolutions: [{ docType: "invoice", active: false }] }).ready, false);
 });
 
@@ -91,10 +91,12 @@ const resolution = { prefix: "SETT", resolutionNumber: "18760000001", minNumber:
 test("cliente: tipo de documento, número sin puntos y datos obligatorios", () => {
   const c = normalizeCustomer({ docType: "NIT", id: "900.123.456-7", name: "  ACME  SAS ", email: "a@acme.co" });
   assert.equal(c.id, "9001234567"); assert.equal(c.name, "ACME SAS"); assert.equal(c.organizationType, 1);
-  assert.equal(normalizeCustomer({ docType: "CC", id: "1.007.135.575", name: "Pedro" }).organizationType, 2);
+  const p = normalizeCustomer({ docType: "CC", id: "1.007.135.575", firstName: "pedro", firstLastName: "pérez", secondLastName: "gil" });
+  assert.equal(p.organizationType, 2); assert.equal(p.name, "PEDRO PÉREZ GIL");
+  assert.throws(() => normalizeCustomer({ docType: "CC", id: "1", name: "Pedro" }), /primer nombre/);
   assert.throws(() => normalizeCustomer({ docType: "XX", id: "1", name: "a" }), /no válido/);
-  assert.throws(() => normalizeCustomer({ docType: "CC", id: "", name: "a" }), /identificación/);
-  assert.throws(() => normalizeCustomer({ docType: "CC", id: "123", name: "a", email: "mal" }), /correo/);
+  assert.throws(() => normalizeCustomer({ docType: "CC", id: "", firstName: "a", firstLastName: "b" }), /identificación/);
+  assert.throws(() => normalizeCustomer({ docType: "CC", id: "123", firstName: "a", firstLastName: "b", email: "mal" }), /correo/);
 });
 
 test("producto: nombre, precio y solo IVA 0, 5 o 19", () => {

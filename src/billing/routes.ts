@@ -1,23 +1,31 @@
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { requireAuth } from "../middleware/auth.js";
+import { serviceKeyAuth, requireServiceKey } from "../middleware/serviceKey.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { rateLimit } from "../middleware/rateLimit.js";
 import { AlanubeError, getDianPlaces } from "../services/alanubeService.js";
 import {
   BILLING_TOOL_ID, REGIME_CODES, TAX_CODES, createCompany, getCompany, listCompanies, lookupNit, normalizeResolution,
-  enableCompanySupportDocs, refreshCompanyEnablement, saveCompanyResolution, startCompanyEnablement, sandboxEnableCompany, isSandbox, updateCompany,
+  enableCompanySupportDocs, refreshCompanyEnablement, saveCompanyResolution, startCompanyEnablement, sandboxEnableCompany, isSandbox, updateCompany, productionResolutions, saveProductionResolution, submitCompanyTestSet, sendCompanyLogo,
 } from "./companies.js";
 import { assertTokenMatchesNit } from "./dianToken.js";
 import { CUSTOMER_DOC_TYPES, TAX_PERCENTS, deleteCustomer, deleteProduct, listCustomers, listProducts, saveCustomer, saveProduct } from "./catalog.js";
-import { emitSupportDocument, getSupportDocFile, saveSupportDocDraft } from "./supportDocuments.js";
+import { emitSupportDocument, getSupportDocFile, saveSupportDocDraft, supportNumbering } from "./supportDocuments.js";
 import { lookupSupplier } from "../services/supportDocsService.js";
-import { creditNoteContext, getDoc, deleteDraft, emitCreditNote, emitInvoice, getDocFile, listDocs, saveCreditNoteDraft, saveInvoiceDraft } from "./invoices.js";
+import { creditNoteContext, getDoc, deleteDraft, emitCreditNote, emitInvoice, getDocFile, invoiceCustomerEmail, invoiceNumbering, jumpInvoiceNumber, getDocView, listDocs, resendInvoiceEmail, saveCreditNoteDraft, saveInvoiceDraft } from "./invoices.js";
+import { consumo, saveCupo } from "./consumo.js";
 import { DianRangesError, fetchDianTestRanges } from "./dianRanges.js";
 
 const router = Router();
-router.use(requireAuth);
-router.use(requireToolAccess(BILLING_TOOL_ID));
 
+const userAuth = (req: Request, res: Response, next: NextFunction) => ((req as any).serviceCall ? next() : requireAuth(req, res, next));
+const userToolAccess = requireToolAccess(BILLING_TOOL_ID);
+const toolAccess = (req: Request, res: Response, next: NextFunction) => ((req as any).serviceCall ? next() : userToolAccess(req, res, next));
+router.use(serviceKeyAuth);
+router.use(userAuth);
+router.use(toolAccess);
+
+const withNumbering = async (c: any) => ({ ...c, numbering: await invoiceNumbering({ ...c, alanube: c.alanube }), supportNumbering: await supportNumbering(c) });
 const actor = (req: Request) => ({ userId: req.user!.userId, isAdmin: !!req.user!.isAdmin });
 
 /** Mensajes de la habilitación de la DIAN/Alanube traducidos para el cliente. */
@@ -30,6 +38,10 @@ function friendly(err: any): string {
 }
 const fail = (res: Response, err: any, status = 400) => res.status(status).json({ ok: false, message: friendly(err) });
 
+// Administración de la plataforma (solo el servicio de Contable; ahí se limita a los administradores de ContaGO SAS)
+router.get("/admin/consumo", requireServiceKey, async (req, res) => { try { res.json({ ok: true, ...(await consumo({ mes: String(req.query.mes || "") })) }); } catch (err) { fail(res, err); } });
+router.put("/admin/cupo", requireServiceKey, async (req, res) => { try { res.json({ ok: true, cupo: await saveCupo(req.body) }); } catch (err) { fail(res, err); } });
+
 // Catálogos del formulario de empresa
 router.get("/catalogs", async (_req, res) => {
   try {
@@ -40,7 +52,7 @@ router.get("/catalogs", async (_req, res) => {
 
 // Nombre y correo registrados en la DIAN para un NIT
 router.get("/nit", rateLimit(30, 10 * 60_000), async (req, res) => {
-  try { res.json({ ok: true, ...(await lookupNit(String(req.query.nit || ""))) }); } catch (err) { fail(res, err); }
+  try { res.json({ ok: true, ...(await lookupNit(String(req.query.nit || ""), String(req.query.type || "31"))) }); } catch (err) { fail(res, err); }
 });
 
 router.get("/empresas", async (req, res) => {
@@ -52,7 +64,7 @@ router.post("/empresas", rateLimit(10, 60 * 60_000), async (req, res) => {
 });
 
 router.get("/empresas/:id", async (req, res) => {
-  try { res.json({ ok: true, company: await refreshCompanyEnablement(actor(req), req.params.id) }); } catch (err) { fail(res, err, 404); }
+  try { res.json({ ok: true, company: await withNumbering(await refreshCompanyEnablement(actor(req), req.params.id)) }); } catch (err) { fail(res, err, 404); }
 });
 
 router.patch("/empresas/:id", async (req, res) => {
@@ -60,8 +72,14 @@ router.patch("/empresas/:id", async (req, res) => {
 });
 
 // Habilitar facturas en la DIAN con el token del cliente (el token no se guarda)
+router.put("/empresas/:id/logo", rateLimit(20, 10 * 60_000), async (req, res) => { try { await sendCompanyLogo(actor(req), req.params.id, req.body?.tipo, req.body?.base64); res.json({ ok: true }); } catch (err) { fail(res, err); } });
 router.post("/empresas/:id/habilitacion", rateLimit(10, 10 * 60_000), async (req, res) => {
   try { res.json({ ok: true, ...(await startCompanyEnablement(actor(req), req.params.id, String(req.body?.tokenDIAN || ""))) }); } catch (err) { fail(res, err); }
+});
+
+// Habilitar enviando el identificador del set de pruebas copiado del portal de la DIAN
+router.post("/empresas/:id/set-pruebas", rateLimit(10, 10 * 60_000), async (req, res) => {
+  try { res.json({ ok: true, company: await submitCompanyTestSet(actor(req), req.params.id, req.body?.testSetId) }); } catch (err) { fail(res, err); }
 });
 
 // Leer en el portal de la DIAN los rangos de numeración de prueba (abre un navegador: límite estricto)
@@ -85,6 +103,12 @@ router.post("/empresas/:id/resolucion", async (req, res) => {
   } catch (err) { fail(res, err); }
 });
 
+// Numeración real de producción: la que la DIAN tiene autorizada para el NIT (vía Alanube) y su activación
+router.put("/empresas/:id/numeracion", async (req, res) => { try { res.json({ ok: true, numbering: await jumpInvoiceNumber(actor(req), req.params.id, Number(req.body?.next)) }); } catch (err) { fail(res, err); } });
+router.get("/empresas/:id/resoluciones-produccion", async (req, res) => { try { res.json({ ok: true, resolutions: await productionResolutions(actor(req), req.params.id) }); } catch (err) { fail(res, err); } });
+router.get("/empresas/:id/resoluciones-ds", async (req, res) => { try { res.json({ ok: true, resolutions: await productionResolutions(actor(req), req.params.id, "supportDocument") }); } catch (err) { fail(res, err); } });
+router.post("/empresas/:id/resolucion-produccion", async (req, res) => { try { res.json({ ok: true, company: await saveProductionResolution(actor(req), req.params.id, req.body) }); } catch (err) { fail(res, err); } });
+
 // ─── Clientes, productos y facturas de una empresa ────────────────────────────────────────────────────────────
 
 router.get("/opciones", (_req, res) => res.json({ ok: true, customerDocTypes: CUSTOMER_DOC_TYPES, taxPercents: TAX_PERCENTS, sandbox: isSandbox() }));
@@ -99,6 +123,7 @@ router.post("/empresas/:id/productos", async (req, res) => { try { res.json({ ok
 router.put("/empresas/:id/productos/:pid", async (req, res) => { try { res.json({ ok: true, product: await saveProduct(actor(req), req.params.id, req.body, req.params.pid) }); } catch (err) { fail(res, err); } });
 router.delete("/empresas/:id/productos/:pid", async (req, res) => { try { await deleteProduct(actor(req), req.params.id, req.params.pid); res.json({ ok: true }); } catch (err) { fail(res, err); } });
 
+router.get("/empresas/:id/documentos/:did", async (req, res) => { try { res.json({ ok: true, document: await getDocView(actor(req), req.params.id, req.params.did) }); } catch (err) { fail(res, err, 404); } });
 router.get("/empresas/:id/documentos", async (req, res) => { try { res.json({ ok: true, documents: await listDocs(actor(req), req.params.id) }); } catch (err) { fail(res, err); } });
 router.post("/empresas/:id/facturas", async (req, res) => { try { res.json({ ok: true, ...(await saveInvoiceDraft(actor(req), req.params.id, req.body)) }); } catch (err) { fail(res, err); } });
 router.put("/empresas/:id/facturas/:did", async (req, res) => { try { res.json({ ok: true, ...(await saveInvoiceDraft(actor(req), req.params.id, req.body, req.params.did)) }); } catch (err) { fail(res, err); } });
@@ -106,6 +131,11 @@ router.delete("/empresas/:id/documentos/:did", async (req, res) => { try { await
 router.post("/empresas/:id/facturas/:did/emitir", rateLimit(30, 10 * 60_000), async (req, res) => {
   try { res.json({ ok: true, emission: await emitInvoice(actor(req), req.params.id, req.params.did) }); }
   catch (err) { console.error("[Facturación] emitir:", (err as Error)?.message); fail(res, err); }
+});
+router.get("/empresas/:id/facturas/:did/correo", async (req, res) => { try { res.json({ ok: true, email: await invoiceCustomerEmail(actor(req), req.params.id, req.params.did) }); } catch (err) { fail(res, err); } });
+router.post("/empresas/:id/facturas/:did/reenviar", rateLimit(20, 10 * 60_000), async (req, res) => {
+  try { res.json({ ok: true, ...(await resendInvoiceEmail(actor(req), req.params.id, req.params.did, req.body?.email)) }); }
+  catch (err) { console.error("[Facturación] reenviar:", (err as Error)?.message); fail(res, err); }
 });
 router.get("/empresas/:id/facturas/:did/nota-credito/contexto", async (req, res) => { try { res.json({ ok: true, ...(await creditNoteContext(actor(req), req.params.id, req.params.did)) }); } catch (err) { fail(res, err); } });
 router.post("/empresas/:id/notas-credito", async (req, res) => { try { res.json({ ok: true, ...(await saveCreditNoteDraft(actor(req), req.params.id, req.body)) }); } catch (err) { fail(res, err); } });

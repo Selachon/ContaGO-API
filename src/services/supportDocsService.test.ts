@@ -176,3 +176,13 @@ test("documentos adicionales: solo PDF, PNG o JPG según el contenido real, máx
   assert.throws(() => validateAttachment({ buffer: Buffer.from("<html>"), originalname: "pagina.png" }), /«pagina.png»/);
   assert.throws(() => validateAttachment({ buffer: Buffer.alloc(10 * 1024 * 1024 + 1, 0x25), originalname: "grande.pdf" }), /más de 10 MB/);
 });
+
+test("documento soporte con varias líneas: ítems, totales y retención sobre la suma", () => {
+  const input = normalizeSupportDoc({ ...raw(), reteRentaPct: 4, lines: [{ description: "Asesoría", quantity: 2, unitPrice: 100000 }, { description: "Transporte", quantity: 1, unitPrice: 50000 }] });
+  assert.equal(input.lines?.length, 2); assert.equal(input.concept, "Asesoría");
+  assert.deepEqual(supportTotals(input), { subtotal: 250000, retention: 10000, net: 240000 });
+  const p: any = buildSupportDocPayload({ input, number: 1, cfg, resolution: res });
+  assert.equal(p.items.length, 2); assert.equal(p.totalAmounts.grossTotal, 250000);
+  assert.equal(p.withholdingTaxTotal[0].taxAmount, 10000);
+  assert.throws(() => normalizeSupportDoc({ ...raw(), lines: [{ description: "", quantity: 1, unitPrice: 1 }] }), /ítem 1/);
+});

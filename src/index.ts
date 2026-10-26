@@ -31,6 +31,7 @@ import erpRoutes from "./erp/routes/index.js";
 import supportDocsRoutes from "./routes/supportDocs.js";
 import supportDocsPublicRoutes from "./routes/supportDocsPublic.js";
 import billingRoutes from "./billing/routes.js";
+import contableBridgeRoutes from "./routes/contableBridge.js";
 import { normalizarTokenSafeLinks } from "./middleware/validateDianUrl.js";
 import { connectMongo, seedAdminUser, migrateToolSlugs } from "./services/database.js";
 import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
@@ -108,6 +109,7 @@ app.use("/erp", erpRoutes);
 app.use("/documentos-soporte", supportDocsRoutes);
 app.use("/public/documentos-soporte", supportDocsPublicRoutes);
 app.use("/facturacion", billingRoutes);
+app.use("/contable-bridge", contableBridgeRoutes);
 
 // Health check
 app.get("/", (_req, res) => {

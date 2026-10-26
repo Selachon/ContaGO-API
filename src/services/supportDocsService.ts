@@ -51,6 +51,8 @@ export interface SupportDocInput {
   concept: string;
   quantity: number;
   unitPrice: number;
+  /** Varias líneas (Contable): si vienen, mandan sobre `concept`/`quantity`/`unitPrice`, que repiten la primera. */
+  lines?: { description: string; quantity: number; unitPrice: number }[];
   issueDate: string;
   /** Retención en la fuente (ReteRenta) en %. */
   reteRentaPct?: number;
@@ -105,9 +107,17 @@ export function normalizeSupportDoc(raw: any): SupportDocInput {
   const cityCode = resident ? clean(s.cityCode, 5) : "";
   const country = resident ? "CO" : clean(s.country, 2).toUpperCase();
   const cityName = resident ? "" : clean(s.cityName, 80);
-  const concept = clean(raw?.concept, 300);
-  const quantity = Number(raw?.quantity);
-  const unitPrice = Number(raw?.unitPrice);
+  const rawLines: any[] = Array.isArray(raw?.lines) ? raw.lines : [];
+  const lines = rawLines.map((l, i) => {
+    const line = { description: clean(l?.description, 300), quantity: Number(l?.quantity), unitPrice: Number(l?.unitPrice) };
+    if (!line.description) throw new Error(`Falta la descripción del ítem ${i + 1}.`);
+    if (!(line.quantity > 0)) throw new Error(`La cantidad del ítem ${i + 1} debe ser mayor que cero.`);
+    if (!(line.unitPrice > 0)) throw new Error(`El valor del ítem ${i + 1} debe ser mayor que cero.`);
+    return line;
+  }).slice(0, 50);
+  const concept = lines.length ? lines[0].description : clean(raw?.concept, 300);
+  const quantity = lines.length ? lines[0].quantity : Number(raw?.quantity);
+  const unitPrice = lines.length ? lines[0].unitPrice : Number(raw?.unitPrice);
   const issueDate = clean(raw?.issueDate, 10) || todayBogota(); // la completa ContaGO al transmitir: por defecto, hoy
   const missing = [
     !name && "nombre del proveedor", !idDigits && "número de identificación del proveedor", !address && "dirección del proveedor",
@@ -133,17 +143,18 @@ export function normalizeSupportDoc(raw: any): SupportDocInput {
       email: clean(s.email, 120) || undefined, phone: clean(s.phone, 30) || undefined, postalCode: clean(s.postalCode, 6) || undefined,
     },
     bill: { number: clean(raw?.bill?.number, 40) || undefined, date: billDate || undefined },
-    concept, quantity, unitPrice, issueDate, reteRentaPct: rete,
+    concept, quantity, unitPrice, ...(lines.length > 0 && { lines }), issueDate, reteRentaPct: rete,
     payment: { form: raw?.payment?.form === "2" ? "2" : "1", days: Number(raw?.payment?.days) || undefined, method: clean(raw?.payment?.method, 3) || undefined },
     notes,
   };
 }
 
 /** Totales del documento: sin IVA; la retención no cambia el total del documento, solo lo que se paga al proveedor. */
-export function supportTotals(input: Pick<SupportDocInput, "quantity" | "unitPrice" | "reteRentaPct">) {
-  const item = buildItem({ description: "x", price: input.unitPrice, quantity: input.quantity, unitCode: "94", taxes: [{ taxCode: "01", percentage: 0 }] });
-  const retention = round2((item.subtotal * (input.reteRentaPct || 0)) / 100);
-  return { subtotal: item.subtotal, retention, net: round2(item.subtotal - retention) };
+export function supportTotals(input: Pick<SupportDocInput, "quantity" | "unitPrice" | "reteRentaPct"> & { lines?: SupportDocInput["lines"] }) {
+  const partes = input.lines?.length ? input.lines.map(l => ({ price: l.unitPrice, quantity: l.quantity })) : [{ price: input.unitPrice, quantity: input.quantity }];
+  const subtotal = round2(partes.reduce((t, p) => t + buildItem({ description: "x", price: p.price, quantity: p.quantity, unitCode: "94", taxes: [{ taxCode: "01", percentage: 0 }] }).subtotal, 0));
+  const retention = round2((subtotal * (input.reteRentaPct || 0)) / 100);
+  return { subtotal, retention, net: round2(subtotal - retention) };
 }
 
 /** Arma el payload de `POST /support-documents`. */
@@ -151,12 +162,13 @@ export function buildSupportDocPayload(args: { input: SupportDocInput; number: n
   const { input, cfg } = args;
   const s = input.supplier;
   const payment = validatePayment({ form: input.payment?.form, days: input.payment?.days, method: input.payment?.method });
-  const items = [buildItem({
+  const partes = input.lines?.length ? input.lines.map(l => ({ concept: l.description, quantity: l.quantity, unitPrice: l.unitPrice })) : [{ concept: input.concept, quantity: input.quantity, unitPrice: input.unitPrice }];
+  const items = partes.map(l => buildItem({
     // El documento soporte NO lleva el prefijo «Cloud Computing - » (eso es solo de las facturas y notas crédito de ContaGO)
-    description: input.concept.replace(/\s+/g, " ").trim().slice(0, 300), price: input.unitPrice, quantity: input.quantity, unitCode: "94",
+    description: l.concept.replace(/\s+/g, " ").trim().slice(0, 300), price: l.unitPrice, quantity: l.quantity, unitCode: "94",
     // Sin `taxes` la DIAN rechaza (DSAU04): se declara el IVA al 0 %
     taxes: [{ taxCode: "01", percentage: 0 }], standardCode: { identificationId: "1", id: "999" },
-  })];
+  }));
   const totals = buildTotals(items);
   const rete = input.reteRentaPct || 0;
   const notes = [
@@ -176,7 +188,7 @@ export function buildSupportDocPayload(args: { input: SupportDocInput; number: n
       name: s.name, origin: s.origin, organizationType: s.organizationType, identificationType: s.idType, identificationNumber: s.id,
       ...(s.idType === "31" && { dv: nitDv(s.id) }), regimeCode: "R-99-PN", taxCode: "ZZ",
       // En pruebas el correo del proveedor se sustituye por el del emisor para no escribirle a terceros
-      email: cfg.email, ...(s.phone && { phone: s.phone }),
+      email: /sandbox/i.test(process.env.ALANUBE_BASE_URL || "") ? cfg.email : (s.email || cfg.email), ...(s.phone && { phone: s.phone }),
       // Residente: municipio DIAN (y código postal si lo tiene). No residente: solo el país, que no puede ser CO
       address: s.origin === "10"
         ? { address: s.address, city: s.cityCode, ...(s.postalCode && { postalCode: s.postalCode }), country: "CO" }

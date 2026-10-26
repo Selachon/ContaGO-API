@@ -33,6 +33,7 @@ import {
   type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
+import { ContableError, facturarVentaContable, lugaresContable, pdfContable, prepararVentaContable } from "../services/contablePortal.js";
 import { COMMISSION_RATE, listLedgerRows, setInvoice, planLegacyImport, runLegacyImport } from "../services/facturacionService.js";
 import { emitTestInvoice, getInvoiceFile } from "../services/alanubeInvoicing.js";
 import { CREDIT_CONCEPTS, defaultConcept, describeCreditNoteTarget, emitTestCreditNote } from "../services/alanubeCreditNotes.js";
@@ -1040,6 +1041,34 @@ router.post("/facturacion/factura", async (req: Request, res: Response) => {
     res.json({ ok: true, changed });
   } catch (err: any) {
     res.status(400).json({ ok: false, message: err.message || "Error registrando la factura" });
+  }
+});
+
+// Facturar una venta del portal con el software contable: se prepara (cliente validado con la DIAN) y, confirmada, se emite
+const ventaDe = (src: any) => ({ userId: String(src?.userId || ""), toolId: String(src?.toolId || ""), paymentId: String(src?.paymentId || "") });
+const falla = (res: Response, err: any) => res.status(err instanceof ContableError ? err.status : 500).json({ ok: false, message: err instanceof ContableError ? err.message : "Error facturando la venta", codigo: err?.codigo });
+router.get("/facturacion/venta/preparar", async (req: Request, res: Response) => {
+  try { res.json(await prepararVentaContable(ventaDe(req.query), req.query.document ? { docType: String(req.query.docType || ""), document: String(req.query.document) } : undefined)); } catch (err) { falla(res, err); }
+});
+router.get("/facturacion/venta/pdf", async (req: Request, res: Response) => {
+  try {
+    const f = await pdfContable(String(req.query.docId || ""));
+    res.setHeader("content-type", f.tipo);
+    res.send(f.data);
+  } catch (err) { falla(res, err); }
+});
+router.get("/facturacion/venta/lugares", async (_req: Request, res: Response) => {
+  try { res.json(await lugaresContable()); } catch (err) { falla(res, err); }
+});
+router.post("/facturacion/venta/facturar", async (req: Request, res: Response) => {
+  try {
+    const v = ventaDe(req.body);
+    const r = await facturarVentaContable(v, req.body?.cliente || {});
+    await logAdminAction({ actorId: req.user!.userId, action: "invoice_sale", after: { ...v, factura: r.numero }, ip: req.ip, userAgent: req.get("user-agent") });
+    res.json(r);
+  } catch (err) {
+    await logAdminAction({ actorId: req.user!.userId, action: "invoice_sale_failed", after: { ...ventaDe(req.body), motivo: (err as Error)?.message }, ip: req.ip, userAgent: req.get("user-agent") }).catch(() => undefined);
+    falla(res, err);
   }
 });
 

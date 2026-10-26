@@ -157,6 +157,15 @@ export async function createSupportDocument(payload: Record<string, unknown>): P
  * Nombre y correo que la DIAN tiene registrados para un documento. Para un número que no existe Alanube responde
  * "Consumidor Final" con HTTP 200: eso se trata como "no encontrado".
  */
+/** Resoluciones de facturación vigentes del NIT en la DIAN de producción (solo existe en producción). */
+export async function getProductionResolutions(nit: string): Promise<Array<{ prefix: string; resolutionNumber: string; minNumber: number; maxNumber: number; startDate: string; endDate: string; technicalKey?: string }>> {
+  const r = await request<{ resolutions?: Array<Record<string, any>> }>("GET", `/resolutions/${encodeURIComponent(nit)}`);
+  return (r.resolutions || []).map(x => ({
+    prefix: String(x.prefix ?? ""), resolutionNumber: String(x.resolutionNumber ?? ""), minNumber: Number(x.minNumber), maxNumber: Number(x.maxNumber),
+    startDate: String(x.startDate ?? ""), endDate: String(x.endDate ?? ""), technicalKey: x.technicalKey ? String(x.technicalKey) : undefined,
+  }));
+}
+
 export async function getAcquirerInfo(identificationType: string, identificationNumber: string): Promise<{ name: string; email: string } | null> {
   const q = `identificationType=${encodeURIComponent(identificationType)}&identificationNumber=${encodeURIComponent(identificationNumber)}`;
   const r = await request<{ receiverName?: string; receiverEmail?: string }>("GET", `/acquirer-info?${q}`);
@@ -176,6 +185,11 @@ export interface AlanubeCompanyCreate {
 
 export async function getCompanyById(id: string): Promise<AlanubeCompany> {
   return (await request<{ company: AlanubeCompany }>("GET", `/companies/${encodeURIComponent(id)}`)).company;
+}
+
+/** Reenvía por correo un documento ya emitido (POST /send-email; tipo 01 = factura, 91 = nota crédito). */
+export async function sendDocumentEmail(documentType: string, documentId: string, to: string, replyTo: string): Promise<void> {
+  await request("POST", "/send-email", { documentType, documentId, email: { to, replyTo } });
 }
 
 /** Edita una empresa ya creada (PATCH /companies/{id}; /company/{id} no existe). */

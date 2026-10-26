@@ -1,10 +1,11 @@
 import { ObjectId, Binary } from "mongodb";
+import { ambienteActual } from "./consumo.js";
 import { getDb } from "../services/database.js";
 import { AlanubeError, createSupportDocument, downloadFile, isInvoiceAccepted } from "../services/alanubeService.js";
 import { normalizeSupportDoc, buildSupportDocPayload, supportTotals, type SupportDocInput } from "../services/supportDocsService.js";
 import { renderSupportDocPdf } from "../services/alanubePdf.js";
 import type { AlanubeIssuerConfig } from "../services/alanubeInvoicing.js";
-import { getCompany, readiness, type Actor } from "./companies.js";
+import { getCompany, isSandbox, readiness, type Actor } from "./companies.js";
 
 /**
  * Documentos soporte (compras a proveedores no obligados a facturar) de las empresas de los clientes. Misma mecánica que las
@@ -28,6 +29,15 @@ export function issuerFromCompany(c: any): AlanubeIssuerConfig {
     regimeCode: i.regimeCodes.join(";"), taxCode: i.taxCode,
     resolution: { resolutionNumber: "", prefix: "", minNumber: 0, maxNumber: 0, startDate: "", endDate: "", technicalKey: "" }, firstNumber: 1,
   };
+}
+
+/** Siguiente consecutivo de la numeración activa del documento soporte (sin reservarlo) y cuánto queda del rango. */
+export async function supportNumbering(c: any) {
+  const res = (c.resolutions || []).find((r: any) => r.docType === "supportDocument" && r.active && (isSandbox() || r.environment === "produccion"));
+  if (!res || !c.alanube?.companyId) return null;
+  const used = ((await counters().findOne({ _id: `DSE:${c.alanube.companyId}:${res.prefix}` } as any) as any)?.seq ?? 0) as number;
+  const next = Math.max(used + 1, res.startNumber ?? res.minNumber);
+  return { prefix: res.prefix, next, fullNext: `${res.prefix}${next}`, min: res.minNumber, max: res.maxNumber, remaining: Math.max(0, res.maxNumber - next + 1), endDate: res.endDate };
 }
 
 const snapshot = (input: SupportDocInput) => {
@@ -59,8 +69,7 @@ async function reserveNumber(c: any, res: any, docId: string): Promise<number> {
 export async function emitSupportDocument(a: Actor, companyId: string, id: string) {
   const company = await getCompany(a, companyId);
   if (!readiness(company).supportReady) throw new Error("Activa primero el documento soporte de tu empresa (paso «Documento soporte» del asistente).");
-  if (!/sandbox/i.test(process.env.ALANUBE_BASE_URL || "")) throw new Error("Por ahora solo se emite en el ambiente de pruebas.");
-  const res = (company.resolutions || []).find((r: any) => r.docType === "supportDocument" && r.active);
+  const res = (company.resolutions || []).find((r: any) => r.docType === "supportDocument" && r.active && (isSandbox() || r.environment === "produccion"));
   const locked = await docs().findOneAndUpdate({ _id: oid(id), companyId, type: "supportDocument", status: { $in: PENDING } }, { $set: { status: "emitiendo", updatedAt: new Date().toISOString() } }, { returnDocument: "after" });
   const doc: any = (locked as any)?.value ?? locked;
   if (!doc) throw new Error("El documento no existe, ya fue emitido o se está emitiendo.");
@@ -79,7 +88,7 @@ export async function emitSupportDocument(a: Actor, companyId: string, id: strin
     }
     await files().updateOne({ _id: r.id } as any, { $set: stored }, { upsert: true });
     const emission = { number, prefix: res.prefix, fullNumber: r.fullNumber, cufe: r.cuds || r.cufe, legalStatus: r.legalStatus, accepted, errors, alanubeId: r.id, at, date: r.date, qrCodeContent: r.qrCodeContent, xmlFileName: r.xmlFileName, total: doc.totals.payableTotal };
-    await docs().updateOne({ _id: oid(id) }, { $set: { status: accepted ? "emitida" : "rechazada", emission, payload, updatedAt: new Date().toISOString() }, $push: { attempts: { number, at, outcome: r.legalStatus } } } as any);
+    await docs().updateOne({ _id: oid(id) }, { $set: { status: accepted ? "emitida" : "rechazada", ambiente: ambienteActual(), emission, payload, updatedAt: new Date().toISOString() }, $push: { attempts: { number, at, outcome: r.legalStatus } } } as any);
     return emission;
   } catch (e: any) {
     const message = e instanceof AlanubeError ? e.message : (e?.message || "Error desconocido");

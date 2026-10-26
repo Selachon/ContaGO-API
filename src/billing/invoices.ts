@@ -1,6 +1,7 @@
 import { ObjectId, Binary } from "mongodb";
+import { ambienteActual } from "./consumo.js";
 import { getDb } from "../services/database.js";
-import { AlanubeError, createCreditNote, createInvoice, downloadFile, getInvoiceFiles, isInvoiceAccepted } from "../services/alanubeService.js";
+import { AlanubeError, createCreditNote, createInvoice, downloadFile, getInvoiceFiles, isInvoiceAccepted, sendDocumentEmail } from "../services/alanubeService.js";
 import { CREDIT_CONCEPTS, assertCreditable, defaultConcept } from "../services/alanubeCreditNotes.js";
 import { extractFromZip, resolveCustomer, validatePayment } from "../services/alanubeInvoicing.js";
 import { buildItem, buildTotals } from "../services/alanubeTotals.js";
@@ -100,7 +101,7 @@ const view = (d: any) => { const { payload, ...rest } = d; return { ...rest, id:
 async function snapshot(a: Actor, companyId: string, input: InvoiceInput) {
   const cu = await getCustomer(a, companyId, input.customerId);
   const { totals } = invoiceTotals(input.lines);
-  return { customer: { id: String(cu._id), name: cu.name, docType: cu.docType, document: cu.id }, totals };
+  return { customer: { id: String(cu._id), name: cu.name, docType: cu.docType, document: cu.id, firstName: cu.firstName, secondName: cu.secondName, firstLastName: cu.firstLastName, secondLastName: cu.secondLastName }, totals };
 }
 
 export async function listDocs(a: Actor, companyId: string) {
@@ -113,6 +114,16 @@ export async function getDoc(a: Actor, companyId: string, id: string) {
   const d = await docs().findOne({ _id: oid(id), companyId });
   if (!d) throw new Error("Documento no encontrado.");
   return d;
+}
+
+/** Documento para pantalla: sin el payload crudo, con el correo del cliente y el ambiente en que se emitió. */
+export async function getDocView(a: Actor, companyId: string, id: string) {
+  const d = await getDoc(a, companyId, id);
+  const cu = d.input?.customerId ? await customerEmailOf(a, companyId, d.input.customerId) : null;
+  return { ...view(d), customerEmail: cu?.email ?? null, customerAddress: cu?.address ?? null };
+}
+async function customerEmailOf(a: Actor, companyId: string, customerId: string) {
+  try { const c: any = await getCustomer(a, companyId, customerId); return { email: c.email as string | undefined, address: c.address as string | undefined }; } catch { return null; }
 }
 
 export async function saveInvoiceDraft(a: Actor, companyId: string, raw: any, id?: string) {
@@ -148,6 +159,27 @@ async function reserveNumber(c: any, res: BillingResolution, docId: string): Pro
   return seq;
 }
 
+/** Siguiente consecutivo de la numeración activa (sin reservarlo) y cuánto queda del rango. */
+export async function invoiceNumbering(c: any) {
+  const res: BillingResolution | undefined = (c.resolutions || []).find((r: any) => r.docType === "invoice" && r.active);
+  if (!res) return null;
+  const used = ((await counters().findOne({ _id: `INV:${c.alanube.companyId}:${res.prefix}` } as any) as any)?.seq ?? 0) as number;
+  const next = Math.max(used + 1, res.startNumber ?? res.minNumber);
+  return { prefix: res.prefix, next, fullNext: `${res.prefix}${next}`, min: res.minNumber, max: res.maxNumber, remaining: Math.max(0, res.maxNumber - next + 1), endDate: res.endDate };
+}
+
+/** Salta la numeración activa: el siguiente número será `next`. Solo hacia adelante (retroceder repetiría números ya usados o emitidos en otro sistema). */
+export async function jumpInvoiceNumber(a: Actor, companyId: string, next: number) {
+  const c = await getCompany(a, companyId);
+  const res: BillingResolution | undefined = (c.resolutions || []).find((r: any) => r.docType === "invoice" && r.active);
+  if (!res) throw new Error("La empresa no tiene una numeración de facturas activa.");
+  if (!Number.isInteger(next) || next < res.minNumber || next > res.maxNumber) throw new Error(`El número debe estar dentro del rango de la resolución (${res.minNumber} a ${res.maxNumber}).`);
+  const cur = await invoiceNumbering(c);
+  if (cur && next < cur.next) throw new Error(`La numeración ya va en ${cur.next}: solo se puede avanzar, no retroceder.`);
+  await counters().updateOne({ _id: `INV:${c.alanube.companyId}:${res.prefix}` } as any, { $max: { seq: next - 1 } }, { upsert: true });
+  return invoiceNumbering(c);
+}
+
 export interface InvoiceEmission {
   number: number; prefix: string; fullNumber?: string; cufe?: string; legalStatus?: string; accepted?: boolean;
   errors: string[]; alanubeId?: string; at: string; errorMessage?: string; date?: string; total?: number; dueDate?: string;
@@ -161,7 +193,6 @@ export interface InvoiceEmission {
 export async function emitInvoice(a: Actor, companyId: string, id: string): Promise<InvoiceEmission> {
   const company = await getCompany(a, companyId);
   if (!readiness(company).ready) throw new Error("Tu empresa aún no está lista para emitir: completa la habilitación y la numeración.");
-  if (!/sandbox/i.test(process.env.ALANUBE_BASE_URL || "")) throw new Error("Por ahora solo se emite en el ambiente de pruebas.");
   const res: BillingResolution | undefined = (company.resolutions || []).find((r: any) => r.docType === "invoice" && r.active);
   if (!res) throw new Error("La empresa no tiene una numeración de facturas activa.");
 
@@ -174,7 +205,7 @@ export async function emitInvoice(a: Actor, companyId: string, id: string): Prom
   try {
     const customer = await getCustomer(a, companyId, doc.input.customerId);
     number = await reserveNumber(company, res, id);
-    const payload = buildInvoicePayload({ company, resolution: res, number, customer, input: doc.input, testMode: true });
+    const payload = buildInvoicePayload({ company, resolution: res, number, customer, input: doc.input, testMode: /sandbox/i.test(process.env.ALANUBE_BASE_URL || "") });
     const r = await createInvoice(payload);
     const accepted = isInvoiceAccepted(r);
     const errors = r.governmentResponse?.errorMessages || [];
@@ -187,7 +218,7 @@ export async function emitInvoice(a: Actor, companyId: string, id: string): Prom
     }
     const total = (payload.totalAmounts as any).payableTotal as number;
     const emission: InvoiceEmission = { number, prefix: res.prefix, fullNumber: r.fullNumber, cufe: r.cufe, legalStatus: r.legalStatus, accepted, errors, alanubeId: r.id, at, date: r.date, total, dueDate: (payload.payments as any)[0]?.paymentDueDate };
-    await docs().updateOne({ _id: oid(id) }, { $set: { status: (accepted ? "emitida" : "rechazada") as DocStatus, emission, zipSaved, payload, updatedAt: new Date().toISOString() }, $push: { attempts: { number, at, outcome: r.legalStatus } } } as any);
+    await docs().updateOne({ _id: oid(id) }, { $set: { status: (accepted ? "emitida" : "rechazada") as DocStatus, ambiente: ambienteActual(), emission, zipSaved, payload, updatedAt: new Date().toISOString() }, $push: { attempts: { number, at, outcome: r.legalStatus } } } as any);
     return emission;
   } catch (e: any) {
     const message = e instanceof AlanubeError ? e.message : (e?.message || "Error desconocido");
@@ -196,13 +227,42 @@ export async function emitInvoice(a: Actor, companyId: string, id: string): Prom
   }
 }
 
+const EMAIL_RX = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+
+/** Correo que tiene el cliente en la factura (el que se propone al reenviar). */
+export async function invoiceCustomerEmail(a: Actor, companyId: string, id: string): Promise<string> {
+  const d = await getDoc(a, companyId, id);
+  const cu = await getCustomer(a, companyId, d.input.customerId).catch(() => null);
+  return (cu?.email || "").trim();
+}
+
+/** Reenvía al correo indicado una factura emitida y aceptada (lo envía Alanube con el PDF y el XML oficiales). */
+export async function resendInvoiceEmail(a: Actor, companyId: string, id: string, rawEmail: unknown) {
+  const company = await getCompany(a, companyId);
+  const d = await getDoc(a, companyId, id);
+  if (d.type !== "invoice" || d.status !== "emitida" || !d.emission?.alanubeId) throw new Error("Solo se pueden reenviar facturas ya emitidas y aceptadas.");
+  const to = String(rawEmail ?? "").trim().toLowerCase();
+  if (!EMAIL_RX.test(to) || to.length > 200) throw new Error("Escribe un correo válido.");
+  await sendDocumentEmail("01", d.emission.alanubeId, to, String(company.input?.email || to));
+  await docs().updateOne({ _id: oid(id) }, { $push: { emailsSent: { to, at: new Date().toISOString() } } } as any);
+  return { to };
+}
+
 /** Archivo oficial de una factura emitida: ZIP (AttachedDocument + PDF), PDF o XML sacados de ese ZIP. */
 export async function getDocFile(a: Actor, companyId: string, id: string, kind: "zip" | "pdf" | "xml") {
   const d = await getDoc(a, companyId, id);
   const alanubeId = d.emission?.alanubeId;
   if (!alanubeId) return null;
-  const f = await files().findOne({ _id: alanubeId } as any);
-  if (!f?.zip) return null;
+  let f = await files().findOne({ _id: alanubeId } as any);
+  if (!f?.zip) {
+    // En producción el ZIP oficial puede tardar en estar listo al emitir: se trae ahora y se guarda
+    const remote = await getInvoiceFiles(alanubeId);
+    if (!remote.zip) return null;
+    const zipBuf = await downloadFile(remote.zip);
+    f = { zip: new Binary(zipBuf) };
+    await files().updateOne({ _id: alanubeId } as any, { $set: { companyId, fullNumber: d.emission.fullNumber, zip: f.zip, savedAt: new Date().toISOString() } }, { upsert: true });
+    await docs().updateOne({ _id: oid(id) }, { $set: { zipSaved: true } });
+  }
   const zip = Buffer.from(f.zip.buffer);
   const name = String(d.emission.fullNumber);
   if (kind === "zip") return { data: zip, filename: `${name}.zip`, contentType: "application/zip" };
@@ -311,7 +371,7 @@ export async function emitCreditNote(a: Actor, companyId: string, id: string): P
       } catch (e: any) { console.warn("[Facturación] ZIP de la nota crédito:", e?.message); }
     }
     const emission: InvoiceEmission = { number, prefix: "NC", fullNumber: r.fullNumber, cufe: (r as any).cude, legalStatus: r.legalStatus, accepted, errors, alanubeId: r.id, at, date: r.date, total: doc.totals.payableTotal };
-    await docs().updateOne({ _id: oid(id) }, { $set: { status: (accepted ? "emitida" : "rechazada") as DocStatus, emission, payload, updatedAt: new Date().toISOString() }, $push: { attempts: { number, at, outcome: r.legalStatus } } } as any);
+    await docs().updateOne({ _id: oid(id) }, { $set: { status: (accepted ? "emitida" : "rechazada") as DocStatus, ambiente: ambienteActual(), emission, payload, updatedAt: new Date().toISOString() }, $push: { attempts: { number, at, outcome: r.legalStatus } } } as any);
     return emission;
   } catch (e: any) {
     const message = e instanceof AlanubeError ? e.message : (e?.message || "Error desconocido");
