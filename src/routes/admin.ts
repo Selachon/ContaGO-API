@@ -1054,7 +1054,10 @@ const ventasDe = (src: any) => {
 };
 const falla = (res: Response, err: any) => res.status(err instanceof ContableError ? err.status : 500).json({ ok: false, message: err instanceof ContableError ? err.message : "Error facturando la venta", codigo: err?.codigo });
 router.get("/facturacion/venta/preparar", async (req: Request, res: Response) => {
-  try { res.json(await prepararVentaContable(ventasDe(req.query), req.query.document ? { docType: String(req.query.docType || ""), document: String(req.query.document) } : undefined)); } catch (err) { falla(res, err); }
+  try { res.json(await prepararVentaContable(ventasDe(req.query), req.query.document ? { docType: String(req.query.docType || ""), document: String(req.query.document) } : undefined)); } catch (err) {
+    await logAdminAction({ actorId: req.user!.userId, action: "invoice_prepare_failed", after: { ventas: ventasDe(req.query), motivo: (err as Error)?.message }, ip: req.ip, userAgent: req.get("user-agent") }).catch(() => undefined);
+    falla(res, err);
+  }
 });
 router.get("/facturacion/venta/pdf", async (req: Request, res: Response) => {
   try {

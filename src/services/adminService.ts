@@ -766,7 +766,8 @@ export async function addToolPayment(id: string, toolId: string, input: NewToolP
     }
     // Activación: arranca el día indicado. Renovación: continúa el periodo vigente si aún no vence.
     let start = input.periodStart && DATE_RE.test(input.periodStart) ? input.periodStart : paidAt;
-    if (type === "renovacion" && !input.periodStart && baseEnd && baseEnd >= paidAt) start = baseEnd;
+    // El plan conserva su ciclo: la renovación siempre continúa desde el vencimiento anterior, aunque se pague tarde (pagar tarde no regala días)
+    if (type === "renovacion" && !input.periodStart && baseEnd) start = baseEnd;
     const end = addMonthsIso(start, months);
     payment.periodicityMonths = months;
     payment.periodStart = start;
