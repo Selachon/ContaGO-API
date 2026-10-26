@@ -21,10 +21,13 @@ async function llamar<T>(path: string, init: { method?: string; body?: unknown }
   return data as T;
 }
 
-export const ventaKey = (t: { userId: string; toolId: string; paymentId: string }) => `${t.userId}|${t.toolId}|${t.paymentId}`;
-export const prepararVentaContable = (t: { userId: string; toolId: string; paymentId: string }, doc?: { docType?: string; document?: string }) =>
-  llamar<any>(`/preparar?venta=${encodeURIComponent(ventaKey(t))}${doc?.document ? `&docType=${encodeURIComponent(doc.docType || "")}&document=${encodeURIComponent(doc.document)}` : ""}`);
-export const facturarVentaContable = (t: { userId: string; toolId: string; paymentId: string }, cliente: unknown) => llamar<any>("/facturar", { method: "POST", body: { venta: ventaKey(t), cliente } });
+export type VentaRef = { userId: string; toolId: string; paymentId: string };
+export const ventaKey = (t: VentaRef) => `${t.userId}|${t.toolId}|${t.paymentId}`;
+/** Una o varias ventas de un mismo cliente: un paquete se factura en una sola factura, una línea por herramienta. */
+const ventasKey = (t: VentaRef | VentaRef[]) => (Array.isArray(t) ? t : [t]).map(ventaKey).join(",");
+export const prepararVentaContable = (t: VentaRef | VentaRef[], doc?: { docType?: string; document?: string }) =>
+  llamar<any>(`/preparar?venta=${encodeURIComponent(ventasKey(t))}${doc?.document ? `&docType=${encodeURIComponent(doc.docType || "")}&document=${encodeURIComponent(doc.document)}` : ""}`);
+export const facturarVentaContable = (t: VentaRef | VentaRef[], cliente: unknown) => llamar<any>("/facturar", { method: "POST", body: { venta: ventasKey(t), cliente } });
 export const lugaresContable = () => llamar<any>("/lugares");
 
 /** PDF de la factura de una venta (binario). */

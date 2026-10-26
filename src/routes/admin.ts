@@ -1046,9 +1046,15 @@ router.post("/facturacion/factura", async (req: Request, res: Response) => {
 
 // Facturar una venta del portal con el software contable: se prepara (cliente validado con la DIAN) y, confirmada, se emite
 const ventaDe = (src: any) => ({ userId: String(src?.userId || ""), toolId: String(src?.toolId || ""), paymentId: String(src?.paymentId || "") });
+// Un paquete: varias ventas del mismo cliente (query pagos=toolId:paymentId,… o cuerpo pagos=[{toolId,paymentId}]) en una sola factura
+const ventasDe = (src: any) => {
+  const userId = String(src?.userId || "");
+  const lista = Array.isArray(src?.pagos) ? src.pagos : typeof src?.pagos === "string" && src.pagos ? src.pagos.split(",").map((x: string) => { const [toolId, paymentId] = x.split(":"); return { toolId, paymentId }; }) : null;
+  return lista ? lista.map((p: any) => ({ userId, toolId: String(p?.toolId || ""), paymentId: String(p?.paymentId || "") })) : [ventaDe(src)];
+};
 const falla = (res: Response, err: any) => res.status(err instanceof ContableError ? err.status : 500).json({ ok: false, message: err instanceof ContableError ? err.message : "Error facturando la venta", codigo: err?.codigo });
 router.get("/facturacion/venta/preparar", async (req: Request, res: Response) => {
-  try { res.json(await prepararVentaContable(ventaDe(req.query), req.query.document ? { docType: String(req.query.docType || ""), document: String(req.query.document) } : undefined)); } catch (err) { falla(res, err); }
+  try { res.json(await prepararVentaContable(ventasDe(req.query), req.query.document ? { docType: String(req.query.docType || ""), document: String(req.query.document) } : undefined)); } catch (err) { falla(res, err); }
 });
 router.get("/facturacion/venta/pdf", async (req: Request, res: Response) => {
   try {
@@ -1062,12 +1068,12 @@ router.get("/facturacion/venta/lugares", async (_req: Request, res: Response) =>
 });
 router.post("/facturacion/venta/facturar", async (req: Request, res: Response) => {
   try {
-    const v = ventaDe(req.body);
+    const v = ventasDe(req.body);
     const r = await facturarVentaContable(v, req.body?.cliente || {});
-    await logAdminAction({ actorId: req.user!.userId, action: "invoice_sale", after: { ...v, factura: r.numero }, ip: req.ip, userAgent: req.get("user-agent") });
+    await logAdminAction({ actorId: req.user!.userId, action: "invoice_sale", after: { ventas: v, factura: r.numero }, ip: req.ip, userAgent: req.get("user-agent") });
     res.json(r);
   } catch (err) {
-    await logAdminAction({ actorId: req.user!.userId, action: "invoice_sale_failed", after: { ...ventaDe(req.body), motivo: (err as Error)?.message }, ip: req.ip, userAgent: req.get("user-agent") }).catch(() => undefined);
+    await logAdminAction({ actorId: req.user!.userId, action: "invoice_sale_failed", after: { ventas: ventasDe(req.body), motivo: (err as Error)?.message }, ip: req.ip, userAgent: req.get("user-agent") }).catch(() => undefined);
     falla(res, err);
   }
 });
