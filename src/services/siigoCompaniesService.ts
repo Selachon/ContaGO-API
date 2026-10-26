@@ -46,6 +46,8 @@ export interface CompanySettings {
   consolidateInc?: boolean;
   /** Si true, cada factura muestra un checkbox para activar IVA mayor valor de forma esporádica (en vez de aplicar a todas). */
   ivaEsporadico?: boolean;
+  /** Cuentas excluidas de la sugerencia de gasto (ej. cuentas de impuestos que el balance incluye pero no deben sugerirse). */
+  excludedGastoAccounts?: string[];
 }
 
 export interface PaymentRecord {
@@ -424,6 +426,7 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.defaultItemMode !== undefined) patch["settings.defaultItemMode"] = settings.defaultItemMode === "product" ? "product" : "account";
   if (settings.consolidateInc !== undefined) patch["settings.consolidateInc"] = Boolean(settings.consolidateInc);
   if (settings.ivaEsporadico !== undefined) patch["settings.ivaEsporadico"] = Boolean(settings.ivaEsporadico);
+  if (settings.excludedGastoAccounts !== undefined) patch["settings.excludedGastoAccounts"] = Array.isArray(settings.excludedGastoAccounts) ? settings.excludedGastoAccounts : [];
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");

@@ -453,17 +453,25 @@ export async function getSupplierProfile(nit: string): Promise<SupplierProfile |
   const key = normNit(nit);
   if (!key) return null;
   const cid = currentCompany();
-  const [doc, learned] = await Promise.all([
+  const [doc, learned, company] = await Promise.all([
     getDb().collection<any>(PROFILES).findOne({ _id: `${cid}:${key}` }),
     getLearnedAccounts(cid, key).catch(() => ({ gastoCode: null, ivaAccountsByRate: {} })),
+    getDb().collection<any>("siigoCompanies").findOne({ _id: cid }, { projection: { "settings.excludedGastoAccounts": 1 } }),
   ]);
+  const excluded = new Set<string>(company?.settings?.excludedGastoAccounts || []);
+  const filterGasto = <T extends { code: string }>(arr: T[]): T[] =>
+    excluded.size ? arr.filter((a) => !excluded.has(a.code)) : arr;
+
   const learnedIvaCode = Object.values(learned.ivaAccountsByRate)[0] || null;
   if (!doc) {
     if (!learned.gastoCode && !learnedIvaCode) return null;
     return { nit: key, name: "", gastoCode: null, gastoName: null, gastoAccounts: [], inventarioAccounts: [], retefuente: null, reteiva: null, reteica: null, paymentName: null, paymentCode: null, cxpCode: null, ivaKind: null, learnedIvaCode, learnedIvaAccountsByRate: learned.ivaAccountsByRate, learnedGastoCode: learned.gastoCode, updatedAt: "" };
   }
   const { _id, ...rest } = doc;
-  return { ...rest, inventarioAccounts: rest.inventarioAccounts || [], learnedIvaCode, learnedIvaAccountsByRate: learned.ivaAccountsByRate, learnedGastoCode: learned.gastoCode } as SupplierProfile;
+  const gastoAccounts = filterGasto(rest.gastoAccounts || []);
+  const gastoCode = (gastoAccounts[0] as any)?.code ?? (excluded.has(rest.gastoCode) ? null : rest.gastoCode);
+  const gastoName = (gastoAccounts[0] as any)?.name ?? (excluded.has(rest.gastoCode) ? null : rest.gastoName);
+  return { ...rest, gastoAccounts, gastoCode, gastoName, inventarioAccounts: rest.inventarioAccounts || [], learnedIvaCode, learnedIvaAccountsByRate: learned.ivaAccountsByRate, learnedGastoCode: learned.gastoCode } as SupplierProfile;
 }
 
 export async function getSuggestionsStatus(): Promise<{ profileCount: number; profilesUpdatedAt: string | null; paymentMapCount: number; paymentMapUpdatedAt: string | null; }> {
