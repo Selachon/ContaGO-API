@@ -2311,7 +2311,9 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         `[SiigoAccounting] Submission FAILED:`,
         error instanceof Error ? error.message : error,
         "| Siigo details:",
-        detalle
+        detalle,
+        "| payload:",
+        JSON.stringify(payload)
       );
       if (error instanceof SiigoError) {
         const nit = supplierNotFoundNit(error.details);
