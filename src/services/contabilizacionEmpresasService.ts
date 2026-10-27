@@ -754,7 +754,7 @@ async function leerPucXlsxZip(buffer: Buffer): Promise<Tabla> {
 
 /**
  * Cuentas usables de un PUC leído. Siigo trae "Nivel agrupación" y "Activo"; Syscafe no (solo CODIGO PUC, NOMBRE, NAT., TERC.…):
- * ahí se toman las cuentas que reciben movimiento = sin subcuentas, o de 6+ dígitos que piden tercero (TERC. = X, ej. 110505 aunque tenga 110505001; en los niveles altos la marca viene en casi todas y no sirve).
+ * ahí se toman las cuentas que reciben movimiento = sin subcuentas (si 233595 tiene 233595001, solo se ofrece la 233595001).
  */
 export function extraerCuentasPuc(tabla: Tabla): CuentaPuc[] {
   const codeCol = columnaPucCodigo(tabla.columns);
@@ -772,15 +772,14 @@ export function extraerCuentasPuc(tabla: Tabla): CuentaPuc[] {
       if (!byCode.has(codigo)) byCode.set(codigo, { codigo, nombre });
     }
   } else {
-    const tercCol = tabla.columns.find((c) => /^terc/.test(normalizarCol(c)));
     const todas = tabla.rows
-      .map((row) => ({ codigo: limpiarCodigoCuenta(row[codeCol]), nombre: nameCol ? String(row[nameCol] ?? "").trim() : "", terc: !!tercCol && /^x$/i.test(String(row[tercCol] ?? "").trim()) }))
+      .map((row) => ({ codigo: limpiarCodigoCuenta(row[codeCol]), nombre: nameCol ? String(row[nameCol] ?? "").trim() : "" }))
       .filter((c) => /^\d+$/.test(c.codigo));
     const codigos = todas.map((c) => c.codigo).sort();
     // Ordenados, una cuenta tiene subcuentas si la siguiente (distinta) empieza por su código.
     const conHijas = new Set<string>();
     codigos.forEach((c, i) => { const sig = codigos.slice(i + 1).find((x) => x !== c); if (sig && sig.startsWith(c)) conHijas.add(c); });
-    for (const c of todas) if ((!conHijas.has(c.codigo) || (c.terc && c.codigo.length >= 6)) && !byCode.has(c.codigo)) byCode.set(c.codigo, { codigo: c.codigo, nombre: c.nombre });
+    for (const c of todas) if (!conHijas.has(c.codigo) && !byCode.has(c.codigo)) byCode.set(c.codigo, { codigo: c.codigo, nombre: c.nombre });
   }
   const cuentas = [...byCode.values()].sort((x, y) => x.codigo.localeCompare(y.codigo, "es", { numeric: true }));
   if (!cuentas.length) throw new Error('No se encontraron cuentas utilizables en el PUC (Siigo: Nivel agrupación = "Transaccional" y Activo = "Sí").');
