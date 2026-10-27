@@ -752,6 +752,41 @@ async function leerPucXlsxZip(buffer: Buffer): Promise<Tabla> {
   return tablaDesdeFilasPuc(sheetPath.replace(/^xl\/worksheets\//i, "").replace(/\.xml$/i, ""), rows);
 }
 
+/**
+ * Cuentas usables de un PUC leído. Siigo trae "Nivel agrupación" y "Activo"; Syscafe no (solo CODIGO PUC, NOMBRE, NAT., TERC.…):
+ * ahí se toman las cuentas que reciben movimiento = sin subcuentas, o de 6+ dígitos que piden tercero (TERC. = X, ej. 110505 aunque tenga 110505001; en los niveles altos la marca viene en casi todas y no sirve).
+ */
+export function extraerCuentasPuc(tabla: Tabla): CuentaPuc[] {
+  const codeCol = columnaPucCodigo(tabla.columns);
+  const nameCol = columnaPucNombre(tabla.columns, codeCol);
+  const nivelCol = columnaPucNivelAgrupacion(tabla.columns);
+  const activoCol = columnaPucActivo(tabla.columns);
+  if (!codeCol) throw new Error("No se encontró la columna de código de cuenta en el PUC.");
+
+  const byCode = new Map<string, CuentaPuc>();
+  if (nivelCol && activoCol) {
+    for (const row of tabla.rows.filter((r) => esPucTransaccional(r[nivelCol]) && esPucActivo(r[activoCol]))) {
+      const codigo = limpiarCodigoCuenta(row[codeCol]);
+      if (!codigo) continue;
+      const nombre = nameCol ? String(row[nameCol] ?? "").trim() : "";
+      if (!byCode.has(codigo)) byCode.set(codigo, { codigo, nombre });
+    }
+  } else {
+    const tercCol = tabla.columns.find((c) => /^terc/.test(normalizarCol(c)));
+    const todas = tabla.rows
+      .map((row) => ({ codigo: limpiarCodigoCuenta(row[codeCol]), nombre: nameCol ? String(row[nameCol] ?? "").trim() : "", terc: !!tercCol && /^x$/i.test(String(row[tercCol] ?? "").trim()) }))
+      .filter((c) => /^\d+$/.test(c.codigo));
+    const codigos = todas.map((c) => c.codigo).sort();
+    // Ordenados, una cuenta tiene subcuentas si la siguiente (distinta) empieza por su código.
+    const conHijas = new Set<string>();
+    codigos.forEach((c, i) => { const sig = codigos.slice(i + 1).find((x) => x !== c); if (sig && sig.startsWith(c)) conHijas.add(c); });
+    for (const c of todas) if ((!conHijas.has(c.codigo) || (c.terc && c.codigo.length >= 6)) && !byCode.has(c.codigo)) byCode.set(c.codigo, { codigo: c.codigo, nombre: c.nombre });
+  }
+  const cuentas = [...byCode.values()].sort((x, y) => x.codigo.localeCompare(y.codigo, "es", { numeric: true }));
+  if (!cuentas.length) throw new Error('No se encontraron cuentas utilizables en el PUC (Siigo: Nivel agrupación = "Transaccional" y Activo = "Sí").');
+  return cuentas;
+}
+
 export async function importarPuc(empresaId: string, buffer: Buffer, filename = "PUC.xlsx"): Promise<CuentaPuc[]> {
   const oid = toObjectId(empresaId);
   if (!oid) throw new Error("Empresa inválida.");
@@ -771,24 +806,7 @@ export async function importarPuc(empresaId: string, buffer: Buffer, filename = 
       );
     }
   }
-  const codeCol = columnaPucCodigo(tabla.columns);
-  const nameCol = columnaPucNombre(tabla.columns, codeCol);
-  const nivelCol = columnaPucNivelAgrupacion(tabla.columns);
-  const activoCol = columnaPucActivo(tabla.columns);
-  if (!codeCol) throw new Error("No se encontró la columna de código de cuenta en el PUC.");
-  if (!nivelCol) throw new Error('No se encontró la columna "Nivel agrupación" en el PUC.');
-  if (!activoCol) throw new Error('No se encontró la columna "Activo" en el PUC.');
-
-  const rowsFiltradas = tabla.rows.filter((row) => esPucTransaccional(row[nivelCol]) && esPucActivo(row[activoCol]));
-  const byCode = new Map<string, CuentaPuc>();
-  for (const row of rowsFiltradas) {
-    const codigo = limpiarCodigoCuenta(row[codeCol]);
-    if (!codigo) continue;
-    const nombre = nameCol ? String(row[nameCol] ?? "").trim() : "";
-    if (!byCode.has(codigo)) byCode.set(codigo, { codigo, nombre });
-  }
-  const cuentas = [...byCode.values()].sort((a, b) => a.codigo.localeCompare(b.codigo, "es", { numeric: true }));
-  if (!cuentas.length) throw new Error('No se encontraron cuentas transaccionales activas en el PUC (Nivel agrupación = "Transaccional" y Activo = "Sí").');
+  const cuentas = extraerCuentasPuc(tabla);
 
   const res = await getDb().collection<any>(EMPRESAS).updateOne(
     { _id: oid },
