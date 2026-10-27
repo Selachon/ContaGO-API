@@ -2284,8 +2284,8 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   });
 
   router.post("/accounting/submit", async (req: Request, res: Response) => {
+    const { type, payload, cufe } = req.body;
     try {
-      const { type, payload, cufe } = req.body;
       if (!type || !payload) return res.status(400).json({ ok: false, message: "type and payload are required" });
 
       console.log(`[SiigoAccounting] Submission request received. Type: ${type}, Supplier: ${payload.supplier?.identification}, Total: ${payload.payments?.[0]?.value}`);
