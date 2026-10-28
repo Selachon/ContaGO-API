@@ -48,6 +48,8 @@ export interface CompanySettings {
   ivaEsporadico?: boolean;
   /** Cuentas excluidas de la sugerencia de gasto (ej. cuentas de impuestos que el balance incluye pero no deben sugerirse). */
   excludedGastoAccounts?: string[];
+  /** Si true, cada factura muestra inputs de prefijo y número para sobrescribir la numeración del proveedor enviada a Siigo. */
+  numeracionManual?: boolean;
 }
 
 export interface PaymentRecord {
@@ -427,6 +429,7 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.consolidateInc !== undefined) patch["settings.consolidateInc"] = Boolean(settings.consolidateInc);
   if (settings.ivaEsporadico !== undefined) patch["settings.ivaEsporadico"] = Boolean(settings.ivaEsporadico);
   if (settings.excludedGastoAccounts !== undefined) patch["settings.excludedGastoAccounts"] = Array.isArray(settings.excludedGastoAccounts) ? settings.excludedGastoAccounts : [];
+  if (settings.numeracionManual !== undefined) patch["settings.numeracionManual"] = Boolean(settings.numeracionManual);
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
