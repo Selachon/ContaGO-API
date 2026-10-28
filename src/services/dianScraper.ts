@@ -344,6 +344,7 @@ export async function downloadCufeDocumentsBrowser(
       if (!/\/User\/AuthToken/i.test(page.url())) break;
       await delay(1000);
     }
+    await checkAuthTokenPageError(page);
     await delay(2000);
     if (isLoginPage(page.url())) throw new Error("TOKEN_EXPIRED");
 
@@ -441,6 +442,29 @@ export function monthKeyFromDianDate(raw: string): string {
 
 function normalizeCufe(value: string): string {
   return (value || "").replace(/[^A-Fa-f0-9]/g, "").trim();
+}
+
+/** Detecta errores de la página DIAN tras el intento de autenticación con AuthToken.
+ *  Lanza un error con mensaje claro si la DIAN muestra un problema conocido (ej. correo duplicado). */
+async function checkAuthTokenPageError(page: Page): Promise<void> {
+  if (!/\/User\/AuthToken/i.test(page.url())) return; // ya redirigió, sin error
+  try {
+    const bodyText: string = await page.evaluate(() => document.body?.innerText || "");
+    const correoMatch = bodyText.match(/No fue posible crear el usuario[^.]*correo[^']*'([^']+)'[^.]*\./i);
+    if (correoMatch) {
+      throw new Error(
+        `DIAN_CORREO_DUPLICADO: La DIAN no pudo crear la sesión porque el correo '${correoMatch[1]}' ya está registrado en otro usuario del portal. ` +
+        `Por favor contacta a soporte ContaGO para resolver esto.`
+      );
+    }
+    const knownErrorMatch = bodyText.match(/No fue posible[^.]{0,200}\./i);
+    if (knownErrorMatch) {
+      throw new Error(`DIAN_AUTH_ERROR: ${knownErrorMatch[0].trim()} — Contacta a soporte ContaGO si el problema persiste.`);
+    }
+  } catch (e) {
+    if (e instanceof Error && (e.message.startsWith("DIAN_CORREO_DUPLICADO") || e.message.startsWith("DIAN_AUTH_ERROR"))) throw e;
+    // evaluate falló (página vacía, etc.) — no bloquear
+  }
 }
 
 interface ExtractOptions {
@@ -921,6 +945,7 @@ export async function getFreshGratisVpfeCookies(tokenUrl: string): Promise<strin
       if (!/\/User\/AuthToken/i.test(authPage.url())) break;
       await delay(1000);
     }
+    await checkAuthTokenPageError(authPage);
     await delay(2000);
     if (isLoginPage(authPage.url())) throw new Error("TOKEN_EXPIRED: El token ha expirado.");
 
@@ -1009,6 +1034,7 @@ export async function extractDocumentIds(
         if (isLoginPage(page.url())) break;
         await delay(1000);
       }
+      await checkAuthTokenPageError(page);
       await delay(1500);
     }
 
@@ -1335,6 +1361,7 @@ export async function extractDocumentIdsByCufe(
         if (isLoginPage(page.url())) break;
         await delay(1000);
       }
+      await checkAuthTokenPageError(page);
       await delay(1500); // respiro para que el dashboard termine de cargar
     }
 

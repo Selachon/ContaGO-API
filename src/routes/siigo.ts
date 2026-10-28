@@ -663,11 +663,14 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         const company = companyId ? await getCompanyPublic(companyId) : null;
         return res.json({ ok: true, data: company ? [company] : [] });
       }
-      // JWT: solo las empresas que el usuario posee o le comparten.
+      // JWT: solo las empresas que el usuario posee o le comparten, filtradas por
+      // ?toolId= si se envía (una empresa puede estar habilitada solo para una
+      // sub-herramienta Siigo, p. ej. Egresos pero no Causación XML).
       // API key interno: todas (integración server-to-server).
+      const toolIdFilter = typeof req.query.toolId === "string" ? req.query.toolId.trim() : "";
       const companies =
         req.integrationAuthMode === "jwt" && req.user?.userId
-          ? await listCompaniesForUser(req.user.userId)
+          ? await listCompaniesForUser(req.user.userId, toolIdFilter || undefined)
           : await listCompanies();
       return res.json({ ok: true, data: companies });
     } catch (error) {

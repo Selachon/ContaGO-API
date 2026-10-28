@@ -323,13 +323,22 @@ export async function listCompanies(): Promise<SiigoCompanyPublic[]> {
   return docs.map(toPublic);
 }
 
-/** Empresas visibles para un usuario: las que posee o las que le comparten. */
-export async function listCompaniesForUser(userId: string): Promise<SiigoCompanyPublic[]> {
-  const docs = await getDb()
-    .collection<any>(COMPANIES)
-    .find({ $or: [{ ownerUserId: userId }, { sharedWith: userId }] })
-    .sort({ name: 1 })
-    .toArray();
+/**
+ * Empresas visibles para un usuario: las que posee o las que le comparten.
+ * Si se pasa toolId, solo devuelve las empresas marcadas para esa herramienta
+ * (toolIds la incluye) o sin toolIds (empresas antiguas, previas a este campo,
+ * se siguen mostrando en todas las herramientas por compatibilidad).
+ */
+export async function listCompaniesForUser(userId: string, toolId?: string): Promise<SiigoCompanyPublic[]> {
+  const query: Record<string, unknown> = { $or: [{ ownerUserId: userId }, { sharedWith: userId }] };
+  if (toolId) {
+    query.$and = [
+      { $or: [{ ownerUserId: userId }, { sharedWith: userId }] },
+      { $or: [{ toolIds: { $exists: false } }, { toolIds: { $size: 0 } }, { toolIds: toolId }] },
+    ];
+    delete query.$or;
+  }
+  const docs = await getDb().collection<any>(COMPANIES).find(query).sort({ name: 1 }).toArray();
   return docs.map(toPublic);
 }
 
