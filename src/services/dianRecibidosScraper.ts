@@ -123,6 +123,9 @@ class RateLimiter {
  * `GetReceivedDocuments`/`GetSentDocuments` no pagina de verdad más allá de 150
  * filas — la única forma de traer más de 150 documentos es acotar el rango.
  */
+/** La página navegó mientras se ejecutaba código en ella (el contexto de Puppeteer ya no existe). */
+const esContextoDestruido = (err: unknown) => /Execution context was destroyed|detached Frame|Cannot find context/i.test(err instanceof Error ? err.message : String(err));
+
 export async function applyReceivedDateFilter(page: Page, from: string, to: string): Promise<void> {
   await page.evaluate((f: string, t: string) => {
     const $ = (window as any).$;
@@ -135,12 +138,14 @@ export async function applyReceivedDateFilter(page: Page, from: string, to: stri
   }, from, to);
   await delay(300);
   const navDone = page.waitForNavigation({ waitUntil: "networkidle2", timeout: 20_000 }).catch(() => null);
+  // El clic en «Buscar» navega la página: si la navegación arranca antes de que evaluate devuelva, Puppeteer lanza
+  // «Execution context was destroyed». Eso significa que el clic funcionó, no que falló.
   await page.evaluate(() => {
     const btn = Array.from(document.querySelectorAll("button")).find(
       (b) => (b.textContent || "").trim().toLowerCase().includes("buscar")
     );
     if (btn) btn.click();
-  });
+  }).catch((err) => { if (!esContextoDestruido(err)) throw err; });
   await navDone;
   await delay(1500);
 }
@@ -266,6 +271,13 @@ export async function fetchDocumentList(page: Page, direction: "received" | "sen
   const PAGE_SIZE = 150; // límite real del servidor DIAN
 
   const fetchPage = async (start: number, length: number, draw: number): Promise<{ data: any[]; recordsTotal: number; recordsFiltered: number }> => {
+    // Si la página aún estaba navegando (tras filtrar por fechas), se espera a que asiente y se reintenta
+    for (let intento = 1; ; intento++) {
+      try { return await fetchPageUna(start, length, draw); }
+      catch (err) { if (!esContextoDestruido(err) || intento >= 3) throw err; await delay(2500); }
+    }
+  };
+  const fetchPageUna = async (start: number, length: number, draw: number): Promise<{ data: any[]; recordsTotal: number; recordsFiltered: number }> => {
     return page.evaluate(async (params: string, url: string) => {
       const resp = await fetch(url, {
         method: "POST",

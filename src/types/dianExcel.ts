@@ -93,6 +93,9 @@ export interface InvoiceData {
   // Metadata para procesamiento
   trackId: string;
   docNumber: string;
+  /** Notas crédito: factura que se acredita (BillingReference del XML). */
+  referencedInvoice?: string;
+  referencedInvoiceCufe?: string;
   zipFilename: string;
   error?: string;
 }

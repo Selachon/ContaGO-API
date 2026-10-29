@@ -189,6 +189,7 @@ export async function extractInvoiceDataFromXml(
       paymentDueDate,
       trackId: docInfo.id,
       docNumber: xmlDocNumber,
+      ...(isNotaCredito ? referenciaDeNotaCredito(invoice) : {}),
     };
   } catch (err) {
     console.error(`Error parseando XML ${docInfo.docnum}:`, err);
@@ -1002,6 +1003,18 @@ function extractCUFE(invoice: any): string {
 /**
  * Obtiene texto de un nodo XML (puede ser string, número, o objeto con #text)
  */
+/** Factura que acredita una nota crédito: BillingReference/InvoiceDocumentReference (número y CUFE). */
+function referenciaDeNotaCredito(nc: any): { referencedInvoice?: string; referencedInvoiceCufe?: string } {
+  const refs = ([] as any[]).concat(nc?.BillingReference ?? []);
+  for (const r of refs) {
+    const d = r?.InvoiceDocumentReference;
+    const numero = getText(d?.ID).trim();
+    const cufe = getText(d?.UUID).trim();
+    if (numero || cufe) return { referencedInvoice: numero || undefined, referencedInvoiceCufe: cufe || undefined };
+  }
+  return {};
+}
+
 function getText(node: any): string {
   if (node === null || node === undefined) return "";
   if (typeof node === "string") return node;

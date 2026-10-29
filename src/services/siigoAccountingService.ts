@@ -79,6 +79,8 @@ export interface XmlCausacionData {
   providerInvoiceNumber: string;
   docNumberRaw: string;
   cufe: string;
+  /** Notas crédito: la factura que acredita (número tal como la emitió el proveedor y su CUFE). */
+  referencedInvoice?: { number: string; cufe: string };
   /** Contado/crédito y vencimiento del XML ("" si no los trae). */
   formaPago?: "contado" | "credito" | "";
   fechaVencimiento?: string;
@@ -358,6 +360,7 @@ export function invoiceDataToCausacion(xmlData: any, opts: { reconcile?: boolean
     providerInvoicePrefix: prefix,
     providerInvoiceNumber: number,
     docNumberRaw: xmlData.docNumber || "",
+    ...(xmlData.referencedInvoice || xmlData.referencedInvoiceCufe ? { referencedInvoice: { number: String(xmlData.referencedInvoice || ""), cufe: String(xmlData.referencedInvoiceCufe || "").toLowerCase() } } : {}),
     cufe: xmlData.cufe || "",
     formaPago: xmlData.paymentForm || "",
     fechaVencimiento: xmlData.paymentDueDate || "",
