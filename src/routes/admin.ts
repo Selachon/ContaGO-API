@@ -33,6 +33,7 @@ import {
   type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
+import { getOfficialPdfByNumber } from "../billing/invoices.js";
 import { ContableError, facturarVentaContable, lugaresContable, pdfContable, prepararVentaContable } from "../services/contablePortal.js";
 import { COMMISSION_RATE, listLedgerRows, setInvoice, planLegacyImport, runLegacyImport } from "../services/facturacionService.js";
 import { emitTestInvoice, getInvoiceFile } from "../services/alanubeInvoicing.js";
@@ -1065,6 +1066,15 @@ router.get("/facturacion/venta/pdf", async (req: Request, res: Response) => {
     res.setHeader("content-type", f.tipo);
     res.send(f.data);
   } catch (err) { falla(res, err); }
+});
+// PDF oficial de una factura por su número (el de la hoja de facturación): sirve para las emitidas desde cualquier camino
+router.get("/facturacion/factura/pdf", async (req: Request, res: Response) => {
+  try {
+    const f = await getOfficialPdfByNumber({ userId: req.user!.userId, isAdmin: true }, String(req.query.numero || ""));
+    if (!f) return res.status(404).json({ ok: false, message: "Esa factura no se emitió por ContaGO, no hay PDF oficial para descargar." });
+    res.setHeader("content-type", f.contentType);
+    res.send(f.data);
+  } catch (err) { res.status(500).json({ ok: false, message: (err as Error)?.message || "No se pudo descargar el PDF." }); }
 });
 router.get("/facturacion/venta/lugares", async (_req: Request, res: Response) => {
   try { res.json(await lugaresContable()); } catch (err) { falla(res, err); }

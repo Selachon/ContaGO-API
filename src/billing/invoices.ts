@@ -270,6 +270,15 @@ export async function getDocFile(a: Actor, companyId: string, id: string, kind: 
   return part ? { data: part, filename: `${name}.${kind}`, contentType: kind === "pdf" ? "application/pdf" : "application/xml" } : null;
 }
 
+/** PDF oficial de una factura o nota crédito emitida, buscada por su número completo (FE142, NC5…). Null si no la emitió el servicio. */
+export async function getOfficialPdfByNumber(a: Actor, fullNumber: string) {
+  const n = clean(fullNumber, 40);
+  if (!n) return null;
+  const d = await docs().findOne({ "emission.fullNumber": n, "emission.accepted": true } as any);
+  if (!d) return null;
+  return getDocFile(a, String(d.companyId), String(d._id), "pdf");
+}
+
 // ─── Notas crédito ───────────────────────────────────────────────────────────────────────────────────────────
 
 export interface CreditNoteInput { invoiceDocId: string; conceptCode: string; lines: InvoiceLineInput[]; notes: string[] }
