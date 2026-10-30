@@ -50,6 +50,10 @@ export interface CompanySettings {
   excludedGastoAccounts?: string[];
   /** Si true, cada factura muestra inputs de prefijo y número para sobrescribir la numeración del proveedor enviada a Siigo. */
   numeracionManual?: boolean;
+  /** Modo de fecha de vencimiento: "auto" = fecha actual (default), "manual" = el usuario debe ingresar la fecha y es obligatoria para causar. */
+  dueDateMode?: "auto" | "manual";
+  /** Mapa descripción → código de producto para sugerencia automática al causar por productos. Array de {desc, code}. */
+  productDescMap?: Array<{ desc: string; code: string }>;
 }
 
 export interface PaymentRecord {
@@ -439,6 +443,8 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.ivaEsporadico !== undefined) patch["settings.ivaEsporadico"] = Boolean(settings.ivaEsporadico);
   if (settings.excludedGastoAccounts !== undefined) patch["settings.excludedGastoAccounts"] = Array.isArray(settings.excludedGastoAccounts) ? settings.excludedGastoAccounts : [];
   if (settings.numeracionManual !== undefined) patch["settings.numeracionManual"] = Boolean(settings.numeracionManual);
+  if (settings.dueDateMode !== undefined) patch["settings.dueDateMode"] = settings.dueDateMode === "manual" ? "manual" : "auto";
+  if (settings.productDescMap !== undefined) patch["settings.productDescMap"] = Array.isArray(settings.productDescMap) ? settings.productDescMap : [];
   if (Object.keys(patch).length === 0) throw new Error("Sin campos a actualizar.");
   const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $set: patch });
   if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
