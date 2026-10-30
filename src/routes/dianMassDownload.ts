@@ -10,6 +10,7 @@ import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
+import { zipEntryPath } from "../services/zipLayout.js";
 import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
 import { rejectIfNitNotAllowed } from "../utils/nitAccess.js";
 import type { ProgressData, DocumentDirection } from "../types/dian.js";
@@ -257,29 +258,6 @@ function safeFilename(nit: string, docNumber: string): string {
   return safeNit && safeDoc ? `${safeNit}-${safeDoc}` : safeNit || safeDoc || "sin-numero";
 }
 
-const MONTHS_ES = [
-  "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
-  "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
-];
-
-function parseInvoiceDate(dateStr: string): { year: string; monthName: string } {
-  let year = "SinAño";
-  let monthName = "SinMes";
-
-  if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
-    const parts = dateStr.split("-");
-    year = parts[0];
-    const month = parseInt(parts[1], 10);
-    monthName = MONTHS_ES[month - 1] || "SinMes";
-  } else if (/^\d{1,2}\/\d{1,2}\/\d{4}/.test(dateStr)) {
-    const parts = dateStr.split("/");
-    year = parts[2];
-    const month = parseInt(parts[1], 10);
-    monthName = MONTHS_ES[month - 1] || "SinMes";
-  }
-  return { year, monthName };
-}
-
 async function processMassDownloadJob(
   jobId: string,
   tokenUrl: string,
@@ -355,17 +333,22 @@ async function processMassDownloadJob(
             }
           } catch {}
 
-          const { year, monthName } = parseInvoiceDate(issueDate);
-          const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
-          const xmlPath = `${year}/${monthName}/${dirLabel}/XML/${safeFilename(nit, docNumber)}.xml`;
-          bundle.file(xmlPath, xmlBuffer);
+          const baseName = safeFilename(nit, docNumber);
+          bundle.file(zipEntryPath(issueDate, direction, "XML", `${baseName}.xml`), xmlBuffer);
 
           // Documento Soporte PDFs are not reliable — skip PDF, keep XML only
-          if (pdfBuffer && pdfBuffer.length > 0 && !isDS) {
-            const pdfPath = `${year}/${monthName}/${dirLabel}/PDF/${safeFilename(nit, docNumber)}.pdf`;
-            bundle.file(pdfPath, pdfBuffer);
-            if (mergePdf) pdfBuffersForMerge.push(pdfBuffer);
+          const withPdf = !!(pdfBuffer && pdfBuffer.length > 0 && !isDS);
+          if (withPdf) {
+            bundle.file(zipEntryPath(issueDate, direction, "PDF", `${baseName}.pdf`), pdfBuffer!);
+            if (mergePdf) pdfBuffersForMerge.push(pdfBuffer!);
           }
+
+          // ZIP individual por documento (XML+PDF), igual que "Descarga masiva + Excel DIAN".
+          const docZip = new JSZip();
+          docZip.file(`${baseName}.xml`, xmlBuffer);
+          if (withPdf) docZip.file(`${baseName}.pdf`, pdfBuffer!);
+          const docZipBuf = await docZip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+          bundle.file(zipEntryPath(issueDate, direction, "ZIP", `${baseName}.zip`), docZipBuf);
         }
       } catch (err) {
         console.warn(`[MASS DL] Error procesando ${result.cufe?.slice(0, 16)}:`, err);

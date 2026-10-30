@@ -17,6 +17,7 @@ import {
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
+import { zipEntryPath } from "../services/zipLayout.js";
 import { getUserGoogleDriveById, updateUserDriveTokens } from "../services/database.js";
 import { encryptToken } from "../utils/encryption.js";
 import { buildDemoLimitInfo, getDemoLimit, rejectIfWrongDemoNit, type DemoLimitInfo } from "../utils/demoLimit.js";
@@ -590,14 +591,15 @@ async function processCufeDownloadJob(
 
           if (hasValidData) {
             const docName = (invoiceData.docNumber || originalCufe.slice(0, 16)).replace(/[^a-zA-Z0-9_-]/g, "_");
-            zipFiles.push({ name: `XML/${docName}.xml`, buffer: xmlBuf });
-            if (pdfBuffer) zipFiles.push({ name: `PDF/${docName}.pdf`, buffer: pdfBuffer });
+            const zipDir: "sent" | "received" = direction === "sent" ? "sent" : "received";
+            zipFiles.push({ name: zipEntryPath(invoiceData.issueDate, zipDir, "XML", `${docName}.xml`), buffer: xmlBuf });
+            if (pdfBuffer) zipFiles.push({ name: zipEntryPath(invoiceData.issueDate, zipDir, "PDF", `${docName}.pdf`), buffer: pdfBuffer });
             // ZIP individual por documento (XML+PDF), igual que "Descarga Masiva DIAN".
             const docZip = new JSZip();
             docZip.file(`${docName}.xml`, xmlBuf);
             if (pdfBuffer) docZip.file(`${docName}.pdf`, pdfBuffer);
             const docZipBuf = await docZip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-            zipFiles.push({ name: `ZIP/${docName}.zip`, buffer: docZipBuf });
+            zipFiles.push({ name: zipEntryPath(invoiceData.issueDate, zipDir, "ZIP", `${docName}.zip`), buffer: docZipBuf });
           }
 
           invoiceMap.set(originalCufe, invoiceData);
@@ -726,7 +728,7 @@ async function processCufeDownloadJob(
     // independiente de si el usuario también las sube a Drive.
     if (zipFiles.length > 0) {
       // PDF unificado con todas las facturas — mismo entregable que "Descarga Masiva DIAN".
-      const pdfEntries = zipFiles.filter((f) => f.name.startsWith("PDF/"));
+      const pdfEntries = zipFiles.filter((f) => f.name.includes("/PDF/"));
       if (pdfEntries.length > 0) {
         setProgress(jobId, { step: "Generando PDF unificado...", current: allCufes.length, total: allCufes.length });
         try {
@@ -755,7 +757,9 @@ async function processCufeDownloadJob(
       const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
       fs.writeFileSync(zipPath, zipBuf);
       job.zipPath = zipPath;
-      job.zipName = `${filePrefix} ${range}.zip`;
+      // El ZIP lleva solo el NIT (sin razón social), igual que "Descarga Masiva DIAN".
+      const zipPrefix = companyNit ? `${companyNit} - ${basePrefix}` : basePrefix;
+      job.zipName = `${zipPrefix} ${range}.zip`;
     }
 
     const skippedCount = skippedEntries.length;
