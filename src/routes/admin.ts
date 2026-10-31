@@ -33,6 +33,7 @@ import {
   type PortalStatusConfig,
 } from "../services/adminService.js";
 import { requireAuth } from "../middleware/auth.js";
+import { analyticsPayload } from "../services/usageAnalytics.js";
 import { getOfficialPdfByNumber } from "../billing/invoices.js";
 import { ContableError, facturarVentaContable, lugaresContable, pdfContable, prepararVentaContable } from "../services/contablePortal.js";
 import { COMMISSION_RATE, listLedgerRows, setInvoice, planLegacyImport, runLegacyImport } from "../services/facturacionService.js";
@@ -845,6 +846,19 @@ router.post("/users/:id/reset-ext-activation", async (req: Request, res: Respons
   } catch (err) {
     console.error("[Admin] Error restableciendo activación de extensión:", err);
     return res.status(500).json({ ok: false, message: "Error interno al restablecer la activación" });
+  }
+});
+
+// ============================================
+// GET /admin/analytics - Eventos de uso de clientes (panel Analítica). Solo lectura.
+// ============================================
+router.get("/analytics", async (req: Request, res: Response) => {
+  try {
+    const days = Math.min(425, Math.max(1, parseInt(req.query.days as string) || 180));
+    res.json({ ok: true, ...(await analyticsPayload(days)) });
+  } catch (err) {
+    console.error("[Admin] Error obteniendo analítica de uso:", err);
+    res.status(500).json({ ok: false, message: "Error interno al obtener la analítica" });
   }
 });
 

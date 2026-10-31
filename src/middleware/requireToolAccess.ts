@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import { getUserDemoAccess, hasPurchase, isDemoTrialExpired } from "../services/database.js";
 import type { DemoAccess } from "../types/auth.js";
+import { trackToolOperation } from "../services/usageAnalytics.js";
 
 // IDs de herramienta que también conceden acceso al gate (decomisionadas o
 // co-acceso). hasPurchase trata estos como "cualquiera de estos da acceso".
@@ -69,6 +70,7 @@ export function requireToolAccess(toolId: string) {
     // Usuarios del portal de cliente: acceso concedido sin chequeo de licencia.
     if ((req.user as any).isPortal) { next(); return; }
     const result = await checkToolAccess(req.user.userId, !!req.user.isAdmin, toolId);
+    if (result.ok) trackToolOperation(req, res, toolId, req.user.userId);
     if (!result.ok) {
       res.status(result.status || 403).json({ status: "error", code: result.code, detalle: result.detalle });
       return;

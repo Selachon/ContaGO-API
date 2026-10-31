@@ -30,6 +30,7 @@ import {
   requireAuth,
 } from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rateLimit.js";
+import { recordLogin, recordSessionReturn } from "../services/usageAnalytics.js";
 import type { AuthResponse, JWTPayload, User } from "../types/auth.js";
 
 const router = Router();
@@ -152,6 +153,7 @@ router.post("/login", rateLimit(10, 15 * 60 * 1000), async (req: Request, res: R
   };
 
   const token = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
+  recordLogin(req, user.id);
   const [purchasedTools, nits, suspendedTools] = await Promise.all([
     getUserPurchases(user.id),
     getUserNits(user.id),
@@ -318,6 +320,7 @@ router.post("/demo/register", rateLimit(5, 15 * 60 * 1000), async (req: Request,
     role: "DEMO",
   };
   const authToken = jwt.sign(payload, getJwtSecret(), { expiresIn: "7d" });
+  recordLogin(req, user.id);
   const [purchasedTools, nits, suspendedTools] = await Promise.all([
     getUserPurchases(user.id),
     getUserNits(user.id),
@@ -569,6 +572,7 @@ router.get("/me", async (req: Request, res: Response) => {
       return res.status(403).json({ ok: false, message: "Tu cuenta ha sido suspendida. Contacta al administrador." });
     }
 
+    recordSessionReturn(req, user.id);
     const [purchasedTools, nits, suspendedTools] = await Promise.all([
       getUserPurchases(user.id),
       getUserNits(user.id),

@@ -127,6 +127,32 @@ export function attachJobs(tool: string, map: Map<string, GuardedJob>): void {
   tools.set(tool, { map });
 }
 
+// ── Aviso de jobs terminados (métricas de uso) ───────────────────────────────
+
+export interface JobFinished { tool: string; jobId: string; job: GuardedJob; durMs: number }
+let finishedHandler: ((e: JobFinished) => void) | null = null;
+const reportedFinished = new WeakSet<object>();
+export function setJobFinishedHandler(h: ((e: JobFinished) => void) | null): void { finishedHandler = h; }
+
+/**
+ * Avisa UNA vez por job que llegó a un estado final. La duración es de punta a punta (desde que se creó el
+ * job), con la resolución del chequeo (2 s). Un fallo del manejador nunca afecta al job.
+ */
+export function runFinishedCheck(now: number = Date.now()): number {
+  if (!finishedHandler) return 0;
+  let n = 0;
+  for (const [tool, entry] of tools) {
+    for (const [jobId, job] of entry.map) {
+      if (!TERMINAL.has(job.status) || reportedFinished.has(job)) continue;
+      reportedFinished.add(job);
+      n++;
+      try { finishedHandler({ tool, jobId, job, durMs: Math.max(0, now - (job.createdAt ?? now)) }); }
+      catch (err) { console.warn("[JobGuard] aviso de job terminado:", (err as Error)?.message); }
+    }
+  }
+  return n;
+}
+
 /** Las rutas lo usan en su isJobCancelled: cancelado por el usuario O abortado por el guardián. */
 export function isJobAborted(job: GuardedJob | undefined | null): boolean {
   return !!job && (job.status === "cancelled" || job.aborted === true);
@@ -416,6 +442,7 @@ export function startJobGuard(jobStore?: JobStore): void {
     timers.push(t);
   };
   every(guardConfig.watchIntervalMs(), () => { runOrphanCheck(); });
+  every(2_000, () => { runFinishedCheck(); });
   every(guardConfig.heartbeatMs(), async () => { await persistHeartbeat(); await reapDeadInstanceJobs(); });
   every(10 * 60_000, () => { sweepOrphanFiles(); });
   console.log(`[JobGuard] activo (instancia ${instanceId}): abandono=${guardConfig.abandonMs() / 60000}min colgado=${guardConfig.stallMs() / 60000}min`);

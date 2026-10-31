@@ -38,6 +38,7 @@ import { seedSiigoCompanyFromEnv } from "./services/siigoCompaniesService.js";
 import { ensureErpIndexes } from "./erp/db.js";
 import { closeAllBrowsers, startOrphanBrowserSweep } from "./services/dianScraper.js";
 import { startJobGuard, onShutdown as jobGuardOnShutdown } from "./services/jobGuard.js";
+import { initUsageAnalytics } from "./services/usageAnalytics.js";
 import { MongoJobStore } from "./services/jobGuardStore.js";
 import { closeRutBrowser } from "./services/rutConsultaService.js";
 
@@ -187,6 +188,7 @@ ensurePuppeteer()
   .then(connectMongo)
   .then(seedAdminUser)
   .then(migrateToolSlugs)
+  .then(() => initUsageAnalytics().catch((err) => console.warn("[Usage] analítica de uso desactivada:", err?.message)))
   .then(seedSiigoCompanyFromEnv)
   .then(ensureErpIndexes)
   .then(() => {
