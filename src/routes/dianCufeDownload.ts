@@ -295,13 +295,14 @@ router.post(
       return res.status(400).json({ status: "error", detalle: "Debes adjuntar un archivo Excel" });
     }
 
-    const { token_url, start_date, end_date, drive_connection_id, include_drive_links, upload_to_drive } = req.body as {
+    const { token_url, start_date, end_date, drive_connection_id, include_drive_links, upload_to_drive, notas_credito_negativas } = req.body as {
       token_url: string;
       start_date?: string;
       end_date?: string;
       drive_connection_id?: string;
       include_drive_links?: boolean;
       upload_to_drive?: boolean;
+      notas_credito_negativas?: boolean;
     };
 
     if (rejectIfWrongDemoNit(req, res, token_url)) return;
@@ -384,7 +385,7 @@ router.post(
       message: demoLimitInfo?.message || `${allCufes.length} CUFEs encontrados. Usa /dian-cufe/job-status/${jobId} para consultar el progreso.`,
     });
 
-    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, allDates, skippedEntries, start_date, end_date, direction, req.user!.userId, drive_connection_id, parseBoolParam(include_drive_links, false), parseBoolParam(upload_to_drive, true)).catch((err) => {
+    processCufeDownloadJob(jobId, token_url, allCufes, downloadCufes, allDates, skippedEntries, start_date, end_date, direction, req.user!.userId, drive_connection_id, parseBoolParam(include_drive_links, false), parseBoolParam(upload_to_drive, true), parseBoolParam(notas_credito_negativas, false)).catch((err) => {
       console.error(`[CUFE DL] Job ${jobId} error:`, err);
       const j = jobTracker.get(jobId);
       if (j) {
@@ -410,6 +411,7 @@ async function processCufeDownloadJob(
   driveConnectionId: string | undefined,
   includeDriveLinks: boolean,
   uploadToDrive: boolean,
+  notasCreditoNegativas: boolean,
 ): Promise<void> {
   const job = jobTracker.get(jobId);
   if (!job) return;
@@ -709,7 +711,7 @@ async function processCufeDownloadJob(
     setProgress(jobId, { step: "Generando Excel...", current: allCufes.length, total: allCufes.length });
 
     const invoices = allCufes.map((cufe) => invoiceMap.get(cufe)!);
-    await generateExcelFile(invoices as InvoiceData[], outputPath, useInlineDriveLinks, direction === "sent", companyName, companyNit);
+    await generateExcelFile(invoices as InvoiceData[], outputPath, useInlineDriveLinks, direction === "sent", companyName, companyNit, notasCreditoNegativas);
 
     const dirLabel = direction === "sent" ? "Emitidas" : "Recibidas";
     const basePrefix = `Facturas ${dirLabel} DIAN`;

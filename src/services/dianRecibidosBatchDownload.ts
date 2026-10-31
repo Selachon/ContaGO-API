@@ -17,6 +17,8 @@ import type { DocumentDirection } from "../types/dian.js";
 export interface DianRecibidosItem {
   cufe: string;
   docName: string;
+  /** Fecha de emisión (ISO o dd/mm/aaaa) para ubicar el documento por año/mes; "" si no se pudo leer. */
+  issueDate: string;
   xmlBuffer: Buffer;
   pdfBuffer: Buffer | null;
 }
@@ -94,9 +96,11 @@ export async function runDianRecibidosBatchDownload(
 
     const processDoc = async (xmlBuf: Buffer, cufe: string): Promise<void> => {
       let docName: string;
+      let issueDate = "";
       try {
         const inv = await extractInvoiceDataFromXml(xmlBuf, { id: cufe, docnum: "" });
         docName = (inv.docNumber || cufe.slice(0, 16)).replace(/[^a-zA-Z0-9_\-]/g, "_");
+        issueDate = inv.issueDateISO || inv.issueDate || "";
       } catch {
         docName = cufe.slice(0, 16);
       }
@@ -113,7 +117,7 @@ export async function runDianRecibidosBatchDownload(
         }
       } catch {}
 
-      items.push({ cufe, docName, xmlBuffer: xmlBuf, pdfBuffer: pdfBuf });
+      items.push({ cufe, docName, issueDate, xmlBuffer: xmlBuf, pdfBuffer: pdfBuf });
       succeededCufes.add(cufe.toLowerCase());
       dlOk++;
       const elapsedMin = (Date.now() - dlStartMs) / 60000;

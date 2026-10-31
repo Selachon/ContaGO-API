@@ -19,6 +19,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { rejectIfNitNotAllowed } from "../utils/nitAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
+import { zipEntryPath } from "../services/zipLayout.js";
 import { resolveExcelBuffer, extractCufesFromExcel } from "./dianCufeDownload.js";
 import { runDianRecibidosBatchDownload } from "../services/dianRecibidosBatchDownload.js";
 import type { DocumentDirection } from "../types/dian.js";
@@ -209,15 +210,15 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
       const zipFiles: Array<{ name: string; buffer: Buffer }> = [];
       for (const it of items) {
         // Carpeta XML/
-        zipFiles.push({ name: `XML/${it.docName}.xml`, buffer: it.xmlBuffer });
+        zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "XML", `${it.docName}.xml`), buffer: it.xmlBuffer });
         // Carpeta PDF/
-        if (it.pdfBuffer) zipFiles.push({ name: `PDF/${it.docName}.pdf`, buffer: it.pdfBuffer });
+        if (it.pdfBuffer) zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "PDF", `${it.docName}.pdf`), buffer: it.pdfBuffer });
         // Carpeta ZIP/ — ZIP individual con XML + PDF
         const docZip = new JSZip();
         docZip.file(`${it.docName}.xml`, it.xmlBuffer);
         if (it.pdfBuffer) docZip.file(`${it.docName}.pdf`, it.pdfBuffer);
         const docZipBuf = await docZip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-        zipFiles.push({ name: `ZIP/${it.docName}.zip`, buffer: docZipBuf });
+        zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "ZIP", `${it.docName}.zip`), buffer: docZipBuf });
         // Recolectar para PDF unificado
         if (wantsUnifiedPdf && it.pdfBuffer) collectedPdfs.push(it.pdfBuffer);
       }

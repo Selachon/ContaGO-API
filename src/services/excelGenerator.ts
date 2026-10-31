@@ -3,6 +3,43 @@ import type { InvoiceData, InvoiceLineItem, TaxDetail } from "../types/dianExcel
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+const neg = (n: number | undefined): number => (n ? -n : 0);
+const negTaxes = (taxes: TaxDetail[] | undefined): TaxDetail[] => (taxes || []).map((t) => ({ ...t, amount: neg(t.amount) }));
+
+/** Notas crédito (y notas de ajuste de documento soporte): reversan el valor del documento original. */
+function esNotaReversion(documentType: string | undefined): boolean {
+  return /nota.*(cr[eé]dito|ajuste)/i.test(documentType || "");
+}
+
+/**
+ * Devuelve las facturas con los valores de las notas crédito en negativo (base, descuentos,
+ * impuestos, retenciones y total), para que al sumar una columna en el Excel salga el neto.
+ */
+export function aplicarSignoNotasCredito(invoices: InvoiceData[]): InvoiceData[] {
+  return invoices.map((inv) => {
+    if (!esNotaReversion(inv.documentType)) return inv;
+    return {
+      ...inv,
+      subtotal: neg(inv.subtotal),
+      iva: neg(inv.iva),
+      total: neg(inv.total),
+      discount: neg(inv.discount),
+      surcharge: neg(inv.surcharge),
+      taxes: negTaxes(inv.taxes),
+      lineItems: (inv.lineItems || []).map((li) => ({
+        ...li,
+        discount: neg(li.discount),
+        surcharge: neg(li.surcharge),
+        totalUnitPrice: neg(li.totalUnitPrice),
+        taxableBase: li.taxableBase === undefined ? undefined : neg(li.taxableBase),
+        ivaAmount: neg(li.ivaAmount),
+        incAmount: neg(li.incAmount),
+        taxes: negTaxes(li.taxes),
+      })),
+    };
+  });
+}
+
 function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
   return [...invoices].sort((a, b) => {
     const da = a.issueDateISO || "9999-12-31";
@@ -32,8 +69,8 @@ function sortInvoicesByDate(invoices: InvoiceData[]): InvoiceData[] {
  * parseadas desde PDF en vez de XML.
  */
 function ivaBase(li: Pick<InvoiceLineItem, "taxableBase" | "totalUnitPrice">, ivaTax: TaxDetail | undefined): number {
-  if (li.taxableBase && li.taxableBase > 0) return li.taxableBase;
-  if (ivaTax && ivaTax.percent > 0 && ivaTax.amount > 0) return ivaTax.amount / (ivaTax.percent / 100);
+  if (li.taxableBase) return li.taxableBase;
+  if (ivaTax && ivaTax.percent > 0 && ivaTax.amount) return ivaTax.amount / (ivaTax.percent / 100);
   return li.totalUnitPrice || 0;
 }
 
@@ -352,7 +389,7 @@ function buildSheet2(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyName
     // Track which tax names are already covered by line items
     const lineItemTaxNames = new Set<string>();
     for (const li of inv.lineItems || []) {
-      for (const tx of li.taxes || []) if (tx.amount > 0) lineItemTaxNames.add(tx.taxName);
+      for (const tx of li.taxes || []) if (tx.amount) lineItemTaxNames.add(tx.taxName);
     }
 
     let itemIdx = 1;
@@ -526,7 +563,7 @@ function buildSheetIVA(ws: ExcelJS.Worksheet, invoices: InvoiceData[], companyNa
 
     // Invoice-level taxes (from DIAN listing) override line-item sums for any matching name
     for (const tax of inv.taxes || []) {
-      if (extraTaxTotals.has(tax.taxName) && (tax.amount || 0) > 0) {
+      if (extraTaxTotals.has(tax.taxName) && (tax.amount || 0) !== 0) {
         extraTaxTotals.set(tax.taxName, tax.amount || 0);
       }
     }
@@ -657,9 +694,10 @@ export async function generateExcelFile(
   includeDriveColumn: boolean,
   isSentDocuments: boolean = false,
   companyName: string = "",
-  companyNit: string = ""
+  companyNit: string = "",
+  notasCreditoNegativas: boolean = false
 ): Promise<void> {
-  const sorted = sortInvoicesByDate(invoices);
+  const sorted = sortInvoicesByDate(notasCreditoNegativas ? aplicarSignoNotasCredito(invoices) : invoices);
 
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "ContaGO";
