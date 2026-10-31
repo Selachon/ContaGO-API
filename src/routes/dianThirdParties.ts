@@ -5,7 +5,8 @@ import { fileURLToPath } from "url";
 import { v4 as uuidv4 } from "uuid";
 import multer from "multer";
 import JSZip from "jszip";
-import { closeBrowserSafely, REAL_USER_AGENT } from "../services/dianScraper.js";
+import { closeBrowserSafely, getFreshGratisVpfeCookies, REAL_USER_AGENT } from "../services/dianScraper.js";
+import { createGratisSession, gratisFetch, gratisXmlUrl } from "../services/gratisDownload.js";
 import { authenticateAndNavigate, fetchDocumentList } from "../services/dianRecibidosScraper.js";
 import { extractThirdPartyDataFromXml } from "../services/xmlParser.js";
 import { generateThirdPartiesExcelFile } from "../services/excelGenerator.js";
@@ -364,7 +365,50 @@ async function processCufeDownloadJob(
   let companyNit = "";
   let companyWasFromDS = false;
 
+  // Camino directo: el XML se baja por CUFE desde gratis-vpfe. La lista del portal solo
+  // devuelve ~150 filas por consulta (ignora `start`), así que los terceros fuera de esa
+  // página quedaban sin datos y el Excel salía vacío.
+  let directDone = false;
   if (downloadCufes.length > 0) {
+    try {
+      setProgress(jobId, { step: "Estableciendo sesión con la DIAN...", current: 0, total: downloadCufes.length });
+      const session = createGratisSession(await getFreshGratisVpfeCookies(tokenUrl), () => getFreshGratisVpfeCookies(tokenUrl));
+      await gratisFetch(gratisXmlUrl(downloadCufes[0]), session, "xml", 2); // verifica la sesión antes de comprometer el job
+
+      let dlOk = 0;
+      let next = 0;
+      const worker = async (): Promise<void> => {
+        while (next < downloadCufes.length && !isJobCancelled(jobId)) {
+          const cufe = downloadCufes[next++];
+          try {
+            const xmlBuf = await gratisFetch(gratisXmlUrl(cufe), session, "xml");
+            const invoiceData = await extractThirdPartyDataFromXml(xmlBuf, { id: cufe, docnum: "" });
+            const isDS = !!invoiceData.isDocumentoSoporte;
+            const ownName = direction === "received" ? invoiceData.receiverName : (isDS ? invoiceData.receiverName : invoiceData.issuerName);
+            const ownNit = direction === "received" ? invoiceData.receiverNit : (isDS ? invoiceData.receiverNit : invoiceData.issuerNit);
+            if ((!companyName || companyName === "N/A") || (companyWasFromDS && !isDS)) {
+              if (ownName && ownName !== "N/A") {
+                companyName = ownName;
+                companyNit = (ownNit && ownNit !== "N/A") ? ownNit : (tokenUrl.match(/rk=(\d+)/)?.[1] || "");
+                companyWasFromDS = isDS;
+              }
+            }
+            invoiceMap.set(cufe, invoiceData);
+          } catch (err) {
+            console.warn(`[ThirdParties] Error doc ${cufe.slice(0, 12)}:`, err instanceof Error ? err.message : err);
+          }
+          dlOk++;
+          setProgress(jobId, { step: `Descargando ${dlOk}/${downloadCufes.length}...`, current: dlOk, total: downloadCufes.length });
+        }
+      };
+      await Promise.all(Array.from({ length: 4 }, worker));
+      directDone = true;
+    } catch (err) {
+      console.warn(`[ThirdParties] Job ${jobId}: camino directo no disponible (${(err instanceof Error ? err.message : String(err)).slice(0, 160)}). Se usa el portal.`);
+    }
+  }
+
+  if (downloadCufes.length > 0 && !directDone) {
     // ── gratis-vpfe bulk approach ────────────────────────────────────────────
     const parseAnyDate = (raw: string): Date | null => {
       if (!raw) return null;
