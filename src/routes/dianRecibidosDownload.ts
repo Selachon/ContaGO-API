@@ -19,7 +19,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { rejectIfNitNotAllowed } from "../utils/nitAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
-import { zipEntryPath } from "../services/zipLayout.js";
+import { buildDeliveryZipName, zipEntryPath } from "../services/zipLayout.js";
 import { resolveExcelBuffer, extractCufesFromExcel } from "./dianCufeDownload.js";
 import { runDianRecibidosBatchDownload } from "../services/dianRecibidosBatchDownload.js";
 import type { DocumentDirection } from "../types/dian.js";
@@ -60,12 +60,6 @@ setInterval(() => {
     }
   }
 }, 60_000);
-
-function makeZipName(direction: DocumentDirection, total: number): string {
-  const label = direction === "sent" ? "emitidos" : "recibidos";
-  const date = new Date().toISOString().slice(0, 10);
-  return `documentos-${label}-DIAN_${date}_${total}docs.zip`;
-}
 
 const router = Router();
 
@@ -257,7 +251,8 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
 
       job.status = "completed";
       job.outputPath = outPath;
-      job.outputName = makeZipName(direction, dlOk);
+      // NIT propio = el de la empresa a la que pertenece el token (rk).
+      job.outputName = buildDeliveryZipName(token_url.match(/[?&]rk=(\d+)/)?.[1] || "", direction, items.map((it) => it.issueDate));
       job.progress = {
         step: `Listo: ${dlOk}/${downloadCufes.length} documentos descargados.`,
         current: dlOk, total: downloadCufes.length, pct: 100,
