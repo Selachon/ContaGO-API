@@ -85,6 +85,8 @@ export interface Ci2Opciones {
   modo?: "compra" | "venta";
   /** Compras para World Office: en vez de líneas contables se arma el contenido de sus dos archivos (producto + IVA + valor). */
   worldoffice?: boolean;
+  /** World Office (ventas): Tipo Documento fijo de la empresa; el consecutivo es el número de la factura. */
+  tipoVentasWo?: string;
   /** World Office: maestro de productos; cada ítem toma el de su tarifa de IVA. */
   productosWo?: { codigo: string; iva: number }[];
   /** Compras que se clasifican como inventario o gasto; en ambos casos el IVA es mayor valor (no hay IVA descontable). */
@@ -461,7 +463,7 @@ const aDdMmYyyy = (v: string) => {
 };
 
 /** World Office (compras): un renglón por producto y tarifa de IVA, con la base como valor; los impuestos los calcula el programa. */
-function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, productos: { codigo: string; iva: number }[]): { doc: WoDocumento; avisos: string[] } {
+function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, productos: { codigo: string; iva: number }[], venta?: { prefijo: string }): { doc: WoDocumento; avisos: string[] } {
   const as = f.asignacion;
   const descripcion = `${abreviarTipoDocumento(f.documentType)} ${f.docNumber} ${f.proveedor}`;
   const grupos = new Map<string, { producto: string; iva: number; valor: number }>();
@@ -470,7 +472,7 @@ function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, p
     const iva = redondear4(it.ivaPercent / 100);
     // El producto sale de la tarifa de IVA del ítem, salvo que se haya fijado uno a mano.
     const producto = limpiarCuenta(as.cuentasItems?.[String(idx)] ?? "") || productos.find((p) => redondear4(p.iva) === iva)?.codigo || "";
-    if (!producto) throw new Ci2Error(`No hay un producto de World Office para IVA ${redondear4(iva * 100)}% en el maestro de productos.`);
+    if (!producto) throw new Ci2Error(`No hay un producto de World Office para IVA ${redondear4(iva * 100)}% en el maestro de productos de ${venta ? "ventas" : "compras"}.`);
     const k = `${producto}|${iva}`;
     const g = grupos.get(k) ?? { producto, iva, valor: 0 };
     g.valor += it.base;
@@ -483,7 +485,8 @@ function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, p
   if (redondear(descuentoNeto(f.items)) > 0 || redondear(ag.recargo) > 0) avisos.push(`${descripcion}: trae descuento o recargo a nivel documento que no va en la interfaz de World Office; revísalo en el documento.`);
   if (ag.obsequios.size) avisos.push(`${descripcion}: trae obsequios que no van en la interfaz de World Office; revísalos en el documento.`);
   const forma = String(as.formaPago || f.formaPago || "").toLowerCase();
-  const credito = forma === "credito";
+  // Ventas: siempre de contado (World Office rechaza las de crédito al importar).
+  const credito = !venta && forma === "credito";
   const emision = f.fecha;
   const venc = aDdMmYyyy(as.fechaVencimiento || f.fechaVencimiento || "");
   const ext = separarNumeroExterno(f.docNumber);
@@ -493,7 +496,8 @@ function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, p
     avisos,
     doc: {
       encabezado: {
-        tipo, numero: consecutivo, fecha: emision, terceroExterno: f.nit, prefijoExterno, numeroExterno,
+        tipo, numero: consecutivo, fecha: emision, terceroExterno: f.nit, prefijoExterno: venta ? "" : prefijoExterno, numeroExterno: venta ? "" : numeroExterno,
+        ...(venta ? { prefijo: venta.prefijo } : {}),
         nota: descripcion.slice(0, 50), formaPago: credito ? "Credito" : "Contado",
       },
       // Contado, o crédito sin fecha de vencimiento legible: vence el mismo día de la emisión.
@@ -525,7 +529,7 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
       const { prefijo, consecutivo: num } = extraerPrefijoConsecutivo(f.docNumber);
       const mapas = opts.tipoPorPrefijo || { factura: {}, notaCredito: {} };
       const esFacturaONc = cat.clave === "FE" || cat.clave === "NC";
-      tipo = (esFacturaONc ? (f.isCreditNote ? mapas.notaCredito[prefijo] : "") || mapas.factura[prefijo] : "") || porDocumento;
+      tipo = opts.worldoffice ? opts.tipoVentasWo || "" : (esFacturaONc ? (f.isCreditNote ? mapas.notaCredito[prefijo] : "") || mapas.factura[prefijo] : "") || porDocumento;
       consecutivo = num;
       if (!tipo) {
         errores.push({ id: f.id, docNumber: f.docNumber, proveedor: f.proveedor, mensaje: esFacturaONc ? `No hay tipo de comprobante para el prefijo "${prefijo}".` : `No hay tipo de comprobante para «${cat.etiqueta}».` });
@@ -546,11 +550,11 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
     try {
       if (opts.worldoffice) {
         if (cat.clave !== "FE") throw new Ci2Error(`World Office solo admite facturas electrónicas por ahora («${cat.etiqueta}» no).`);
-        const r = armarFacturaWo(f, tipo, consecutivo, opts.productosWo || []);
+        const r = armarFacturaWo(f, tipo, consecutivo, opts.productosWo || [], venta ? { prefijo: extraerPrefijoConsecutivo(f.docNumber).prefijo } : undefined);
         wo.push(r.doc);
         advertencias.push(...r.avisos);
         asignados.push({ id: f.id, tipo, consecutivo });
-        contador[tipo] = consecutivo + 1;
+        if (!venta) contador[tipo] = consecutivo + 1;
         continue;
       }
       const r = armarFactura(f, tipo, consecutivo, opts);
@@ -568,7 +572,7 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
 
   if (opts.worldoffice) {
     const siguientesWo: Record<string, number> = {};
-    for (const a of asignados) siguientesWo[a.tipo] = contador[a.tipo];
+    if (!venta) for (const a of asignados) siguientesWo[a.tipo] = contador[a.tipo];
     return {
       salida: [], partes: [], informe: [], wo, advertencias, errores, asignados, siguientes: siguientesWo,
       resumen: { documentos: asignados.length, notasCredito: 0, lineas: wo.reduce((n, d) => n + d.renglones.length, 0), partes: 1 },

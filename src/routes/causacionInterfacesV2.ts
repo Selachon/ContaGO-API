@@ -595,7 +595,7 @@ router.get("/empresas/:id/productos-wo", async (req: Request, res: Response) => 
   try {
     const empresaId = await exigirEmpresa(req, res);
     if (!empresaId) return;
-    res.json({ status: "ok", productos: await getProductosWo(empresaId) });
+    res.json({ status: "ok", productos: await getProductosWo(empresaId, req.query.modo === "ventas" ? "ventas" : "compras") });
   } catch (e) {
     err(res, e, 500);
   }
@@ -605,7 +605,7 @@ router.put("/empresas/:id/productos-wo", async (req: Request, res: Response) => 
   try {
     const empresaId = await exigirEmpresa(req, res);
     if (!empresaId) return;
-    res.json({ status: "ok", productos: await setProductosWo(empresaId, req.body?.productos) });
+    res.json({ status: "ok", productos: await setProductosWo(empresaId, req.body?.productos, req.query.modo === "ventas" ? "ventas" : "compras") });
   } catch (e) {
     err(res, e);
   }
@@ -707,8 +707,8 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     const worldoffice = sistemaContable === "worldoffice";
     const configWo = worldoffice ? await getConfigWorldOffice(empresaId) : null;
     if (worldoffice) {
-      if (venta) return err(res, new Error("World Office solo está habilitado para compras por ahora."));
       if (!configWo!.empresa || !configWo!.terceroInterno || !configWo!.bodega) return err(res, new Error("Faltan los parámetros de World Office de la empresa (nombre en World Office, Tercero Interno y Bodega)."));
+      if (venta && !configWo!.tipoVentas) return err(res, new Error("Falta el Tipo Documento de ventas de World Office (Parámetros → datos de la empresa en World Office)."));
     } else if (!impuestos?.rows?.length) return err(res, new Error("La empresa no tiene tabla de impuestos cargada (Configuración)."));
     const pendientes = facturas.filter((f) => f.estado === "pendiente" && f.tipo === tipo);
     if (!pendientes.length) return err(res, new Error("Ninguna de las facturas seleccionadas está pendiente."));
@@ -749,7 +749,8 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       modo: tipo,
       inventario: !venta && !worldoffice && cfgInventario.activo ? cfgInventario : undefined,
       worldoffice,
-      productosWo: worldoffice ? await getProductosWo(empresaId) : undefined,
+      productosWo: worldoffice ? await getProductosWo(empresaId, venta ? "ventas" : "compras") : undefined,
+      tipoVentasWo: worldoffice && venta ? configWo!.tipoVentas : undefined,
       tipoPorPrefijo: prefijos,
       tipoPorDocumento,
       autorretencion: venta ? autorretencion : undefined,
@@ -776,7 +777,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     let archivos: { nombre: string; tipo: "interfaz" | "informe"; data: Buffer }[];
     if (worldoffice) {
       // World Office carga dos archivos: encabezados de los documentos y su contenido.
-      const wo = escribirInterfazWo(r.wo || [], configWo!);
+      const wo = escribirInterfazWo(r.wo || [], configWo!, new Date(), venta);
       archivos = [
         { nombre: `Encabezados_WorldOffice_${sufijo}.xls`, tipo: "interfaz", data: wo.encabezados },
         { nombre: `Movimientos_WorldOffice_${sufijo}.xls`, tipo: "interfaz", data: wo.movimientos },

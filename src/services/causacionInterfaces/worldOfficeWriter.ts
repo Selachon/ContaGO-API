@@ -13,6 +13,23 @@ export const COLUMNAS_WO_ENCABEZADO = [
   "Encab: Importacion", "Encab: Sucursal", "Encab: Clasificación",
 ] as const;
 
+/** Ventas: encabezado con prefijo de la factura, fecha de entrega y sin documento externo de proveedor. */
+export const COLUMNAS_WO_VENTA_ENCABEZADO = [
+  "Encab: Empresa", "Encab: Tipo Documento", "Encab: Prefijo", "Encab: Documento Número", "Encab: Fecha", "Encab: Tercero Interno",
+  "Encab: Tercero Externo", "Encab: Nota", "Encab: FormaPago", "Encab: Fecha Entrega", "Encab: Prefijo Documento Externo", "Encab: Número_Documento_Externo",
+  "Encab: Verificado", "Encab: Anulado",
+  ...Array.from({ length: 15 }, (_, i) => `Encab: Personalizado ${i + 1}`),
+  "Encab: Sucursal", "Encab: Clasificación",
+] as const;
+
+export const COLUMNAS_WO_VENTA_MOVIMIENTO = [
+  "Encab: Empresa", "Encab: Tipo Documento", "Encab: Prefijo", "Encab: Documento Número", "Detalle: Producto", "Detalle: Bodega",
+  "Detalle: UnidadDeMedida", "Detalle: Cantidad", "Detalle: IVA", "Detalle: Valor Unitario", "Detalle: Descuento", "Detalle: Vencimiento",
+  "Detalle: Nota", "Detalle: Centro costos",
+  ...Array.from({ length: 15 }, (_, i) => `Detalle: Personalizado${i + 1}`),
+  "Detalle: Código Centro Costos",
+] as const;
+
 export const COLUMNAS_WO_MOVIMIENTO = [
   "Encab: Empresa", "Encab: Tipo Documento", "Encab: Prefijo", "Encab: Documento Número", "Detalle: Producto", "Detalle: Bodega",
   "Detalle: UnidadDeMedida", "Detalle: Cantidad", "Detalle: IVA", "Detalle: Valor Unitario", "Detalle: Descuento", "Detalle: Vencimiento",
@@ -32,6 +49,8 @@ export interface WoConfig {
 
 export interface WoEncabezado {
   tipo: string;
+  /** Ventas: prefijo de la factura emitida (en compras va vacío). */
+  prefijo?: string;
   numero: number;
   /** dd/mm/yyyy */
   fecha: string;
@@ -77,13 +96,13 @@ export function separarNumeroExterno(docNumber: string): { prefijo: string; nume
   return m ? { prefijo: m[1], numero: m[2] } : { prefijo: "", numero: limpio };
 }
 
-export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date = new Date()): { encabezados: Buffer; movimientos: Buffer } {
+export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date = new Date(), venta = false): { encabezados: Buffer; movimientos: Buffer } {
   const emision = Math.round(Date.UTC(hoy.getFullYear(), hoy.getMonth(), hoy.getDate()) / 86400000) + 25569;
   const filasEnc = docs.map(({ encabezado: e }) => {
     const f: Record<string, unknown> = {
       "Encab: Empresa": cfg.empresa,
       "Encab: Tipo Documento": e.tipo,
-      "Encab: Prefijo": "",
+      "Encab: Prefijo": e.prefijo ?? "",
       "Encab: Documento Número": e.numero,
       "Encab: Fecha": celdaFecha(serialExcel(e.fecha)),
       "Encab: Tercero Interno": numeroONada(soloDigitos(cfg.terceroInterno)),
@@ -95,8 +114,11 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
       "Encab: Verificado": 0,
       "Encab: Anulado": 0,
       "Encab: Fecha Emision": celdaFecha(emision),
+      // Ventas: la fecha de entrega es la de emisión de la factura y el documento nace verificado.
+      "Encab: Fecha Entrega": celdaFecha(serialExcel(e.fecha)),
+      ...(venta ? { "Encab: Verificado": -1 } : {}),
     };
-    return COLUMNAS_WO_ENCABEZADO.map((c) => f[c] ?? "");
+    return (venta ? COLUMNAS_WO_VENTA_ENCABEZADO : COLUMNAS_WO_ENCABEZADO).map((c) => f[c] ?? "");
   });
   const filasMov: unknown[][] = [];
   for (const d of docs) {
@@ -104,7 +126,7 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
       const f: Record<string, unknown> = {
         "Encab: Empresa": cfg.empresa,
         "Encab: Tipo Documento": d.encabezado.tipo,
-        "Encab: Prefijo": "",
+        "Encab: Prefijo": d.encabezado.prefijo ?? "",
         "Encab: Documento Número": d.encabezado.numero,
         "Detalle: Producto": r.producto,
         "Detalle: Bodega": cfg.bodega,
@@ -115,8 +137,9 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
         "Detalle: Descuento": 0,
         "Detalle: Vencimiento": celdaFecha(serialExcel(d.vencimiento)),
         "Detalle: Centro costos": r.centroCostos,
+        ...(venta ? { "Detalle: Nota": d.encabezado.nota } : {}),
       };
-      filasMov.push(COLUMNAS_WO_MOVIMIENTO.map((c) => f[c] ?? ""));
+      filasMov.push((venta ? COLUMNAS_WO_VENTA_MOVIMIENTO : COLUMNAS_WO_MOVIMIENTO).map((c) => f[c] ?? ""));
     }
   }
   // Las celdas vacías no se escriben: una celda de texto vacía hace fallar la importación de World Office.
@@ -127,7 +150,7 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
     return XLSX.write(wb, { bookType: "xls", type: "buffer" }) as Buffer;
   };
   return {
-    encabezados: libro("Encabezados", COLUMNAS_WO_ENCABEZADO, filasEnc),
-    movimientos: libro("Movimientos Inventarios", COLUMNAS_WO_MOVIMIENTO, filasMov),
+    encabezados: libro("Encabezados", venta ? COLUMNAS_WO_VENTA_ENCABEZADO : COLUMNAS_WO_ENCABEZADO, filasEnc),
+    movimientos: libro("Movimientos Inventarios", venta ? COLUMNAS_WO_VENTA_MOVIMIENTO : COLUMNAS_WO_MOVIMIENTO, filasMov),
   };
 }

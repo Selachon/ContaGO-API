@@ -210,11 +210,14 @@ export interface ConfigWorldOffice {
   /** NIT de quien genera el documento dentro de la empresa (Tercero Interno). */
   terceroInterno: string;
   bodega: string;
+  /** Tipo Documento de las facturas de venta (ej. FV). */
+  tipoVentas: string;
 }
 const normWo = (v: any): ConfigWorldOffice => ({
   empresa: String(v?.empresa ?? "").trim(),
   terceroInterno: String(v?.terceroInterno ?? "").replace(/\D/g, ""),
   bodega: String(v?.bodega ?? "").trim(),
+  tipoVentas: String(v?.tipoVentas ?? "").trim(),
 });
 
 export interface EmpresaPublic {
@@ -412,13 +415,17 @@ export const PRODUCTOS_WO_BASE: ProductoWo[] = [
   { codigo: "0018", descripcion: "COMPRAS GRAVADAS AL 5%", iva: 0.05 },
 ];
 
-export async function getProductosWo(empresaId: string): Promise<ProductoWo[]> {
+/** Compras y ventas tienen maestros independientes: los productos de ventas arrancan vacíos (los códigos los define cada empresa). */
+const campoProductosWo = (modo: "compras" | "ventas") => (modo === "ventas" ? "productosWoVentas" : "productosWo");
+
+export async function getProductosWo(empresaId: string, modo: "compras" | "ventas" = "compras"): Promise<ProductoWo[]> {
   const oid = toObjectId(empresaId);
-  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { productosWo: 1 } }) : null;
-  return Array.isArray(doc?.productosWo) ? doc.productosWo : PRODUCTOS_WO_BASE;
+  const campo = campoProductosWo(modo);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { [campo]: 1 } }) : null;
+  return Array.isArray(doc?.[campo]) ? doc[campo] : modo === "ventas" ? [] : PRODUCTOS_WO_BASE;
 }
 
-export async function setProductosWo(empresaId: string, productos: unknown): Promise<ProductoWo[]> {
+export async function setProductosWo(empresaId: string, productos: unknown, modo: "compras" | "ventas" = "compras"): Promise<ProductoWo[]> {
   const oid = toObjectId(empresaId);
   if (!oid) throw new Error("Empresa inválida.");
   if (!Array.isArray(productos)) throw new Error("Lista de productos inválida.");
@@ -433,7 +440,7 @@ export async function setProductosWo(empresaId: string, productos: unknown): Pro
     if (limpio.some((x) => x.codigo === codigo)) throw new Error(`El producto ${codigo} está repetido.`);
     limpio.push({ codigo, descripcion, iva: Math.round(iva * 10000) / 10000 });
   }
-  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { productosWo: limpio, updatedAt: new Date() } });
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { [campoProductosWo(modo)]: limpio, updatedAt: new Date() } });
   return limpio;
 }
 
