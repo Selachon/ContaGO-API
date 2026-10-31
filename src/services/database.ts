@@ -67,6 +67,7 @@ interface UserRecord {
   nits: string[];
   status?: "active" | "suspended";
   force_password_change?: boolean;
+  survey?: { at: string; answered: boolean };
   created_at: string;
   legacyId?: number;
   google_drive?: GoogleDriveConfig;
@@ -219,6 +220,7 @@ function mapUser(record: UserRecord | null): User | null {
     nits: record.nits || [],
     status: record.status || "active",
     force_password_change: !!record.force_password_change,
+    survey: record.survey,
     created_at: record.created_at,
     demo: record.demo,
     companiesInPlan: record.companiesInPlan,
@@ -479,6 +481,40 @@ export async function createUser(
     console.error("Error creating user:", err);
     return null;
   }
+}
+
+/**
+ * Registra que el usuario ya vio la encuesta de experiencia (una sola vez).
+ * Si respondió, guarda la calificación en `surveyResponses`. Devuelve false si ya la había visto.
+ */
+export async function recordSurvey(
+  userId: string,
+  entry: { rating?: number; comment?: string }
+): Promise<boolean> {
+  if (!db) throw new Error("MongoDB no está conectado");
+  const oid = new ObjectId(userId);
+  const answered = typeof entry.rating === "number";
+  const at = new Date().toISOString();
+
+  // Condición atómica: solo marca si aún no tenía encuesta registrada
+  const res = await usersCollection().updateOne(
+    { _id: oid, survey: { $exists: false } },
+    { $set: { survey: { at, answered } } }
+  );
+  if (!res.modifiedCount) return false;
+
+  if (answered) {
+    const user = await usersCollection().findOne({ _id: oid }, { projection: { email: 1, name: 1 } });
+    await db.collection("surveyResponses").insertOne({
+      userId,
+      email: user?.email,
+      name: user?.name,
+      rating: entry.rating,
+      comment: entry.comment || "",
+      createdAt: at,
+    });
+  }
+  return true;
 }
 
 export async function updateUserPassword(userId: string, plainPassword: string, forcePasswordChange: boolean): Promise<boolean> {

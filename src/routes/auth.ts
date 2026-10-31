@@ -13,6 +13,7 @@ import {
   isDemoTrialExpired,
   updateUserPassword,
   verifyPassword,
+  recordSurvey,
 } from "../services/database.js";
 import {
   getPersonalKanbanBoard,
@@ -91,6 +92,7 @@ function buildAuthUser(user: User, purchasedTools: string[], nits: string[], sus
     companiesInPlan: user.companiesInPlan,
     toolCompanyLimits: user.toolCompanyLimits,
     forcePasswordChange: !!user.force_password_change,
+    surveyDone: !!user.survey,
     suspendedTools,
     demo,
   };
@@ -619,6 +621,30 @@ router.put("/kanban", requireAuth, async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[Auth] Error actualizando kanban personal:", err);
     return res.status(500).json({ ok: false, message: "Error guardando Kanban personal" });
+  }
+});
+
+// ============================================
+// POST /auth/survey (encuesta de experiencia: una sola vez por usuario)
+// Body: { rating?: 1-5, comment?: string } — sin rating = la vio y la descartó.
+// ============================================
+router.post("/survey", requireAuth, rateLimit(10, 15 * 60 * 1000), async (req: Request, res: Response) => {
+  try {
+    const rawRating = req.body?.rating;
+    let rating: number | undefined;
+    if (rawRating !== undefined && rawRating !== null) {
+      rating = Number(rawRating);
+      if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+        return res.status(400).json({ ok: false, message: "La calificación debe ser un entero entre 1 y 5" });
+      }
+    }
+    const comment = typeof req.body?.comment === "string" ? req.body.comment.trim().slice(0, 500) : "";
+
+    const saved = await recordSurvey(req.user!.userId, { rating, comment });
+    return res.json({ ok: true, alreadyDone: !saved });
+  } catch (err) {
+    console.error("[Auth] Error guardando encuesta:", err);
+    return res.status(500).json({ ok: false, message: "No se pudo guardar la encuesta" });
   }
 });
 
