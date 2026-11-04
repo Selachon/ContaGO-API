@@ -932,6 +932,60 @@ router.put("/portal-status", async (req: Request, res: Response) => {
   }
 });
 
+// ============================================
+// GET /admin/debug/procs - Diagnostico puntual del "Cannot fork" (EAGAIN de
+// PIDs). Lee /proc directamente (sin spawnear nada) para ver que esta
+// acumulando procesos en el contenedor. Temporal: quitar una vez resuelto
+// el incidente de nov-2026.
+// ============================================
+router.get("/debug/procs", async (_req: Request, res: Response) => {
+  try {
+    const fs = await import("fs");
+    const entries = fs.readdirSync("/proc").filter((e) => /^\d+$/.test(e));
+    const byComm: Record<string, number> = {};
+    const rows: Array<{ pid: number; ppid: number; comm: string; etimeSec: number; cmdline: string }> = [];
+    const bootUptimeSec = (() => {
+      try { return parseFloat(fs.readFileSync("/proc/uptime", "utf8").split(" ")[0]); } catch { return 0; }
+    })();
+    const clkTck = 100; // USER_HZ estandar en Linux
+
+    for (const entry of entries) {
+      const pid = Number(entry);
+      try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        const afterComm = stat.slice(stat.indexOf(")") + 2);
+        const fields = afterComm.split(" ");
+        const ppid = Number(fields[1]);
+        const starttimeTicks = Number(fields[19]);
+        const comm = stat.slice(stat.indexOf("(") + 1, stat.lastIndexOf(")"));
+        byComm[comm] = (byComm[comm] || 0) + 1;
+        const etimeSec = Math.round(bootUptimeSec - starttimeTicks / clkTck);
+        let cmdline = "";
+        try {
+          cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim().slice(0, 200);
+        } catch { /* desaparecio */ }
+        rows.push({ pid, ppid, comm, etimeSec, cmdline });
+      } catch { /* proceso desaparecio mientras se leia */ }
+    }
+
+    rows.sort((a, b) => b.etimeSec - a.etimeSec);
+
+    const pidsCur = (() => { try { return fs.readFileSync("/sys/fs/cgroup/pids.current", "utf8").trim(); } catch { return null; } })();
+    const pidsMax = (() => { try { return fs.readFileSync("/sys/fs/cgroup/pids.max", "utf8").trim(); } catch { return null; } })();
+
+    res.json({
+      ok: true,
+      pidsCur,
+      pidsMax,
+      totalProcs: rows.length,
+      byComm: Object.entries(byComm).sort((a, b) => b[1] - a[1]),
+      oldest: rows.slice(0, 60),
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, message: (err as Error)?.message || String(err) });
+  }
+});
+
 function summarizeKanban(board: AdminKanbanBoard): Record<string, unknown> {
   return {
     statuses: board.statuses?.length || 0,
