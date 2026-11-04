@@ -47,6 +47,8 @@ export interface User {
   companiesInPlan?: number;
   toolCompanyLimits?: Record<string, number>;
   toolNits?: Record<string, string[]>;
+  /** Mes más antiguo (AAAA-MM) desde el que puede traer facturas de la DIAN, por herramienta. Sin valor rige la ventana de 12 meses. */
+  ingestFromMonth?: Record<string, string>;
   licenseStartDate?: string;
   billing?: BillingInfo;
 }
@@ -79,6 +81,7 @@ export interface AuthResponse {
     purchasedTools: string[];
     nits: string[];
     toolNits?: Record<string, string[]>;
+    ingestFromMonth?: Record<string, string>;
     companiesInPlan?: number;
     toolCompanyLimits?: Record<string, number>;
     forcePasswordChange?: boolean;

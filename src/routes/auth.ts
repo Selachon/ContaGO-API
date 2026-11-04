@@ -90,6 +90,7 @@ function buildAuthUser(user: User, purchasedTools: string[], nits: string[], sus
     purchasedTools,
     nits,
     toolNits: user.toolNits || {},
+    ingestFromMonth: user.ingestFromMonth || {},
     companiesInPlan: user.companiesInPlan,
     toolCompanyLimits: user.toolCompanyLimits,
     forcePasswordChange: !!user.force_password_change,

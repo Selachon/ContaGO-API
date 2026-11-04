@@ -84,6 +84,8 @@ interface UserRecord {
   // los NITs (normalizados o no) que ese usuario puede operar en ella. Sustituye
   // al uso de `nits` como lista global para las herramientas con alcance por NIT.
   toolNits?: Record<string, string[]>;
+  // Mes más antiguo (AAAA-MM) que el usuario puede traer de la DIAN, por herramienta; sin valor rige la ventana de 12 meses.
+  ingestFromMonth?: Record<string, string>;
   invoiceRef?: string;
   siigoCompanies?: string[];
   billing?: BillingInfo;
@@ -226,6 +228,7 @@ function mapUser(record: UserRecord | null): User | null {
     companiesInPlan: record.companiesInPlan,
     toolCompanyLimits: record.toolCompanyLimits,
     toolNits: record.toolNits || {},
+    ingestFromMonth: record.ingestFromMonth || {},
     licenseStartDate: record.licenseStartDate,
     billing: record.billing,
   };

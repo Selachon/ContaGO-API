@@ -28,6 +28,7 @@ import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { exigirEmpresaHabilitada } from "../services/empresasNitGuard.js";
+import { getUserById } from "../services/database.js";
 import { requireAuth } from "../middleware/auth.js";
 import { ingestFromDian, ingestNewByDateRange, type IngestResult } from "../services/siigoDianIngestService.js";
 import { attachJobs, isJobAborted } from "../services/jobGuard.js";
@@ -308,6 +309,18 @@ async function tokenDeLaEmpresa(res: Response, empresaId: string, tokenUrl: stri
   return true;
 }
 
+/** Ventana de meses que se pueden traer: los últimos 12, o desde el mes habilitado al usuario (admin sin límite). */
+async function mesPermitido(req: Request, month: string): Promise<boolean> {
+  if (req.user?.isAdmin) return true;
+  const now = new Date();
+  const ventana = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+  const desdeVentana = `${ventana.getFullYear()}-${String(ventana.getMonth() + 1).padStart(2, "0")}`;
+  const user = req.user?.userId ? await getUserById(req.user.userId) : null;
+  const habilitado = user?.ingestFromMonth?.["causacion-interfaces-v2"];
+  const piso = habilitado && /^\d{4}-\d{2}$/.test(habilitado) && habilitado < desdeVentana ? habilitado : desdeVentana;
+  return month >= piso;
+}
+
 router.post("/empresas/:id/traer", async (req: Request, res: Response) => {
   try {
     const empresaId = await exigirEmpresa(req, res);
@@ -315,6 +328,7 @@ router.post("/empresas/:id/traer", async (req: Request, res: Response) => {
     const tokenUrl = tryExtractDianUrlFromSafeLink(String(req.body?.tokenUrl || "").trim());
     const month = String(req.body?.month || "").trim();
     if (!/^\d{4}-\d{2}$/.test(month)) return err(res, new Error("Selecciona el mes a traer."));
+    if (!(await mesPermitido(req, month))) return err(res, new Error("Ese mes está fuera de los últimos 12 meses de tu plan. Escríbenos para habilitarlo."));
 
     if (!(await tokenDeLaEmpresa(res, empresaId, tokenUrl))) return;
 
