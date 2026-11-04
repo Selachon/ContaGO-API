@@ -4,7 +4,7 @@ import {
   REAL_USER_AGENT,
   closeBrowserSafely,
 } from "./dianScraper.js";
-import { authenticateAndNavigate, applyReceivedDateFilter, fetchDocumentList, downloadXmlFile, type RecibidoDocument } from "./dianRecibidosScraper.js";
+import { authenticateAndNavigate, applyReceivedDateFilter, fetchDocumentList, downloadXmlFile, esContextoDestruido, type RecibidoDocument } from "./dianRecibidosScraper.js";
 import { processXmlBatch, type BatchItem } from "./siigoAccountingService.js";
 import { getIngestedCufes, upsertDianInvoices, getCausedInvoiceIndex } from "./siigoIngestedCufesService.js";
 import { matchesCaused } from "./siigoCausadasPlan.js";
@@ -61,12 +61,24 @@ async function fetchDocumentsSplitByRange(
       break;
     }
     const [f, t] = queue.shift()!;
-    await applyReceivedDateFilter(
-      page,
-      fmtDdMmYyyy(parseISODate(f).getTime()),
-      fmtDdMmYyyy(parseISODate(t).getTime())
-    );
-    const docs = await fetchDocumentList(page, direction === "sent" ? "sent" : "received");
+    // La DIAN a veces navega la página mientras se escribe el filtro o se lee la tabla («Execution context was destroyed»):
+    // se repite la consulta de ese rango en la misma sesión en vez de tumbar toda la ingesta.
+    let docs: RecibidoDocument[] = [];
+    for (let intento = 1; ; intento++) {
+      try {
+        await applyReceivedDateFilter(
+          page,
+          fmtDdMmYyyy(parseISODate(f).getTime()),
+          fmtDdMmYyyy(parseISODate(t).getTime())
+        );
+        docs = await fetchDocumentList(page, direction === "sent" ? "sent" : "received");
+        break;
+      } catch (err) {
+        if (!esContextoDestruido(err) || intento >= 3) throw err;
+        console.warn(`[Siigo Ingest] La página navegó al consultar ${f}..${t} (intento ${intento}/3): reintentando.`);
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
     console.log(`[Siigo Ingest] Rango ${f}..${t}: ${docs.length} documento(s)`);
     if (docs.length >= LIMIT && f !== t) {
       // Posible truncado por el tope del servidor: partir el rango en dos.

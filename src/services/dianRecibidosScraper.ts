@@ -124,7 +124,7 @@ class RateLimiter {
  * filas — la única forma de traer más de 150 documentos es acotar el rango.
  */
 /** La página navegó mientras se ejecutaba código en ella (el contexto de Puppeteer ya no existe). */
-const esContextoDestruido = (err: unknown) => /Execution context was destroyed|detached Frame|Cannot find context/i.test(err instanceof Error ? err.message : String(err));
+export const esContextoDestruido = (err: unknown) => /Execution context was destroyed|detached Frame|Cannot find context/i.test(err instanceof Error ? err.message : String(err));
 
 export async function applyReceivedDateFilter(page: Page, from: string, to: string): Promise<void> {
   await page.evaluate((f: string, t: string) => {
