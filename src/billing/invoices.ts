@@ -256,7 +256,7 @@ export async function getDocFile(a: Actor, companyId: string, id: string, kind: 
   let f = await files().findOne({ _id: alanubeId } as any);
   if (!f?.zip) {
     // En producción el ZIP oficial puede tardar en estar listo al emitir: se trae ahora y se guarda
-    const remote = await getInvoiceFiles(alanubeId);
+    const remote = await getInvoiceFiles(alanubeId, 3, 2000, d.type === "creditNote" ? "credit-notes" : "invoices");
     if (!remote.zip) return null;
     const zipBuf = await downloadFile(remote.zip);
     f = { zip: new Binary(zipBuf) };
@@ -345,20 +345,36 @@ export async function saveCreditNoteDraft(a: Actor, companyId: string, raw: any,
   return { id };
 }
 
-/** Consecutivo de notas crédito de la empresa: no usa resolución; en pruebas arranca en un número alto aleatorio y queda fijo. */
-async function reserveCreditNumber(c: any, docId: string): Promise<number> {
-  const id = `NC:${c.alanube.companyId}`;
-  await counters().updateOne({ _id: id } as any, { $setOnInsert: { seq: suggestTestStart(1, 5_000_000) - 1 } }, { upsert: true });
+/**
+ * Consecutivo de notas crédito de la empresa: no usa resolución. En pruebas arranca en un número alto aleatorio y queda fijo; en producción
+ * lleva su propio contador (`NCP`) que arranca en 1, para no heredar la numeración de pruebas.
+ */
+async function reserveCreditNumber(c: any, docId: string, wanted?: number): Promise<number> {
+  const produccion = !/sandbox/i.test(process.env.ALANUBE_BASE_URL || "");
+  const clave = produccion ? "NCP" : "NC";
+  // Número que manda el software contable (consecutivo del documento NC en su catálogo): se respeta y el contador interno lo sigue
+  if (Number.isInteger(wanted) && (wanted as number) > 0) {
+    try { await numbers().insertOne({ _id: `${c.alanube.companyId}:${clave}:${wanted}`, docId, at: new Date().toISOString() } as any); }
+    catch (e: any) {
+      // Reintento de la misma nota (la emisión anterior falló): puede reutilizar su número
+      if (e?.code === 11000 && (await numbers().findOne({ _id: `${c.alanube.companyId}:${clave}:${wanted}` } as any) as any)?.docId === docId) { /* mismo documento */ }
+      else if (e?.code === 11000) throw new Error(`El número NC ${wanted} ya se usó en otra nota crédito. Ajusta el consecutivo del documento NC en el catálogo de documentos.`);
+      else throw e;
+    }
+    await counters().updateOne({ _id: `${clave}:${c.alanube.companyId}` } as any, { $max: { seq: wanted } }, { upsert: true });
+    return wanted as number;
+  }
+  const id = `${clave}:${c.alanube.companyId}`;
+  await counters().updateOne({ _id: id } as any, { $setOnInsert: { seq: produccion ? 0 : suggestTestStart(1, 5_000_000) - 1 } }, { upsert: true });
   const r: any = await counters().findOneAndUpdate({ _id: id } as any, { $inc: { seq: 1 } }, { returnDocument: "after" });
   const seq: number = (r?.value ?? r).seq;
-  await numbers().insertOne({ _id: `${c.alanube.companyId}:NC:${seq}`, docId, at: new Date().toISOString() } as any);
+  await numbers().insertOne({ _id: `${c.alanube.companyId}:${clave}:${seq}`, docId, at: new Date().toISOString() } as any);
   return seq;
 }
 
-export async function emitCreditNote(a: Actor, companyId: string, id: string): Promise<InvoiceEmission> {
+export async function emitCreditNote(a: Actor, companyId: string, id: string, wantedNumber?: number): Promise<InvoiceEmission> {
   const company = await getCompany(a, companyId);
   if (!readiness(company).ready) throw new Error("Tu empresa aún no está lista para emitir.");
-  if (!/sandbox/i.test(process.env.ALANUBE_BASE_URL || "")) throw new Error("Por ahora solo se emite en el ambiente de pruebas.");
   const locked = await docs().findOneAndUpdate({ _id: oid(id), companyId, type: "creditNote", status: { $in: PENDING } }, { $set: { status: "emitiendo" as DocStatus, updatedAt: new Date().toISOString() } }, { returnDocument: "after" });
   const doc: any = (locked as any)?.value ?? locked;
   if (!doc) throw new Error("La nota crédito no existe, ya fue emitida o se está emitiendo.");
@@ -368,7 +384,7 @@ export async function emitCreditNote(a: Actor, companyId: string, id: string): P
     const invoice = await getDoc(a, companyId, doc.invoiceDocId);
     // Se revalida al emitir: entre guardar y emitir pudo emitirse otra nota
     assertCreditable({ invoiceTotal: invoice.totals.payableTotal, alreadyCredited: await creditedTotal(companyId, doc.invoiceDocId), refund: doc.totals.payableTotal });
-    number = await reserveCreditNumber(company, id);
+    number = await reserveCreditNumber(company, id, wantedNumber);
     const payload = buildCreditNotePayloadForCompany({ company, invoice, number, input: doc.input });
     const r = await createCreditNote(payload);
     const accepted = isInvoiceAccepted(r);

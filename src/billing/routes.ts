@@ -141,7 +141,7 @@ router.get("/empresas/:id/facturas/:did/nota-credito/contexto", async (req, res)
 router.post("/empresas/:id/notas-credito", async (req, res) => { try { res.json({ ok: true, ...(await saveCreditNoteDraft(actor(req), req.params.id, req.body)) }); } catch (err) { fail(res, err); } });
 router.put("/empresas/:id/notas-credito/:did", async (req, res) => { try { res.json({ ok: true, ...(await saveCreditNoteDraft(actor(req), req.params.id, req.body, req.params.did)) }); } catch (err) { fail(res, err); } });
 router.post("/empresas/:id/notas-credito/:did/emitir", rateLimit(30, 10 * 60_000), async (req, res) => {
-  try { res.json({ ok: true, emission: await emitCreditNote(actor(req), req.params.id, req.params.did) }); }
+  try { res.json({ ok: true, emission: await emitCreditNote(actor(req), req.params.id, req.params.did, Number(req.body?.number) || undefined) }); }
   catch (err) { console.error("[Facturación] emitir nota crédito:", (err as Error)?.message); fail(res, err); }
 });
 router.post("/empresas/:id/habilitacion-pruebas", rateLimit(20, 10 * 60_000), async (req, res) => { try { res.json({ ok: true, company: await sandboxEnableCompany(actor(req), req.params.id) }); } catch (err) { fail(res, err); } });
