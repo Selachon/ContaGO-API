@@ -194,6 +194,8 @@ export type Consecutivos = Record<string, number>;
 export interface CuentaPuc {
   codigo: string;
   nombre: string;
+  /** Siigo Pyme: porcentaje de retención/impuesto que trae la cuenta en su plan de cuentas (%RETENCION). */
+  tarifa?: number;
 }
 
 export interface PucResumen {
@@ -222,8 +224,8 @@ export interface ConfigSiigoPyme {
   diasVencimiento: number;
   /** Catálogo de formas de pago: el usuario las elige por nombre; a la interfaz va el código y la cuenta por pagar es la que Siigo Pyme relaciona con cada una. */
   formasPago: { nombre: string; codigo: number; cuenta: string }[];
-  /** Código de la forma de pago que se usa si la factura no tiene otra. */
-  formaPagoDefecto: number;
+  /** Cuenta del IVA que la empresa asume como gasto (no descontable). */
+  cuentaIvaAsumido: string;
   /** Listado de centros de costo (y subcentro) para asignar a cada factura. */
   centros: { centro: number; subcentro: number; nombre: string }[];
 }
@@ -239,7 +241,7 @@ const normPyme = (v: any): ConfigSiigoPyme => {
   const centros = (Array.isArray(v?.centros) ? v.centros : [])
     .map((c: any) => ({ centro: entero(c?.centro), subcentro: entero(c?.subcentro), nombre: String(c?.nombre ?? "").trim() }))
     .filter((c: { centro: number }) => c.centro > 0);
-  return { vendedor: entero(v?.vendedor), diasVencimiento: v?.diasVencimiento === undefined ? 30 : entero(v.diasVencimiento, 30), formasPago, formaPagoDefecto: entero(v?.formaPagoDefecto, 0), centros };
+  return { vendedor: entero(v?.vendedor), diasVencimiento: v?.diasVencimiento === undefined ? 30 : entero(v.diasVencimiento, 30), formasPago, cuentaIvaAsumido: String(v?.cuentaIvaAsumido ?? "521570").replace(/\D/g, ""), centros };
 };
 
 const normWo = (v: any): ConfigWorldOffice => ({
@@ -477,7 +479,7 @@ export async function setProductosWo(empresaId: string, productos: unknown, modo
 
 /**
  * Lee el reporte «Formas de pago» que se baja de Siigo Pyme (código, nombre y cuenta de cada una) y lo guarda como catálogo
- * de la empresa. Reemplaza el catálogo anterior; conserva la forma por defecto si sigue existiendo.
+ * de la empresa. Reemplaza el catálogo anterior.
  */
 export async function importarFormasPagoPyme(empresaId: string, buffer: Buffer): Promise<ConfigSiigoPyme> {
   const oid = toObjectId(empresaId);
@@ -499,7 +501,7 @@ export async function importarFormasPagoPyme(empresaId: string, buffer: Buffer):
   }
   if (!formasPago.length) throw new Error("El archivo no trae formas de pago.");
   const actual = await getConfigSiigoPyme(empresaId);
-  const nueva = normPyme({ ...actual, formasPago, formaPagoDefecto: formasPago.some((f) => f.codigo === actual.formaPagoDefecto) ? actual.formaPagoDefecto : 0 });
+  const nueva = normPyme({ ...actual, formasPago });
   await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { siigoPyme: nueva, updatedAt: new Date() } });
   return nueva;
 }
@@ -897,10 +899,89 @@ export function extraerCuentasPuc(tabla: Tabla): CuentaPuc[] {
   return cuentas;
 }
 
+/**
+ * Reporte «Plan de cuentas / numérico» de Siigo Pyme: cuentas con guiones (11-05-05), DESCRIPCION y CLASE. Reciben
+ * movimiento las que traen clase (Act, Pas, Ing, Gas…); los títulos y subtítulos van sin clase. null si el archivo no es de ese formato.
+ */
+function cuentasDePucPyme(buffer: Buffer): CuentaPuc[] | null {
+  let filas: unknown[][];
+  try {
+    const wb = XLSX.read(buffer, { type: "buffer" });
+    filas = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "", raw: true });
+  } catch {
+    return null;
+  }
+  const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
+  const h = filas.slice(0, 20).findIndex((r) => norm(r[0]) === "cuenta" && norm(r[1]) === "descripcion" && r.some((c) => norm(c) === "clase"));
+  if (h < 0) return null;
+  const iClase = filas[h].findIndex((c) => norm(c) === "clase");
+  const iRet = filas[h].findIndex((c) => /^%\s*ret/.test(norm(c)));
+  const porCodigo = new Map<string, CuentaPuc>();
+  for (const r of filas.slice(h + 1)) {
+    const codigo = String(r[0] ?? "").replace(/\D/g, "");
+    if (!codigo || !String(r[iClase] ?? "").trim() || porCodigo.has(codigo)) continue;
+    const tarifa = iRet >= 0 ? Number(String(r[iRet] ?? "").replace(",", ".")) : NaN;
+    porCodigo.set(codigo, { codigo, nombre: String(r[1] ?? "").trim(), ...(Number.isFinite(tarifa) && tarifa > 0 ? { tarifa } : {}) });
+  }
+  const todas = [...porCodigo.values()].sort((x, y) => x.codigo.localeCompare(y.codigo, "es", { numeric: true }));
+  // Una cuenta con subcuentas no recibe movimiento: solo se ofrecen las de más abajo en la rama.
+  return todas.filter((c, i) => !todas[i + 1]?.codigo.startsWith(c.codigo));
+}
+
+/**
+ * Tabla de impuestos de Siigo Pyme (compras) construida con las cuentas del plan de cuentas que traen porcentaje:
+ * IVA descontable (240802 compras y 240803 servicios), retefuente (2465), ReteICA (2468, por mil) y ReteIVA (2467).
+ */
+export function tablaImpuestosPyme(cuentas: CuentaPuc[]): Tabla {
+  const columns = ["Código", "Tarifa", "Tipo de impuesto", "Nombre", "Compras", "Ventas", "Base"];
+  const rows: Tabla["rows"] = [];
+  const agregar = (tipo: string, tarifa: number, c: CuentaPuc) => rows.push({ "Código": rows.length + 1, Tarifa: tarifa, "Tipo de impuesto": tipo, Nombre: c.nombre, Compras: c.codigo, Ventas: "", Base: 0 } as any);
+  // Se dejan fuera las cuentas que no son de compras locales: devoluciones, régimen simple, extranjeros, nómina y CREE.
+  const noAplica = /\bRS\b|\bDEV\b|DEVOLUCION|EXTRANJERO|EXTERIOR|SALARIO|EMPLD|EMPLEADOS|ASIMULAN|CREE/i;
+  for (const c of cuentas) {
+    if (!(c.tarifa && c.tarifa > 0) || noAplica.test(c.nombre)) continue;
+    if (c.codigo.startsWith("240802") || c.codigo.startsWith("240803")) agregar("IVA", c.tarifa, c);
+    else if (c.codigo.startsWith("2465")) agregar("Retefuente", c.tarifa, c);
+    else if (c.codigo.startsWith("2467")) agregar("ReteIVA", c.tarifa, c);
+    else if (c.codigo.startsWith("2468")) {
+      // La cuenta dice «4.14*1000»: la tarifa de ReteICA va por mil.
+      const m = /([\d.]+)\s*\*\s*1000/.exec(c.nombre);
+      agregar("ReteICA", m ? Number(m[1]) : Math.round(c.tarifa * 10 * 100) / 100, c);
+    }
+  }
+  return { sheetName: "Impuestos", columns, rows };
+}
+
+/** Reconstruye la tabla de impuestos de una empresa de Siigo Pyme desde su plan de cuentas (reemplaza la que tenga). */
+export async function generarTablaImpuestosPyme(empresaId: string): Promise<Tabla> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { "puc.cuentas": 1 } });
+  const cuentas: CuentaPuc[] = Array.isArray(doc?.puc?.cuentas) ? doc.puc.cuentas : [];
+  if (!cuentas.length) throw new Error("Carga primero el plan de cuentas (PUC) de la empresa.");
+  const tabla = tablaImpuestosPyme(cuentas);
+  if (!tabla.rows.length) throw new Error("El plan de cuentas no trae cuentas de IVA (240802 / 240803) ni de retenciones (2465, 2467, 2468) con porcentaje.");
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { "tables.impuestos": tabla, updatedAt: new Date() } });
+  return tabla;
+}
+
 export async function importarPuc(empresaId: string, buffer: Buffer, filename = "PUC.xlsx"): Promise<CuentaPuc[]> {
   const oid = toObjectId(empresaId);
   if (!oid) throw new Error("Empresa inválida.");
   let tabla: Tabla;
+  const pyme = cuentasDePucPyme(buffer);
+  if (pyme) {
+    if (!pyme.length) throw new Error("No encontré cuentas con clase (Act, Pas, Ing, Gas…) en el plan de cuentas de Siigo Pyme.");
+    const res = await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { puc: { cuentas: pyme, filename, updatedAt: new Date() }, updatedAt: new Date() } });
+    if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
+    // Siigo Pyme: si la empresa aún no tiene tabla de impuestos, se arma con las cuentas del plan que traen porcentaje.
+    const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { sistemaContable: 1, "tables.impuestos.rows": 1 } });
+    if (normSistema(doc?.sistemaContable) === "siigopyme" && !(doc?.tables?.impuestos?.rows?.length > 0)) {
+      const tabla = tablaImpuestosPyme(pyme);
+      if (tabla.rows.length) await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { "tables.impuestos": tabla } });
+    }
+    return pyme;
+  }
   try {
     tabla = await leerHojaConEncabezadoDinamico(buffer, (columns) => {
       const codeCol = columnaPucCodigo(columns);

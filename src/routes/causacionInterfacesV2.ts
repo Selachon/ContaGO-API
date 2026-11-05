@@ -42,6 +42,7 @@ import {
   getConfigSiigoPyme,
   importarFormasPagoPyme,
   importarCentrosPyme,
+  generarTablaImpuestosPyme,
   type ConfigSiigoPyme,
   getConfigInventario,
   type ConfigInventario,
@@ -189,18 +190,21 @@ function retencionesNoAplican(items: any[], ef: any, op: ReturnType<typeof opcio
 }
 
 /** Tarifas de retención disponibles en la tabla de impuestos de la empresa. */
-function opcionesRetencion(rows: Record<string, unknown>[]) {
+function opcionesRetencion(rows: Record<string, unknown>[], porCuenta = false) {
   const por = (tipo: string) => {
-    const vistos = new Set<number>();
-    const out: { tarifa: number; nombre: string; baseMinima: number }[] = [];
+    const vistos = new Set<string>();
+    const out: { tarifa: number; nombre: string; baseMinima: number; cuenta?: string }[] = [];
     for (const r of rows) {
       if (!String(r["Tipo de impuesto"] ?? "").toUpperCase().includes(tipo)) continue;
       const tarifa = toNumero(r["Tarifa"]);
-      if (!(tarifa > 0) || vistos.has(tarifa)) continue;
-      vistos.add(tarifa);
-      out.push({ tarifa, nombre: String(r["Nombre"] ?? "").trim(), baseMinima: toNumero(r["Base"]) });
+      const cuenta = limpiarCuenta(r["Compras"]);
+      const llave = porCuenta ? cuenta : String(tarifa);
+      if (!(tarifa > 0) || vistos.has(llave)) continue;
+      vistos.add(llave);
+      // Siigo Pyme: varias cuentas comparten tarifa, así que cada opción es una cuenta.
+      out.push({ tarifa, nombre: String(r["Nombre"] ?? "").trim(), baseMinima: toNumero(r["Base"]), ...(porCuenta ? { cuenta } : {}) });
     }
-    return out.sort((a, b) => a.tarifa - b.tarifa);
+    return out.sort((a, b) => a.tarifa - b.tarifa || (a.cuenta ?? "").localeCompare(b.cuenta ?? ""));
   };
   return { retefuente: por("RETEFUENTE"), reteica: por("RETEICA"), reteiva: por("RETEIVA") };
 }
@@ -209,8 +213,7 @@ function opcionesRetencion(rows: Record<string, unknown>[]) {
 function efectiva(f: Ci2Factura, sug?: Ci2Asignacion, glob: Ci2CuentasGlobales = {}, pyme: ConfigSiigoPyme | null = null): Ci2Asignacion {
   const a: Ci2Asignacion = { ...ASIG_VACIA, ...(sug || {}), ...f.asignacion };
   if (pyme) {
-    // Siigo Pyme: la forma de pago por defecto rellena la factura que no tiene otra, y su cuenta es la cuenta por pagar.
-    if (!String(a.formaPagoCodigo ?? "").trim() && pyme.formasPago.some((x) => x.codigo === pyme.formaPagoDefecto)) a.formaPagoCodigo = String(pyme.formaPagoDefecto);
+    // Siigo Pyme: la cuenta por pagar es la que Siigo Pyme relaciona con la forma de pago elegida en la factura.
     const forma = pyme.formasPago.find((x) => String(x.codigo) === String(a.formaPagoCodigo ?? "").trim());
     if (forma?.cuenta) a.cuentaPorPagar = forma.cuenta;
   }
@@ -243,8 +246,12 @@ function ivaMayorSugerido(a: Ci2Asignacion, cfgInv: ConfigInventario | null): Re
 function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo = "compra", tarifasInc: Set<number> = new Set(), worldOffice = false, cfgInv: ConfigInventario | null = null, pyme = false): string[] {
   const clasifica = !!cfgInv;
   const out: string[] = [];
-  // Siigo Pyme: cada factura necesita su forma de pago (código del catálogo de la empresa).
-  if (pyme && tipo === "compra" && !/^\d+$/.test(String(a.formaPagoCodigo ?? "").trim())) out.push("formaPagoCodigo");
+  // Siigo Pyme: cada factura se asigna a mano a su forma de pago (catálogo de la empresa) y a su centro de costo.
+  if (pyme && tipo === "compra") {
+    if (!/^\d+$/.test(String(a.formaPagoCodigo ?? "").trim())) out.push("formaPagoCodigo");
+    if (!/^\d+(\D+\d+)?$/.test(String(a.centroCostos ?? "").trim())) out.push("centroCostos");
+    if (items.some((i) => !i.isGift && !i.isSurcharge && i.base > 0 && i.ivaPercent > 0) && !["compras", "servicios", "asumido"].includes(String(a.tratamientoIva ?? ""))) out.push("tratamientoIva");
+  }
   if (clasifica && tipo === "compra" && a.destino !== "inventario" && a.destino !== "gasto") out.push("destino");
   // World Office: el producto sale de la tarifa de IVA (maestro de productos), no de la cuenta del proveedor.
   if (worldOffice) return out;
@@ -489,7 +496,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
     const pymeCfg = await pymeDe(empresaId);
     const siigoPyme = (await getSistemaContable(empresaId)) === "siigopyme";
     const cfgInv = await getConfigInventario(empresaId);
-    const opciones = opcionesRetencion(impuestos?.rows || []);
+    const opciones = opcionesRetencion(impuestos?.rows || [], siigoPyme);
     res.json({
       status: "ok",
       cuentasGlobales: glob,
@@ -543,7 +550,7 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
     const sug = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
     const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo), await pymeDe(empresaId));
     const tarifasInc = tarifasIncDe((await getTabla(empresaId, "impuestos"))?.rows);
-    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote), (await getSistemaContable(empresaId)) === "siigopyme"), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
+    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any, (await getSistemaContable(empresaId)) === "siigopyme")), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote), (await getSistemaContable(empresaId)) === "siigopyme"), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
   } catch (e) {
     err(res, e);
   }
@@ -685,6 +692,18 @@ router.post("/empresas/:id/formas-pago-pyme", upload.single("archivo"), async (r
   }
 });
 
+router.post("/empresas/:id/impuestos-desde-puc", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    if ((await getSistemaContable(empresaId)) !== "siigopyme") return err(res, new Error("Esta empresa no es de Siigo Pyme."));
+    const tabla = await generarTablaImpuestosPyme(empresaId);
+    res.json({ status: "ok", filas: tabla.rows.length });
+  } catch (e) {
+    err(res, e);
+  }
+});
+
 router.post("/empresas/:id/centros-pyme", upload.single("archivo"), async (req: Request, res: Response) => {
   try {
     const empresaId = await exigirEmpresa(req, res);
@@ -811,7 +830,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       modo: tipo,
       inventario: !venta && !worldoffice && cfgInventario.activo ? cfgInventario : undefined,
       worldoffice,
-      pyme: siigoPyme ? { diasVencimiento: configPyme!.diasVencimiento, formaPagoDefecto: configPyme!.formaPagoDefecto } : undefined,
+      pyme: siigoPyme ? { diasVencimiento: configPyme!.diasVencimiento, cuentaIvaAsumido: configPyme!.cuentaIvaAsumido } : undefined,
       productosWo: worldoffice ? await getProductosWo(empresaId, venta ? "ventas" : "compras") : undefined,
       tipoVentasWo: worldoffice && venta ? configWo!.tipoVentas : undefined,
       tipoPorPrefijo: prefijos,

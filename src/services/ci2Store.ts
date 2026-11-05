@@ -176,9 +176,9 @@ export async function cufesRegistrados(empresaId: string): Promise<string[]> {
 const CAMPOS_ASIGNACION: (keyof Ci2Asignacion)[] = [
   "cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento",
   "cuentaRecargo", "centroCostos", "tarifaRetefuente", "tarifaReteica", "tarifaReteiva", "baseMinimaReteicaEspecial", "cuentasItems",
-  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor", "formaPagoCodigo", "comprobante",
+  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva",
 ];
-const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "formaPagoCodigo", "comprobante"]);
+const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva"]);
 
 /** Aplica ediciones manuales a una factura pendiente. `null` en un campo = volver a la sugerencia. */
 export async function editarAsignacion(empresaId: string, id: string, cambios: Record<string, unknown>): Promise<Ci2Factura | null> {

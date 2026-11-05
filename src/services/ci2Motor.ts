@@ -48,6 +48,12 @@ export interface Ci2Asignacion {
   /** Siigo Pyme: código de la forma de pago (catálogo de la empresa) y comprobante de la factura ("P-1") cuando no es el de su clase. */
   formaPagoCodigo?: string;
   comprobante?: string;
+  /** Siigo Pyme: cómo se trata el IVA de la factura (descontable de compras, de servicios, o asumido como gasto). */
+  tratamientoIva?: "compras" | "servicios" | "asumido";
+  /** Siigo Pyme: cuenta de retención elegida (varias cuentas comparten tarifa). */
+  cuentaRetefuente?: string;
+  cuentaReteica?: string;
+  cuentaReteiva?: string;
   /** Empresas que clasifican las compras: a dónde va la factura (decisión manual de cada una). */
   destino?: "inventario" | "gasto";
   /** Inventario: cuenta elegida para la base de cada tarifa de IVA ("0", "5", "19") cuando hay varias posibles. */
@@ -90,7 +96,7 @@ export interface Ci2Opciones {
   /** Compras para World Office: en vez de líneas contables se arma el contenido de sus dos archivos (producto + IVA + valor). */
   worldoffice?: boolean;
   /** Siigo Pyme (compras): el modelo general de movimiento contable; las líneas llevan los datos auxiliares que pide. */
-  pyme?: { diasVencimiento: number; formaPagoDefecto: number };
+  pyme?: { diasVencimiento: number; cuentaIvaAsumido: string };
   /** World Office (ventas): Tipo Documento fijo de la empresa; el consecutivo es el número de la factura. */
   tipoVentasWo?: string;
   /** World Office: maestro de productos; cada ítem toma el de su tarifa de IVA. */
@@ -149,11 +155,15 @@ export function cuentaIvaMayor(as: Pick<Ci2Asignacion, "cuentasIvaMayor">, posib
 
 const texto = (v: unknown) => (v === null || v === undefined ? "" : String(v));
 
-function buscarImpuesto(impuestos: FilaImpuesto[], tipo: string, tarifa: number, columna = "Compras"): Ci2Impuesto {
+/** `cuentaElegida`: Siigo Pyme tiene varias cuentas por tarifa; se usa la fila de la cuenta que se escogió en la factura. `prefijoCuenta`: solo filas cuya cuenta empiece así (IVA de compras o de servicios). */
+function buscarImpuesto(impuestos: FilaImpuesto[], tipo: string, tarifa: number, columna = "Compras", cuentaElegida = "", prefijoCuenta = ""): Ci2Impuesto {
   const tipoU = tipo.toUpperCase().trim();
   const objetivo = redondear4(tarifa);
+  const elegida = limpiarCuenta(cuentaElegida);
   const fila = impuestos.find((r) => {
     if (redondear4(toNumero(r["Tarifa"])) !== objetivo) return false;
+    if (elegida && limpiarCuenta(r[columna]) !== elegida) return false;
+    if (prefijoCuenta && !limpiarCuenta(r[columna]).startsWith(prefijoCuenta)) return false;
     if (tipoU === "INC") return texto(r["Nombre"]).toUpperCase().includes("IMPOCONSUMO");
     return texto(r["Tipo de impuesto"]).toUpperCase().includes(tipoU);
   });
@@ -346,10 +356,21 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
       agregarLinea(cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`);
       continue;
     }
-    const imp = impuesto("IVA", t);
-    // Siigo Pyme: la base del IVA es la base de los ítems de esa tarifa.
+    // Siigo Pyme: la base del IVA es la base de los ítems de esa tarifa, y la cuenta depende de cómo se trate el IVA de la factura.
     const baseTarifa = f.items.reduce((x, it, idx) => (redondear4(it.ivaPercent) === redondear4(t) ? x + (ag.basesItem.get(idx) ?? 0) : x), 0);
-    agregarLinea(imp.cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`, imp.codigo, "", pyme ? baseTarifa : undefined, pyme ? { "Rol": "iva" } : undefined);
+    if (pyme) {
+      const trat = as.tratamientoIva;
+      if (trat !== "compras" && trat !== "servicios" && trat !== "asumido") throw new Ci2Error("Elige cómo se trata el IVA de la factura (compras, servicios o asumido).");
+      if (trat === "asumido") {
+        agregarLinea(exigirCuenta(opts.pyme!.cuentaIvaAsumido, "Cuenta de IVA asumido", "El IVA va como asumido."), ag.iva.get(t)!, natBase, `IVA${t} ASUMIDO ${descripcion}`, "", "", baseTarifa, { "Rol": "iva" });
+        continue;
+      }
+      const impP = buscarImpuesto(opts.impuestos, "IVA", t, colCuenta, "", trat === "compras" ? "240802" : "240803");
+      agregarLinea(impP.cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`, impP.codigo, "", baseTarifa, { "Rol": "iva" });
+      continue;
+    }
+    const imp = impuesto("IVA", t);
+    agregarLinea(imp.cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`, imp.codigo);
   }
   for (const t of [...ag.inc.keys()].sort((x, y) => y - x)) {
     if (inventario) {
@@ -402,7 +423,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   const forzada = (k: string) => !!as.retForzadas?.includes(k);
   let baseMinRf = 0, baseMinRica = 0, baseMinRiva = 0, rf = 0, rica = 0, riva = 0;
   if (as.tarifaRetefuente > 0) {
-    const imp = impuesto("RETEFUENTE", as.tarifaRetefuente);
+    const imp = buscarImpuesto(opts.impuestos, "RETEFUENTE", as.tarifaRetefuente, colCuenta, pyme ? as.cuentaRetefuente ?? "" : "");
     baseMinRf = imp.baseMinima;
     if (forzada("tarifaRetefuente") || baseGasto >= baseMinRf) {
       rf = (baseGasto * as.tarifaRetefuente) / 100;
@@ -410,7 +431,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     }
   }
   if (as.tarifaReteica > 0) {
-    const imp = impuesto("RETEICA", as.tarifaReteica);
+    const imp = buscarImpuesto(opts.impuestos, "RETEICA", as.tarifaReteica, colCuenta, pyme ? as.cuentaReteica ?? "" : "");
     baseMinRica = as.baseMinimaReteicaEspecial || imp.baseMinima;
     if (forzada("tarifaReteica") || baseGasto >= baseMinRica) {
       rica = (baseGasto * as.tarifaReteica) / 1000;
@@ -418,7 +439,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     }
   }
   if (as.tarifaReteiva > 0 && ivaTotal > 0) {
-    const imp = impuesto("RETEIVA", as.tarifaReteiva);
+    const imp = buscarImpuesto(opts.impuestos, "RETEIVA", as.tarifaReteiva, colCuenta, pyme ? as.cuentaReteiva ?? "" : "");
     baseMinRiva = imp.baseMinima;
     if (forzada("tarifaReteiva") || ivaTotal >= baseMinRiva) {
       riva = (ivaTotal * as.tarifaReteiva) / 100;
@@ -600,6 +621,7 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
       if (opts.pyme && !venta) {
         const codigo = String(f.asignacion.formaPagoCodigo ?? "").trim();
         if (!/^\d+$/.test(codigo)) throw new Ci2Error("Elige la forma de pago de la factura (catálogo de Siigo Pyme en Parámetros).");
+        if (!/^\d+(\D+\d+)?$/.test(String(f.asignacion.centroCostos ?? "").trim())) throw new Ci2Error("Elige el centro de costo de la factura.");
         const doc = Math.trunc(Number(separarNumeroExterno(f.docNumber).numero)) || 0;
         const vence = sumarDias(f.fecha, opts.pyme.diasVencimiento);
         for (const l of r.lineas) Object.assign(l, { "Doc proveedor": doc, "Fecha doc proveedor": f.fecha, "Forma pago Pyme": Number(codigo), "Vence": vence });
