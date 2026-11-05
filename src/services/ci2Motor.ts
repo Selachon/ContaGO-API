@@ -50,6 +50,8 @@ export interface Ci2Asignacion {
   comprobante?: string;
   /** Siigo Pyme: cómo se trata el IVA de la factura (descontable de compras, de servicios, o asumido como gasto). */
   tratamientoIva?: "compras" | "servicios" | "asumido";
+  /** Siigo Pyme: concepto que va a Siigo en cada línea (descripción de la secuencia); si falta se usa el sugerido. */
+  concepto?: string;
   /** Siigo Pyme: cuenta de retención elegida (varias cuentas comparten tarifa). */
   cuentaRetefuente?: string;
   cuentaReteica?: string;
@@ -262,8 +264,11 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   const crear = (cuenta: unknown, debito: number, credito: number, desc: string, codImp: CeldaValor = "", centro = "", baseRet?: number, meta?: FilaSiigo) => {
     // Siigo Pyme: la descripción siempre empieza por FC + número de la factura del proveedor, con la etiqueta (IVA19, RF…) si la hay.
     if (pyme) {
+      // El concepto es el de la factura (editable); a las líneas de impuestos se les agrega la etiqueta (IVA19, RF…) tras el «FC<número>».
       const etiqueta = desc.replace(descripcion, "").trim();
-      desc = `FC${numProveedor}${etiqueta ? " " + etiqueta : ""} ${f.proveedor}`;
+      const concepto = (as.concepto || "").trim() || conceptoSugeridoPyme(f.docNumber, f.items, f.proveedor);
+      const m = /^(FC\d+)\s*(.*)$/i.exec(concepto);
+      desc = etiqueta ? (m ? `${m[1]} ${etiqueta} ${m[2]}` : `${etiqueta} ${concepto}`) : concepto;
     }
     const l: FilaSiigo = {};
     for (const c of COLUMNAS_SIIGO) l[c] = "";
@@ -511,6 +516,13 @@ const aDdMmYyyy = (v: string) => {
 };
 
 /** dd/mm/yyyy + días → dd/mm/yyyy. */
+/** Siigo Pyme: concepto sugerido de la factura, «FC<número del proveedor> <qué se compró>». Máximo 50 caracteres. */
+export function conceptoSugeridoPyme(docNumber: string, items: { description?: string; isGift?: boolean }[], proveedor: string): string {
+  const numero = Math.trunc(Number(separarNumeroExterno(docNumber).numero)) || 0;
+  const que = (items.find((i) => !i.isGift && String(i.description ?? "").trim())?.description || proveedor || "").replace(/\s+/g, " ").trim().toUpperCase();
+  return `FC${numero} ${que}`.trim().slice(0, 50);
+}
+
 function sumarDias(ddmmyyyy: string, dias: number): string {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(ddmmyyyy || "");
   if (!m) return ddmmyyyy;

@@ -57,7 +57,7 @@ import {
   userCanAccessEmpresa,
 } from "../services/contabilizacionEmpresasService.js";
 import JSZip from "jszip";
-import { categoriaDocumento, cuentaBaseInventario, cuentaIvaMayor, descuentoNeto, generarInterfaz, nombresImpuestosExtra, type Ci2Asignacion, type Ci2FacturaInput } from "../services/ci2Motor.js";
+import { categoriaDocumento, conceptoSugeridoPyme, cuentaBaseInventario, cuentaIvaMayor, descuentoNeto, generarInterfaz, nombresImpuestosExtra, type Ci2Asignacion, type Ci2FacturaInput } from "../services/ci2Motor.js";
 import { extractCufesFromExcel, resolveExcelBuffer } from "../services/dianExcelCufes.js";
 import {
   cufesRegistrados,
@@ -504,7 +504,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
       facturas: facturas.map((f) => {
         const sug = sugs.get(f.nit);
         const ef = efectiva(f, sug, glob, pymeCfg);
-        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, worldOffice, cfgInv.activo && !f.isCreditNote ? cfgInv : null, siigoPyme), ivaMayorSugerido: ivaMayorSugerido(ef, cfgInv.activo ? cfgInv : null), sinParametros: !sug };
+        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, conceptoSugerido: conceptoSugeridoPyme(f.docNumber, f.items, f.proveedor), faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, worldOffice, cfgInv.activo && !f.isCreditNote ? cfgInv : null, siigoPyme), ivaMayorSugerido: ivaMayorSugerido(ef, cfgInv.activo ? cfgInv : null), sinParametros: !sug };
       }),
     });
   } catch (e) {
@@ -550,7 +550,7 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
     const sug = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
     const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo), await pymeDe(empresaId));
     const tarifasInc = tarifasIncDe((await getTabla(empresaId, "impuestos"))?.rows);
-    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any, (await getSistemaContable(empresaId)) === "siigopyme")), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote), (await getSistemaContable(empresaId)) === "siigopyme"), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
+    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any, (await getSistemaContable(empresaId)) === "siigopyme")), sugerencia: sug || null, efectiva: ef, conceptoSugerido: conceptoSugeridoPyme(f.docNumber, f.items, f.proveedor), faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote), (await getSistemaContable(empresaId)) === "siigopyme"), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
   } catch (e) {
     err(res, e);
   }
