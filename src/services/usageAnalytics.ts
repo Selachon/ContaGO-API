@@ -5,7 +5,6 @@
  *  - NUNCA bloquea ni rompe la petición: registrar es "dispara y olvida" y todo error se traga.
  *  - NUNCA se guarda contenido de archivos, cuerpos de petición ni la IP; solo metadatos:
  *    quién, cuándo, qué herramienta, cuántas facturas, cuánto tardó, si salió bien y la causa del error.
- *  - La ubicación se guarda como municipio aproximado, calculado en el servidor (ver geoIp.ts).
  *
  * Dos fuentes de operaciones:
  *  - "request": operaciones síncronas (la respuesta HTTP ES la operación). Solo las rutas de la lista
@@ -16,7 +15,6 @@
 import type { Request, Response } from "express";
 import type { Collection } from "mongodb";
 import { getDb } from "./database.js";
-import { resolveGeo, type Geo } from "./geoIp.js";
 import { setJobFinishedHandler, type GuardedJob } from "./jobGuard.js";
 
 export type UsageKind = "login" | "use";
@@ -37,7 +35,6 @@ export interface UsageEvent {
   err?: string;
   /** duración en milisegundos */
   durMs?: number;
-  geo?: Geo;
 }
 
 export interface EventSink {
@@ -90,7 +87,7 @@ export function recordEvent(ev: UsageEvent): void {
 // ── Entradas ────────────────────────────────────────────────────────────────
 
 export function recordLogin(req: Request, userId: string): void {
-  recordEvent({ ts: new Date(), userId, kind: "login", op: "login", geo: resolveGeo(req.ip || req.socket?.remoteAddress) || undefined });
+  recordEvent({ ts: new Date(), userId, kind: "login", op: "login" });
 }
 
 /**
@@ -104,7 +101,7 @@ export function recordSessionReturn(req: Request, userId: string, now: number = 
   if (prev !== undefined && now - prev < SESSION_GAP_MS) return;
   lastTouch.set(userId, now);
   if (lastTouch.size > 5000) for (const [k, t] of lastTouch) if (now - t >= SESSION_GAP_MS) lastTouch.delete(k);
-  recordEvent({ ts: new Date(now), userId, kind: "login", op: "return", geo: resolveGeo(req.ip || req.socket?.remoteAddress) || undefined });
+  recordEvent({ ts: new Date(now), userId, kind: "login", op: "return" });
 }
 
 /** Solo para pruebas. */
@@ -164,7 +161,6 @@ export function trackToolOperation(req: Request, res: Response, gateTool: string
         ts: new Date(), userId, kind: "use", tool: op.tool, op: op.op, src: "request", ok,
         ...(ok ? {} : { err: summarizeError(res.statusCode) }),
         durMs: Date.now() - started,
-        geo: resolveGeo(req.ip || req.socket?.remoteAddress) || undefined,
       });
     });
   } catch { /* nunca afectar la petición */ }
@@ -215,7 +211,6 @@ export function onJobFinished(e: { tool: string; jobId: string; job: GuardedJob;
 
 export interface CompactEvent {
   t: number; u: string; k: UsageKind; tool?: string; op?: string; docs?: number; ok?: boolean; err?: string; dur?: number;
-  city?: string; region?: string; country?: string;
 }
 
 /** Eventos en formato compacto para el panel (se piden por rango, con tope para no saturar la respuesta). */
@@ -225,45 +220,31 @@ export async function listEvents(days: number, limit = 200_000): Promise<Compact
   return rows.map((r) => ({
     t: new Date(r.ts as Date).getTime(), u: String(r.userId), k: r.kind as UsageKind,
     tool: r.tool, op: r.op, docs: r.docs, ok: r.ok, err: r.err, dur: r.durMs,
-    city: r.geo?.city, region: r.geo?.region, country: r.geo?.country,
   }));
 }
 
 export interface ClientRow {
-  id: string; name: string; email: string; status: string; created: number;
+  id: string; name: string; email: string; phone?: string; status: string; created: number;
   tools: string[]; licenseEnd?: number; paid?: number; nitsAllowed?: number;
-  /** municipio más frecuente según la IP (aproximado) */
-  city?: string; region?: string;
 }
 
 interface UserDoc {
-  _id: { toString(): string }; name?: string; email?: string; status?: string; created_at?: string; is_admin?: boolean;
+  _id: { toString(): string }; name?: string; email?: string; phone?: string; status?: string; created_at?: string; is_admin?: boolean;
   purchasedTools?: string[]; licenseEndDate?: string; paymentAmount?: number; companiesInPlan?: number;
 }
 
-/** Clientes (sin administradores) con su municipio más frecuente. Los administradores quedan fuera: sus pruebas no son uso de clientes. */
-export function summarizeClients(users: UserDoc[], events: CompactEvent[]): ClientRow[] {
-  const byUser = new Map<string, Map<string, { n: number; region?: string }>>();
-  for (const e of events) {
-    if (!e.city) continue;
-    const m = byUser.get(e.u) || new Map();
-    const cur = m.get(e.city) || { n: 0, region: e.region };
-    cur.n++;
-    m.set(e.city, cur);
-    byUser.set(e.u, m);
-  }
+/** Clientes (sin administradores). Los administradores quedan fuera: sus pruebas no son uso de clientes. */
+export function summarizeClients(users: UserDoc[]): ClientRow[] {
   return users.filter((u) => !u.is_admin).map((u) => {
     const id = u._id.toString();
-    const top = [...(byUser.get(id) || [])].sort((a, b) => b[1].n - a[1].n)[0];
     const created = u.created_at ? Date.parse(u.created_at) : NaN;
     const end = u.licenseEndDate ? Date.parse(u.licenseEndDate) : NaN;
     return {
-      id, name: u.name || u.email || id, email: u.email || "", status: u.status || "active",
+      id, name: u.name || u.email || id, email: u.email || "", ...(u.phone ? { phone: String(u.phone).trim() } : {}), status: u.status || "active",
       created: Number.isFinite(created) ? created : 0, tools: u.purchasedTools || [],
       ...(Number.isFinite(end) ? { licenseEnd: end } : {}),
       ...(typeof u.paymentAmount === "number" ? { paid: u.paymentAmount } : {}),
       ...(typeof u.companiesInPlan === "number" ? { nitsAllowed: u.companiesInPlan } : {}),
-      ...(top ? { city: top[0], region: top[1].region } : {}),
     };
   });
 }
@@ -271,7 +252,7 @@ export function summarizeClients(users: UserDoc[], events: CompactEvent[]): Clie
 export async function analyticsPayload(days: number): Promise<{ generatedAt: number; days: number; clients: ClientRow[]; events: CompactEvent[] }> {
   const users = (await getDb().collection("users").find({ is_admin: { $ne: true } }).toArray()) as unknown as UserDoc[];
   const all = await listEvents(days);
-  const clients = summarizeClients(users, all);
+  const clients = summarizeClients(users);
   const ids = new Set(clients.map((c) => c.id));
   const events = all.filter((e) => ids.has(e.u));
   return { generatedAt: Date.now(), days, clients, events };

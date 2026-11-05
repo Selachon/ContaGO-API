@@ -6,7 +6,6 @@ import {
   _setSinkForTests, _resetSessionTouchForTests, classifyOperation, onJobFinished, recordLogin, recordSessionReturn,
   summarizeClients, summarizeError, trackToolOperation, type CompactEvent, type UsageEvent,
 } from "./usageAnalytics.js";
-import { _setLookupForTests, isPrivateIp, normalizeIp, resolveGeo } from "./geoIp.js";
 import { _resetJobGuardForTests, attachJobs, runFinishedCheck, setJobFinishedHandler, type GuardedJob } from "./jobGuard.js";
 
 let events: UsageEvent[];
@@ -14,33 +13,17 @@ beforeEach(() => {
   events = [];
   _setSinkForTests({ insert: async (e) => { events.push(e); } });
   _resetSessionTouchForTests();
-  _setLookupForTests((ip) => (ip === "200.118.60.1" ? { country: "CO", region: "ANT", city: "Medellín" } : ip === "190.1.1.1" ? { country: "CO", region: "", city: "" } : ip === "8.8.8.8" ? { country: "US", region: "CA", city: "Mountain View" } : null));
 });
 
 const fakeReq = (over: Partial<Request> = {}) => ({ method: "POST", path: "/", ip: "200.118.60.1", socket: {}, ...over }) as unknown as Request;
 const fakeRes = () => Object.assign(new EventEmitter(), { statusCode: 200 }) as unknown as Response & EventEmitter;
 const tick = () => new Promise((r) => setImmediate(r));
 
-test("geo: normaliza IPv6 mapeada, ignora IP privadas y devuelve municipio de Colombia", () => {
-  assert.equal(normalizeIp("::ffff:200.118.60.1"), "200.118.60.1");
-  assert.ok(isPrivateIp("10.0.0.5") && isPrivateIp("192.168.1.9") && isPrivateIp("100.107.175.14") && isPrivateIp("::1") && isPrivateIp("172.20.1.1"));
-  assert.ok(!isPrivateIp("200.118.60.1") && !isPrivateIp("172.15.0.1"));
-  assert.deepEqual(resolveGeo("::ffff:200.118.60.1"), { country: "CO", region: "Antioquia", city: "Medellín" });
-  assert.equal(resolveGeo("192.168.0.4"), null);
-  assert.equal(resolveGeo(undefined), null);
-});
-
-test("geo: IP de Colombia sin municipio conserva solo el país; fuera de Colombia no guarda ciudad", () => {
-  assert.deepEqual(resolveGeo("190.1.1.1"), { country: "CO" });
-  assert.deepEqual(resolveGeo("8.8.8.8"), { country: "US" });
-});
-
-test("geo: nunca guarda la IP en el evento", async () => {
+test("la IP nunca se guarda en el evento", async () => {
   recordLogin(fakeReq(), "u1");
   await tick();
   assert.equal(events.length, 1);
   assert.ok(!JSON.stringify(events[0]).includes("200.118.60.1"));
-  assert.equal(events[0].geo?.city, "Medellín");
 });
 
 test("entradas: el regreso con sesión vigente se registra como máximo cada 6 horas", async () => {
@@ -148,17 +131,16 @@ test("jobGuard: un manejador que falla no rompe el chequeo", () => {
   setJobFinishedHandler(null);
 });
 
-test("clientes: excluye administradores y calcula el municipio más frecuente", () => {
+test("clientes: excluye administradores y trae el teléfono", () => {
   const users = [
-    { _id: { toString: () => "u1" }, name: "Ana", email: "a@x.co", created_at: "2026-01-05T00:00:00Z", purchasedTools: ["dian-recibidos"], licenseEndDate: "2027-01-05", paymentAmount: 150000, companiesInPlan: 5 },
+    { _id: { toString: () => "u1" }, name: "Ana", email: "a@x.co", phone: " 3001234567 ", created_at: "2026-01-05T00:00:00Z", purchasedTools: ["dian-recibidos"], licenseEndDate: "2027-01-05", paymentAmount: 150000, companiesInPlan: 5 },
     { _id: { toString: () => "adm" }, name: "Admin", is_admin: true },
-    { _id: { toString: () => "u3" }, name: "Sin ubicación" },
+    { _id: { toString: () => "u3" }, name: "Sin teléfono" },
   ];
-  const ev = (u: string, city?: string): CompactEvent => ({ t: 1, u, k: "login", city, region: city ? "Antioquia" : undefined });
-  const rows = summarizeClients(users, [ev("u1", "Medellín"), ev("u1", "Bogotá"), ev("u1", "Medellín"), ev("u3"), ev("adm", "Cali")]);
+  const rows = summarizeClients(users);
   assert.deepEqual(rows.map((r) => r.id), ["u1", "u3"]);
-  assert.equal(rows[0].city, "Medellín");
+  assert.equal(rows[0].phone, "3001234567");
   assert.equal(rows[0].nitsAllowed, 5);
   assert.equal(rows[0].created, Date.parse("2026-01-05T00:00:00Z"));
-  assert.equal(rows[1].city, undefined);
+  assert.equal(rows[1].phone, undefined);
 });
