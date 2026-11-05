@@ -401,9 +401,16 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
       agregarLinea(cuentaInv(inventario.impuestos, nombre, `el impuesto ${nombre}`), valor, natBase, `${nombre} ${descripcion}`);
     }
   } else {
-    const otros = [...ag.otros.values()].reduce((x, y) => x + y, 0);
-    if (redondear(otros) !== 0) {
-      agregarLinea(exigirCuenta(as.cuentaOtrosImpuestos, "Cuenta de otros impuestos", "Hay otros impuestos."), otros, natBase, `OTROS IMP ${descripcion}`);
+    // Cada impuesto va a su cuenta si la empresa la fijó (se decide en la factura); los demás se juntan en la cuenta general de otros impuestos.
+    let sinCuentaPropia = 0;
+    for (const [nombre, valor] of ag.otros) {
+      if (redondear(valor) === 0) continue;
+      const propia = limpiarCuenta(as.cuentasImpuestos?.[nombre] ?? "");
+      if (propia) agregarLinea(propia, valor, natBase, `${nombre} ${descripcion}`);
+      else sinCuentaPropia += valor;
+    }
+    if (redondear(sinCuentaPropia) !== 0) {
+      agregarLinea(exigirCuenta(as.cuentaOtrosImpuestos, "Cuenta de otros impuestos", "Hay otros impuestos."), sinCuentaPropia, natBase, `OTROS IMP ${descripcion}`);
     }
   }
   let ivaObsequios = 0;

@@ -282,7 +282,10 @@ function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo
   if (tipo === "venta") {
     // Cada impuesto pide su propia cuenta.
     for (const n of nombres) if (!limpiarCuenta(a.cuentasImpuestos?.[n] ?? "")) out.push(`imp:${n}`);
-  } else if (!inv && nombres.length && !limpiarCuenta(a.cuentaOtrosImpuestos)) out.push("cuentaOtrosImpuestos");
+  } else if (!inv && !limpiarCuenta(a.cuentaOtrosImpuestos)) {
+    // Sin cuenta general de otros impuestos, cada impuesto de la factura pide su propia cuenta (queda recordada para la empresa).
+    for (const n of nombres) if (!limpiarCuenta(a.cuentasImpuestos?.[n] ?? "")) out.push(`imp:${n}`);
+  }
   return out;
 }
 
