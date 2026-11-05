@@ -17,6 +17,7 @@
  * Metadatos y tablas viven en Mongo (`contabilizacionEmpresas`); la plantilla en
  * disco bajo CONTAGO_DATA_DIR/contabilizacion/empresas/<empresaId>/.
  */
+import * as XLSX from "xlsx";
 import { ObjectId } from "mongodb";
 import JSZip from "jszip";
 import fs from "fs";
@@ -219,8 +220,8 @@ export interface ConfigSiigoPyme {
   vendedor: number;
   /** Días entre la emisión y el vencimiento de la cuenta por pagar. */
   diasVencimiento: number;
-  /** Catálogo de formas de pago: el usuario las elige por nombre y a la interfaz va el código. */
-  formasPago: { nombre: string; codigo: number }[];
+  /** Catálogo de formas de pago: el usuario las elige por nombre; a la interfaz va el código y la cuenta por pagar es la que Siigo Pyme relaciona con cada una. */
+  formasPago: { nombre: string; codigo: number; cuenta: string }[];
   /** Código de la forma de pago que se usa si la factura no tiene otra. */
   formaPagoDefecto: number;
   /** Listado de centros de costo (y subcentro) para asignar a cada factura. */
@@ -233,7 +234,7 @@ const entero = (v: unknown, def = 0) => {
 const normPyme = (v: any): ConfigSiigoPyme => {
   const vistos = new Set<number>();
   const formasPago = (Array.isArray(v?.formasPago) ? v.formasPago : [])
-    .map((f: any) => ({ nombre: String(f?.nombre ?? "").trim(), codigo: entero(f?.codigo, -1) }))
+    .map((f: any) => ({ nombre: String(f?.nombre ?? "").trim(), codigo: entero(f?.codigo, -1), cuenta: String(f?.cuenta ?? "").replace(/\D/g, "") }))
     .filter((f: { nombre: string; codigo: number }) => f.nombre && f.codigo >= 0 && !vistos.has(f.codigo) && vistos.add(f.codigo));
   const centros = (Array.isArray(v?.centros) ? v.centros : [])
     .map((c: any) => ({ centro: entero(c?.centro), subcentro: entero(c?.subcentro), nombre: String(c?.nombre ?? "").trim() }))
@@ -472,6 +473,71 @@ export async function setProductosWo(empresaId: string, productos: unknown, modo
   }
   await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { [campoProductosWo(modo)]: limpio, updatedAt: new Date() } });
   return limpio;
+}
+
+/**
+ * Lee el reporte «Formas de pago» que se baja de Siigo Pyme (código, nombre y cuenta de cada una) y lo guarda como catálogo
+ * de la empresa. Reemplaza el catálogo anterior; conserva la forma por defecto si sigue existiendo.
+ */
+export async function importarFormasPagoPyme(empresaId: string, buffer: Buffer): Promise<ConfigSiigoPyme> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const wb = XLSX.read(buffer, { type: "buffer" });
+  const filas: unknown[][] = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "", raw: true });
+  const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
+  const h = filas.findIndex((r) => r.some((c) => /^forma\s*pago/.test(norm(c))) && r.some((c) => norm(c) === "nombre") && r.some((c) => norm(c) === "cuenta"));
+  if (h < 0) throw new Error("No encontré los encabezados «FORMA PAGO», «NOMBRE» y «CUENTA». Sube el reporte de formas de pago tal como lo baja Siigo Pyme.");
+  const iCod = filas[h].findIndex((c) => /^forma\s*pago/.test(norm(c)));
+  const iNom = filas[h].findIndex((c) => norm(c) === "nombre");
+  const iCta = filas[h].findIndex((c) => norm(c) === "cuenta");
+  const formasPago: { nombre: string; codigo: number; cuenta: string }[] = [];
+  for (const r of filas.slice(h + 1)) {
+    const codigo = String(r[iCod] ?? "").trim();
+    const nombre = String(r[iNom] ?? "").trim();
+    if (!/^\d+$/.test(codigo) || !nombre) continue;
+    formasPago.push({ nombre, codigo: Number(codigo), cuenta: String(r[iCta] ?? "").replace(/\D/g, "") });
+  }
+  if (!formasPago.length) throw new Error("El archivo no trae formas de pago.");
+  const actual = await getConfigSiigoPyme(empresaId);
+  const nueva = normPyme({ ...actual, formasPago, formaPagoDefecto: formasPago.some((f) => f.codigo === actual.formaPagoDefecto) ? actual.formaPagoDefecto : 0 });
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { siigoPyme: nueva, updatedAt: new Date() } });
+  return nueva;
+}
+
+/**
+ * Lee el reporte «Parámetros tabla centros de costos» de Siigo Pyme (centro, nombre, subcentro, nombre) y lo guarda como
+ * listado de centros de la empresa. La fila de un centro sin subcentro se guarda con subcentro 0. Reemplaza el listado anterior.
+ */
+export async function importarCentrosPyme(empresaId: string, buffer: Buffer): Promise<ConfigSiigoPyme> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const wb = XLSX.read(buffer, { type: "buffer" });
+  const filas: unknown[][] = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: "", raw: true });
+  const norm = (v: unknown) => String(v ?? "").trim().toLowerCase();
+  const h = filas.findIndex((r) => r.some((c) => /^centro/.test(norm(c))) && r.some((c) => /^subcentro/.test(norm(c))));
+  if (h < 0) throw new Error("No encontré los encabezados «CENTRO COS» y «SUBCENTRO». Sube el reporte de centros de costo tal como lo baja Siigo Pyme.");
+  const iCentro = filas[h].findIndex((c) => /^centro/.test(norm(c)));
+  const iSub = filas[h].findIndex((c) => /^subcentro/.test(norm(c)));
+  const nombres = filas[h].map((c, i) => (norm(c) === "nombre" ? i : -1)).filter((i) => i >= 0);
+  const iNomCentro = nombres.find((i) => i > iCentro && i < iSub) ?? -1;
+  const iNomSub = nombres.find((i) => i > iSub) ?? -1;
+  const vistos = new Set<string>();
+  const centros: { centro: number; subcentro: number; nombre: string }[] = [];
+  for (const r of filas.slice(h + 1)) {
+    const centro = String(r[iCentro] ?? "").trim();
+    if (!/^\d+$/.test(centro) || Number(centro) <= 0) continue;
+    const sub = String(r[iSub] ?? "").trim();
+    const nCentro = iNomCentro >= 0 ? String(r[iNomCentro] ?? "").trim() : "";
+    const nSub = iNomSub >= 0 ? String(r[iNomSub] ?? "").trim() : "";
+    const llave = `${Number(centro)}/${Number(sub || 0)}`;
+    if (vistos.has(llave)) continue;
+    vistos.add(llave);
+    centros.push({ centro: Number(centro), subcentro: Number(sub || 0), nombre: [nCentro, nSub].filter(Boolean).join(" - ") });
+  }
+  if (!centros.length) throw new Error("El archivo no trae centros de costo.");
+  const nueva = normPyme({ ...(await getConfigSiigoPyme(empresaId)), centros });
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { siigoPyme: nueva, updatedAt: new Date() } });
+  return nueva;
 }
 
 export async function getConfigSiigoPyme(empresaId: string): Promise<ConfigSiigoPyme> {

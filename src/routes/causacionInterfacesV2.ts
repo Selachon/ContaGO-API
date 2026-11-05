@@ -40,6 +40,9 @@ import {
   getConfigWorldOffice,
   getProductosWo,
   getConfigSiigoPyme,
+  importarFormasPagoPyme,
+  importarCentrosPyme,
+  type ConfigSiigoPyme,
   getConfigInventario,
   type ConfigInventario,
   setConfigInventario,
@@ -203,21 +206,23 @@ function opcionesRetencion(rows: Record<string, unknown>[]) {
 }
 
 /** Sugerencia del proveedor + lo editado en la factura; las cuentas globales de la empresa rellenan lo que siga vacío. */
-function efectiva(f: Ci2Factura, sug?: Ci2Asignacion, glob: Ci2CuentasGlobales = {}, pagoDefecto = ""): Ci2Asignacion {
+function efectiva(f: Ci2Factura, sug?: Ci2Asignacion, glob: Ci2CuentasGlobales = {}, pyme: ConfigSiigoPyme | null = null): Ci2Asignacion {
   const a: Ci2Asignacion = { ...ASIG_VACIA, ...(sug || {}), ...f.asignacion };
-  // Siigo Pyme: la forma de pago de la empresa rellena la factura que no tiene otra.
-  if (pagoDefecto && !String(a.formaPagoCodigo ?? "").trim()) a.formaPagoCodigo = pagoDefecto;
+  if (pyme) {
+    // Siigo Pyme: la forma de pago por defecto rellena la factura que no tiene otra, y su cuenta es la cuenta por pagar.
+    if (!String(a.formaPagoCodigo ?? "").trim() && pyme.formasPago.some((x) => x.codigo === pyme.formaPagoDefecto)) a.formaPagoCodigo = String(pyme.formaPagoDefecto);
+    const forma = pyme.formasPago.find((x) => String(x.codigo) === String(a.formaPagoCodigo ?? "").trim());
+    if (forma?.cuenta) a.cuentaPorPagar = forma.cuenta;
+  }
   a.retForzadas = (["tarifaRetefuente", "tarifaReteica", "tarifaReteiva"] as const).filter((k) => k in f.asignacion && Number((f.asignacion as any)[k]) > 0);
   for (const k of CAMPOS_GLOBALES) if (!limpiarCuenta(a[k])) a[k] = glob[k] || "";
   a.cuentasImpuestos = { ...(glob.cuentasImpuestos || {}) };
   return a;
 }
 
-/** Código de la forma de pago por defecto de Siigo Pyme ("" si la empresa no es de Siigo Pyme o no la fijó). */
-async function pagoDefectoDe(empresaId: string): Promise<string> {
-  if ((await getSistemaContable(empresaId)) !== "siigopyme") return "";
-  const c = await getConfigSiigoPyme(empresaId);
-  return c.formasPago.some((x) => x.codigo === c.formaPagoDefecto) ? String(c.formaPagoDefecto) : "";
+/** Parámetros de Siigo Pyme de la empresa, o null si no es de Siigo Pyme. */
+async function pymeDe(empresaId: string): Promise<ConfigSiigoPyme | null> {
+  return (await getSistemaContable(empresaId)) === "siigopyme" ? getConfigSiigoPyme(empresaId) : null;
 }
 
 /** Tarifas de impoconsumo que existen en la tabla de impuestos de la empresa. */
@@ -481,7 +486,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
     const [facturas, sugs, impuestos, glob] = await Promise.all([listarFacturas(empresaId, estado, tipo), sugerenciasPorNit(empresaId, tipo), getTabla(empresaId, "impuestos"), getCuentasGlobales(empresaId, tipo)]);
     const tarifasInc = tarifasIncDe(impuestos?.rows);
     const worldOffice = (await getSistemaContable(empresaId)) === "worldoffice";
-    const pagoDefecto = await pagoDefectoDe(empresaId);
+    const pymeCfg = await pymeDe(empresaId);
     const siigoPyme = (await getSistemaContable(empresaId)) === "siigopyme";
     const cfgInv = await getConfigInventario(empresaId);
     const opciones = opcionesRetencion(impuestos?.rows || []);
@@ -491,7 +496,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
       opcionesRetencion: opciones,
       facturas: facturas.map((f) => {
         const sug = sugs.get(f.nit);
-        const ef = efectiva(f, sug, glob, pagoDefecto);
+        const ef = efectiva(f, sug, glob, pymeCfg);
         return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, worldOffice, cfgInv.activo && !f.isCreditNote ? cfgInv : null, siigoPyme), ivaMayorSugerido: ivaMayorSugerido(ef, cfgInv.activo ? cfgInv : null), sinParametros: !sug };
       }),
     });
@@ -536,7 +541,7 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
       await guardarParametroProveedor(empresaId, tipo, f.nit, f.proveedor, Object.fromEntries(aParametro.map((k) => [k, (f!.asignacion as any)[k]])));
     }
     const sug = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
-    const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo), await pagoDefectoDe(empresaId));
+    const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo), await pymeDe(empresaId));
     const tarifasInc = tarifasIncDe((await getTabla(empresaId, "impuestos"))?.rows);
     res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote), (await getSistemaContable(empresaId)) === "siigopyme"), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
   } catch (e) {
@@ -668,6 +673,30 @@ router.put("/empresas/:id/cuentas-globales", async (req: Request, res: Response)
 });
 
 // Lee el movimiento auxiliar de Siigo y devuelve el siguiente consecutivo por tipo de comprobante.
+router.post("/empresas/:id/formas-pago-pyme", upload.single("archivo"), async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    if ((await getSistemaContable(empresaId)) !== "siigopyme") return err(res, new Error("Esta empresa no es de Siigo Pyme."));
+    if (!req.file) return err(res, new Error("Sube el Excel de formas de pago de Siigo Pyme."));
+    res.json({ status: "ok", siigoPyme: await importarFormasPagoPyme(empresaId, req.file.buffer) });
+  } catch (e) {
+    err(res, e);
+  }
+});
+
+router.post("/empresas/:id/centros-pyme", upload.single("archivo"), async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    if ((await getSistemaContable(empresaId)) !== "siigopyme") return err(res, new Error("Esta empresa no es de Siigo Pyme."));
+    if (!req.file) return err(res, new Error("Sube el Excel de centros de costo de Siigo Pyme."));
+    res.json({ status: "ok", siigoPyme: await importarCentrosPyme(empresaId, req.file.buffer) });
+  } catch (e) {
+    err(res, e);
+  }
+});
+
 router.post("/empresas/:id/consecutivos/detectar", upload.single("auxiliar"), async (req: Request, res: Response) => {
   try {
     const empresaId = await exigirEmpresa(req, res);
@@ -736,7 +765,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     const worldoffice = sistemaContable === "worldoffice";
     const siigoPyme = sistemaContable === "siigopyme";
     const configPyme = siigoPyme ? await getConfigSiigoPyme(empresaId) : null;
-    const pagoDefecto = await pagoDefectoDe(empresaId);
+    const pymeCfg = await pymeDe(empresaId);
     if (siigoPyme && venta) return err(res, new Error("Siigo Pyme solo está habilitado para compras por ahora."));
     const configWo = worldoffice ? await getConfigWorldOffice(empresaId) : null;
     if (worldoffice) {
@@ -775,7 +804,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       totalIva: f.totals.iva,
       formaPago: f.formaPago,
       fechaVencimiento: f.fechaVencimiento,
-      asignacion: efectiva(f, sugs.get(f.nit), glob, pagoDefecto),
+      asignacion: efectiva(f, sugs.get(f.nit), glob, pymeCfg),
     }));
 
     const r = generarInterfaz(entradas, {
