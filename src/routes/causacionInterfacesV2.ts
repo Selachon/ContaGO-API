@@ -43,6 +43,7 @@ import {
   importarFormasPagoPyme,
   importarCentrosPyme,
   generarTablaImpuestosPyme,
+  getCuentasConCentroPyme,
   type ConfigSiigoPyme,
   getConfigInventario,
   type ConfigInventario,
@@ -869,8 +870,9 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       ];
     } else if (siigoPyme) {
       const empresaNombre = empresas.find((e) => e.id === empresaId)?.nombre || "";
+      const cuentasConCentro = await getCuentasConCentroPyme(empresaId);
       archivos = [
-        { nombre: `MovimientoContable_SiigoPyme_${sufijo}.xlsx`, tipo: "interfaz", data: escribirInterfazSiigoPyme(r.salida, { empresa: empresaNombre, vendedor: configPyme!.vendedor }) },
+        { nombre: `MovimientoContable_SiigoPyme_${sufijo}.xlsx`, tipo: "interfaz", data: escribirInterfazSiigoPyme(r.salida, { empresa: empresaNombre, vendedor: configPyme!.vendedor, cuentasConCentro: cuentasConCentro.size ? cuentasConCentro : undefined }) },
         { nombre: `Informe_Retenciones_${sufijo}.xlsx`, tipo: "informe", data: await escribirInformeRetenciones(r.informe) },
       ];
     } else {

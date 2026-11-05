@@ -347,8 +347,12 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     }
     for (const [cuenta, base] of porCuenta) {
       const g = ivaCuenta.get(cuenta)!;
-      const pct = [...g.tarifas.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? 0;
-      const meta: FilaSiigo | undefined = pyme ? { "Rol": "base", "IVA %": pct, "IVA valor": redondear(g.valor), "Gravada": g.valor > 0 ? "S" : "N" } : undefined;
+      const pct = [...g.tarifas.entries()].filter(([t]) => t > 0).sort((x, y) => y[1] - x[1])[0]?.[0] ?? 0;
+      // Siigo Pyme valida el IVA por ítem contra la cuenta de IVA del comprobante: los gastos van con el IVA de servicios (240803)
+      // y el inventario con el de compras (240802). Si el tratamiento elegido no coincide, el IVA va solo en su línea, sin detalle por ítem.
+      const esInventario = limpiarCuenta(cuenta).startsWith("14");
+      const detalleIva = (as.tratamientoIva === "servicios" && !esInventario) || (as.tratamientoIva === "compras" && esInventario);
+      const meta: FilaSiigo | undefined = pyme ? { "Rol": "base", "IVA %": detalleIva ? pct : 0, "IVA valor": detalleIva ? redondear(g.valor) : 0, "Gravada": g.valor > 0 ? "S" : "N" } : undefined;
       agregarLinea(cuenta, base, natBase, descripcion, "", as.centroCostos, undefined, meta);
     }
   }

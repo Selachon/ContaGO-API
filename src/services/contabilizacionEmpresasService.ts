@@ -196,6 +196,8 @@ export interface CuentaPuc {
   nombre: string;
   /** Siigo Pyme: porcentaje de retención/impuesto que trae la cuenta en su plan de cuentas (%RETENCION). */
   tarifa?: number;
+  /** Siigo Pyme: la cuenta exige centro de costo (columna C.COSTO del plan de cuentas). */
+  centro?: boolean;
 }
 
 export interface PucResumen {
@@ -916,12 +918,13 @@ function cuentasDePucPyme(buffer: Buffer): CuentaPuc[] | null {
   if (h < 0) return null;
   const iClase = filas[h].findIndex((c) => norm(c) === "clase");
   const iRet = filas[h].findIndex((c) => /^%\s*ret/.test(norm(c)));
+  const iCentro = filas[h].findIndex((c) => /^c\.?\s*costo/.test(norm(c)));
   const porCodigo = new Map<string, CuentaPuc>();
   for (const r of filas.slice(h + 1)) {
     const codigo = String(r[0] ?? "").replace(/\D/g, "");
     if (!codigo || !String(r[iClase] ?? "").trim() || porCodigo.has(codigo)) continue;
     const tarifa = iRet >= 0 ? Number(String(r[iRet] ?? "").replace(",", ".")) : NaN;
-    porCodigo.set(codigo, { codigo, nombre: String(r[1] ?? "").trim(), ...(Number.isFinite(tarifa) && tarifa > 0 ? { tarifa } : {}) });
+    porCodigo.set(codigo, { codigo, nombre: String(r[1] ?? "").trim(), ...(Number.isFinite(tarifa) && tarifa > 0 ? { tarifa } : {}), ...(iCentro >= 0 && String(r[iCentro] ?? "").trim() ? { centro: true } : {}) });
   }
   const todas = [...porCodigo.values()].sort((x, y) => x.codigo.localeCompare(y.codigo, "es", { numeric: true }));
   // Una cuenta con subcuentas no recibe movimiento: solo se ofrecen las de más abajo en la rama.
@@ -950,6 +953,14 @@ export function tablaImpuestosPyme(cuentas: CuentaPuc[]): Tabla {
     }
   }
   return { sheetName: "Impuestos", columns, rows };
+}
+
+/** Siigo Pyme: cuentas del plan (a 10 dígitos) que exigen centro de costo; vacío si el plan se cargó sin esa columna. */
+export async function getCuentasConCentroPyme(empresaId: string): Promise<Set<string>> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { "puc.cuentas": 1 } }) : null;
+  const cuentas: CuentaPuc[] = Array.isArray(doc?.puc?.cuentas) ? doc.puc.cuentas : [];
+  return new Set(cuentas.filter((c) => c.centro).map((c) => String(c.codigo).replace(/\D/g, "").padEnd(10, "0")));
 }
 
 /** Reconstruye la tabla de impuestos de una empresa de Siigo Pyme desde su plan de cuentas (reemplaza la que tenga). */

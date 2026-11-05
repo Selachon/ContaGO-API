@@ -11,6 +11,8 @@ import type { FilaSiigo } from "./types.js";
 export interface PymeConfig {
   empresa: string;
   vendedor: number;
+  /** Cuentas (10 dígitos) que exigen centro de costo según el plan de cuentas. Si se da, el centro del comprobante va en esas líneas y solo en ellas. */
+  cuentasConCentro?: Set<string>;
 }
 
 const MESES = ["ENE", "FEB", "MAR", "ABR", "MAY", "JUN", "JUL", "AGO", "SEP", "OCT", "NOV", "DIC"];
@@ -57,6 +59,14 @@ export function escribirInterfazSiigoPyme(filas: FilaSiigo[], cfg: PymeConfig, a
   const aaaammdd = ahora.getFullYear() * 10000 + (ahora.getMonth() + 1) * 100 + ahora.getDate();
   const hhmmss = ahora.getHours() * 10000 + ahora.getMinutes() * 100 + ahora.getSeconds();
 
+  // Centro de costo de cada comprobante: el de la primera línea que lo trae (el gasto).
+  const centroDoc = new Map<string, [number, number]>();
+  for (const l of filas) {
+    const k = `${texto(l["Tipo de comprobante"])}|${texto(l["Consecutivo comprobante"])}`;
+    const c = centro(l["Código centro/subcentro de costos"]);
+    if (c[0] > 0 && !centroDoc.has(k)) centroDoc.set(k, c);
+  }
+
   const datos = filas.map((l) => {
     const c = partirComprobantePyme(texto(l["Tipo de comprobante"]));
     if (!c) throw new Error(`El comprobante «${texto(l["Tipo de comprobante"])}» no sirve para Siigo Pyme: usa la letra y el código, por ejemplo P-1.`);
@@ -73,7 +83,10 @@ export function escribirInterfazSiigoPyme(filas: FilaSiigo[], cfg: PymeConfig, a
     const deb = num(l["Débito"]);
     const cre = num(l["Crédito"]);
     const rol = texto(l["Rol"]);
-    const [cc, sub] = centro(l["Código centro/subcentro de costos"]);
+    const cuenta = cuentaPyme(l["Código cuenta contable"]);
+    const [cc, sub] = cfg.cuentasConCentro
+      ? (cfg.cuentasConCentro.has(String(cuenta)) ? centroDoc.get(`${texto(l["Tipo de comprobante"])}|${texto(l["Consecutivo comprobante"])}`) ?? [0, 0] : [0, 0])
+      : centro(l["Código centro/subcentro de costos"]);
     const baseRet = l["Base retención"] === undefined || l["Base retención"] === "" ? null : Math.round(num(l["Base retención"]));
     const [anioP, mesP, diaP] = fechaPartes(texto(l["Fecha doc proveedor"]));
     const docProv = Math.trunc(num(l["Doc proveedor"]));
@@ -81,7 +94,7 @@ export function escribirInterfazSiigoPyme(filas: FilaSiigo[], cfg: PymeConfig, a
     f[0] = c.letra;
     f[1] = c.codigo;
     f[2] = numero;
-    f[3] = cuentaPyme(l["Código cuenta contable"]);
+    f[3] = cuenta;
     f[4] = deb !== 0 ? "D" : "C";
     f[5] = Math.abs(deb !== 0 ? deb : cre);
     f[6] = anio;
