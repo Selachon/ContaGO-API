@@ -176,9 +176,9 @@ export async function cufesRegistrados(empresaId: string): Promise<string[]> {
 const CAMPOS_ASIGNACION: (keyof Ci2Asignacion)[] = [
   "cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento",
   "cuentaRecargo", "centroCostos", "tarifaRetefuente", "tarifaReteica", "tarifaReteiva", "baseMinimaReteicaEspecial", "cuentasItems",
-  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor",
+  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor", "formaPagoCodigo", "comprobante",
 ];
-const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino"]);
+const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "formaPagoCodigo", "comprobante"]);
 
 /** Aplica ediciones manuales a una factura pendiente. `null` en un campo = volver a la sugerencia. */
 export async function editarAsignacion(empresaId: string, id: string, cambios: Record<string, unknown>): Promise<Ci2Factura | null> {

@@ -39,6 +39,7 @@ import {
   getSistemaContable,
   getConfigWorldOffice,
   getProductosWo,
+  getConfigSiigoPyme,
   getConfigInventario,
   type ConfigInventario,
   setConfigInventario,
@@ -82,6 +83,7 @@ import {
 } from "../services/ci2Store.js";
 import { escribirInformeRetenciones, escribirInterfazSiigo } from "../services/causacionInterfaces/excelWriter.js";
 import { escribirInterfazWo } from "../services/causacionInterfaces/worldOfficeWriter.js";
+import { escribirInterfazSiigoPyme } from "../services/causacionInterfaces/siigoPymeWriter.js";
 import { escribirInterfazSyscafe } from "../services/causacionInterfaces/syscafeWriter.js";
 import { limpiarCuenta, toNumero } from "../services/causacionInterfaces/normalize.js";
 import { tryExtractDianUrlFromSafeLink } from "../middleware/validateDianUrl.js";
@@ -201,12 +203,21 @@ function opcionesRetencion(rows: Record<string, unknown>[]) {
 }
 
 /** Sugerencia del proveedor + lo editado en la factura; las cuentas globales de la empresa rellenan lo que siga vacío. */
-function efectiva(f: Ci2Factura, sug?: Ci2Asignacion, glob: Ci2CuentasGlobales = {}): Ci2Asignacion {
+function efectiva(f: Ci2Factura, sug?: Ci2Asignacion, glob: Ci2CuentasGlobales = {}, pagoDefecto = ""): Ci2Asignacion {
   const a: Ci2Asignacion = { ...ASIG_VACIA, ...(sug || {}), ...f.asignacion };
+  // Siigo Pyme: la forma de pago de la empresa rellena la factura que no tiene otra.
+  if (pagoDefecto && !String(a.formaPagoCodigo ?? "").trim()) a.formaPagoCodigo = pagoDefecto;
   a.retForzadas = (["tarifaRetefuente", "tarifaReteica", "tarifaReteiva"] as const).filter((k) => k in f.asignacion && Number((f.asignacion as any)[k]) > 0);
   for (const k of CAMPOS_GLOBALES) if (!limpiarCuenta(a[k])) a[k] = glob[k] || "";
   a.cuentasImpuestos = { ...(glob.cuentasImpuestos || {}) };
   return a;
+}
+
+/** Código de la forma de pago por defecto de Siigo Pyme ("" si la empresa no es de Siigo Pyme o no la fijó). */
+async function pagoDefectoDe(empresaId: string): Promise<string> {
+  if ((await getSistemaContable(empresaId)) !== "siigopyme") return "";
+  const c = await getConfigSiigoPyme(empresaId);
+  return c.formasPago.some((x) => x.codigo === c.formaPagoDefecto) ? String(c.formaPagoDefecto) : "";
 }
 
 /** Tarifas de impoconsumo que existen en la tabla de impuestos de la empresa. */
@@ -224,9 +235,11 @@ function ivaMayorSugerido(a: Ci2Asignacion, cfgInv: ConfigInventario | null): Re
   return out;
 }
 
-function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo = "compra", tarifasInc: Set<number> = new Set(), worldOffice = false, cfgInv: ConfigInventario | null = null): string[] {
+function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo = "compra", tarifasInc: Set<number> = new Set(), worldOffice = false, cfgInv: ConfigInventario | null = null, pyme = false): string[] {
   const clasifica = !!cfgInv;
   const out: string[] = [];
+  // Siigo Pyme: cada factura necesita su forma de pago (código del catálogo de la empresa).
+  if (pyme && tipo === "compra" && !/^\d+$/.test(String(a.formaPagoCodigo ?? "").trim())) out.push("formaPagoCodigo");
   if (clasifica && tipo === "compra" && a.destino !== "inventario" && a.destino !== "gasto") out.push("destino");
   // World Office: el producto sale de la tarifa de IVA (maestro de productos), no de la cuenta del proveedor.
   if (worldOffice) return out;
@@ -468,6 +481,8 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
     const [facturas, sugs, impuestos, glob] = await Promise.all([listarFacturas(empresaId, estado, tipo), sugerenciasPorNit(empresaId, tipo), getTabla(empresaId, "impuestos"), getCuentasGlobales(empresaId, tipo)]);
     const tarifasInc = tarifasIncDe(impuestos?.rows);
     const worldOffice = (await getSistemaContable(empresaId)) === "worldoffice";
+    const pagoDefecto = await pagoDefectoDe(empresaId);
+    const siigoPyme = (await getSistemaContable(empresaId)) === "siigopyme";
     const cfgInv = await getConfigInventario(empresaId);
     const opciones = opcionesRetencion(impuestos?.rows || []);
     res.json({
@@ -476,8 +491,8 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
       opcionesRetencion: opciones,
       facturas: facturas.map((f) => {
         const sug = sugs.get(f.nit);
-        const ef = efectiva(f, sug, glob);
-        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, worldOffice, cfgInv.activo && !f.isCreditNote ? cfgInv : null), ivaMayorSugerido: ivaMayorSugerido(ef, cfgInv.activo ? cfgInv : null), sinParametros: !sug };
+        const ef = efectiva(f, sug, glob, pagoDefecto);
+        return { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opciones), categoria: categoriaDocumento(f.documentType, f.isCreditNote), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, worldOffice, cfgInv.activo && !f.isCreditNote ? cfgInv : null, siigoPyme), ivaMayorSugerido: ivaMayorSugerido(ef, cfgInv.activo ? cfgInv : null), sinParametros: !sug };
       }),
     });
   } catch (e) {
@@ -521,9 +536,9 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
       await guardarParametroProveedor(empresaId, tipo, f.nit, f.proveedor, Object.fromEntries(aParametro.map((k) => [k, (f!.asignacion as any)[k]])));
     }
     const sug = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
-    const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo));
+    const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo), await pagoDefectoDe(empresaId));
     const tarifasInc = tarifasIncDe((await getTabla(empresaId, "impuestos"))?.rows);
-    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote)), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
+    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any)), sugerencia: sug || null, efectiva: ef, faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote), (await getSistemaContable(empresaId)) === "siigopyme"), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
   } catch (e) {
     err(res, e);
   }
@@ -719,6 +734,10 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     const sistemaContable = await getSistemaContable(empresaId);
     const cfgInventario = await getConfigInventario(empresaId);
     const worldoffice = sistemaContable === "worldoffice";
+    const siigoPyme = sistemaContable === "siigopyme";
+    const configPyme = siigoPyme ? await getConfigSiigoPyme(empresaId) : null;
+    const pagoDefecto = await pagoDefectoDe(empresaId);
+    if (siigoPyme && venta) return err(res, new Error("Siigo Pyme solo está habilitado para compras por ahora."));
     const configWo = worldoffice ? await getConfigWorldOffice(empresaId) : null;
     if (worldoffice) {
       if (!configWo!.empresa || !configWo!.terceroInterno || !configWo!.bodega) return err(res, new Error("Faltan los parámetros de World Office de la empresa (nombre en World Office, Tercero Interno y Bodega)."));
@@ -756,13 +775,14 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       totalIva: f.totals.iva,
       formaPago: f.formaPago,
       fechaVencimiento: f.fechaVencimiento,
-      asignacion: efectiva(f, sugs.get(f.nit), glob),
+      asignacion: efectiva(f, sugs.get(f.nit), glob, pagoDefecto),
     }));
 
     const r = generarInterfaz(entradas, {
       modo: tipo,
       inventario: !venta && !worldoffice && cfgInventario.activo ? cfgInventario : undefined,
       worldoffice,
+      pyme: siigoPyme ? { diasVencimiento: configPyme!.diasVencimiento, formaPagoDefecto: configPyme!.formaPagoDefecto } : undefined,
       productosWo: worldoffice ? await getProductosWo(empresaId, venta ? "ventas" : "compras") : undefined,
       tipoVentasWo: worldoffice && venta ? configWo!.tipoVentas : undefined,
       tipoPorPrefijo: prefijos,
@@ -785,7 +805,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     const sufijo = venta ? "Ventas" : "Compras";
     // Mismas líneas contables; cambia solo el archivo según el programa contable de la empresa.
     const syscafe = sistemaContable === "syscafe";
-    const sistema = syscafe ? "Syscafe" : "Siigo";
+    const sistema = syscafe ? "Syscafe" : siigoPyme ? "SiigoPyme" : "Siigo";
     const ext = syscafe ? "xls" : "xlsx";
     const escribir = async (filas: typeof r.salida) => (syscafe ? escribirInterfazSyscafe(filas) : await escribirInterfazSiigo(filas));
     let archivos: { nombre: string; tipo: "interfaz" | "informe"; data: Buffer }[];
@@ -795,6 +815,12 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       archivos = [
         { nombre: `Encabezados_WorldOffice_${sufijo}.xls`, tipo: "interfaz", data: wo.encabezados },
         { nombre: `Movimientos_WorldOffice_${sufijo}.xls`, tipo: "interfaz", data: wo.movimientos },
+      ];
+    } else if (siigoPyme) {
+      const empresaNombre = empresas.find((e) => e.id === empresaId)?.nombre || "";
+      archivos = [
+        { nombre: `MovimientoContable_SiigoPyme_${sufijo}.xlsx`, tipo: "interfaz", data: escribirInterfazSiigoPyme(r.salida, { empresa: empresaNombre, vendedor: configPyme!.vendedor }) },
+        { nombre: `Informe_Retenciones_${sufijo}.xlsx`, tipo: "informe", data: await escribirInformeRetenciones(r.informe) },
       ];
     } else {
       archivos = [

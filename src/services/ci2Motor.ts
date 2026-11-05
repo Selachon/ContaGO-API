@@ -18,6 +18,7 @@ import { COLUMNAS_SIIGO, COLUMNAS_INFORME, type FilaSiigo, type FilaInforme, typ
 import { dividirEnPartes } from "./causacionInterfaces/compras.js";
 import { extraerPrefijoConsecutivo } from "./causacionInterfaces/ventas.js";
 import { separarNumeroExterno, type WoDocumento } from "./causacionInterfaces/worldOfficeWriter.js";
+import { partirComprobantePyme } from "./causacionInterfaces/siigoPymeWriter.js";
 import { abreviarTipoDocumento, limpiarCuenta, redondear, redondear4, toNumero } from "./causacionInterfaces/normalize.js";
 
 /** Cuentas y retenciones efectivas de una factura (sugeridas + ediciones del usuario). */
@@ -44,6 +45,9 @@ export interface Ci2Asignacion {
   fechaVencimiento?: string;
   prefijoExterno?: string;
   numeroExterno?: string;
+  /** Siigo Pyme: código de la forma de pago (catálogo de la empresa) y comprobante de la factura ("P-1") cuando no es el de su clase. */
+  formaPagoCodigo?: string;
+  comprobante?: string;
   /** Empresas que clasifican las compras: a dónde va la factura (decisión manual de cada una). */
   destino?: "inventario" | "gasto";
   /** Inventario: cuenta elegida para la base de cada tarifa de IVA ("0", "5", "19") cuando hay varias posibles. */
@@ -85,6 +89,8 @@ export interface Ci2Opciones {
   modo?: "compra" | "venta";
   /** Compras para World Office: en vez de líneas contables se arma el contenido de sus dos archivos (producto + IVA + valor). */
   worldoffice?: boolean;
+  /** Siigo Pyme (compras): el modelo general de movimiento contable; las líneas llevan los datos auxiliares que pide. */
+  pyme?: { diasVencimiento: number; formaPagoDefecto: number };
   /** World Office (ventas): Tipo Documento fijo de la empresa; el consecutivo es el número de la factura. */
   tipoVentasWo?: string;
   /** World Office: maestro de productos; cada ítem toma el de su tarifa de IVA. */
@@ -241,7 +247,14 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   const descripcion = `${tipoDocAbrev} ${f.docNumber} ${f.proveedor}`;
   const lineas: FilaSiigo[] = [];
 
-  const crear = (cuenta: unknown, debito: number, credito: number, desc: string, codImp: CeldaValor = "", centro = "", baseRet?: number) => {
+  const pyme = !!opts.pyme && !venta;
+  const numProveedor = Math.trunc(Number(separarNumeroExterno(f.docNumber).numero)) || 0;
+  const crear = (cuenta: unknown, debito: number, credito: number, desc: string, codImp: CeldaValor = "", centro = "", baseRet?: number, meta?: FilaSiigo) => {
+    // Siigo Pyme: la descripción siempre empieza por FC + número de la factura del proveedor, con la etiqueta (IVA19, RF…) si la hay.
+    if (pyme) {
+      const etiqueta = desc.replace(descripcion, "").trim();
+      desc = `FC${numProveedor}${etiqueta ? " " + etiqueta : ""} ${f.proveedor}`;
+    }
     const l: FilaSiigo = {};
     for (const c of COLUMNAS_SIIGO) l[c] = "";
     l["Tipo de comprobante"] = tipo;
@@ -256,14 +269,15 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     l["Crédito"] = credito;
     // Base de la retención: no es columna de Siigo, la usan los formatos que la piden (Syscafe).
     if (baseRet !== undefined) l["Base retención"] = redondear(baseRet);
+    if (meta) Object.assign(l, meta);
     lineas.push(l);
   };
-  const agregarLinea = (cuenta: unknown, valor: number, nat: "D" | "C", desc: string, codImp: CeldaValor = "", centro = "", baseRet?: number) => {
+  const agregarLinea = (cuenta: unknown, valor: number, nat: "D" | "C", desc: string, codImp: CeldaValor = "", centro = "", baseRet?: number, meta?: FilaSiigo) => {
     const v = redondear(valor);
     if (v === 0) return;
     const debito = nat === "D" ? (esNc ? 0 : v) : esNc ? v : 0;
     const credito = nat === "D" ? (esNc ? v : 0) : esNc ? 0 : v;
-    crear(cuenta, debito, credito, desc, codImp, centro, baseRet);
+    crear(cuenta, debito, credito, desc, codImp, centro, baseRet, meta);
   };
 
   const baseGasto = ag.baseGasto;
@@ -304,13 +318,24 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     // Un renglón de gasto por cuenta distinta (en orden de aparición); los ítems sin cuenta propia van a la del proveedor.
     // Con IVA mayor valor, el IVA de cada ítem se suma a la cuenta de su gasto.
     const porCuenta = new Map<string, number>();
+    // Siigo Pyme: cada línea de base lleva el IVA de sus ítems (porcentaje de la tarifa con más base y valor total).
+    const ivaCuenta = new Map<string, { valor: number; tarifas: Map<number, number> }>();
     for (const [idx, base] of ag.basesItem) {
       const propia = limpiarCuenta(as.cuentasItems?.[String(idx)] ?? "");
       const cuenta = exigirCuenta(propia || as.cuentaGasto, venta ? "Cuenta de ingreso" : "Cuenta de gasto", venta ? "Hay base de ingreso." : "Hay base de gasto.");
       const iva = ivaMayorGasto ? (base * f.items[idx].ivaPercent) / 100 : 0;
       porCuenta.set(cuenta, (porCuenta.get(cuenta) ?? 0) + base + iva);
+      const g = ivaCuenta.get(cuenta) ?? { valor: 0, tarifas: new Map<number, number>() };
+      g.valor += (base * f.items[idx].ivaPercent) / 100;
+      g.tarifas.set(redondear4(f.items[idx].ivaPercent), (g.tarifas.get(redondear4(f.items[idx].ivaPercent)) ?? 0) + base);
+      ivaCuenta.set(cuenta, g);
     }
-    for (const [cuenta, base] of porCuenta) agregarLinea(cuenta, base, natBase, descripcion, "", as.centroCostos);
+    for (const [cuenta, base] of porCuenta) {
+      const g = ivaCuenta.get(cuenta)!;
+      const pct = [...g.tarifas.entries()].sort((x, y) => y[1] - x[1])[0]?.[0] ?? 0;
+      const meta: FilaSiigo | undefined = pyme ? { "Rol": "base", "IVA %": pct, "IVA valor": redondear(g.valor), "Gravada": g.valor > 0 ? "S" : "N" } : undefined;
+      agregarLinea(cuenta, base, natBase, descripcion, "", as.centroCostos, undefined, meta);
+    }
   }
   for (const t of tarifasIva) {
     if (t <= 0 || ivaMayorGasto) continue;
@@ -322,7 +347,9 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
       continue;
     }
     const imp = impuesto("IVA", t);
-    agregarLinea(imp.cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`, imp.codigo);
+    // Siigo Pyme: la base del IVA es la base de los ítems de esa tarifa.
+    const baseTarifa = f.items.reduce((x, it, idx) => (redondear4(it.ivaPercent) === redondear4(t) ? x + (ag.basesItem.get(idx) ?? 0) : x), 0);
+    agregarLinea(imp.cuenta, ag.iva.get(t)!, natBase, `IVA${t} ${descripcion}`, imp.codigo, "", pyme ? baseTarifa : undefined, pyme ? { "Rol": "iva" } : undefined);
   }
   for (const t of [...ag.inc.keys()].sort((x, y) => y - x)) {
     if (inventario) {
@@ -395,7 +422,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     baseMinRiva = imp.baseMinima;
     if (forzada("tarifaReteiva") || ivaTotal >= baseMinRiva) {
       riva = (ivaTotal * as.tarifaReteiva) / 100;
-      agregarLinea(imp.cuenta, riva, natRet, `RIVA ${descripcion}`, imp.codigo, "", ivaTotal);
+      agregarLinea(imp.cuenta, riva, natRet, `RIVA ${descripcion}`, imp.codigo, "", ivaTotal, pyme ? { "Base ReteIVA": redondear(ivaTotal) } : undefined);
     }
   }
 
@@ -420,7 +447,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     const v = redondear(Math.abs(dif));
     if (v !== 0) crear(cuenta, dif < 0 ? v : 0, dif < 0 ? 0 : v, descripcion);
   } else {
-    agregarLinea(exigirCuenta(as.cuentaPorPagar, "Cuenta por pagar / forma de pago", "Falta la contrapartida."), esNc ? dif * -1 : dif, "C", descripcion);
+    agregarLinea(exigirCuenta(as.cuentaPorPagar, "Cuenta por pagar / forma de pago", "Falta la contrapartida."), esNc ? dif * -1 : dif, "C", descripcion, "", pyme ? as.centroCostos : "", undefined, pyme ? { "Rol": "cxp" } : undefined);
   }
 
   const inf: FilaInforme = {};
@@ -461,6 +488,14 @@ const aDdMmYyyy = (v: string) => {
   const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(v || "");
   return m ? `${m[3]}/${m[2]}/${m[1]}` : v || "";
 };
+
+/** dd/mm/yyyy + días → dd/mm/yyyy. */
+function sumarDias(ddmmyyyy: string, dias: number): string {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(ddmmyyyy || "");
+  if (!m) return ddmmyyyy;
+  const d = new Date(Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1]) + dias));
+  return `${String(d.getUTCDate()).padStart(2, "0")}/${String(d.getUTCMonth() + 1).padStart(2, "0")}/${d.getUTCFullYear()}`;
+}
 
 /** World Office (compras): un renglón por producto y tarifa de IVA, con la base como valor; los impuestos los calcula el programa. */
 function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, productos: { codigo: string; iva: number }[], venta?: { prefijo: string }): { doc: WoDocumento; avisos: string[] } {
@@ -540,9 +575,13 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
         continue;
       }
     } else {
-      tipo = porDocumento || (cat.clave === "NC" ? opts.tipoComprasNc : cat.clave === "FE" ? opts.tipoCompras : "");
+      tipo = (opts.pyme && f.asignacion.comprobante?.trim().toUpperCase()) || porDocumento || (cat.clave === "NC" ? opts.tipoComprasNc : cat.clave === "FE" ? opts.tipoCompras : "");
       if (!tipo) {
         errores.push({ id: f.id, docNumber: f.docNumber, proveedor: f.proveedor, mensaje: `No hay tipo de comprobante para «${cat.etiqueta}».` });
+        continue;
+      }
+      if (opts.pyme && !partirComprobantePyme(tipo)) {
+        errores.push({ id: f.id, docNumber: f.docNumber, proveedor: f.proveedor, mensaje: `El comprobante «${tipo}» no sirve para Siigo Pyme: usa la letra y el código, por ejemplo P-1.` });
         continue;
       }
       consecutivo = contador[tipo] ?? 1;
@@ -558,6 +597,13 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
         continue;
       }
       const r = armarFactura(f, tipo, consecutivo, opts);
+      if (opts.pyme && !venta) {
+        const codigo = String(f.asignacion.formaPagoCodigo ?? "").trim();
+        if (!/^\d+$/.test(codigo)) throw new Ci2Error("Elige la forma de pago de la factura (catálogo de Siigo Pyme en Parámetros).");
+        const doc = Math.trunc(Number(separarNumeroExterno(f.docNumber).numero)) || 0;
+        const vence = sumarDias(f.fecha, opts.pyme.diasVencimiento);
+        for (const l of r.lineas) Object.assign(l, { "Doc proveedor": doc, "Fecha doc proveedor": f.fecha, "Forma pago Pyme": Number(codigo), "Vence": vence });
+      }
       salida.push(...r.lineas);
       informe.push(r.inf);
       if (r.aviso) advertencias.push(r.aviso);

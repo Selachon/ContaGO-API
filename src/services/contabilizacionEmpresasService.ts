@@ -200,8 +200,8 @@ export interface PucResumen {
   cuentas: number;
 }
 
-export type SistemaContable = "siigo" | "syscafe" | "worldoffice";
-const normSistema = (v: unknown): SistemaContable => (v === "syscafe" || v === "worldoffice" ? v : "siigo");
+export type SistemaContable = "siigo" | "syscafe" | "worldoffice" | "siigopyme";
+const normSistema = (v: unknown): SistemaContable => (v === "syscafe" || v === "worldoffice" || v === "siigopyme" ? v : "siigo");
 
 /** Parámetros de la empresa en World Office (solo si su sistema contable es World Office). */
 export interface ConfigWorldOffice {
@@ -213,6 +213,34 @@ export interface ConfigWorldOffice {
   /** Tipo Documento de las facturas de venta (ej. FV). */
   tipoVentas: string;
 }
+/** Parámetros de la empresa para la interfaz de Siigo Pyme (movimiento contable, modelo general). */
+export interface ConfigSiigoPyme {
+  /** Código del vendedor que va en cada línea (0 si no se usa). */
+  vendedor: number;
+  /** Días entre la emisión y el vencimiento de la cuenta por pagar. */
+  diasVencimiento: number;
+  /** Catálogo de formas de pago: el usuario las elige por nombre y a la interfaz va el código. */
+  formasPago: { nombre: string; codigo: number }[];
+  /** Código de la forma de pago que se usa si la factura no tiene otra. */
+  formaPagoDefecto: number;
+  /** Listado de centros de costo (y subcentro) para asignar a cada factura. */
+  centros: { centro: number; subcentro: number; nombre: string }[];
+}
+const entero = (v: unknown, def = 0) => {
+  const n = Math.trunc(Number(String(v ?? "").replace(/\D/g, "")));
+  return Number.isFinite(n) ? n : def;
+};
+const normPyme = (v: any): ConfigSiigoPyme => {
+  const vistos = new Set<number>();
+  const formasPago = (Array.isArray(v?.formasPago) ? v.formasPago : [])
+    .map((f: any) => ({ nombre: String(f?.nombre ?? "").trim(), codigo: entero(f?.codigo, -1) }))
+    .filter((f: { nombre: string; codigo: number }) => f.nombre && f.codigo >= 0 && !vistos.has(f.codigo) && vistos.add(f.codigo));
+  const centros = (Array.isArray(v?.centros) ? v.centros : [])
+    .map((c: any) => ({ centro: entero(c?.centro), subcentro: entero(c?.subcentro), nombre: String(c?.nombre ?? "").trim() }))
+    .filter((c: { centro: number }) => c.centro > 0);
+  return { vendedor: entero(v?.vendedor), diasVencimiento: v?.diasVencimiento === undefined ? 30 : entero(v.diasVencimiento, 30), formasPago, formaPagoDefecto: entero(v?.formaPagoDefecto, 0), centros };
+};
+
 const normWo = (v: any): ConfigWorldOffice => ({
   empresa: String(v?.empresa ?? "").trim(),
   terceroInterno: String(v?.terceroInterno ?? "").replace(/\D/g, ""),
@@ -235,6 +263,7 @@ export interface EmpresaPublic {
   /** Programa contable al que va dirigida la interfaz que genera Causación Interfaces 2.0. */
   sistemaContable: SistemaContable;
   worldOffice: ConfigWorldOffice;
+  siigoPyme: ConfigSiigoPyme;
   /** Compras clasificadas como inventario o gasto por factura (ver ConfigInventario). */
   clasificarCompras: boolean;
   comprobantes: Comprobantes;
@@ -319,6 +348,7 @@ function toPublic(doc: any): EmpresaPublic {
     cuentaGastoPorTarifaIva: !!doc.cuentaGastoPorTarifaIva,
     sistemaContable: normSistema(doc.sistemaContable),
     worldOffice: normWo(doc.worldOffice),
+    siigoPyme: normPyme(doc.siigoPyme),
     clasificarCompras: !!doc.inventario?.activo,
     comprobantes: normComprobantes(doc.comprobantes),
     consecutivos: (doc.consecutivos && typeof doc.consecutivos === "object" ? doc.consecutivos : {}) as Consecutivos,
@@ -444,6 +474,12 @@ export async function setProductosWo(empresaId: string, productos: unknown, modo
   return limpio;
 }
 
+export async function getConfigSiigoPyme(empresaId: string): Promise<ConfigSiigoPyme> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { siigoPyme: 1 } }) : null;
+  return normPyme(doc?.siigoPyme);
+}
+
 export async function getConfigWorldOffice(empresaId: string): Promise<ConfigWorldOffice> {
   const oid = toObjectId(empresaId);
   const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { worldOffice: 1 } }) : null;
@@ -523,6 +559,7 @@ export async function updateEmpresa(
     cuentaGastoPorTarifaIva?: boolean;
     sistemaContable?: string;
     worldOffice?: Partial<ConfigWorldOffice>;
+    siigoPyme?: Partial<ConfigSiigoPyme>;
     comprobantes?: Partial<Comprobantes>;
     consecutivos?: Consecutivos;
   }
@@ -548,6 +585,7 @@ export async function updateEmpresa(
   }
   if (patch.sistemaContable !== undefined) set.sistemaContable = normSistema(patch.sistemaContable);
   if (patch.worldOffice !== undefined) set.worldOffice = normWo(patch.worldOffice);
+  if (patch.siigoPyme !== undefined) set.siigoPyme = normPyme(patch.siigoPyme);
   if (patch.comprobantes !== undefined) set.comprobantes = normComprobantes(patch.comprobantes);
   if (patch.consecutivos !== undefined && patch.consecutivos && typeof patch.consecutivos === "object") {
     const limpio: Consecutivos = {};
