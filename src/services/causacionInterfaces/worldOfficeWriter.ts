@@ -87,6 +87,8 @@ export function serialExcel(ddmmyyyy: string): number | "" {
 const celdaFecha = (serial: number | "") => (serial === "" ? "" : { t: "n", v: serial, z: "dd-mm-yy" });
 
 const soloDigitos = (v: string) => String(v ?? "").replace(/\D/g, "");
+/** Consumidor final: la DIAN lo factura con 222222222222 (12 dígitos) y World Office lo tiene creado como 222222222 (9). */
+const terceroWo = (v: string) => { const d = soloDigitos(v); return /^2{9,12}$/.test(d) ? "222222222" : d; };
 const numeroONada = (v: string) => (/^\d+$/.test(v) ? Number(v) : v);
 
 /** Separa el número del proveedor en prefijo y número (los dígitos finales). */
@@ -106,7 +108,7 @@ export function escribirInterfazWo(docs: WoDocumento[], cfg: WoConfig, hoy: Date
       "Encab: Documento Número": e.numero,
       "Encab: Fecha": celdaFecha(serialExcel(e.fecha)),
       "Encab: Tercero Interno": numeroONada(soloDigitos(cfg.terceroInterno)),
-      "Encab: Tercero Externo": numeroONada(soloDigitos(e.terceroExterno)),
+      "Encab: Tercero Externo": numeroONada(terceroWo(e.terceroExterno)),
       "Encab: Pref Dto Ext": e.prefijoExterno,
       "Encab: No. Dto Ext": numeroONada(e.numeroExterno),
       "Encab: Nota": e.nota,
