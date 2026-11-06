@@ -62,6 +62,8 @@ export interface Ci2Asignacion {
   destino?: "inventario" | "gasto";
   /** Inventario: cuenta elegida para la base de cada tarifa de IVA ("0", "5", "19") cuando hay varias posibles. */
   cuentasInventario?: Record<string, string>;
+  /** Impoconsumo: cuenta elegida por tarifa ("8") cuando la tabla de impuestos trae varias con la misma tarifa. */
+  cuentasInc?: Record<string, string>;
   /** Inventario: cuenta de IVA mayor valor elegida por tarifa ("5", "19") cuando hay varias posibles. */
   cuentasIvaMayor?: Record<string, string>;
 }
@@ -394,7 +396,10 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     }
     // Si la tabla no tiene el impoconsumo de esa tarifa, se pide su cuenta aparte ("INC 8%").
     const cuentaAparte = limpiarCuenta(as.cuentasImpuestos?.[`INC ${t}%`] ?? "");
-    const imp = cuentaAparte ? { cuenta: cuentaAparte, codigo: "" as CeldaValor, baseMinima: 0 } : impuesto("INC", t);
+    // Con varias cuentas de impoconsumo para la misma tarifa en la tabla, se usa la elegida en la factura (si ya no existe en la tabla, la primera).
+    const elegidaInc = limpiarCuenta(as.cuentasInc?.[String(redondear4(t))] ?? "");
+    const conElegida = () => { if (!elegidaInc) return null; try { return buscarImpuesto(opts.impuestos, "INC", t, colCuenta, elegidaInc); } catch { return null; } };
+    const imp = cuentaAparte ? { cuenta: cuentaAparte, codigo: "" as CeldaValor, baseMinima: 0 } : conElegida() ?? impuesto("INC", t);
     agregarLinea(imp.cuenta, ag.inc.get(t)!, natBase, `IMPOCONSUMO ${descripcion}`, imp.codigo);
   }
   if (venta) {

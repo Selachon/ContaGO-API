@@ -157,10 +157,11 @@ const COLUMNA_PARAM: Partial<Record<keyof Ci2Asignacion, string>> = {
   destino: "Destino",
   cuentasInventario: "Cuentas_inventario",
   cuentasIvaMayor: "Cuentas_iva_mayor",
+  cuentasInc: "Cuentas_inc",
 };
 /** Campos del parámetro que se guardan como texto tal cual (sin limpiar como cuenta) o como JSON ({tarifa: cuenta}). */
 const PARAM_TEXTO = new Set<keyof Ci2Asignacion>(["formaPago", "formaPagoCodigo", "comprobante", "tratamientoIva", "destino"]);
-const PARAM_JSON = new Set<keyof Ci2Asignacion>(["cuentasInventario", "cuentasIvaMayor"]);
+const PARAM_JSON = new Set<keyof Ci2Asignacion>(["cuentasInventario", "cuentasIvaMayor", "cuentasInc"]);
 const COLUMNA_PARAM_VENTAS: Partial<Record<keyof Ci2Asignacion, string>> = {
   ...COLUMNA_PARAM,
   cuentaGasto: "Cuenta_ingreso",
@@ -227,6 +228,20 @@ function opcionesRetencion(rows: Record<string, unknown>[], porCuenta = false) {
     return out.sort((a, b) => a.tarifa - b.tarifa || (a.cuenta ?? "").localeCompare(b.cuenta ?? ""));
   };
   return { retefuente: por("RETEFUENTE"), reteica: por("RETEICA"), reteiva: por("RETEIVA") };
+}
+
+/** Cuentas de impoconsumo de la tabla de impuestos por tarifa ("8": [cuentas]); solo importan las tarifas con más de una. */
+function opcionesInc(rows: Record<string, unknown>[], venta: boolean): Record<string, string[]> {
+  const col = venta ? "Ventas" : "Compras";
+  const por: Record<string, string[]> = {};
+  for (const r of rows) {
+    if (!String(r["Nombre"] ?? "").toUpperCase().includes("IMPOCONSUMO")) continue;
+    const cuenta = limpiarCuenta(r[col]);
+    const t = String(Math.round(toNumero(r["Tarifa"]) * 10000) / 10000);
+    if (!cuenta || t === "0") continue;
+    (por[t] ||= []).includes(cuenta) || por[t].push(cuenta);
+  }
+  return Object.fromEntries(Object.entries(por).filter(([, l]) => l.length > 1));
 }
 
 /** Sugerencia del proveedor + lo editado en la factura; las cuentas globales de la empresa rellenan lo que siga vacío. */
@@ -525,6 +540,7 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
       status: "ok",
       cuentasGlobales: glob,
       opcionesRetencion: opciones,
+      opcionesInc: opcionesInc((impuestos?.rows || []) as any, tipo === "venta"),
       facturas: facturas.map((f) => {
         const sug = sugs.get(f.nit);
         const ef = efectiva(f, sug, glob, pymeCfg);

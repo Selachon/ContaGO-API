@@ -176,7 +176,7 @@ export async function cufesRegistrados(empresaId: string): Promise<string[]> {
 const CAMPOS_ASIGNACION: (keyof Ci2Asignacion)[] = [
   "cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento",
   "cuentaRecargo", "centroCostos", "tarifaRetefuente", "tarifaReteica", "tarifaReteiva", "baseMinimaReteicaEspecial", "cuentasItems",
-  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva", "concepto", "cuentaIvaMayorValor",
+  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva", "concepto", "cuentaIvaMayorValor", "cuentasInc",
 ];
 const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva", "concepto", "cuentaIvaMayorValor"]);
 
@@ -190,7 +190,7 @@ export async function editarAsignacion(empresaId: string, id: string, cambios: R
     if (!(k in cambios)) continue;
     const v = cambios[k];
     if (v === null) unset[`asignacion.${k}`] = "";
-    else if (k === "cuentasItems" || k === "cuentasInventario" || k === "cuentasIvaMayor") {
+    else if (k === "cuentasItems" || k === "cuentasInventario" || k === "cuentasIvaMayor" || k === "cuentasInc") {
       // { índiceÍtem | tarifa: cuenta }; un valor vacío quita la cuenta propia.
       const limpio: Record<string, string> = {};
       for (const [i, c] of Object.entries((v && typeof v === "object" ? v : {}) as Record<string, unknown>)) {
