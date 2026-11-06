@@ -219,13 +219,16 @@ export interface ConfigWorldOffice {
   tipoVentas: string;
 }
 /** Parámetros de la empresa para la interfaz de Siigo Pyme (movimiento contable, modelo general). */
+/** `terceroNit`: formas de pago en que la deuda queda con el banco (tarjeta de crédito…): la línea por pagar va a ese tercero y no al proveedor. */
+export interface FormaPagoPyme { nombre: string; codigo: number; cuenta: string; terceroNit?: string }
+
 export interface ConfigSiigoPyme {
   /** Código del vendedor que va en cada línea (0 si no se usa). */
   vendedor: number;
   /** Días entre la emisión y el vencimiento de la cuenta por pagar. */
   diasVencimiento: number;
   /** Catálogo de formas de pago: el usuario las elige por nombre; a la interfaz va el código y la cuenta por pagar es la que Siigo Pyme relaciona con cada una. */
-  formasPago: { nombre: string; codigo: number; cuenta: string }[];
+  formasPago: FormaPagoPyme[];
   /** Cuenta del IVA que la empresa asume como gasto (no descontable). */
   cuentaIvaAsumido: string;
   /** Listado de centros de costo (y subcentro) para asignar a cada factura. */
@@ -238,7 +241,10 @@ const entero = (v: unknown, def = 0) => {
 const normPyme = (v: any): ConfigSiigoPyme => {
   const vistos = new Set<number>();
   const formasPago = (Array.isArray(v?.formasPago) ? v.formasPago : [])
-    .map((f: any) => ({ nombre: String(f?.nombre ?? "").trim(), codigo: entero(f?.codigo, -1), cuenta: String(f?.cuenta ?? "").replace(/\D/g, "") }))
+    .map((f: any) => {
+      const terceroNit = String(f?.terceroNit ?? "").replace(/\D/g, "");
+      return { nombre: String(f?.nombre ?? "").trim(), codigo: entero(f?.codigo, -1), cuenta: String(f?.cuenta ?? "").replace(/\D/g, ""), ...(terceroNit ? { terceroNit } : {}) };
+    })
     .filter((f: { nombre: string; codigo: number }) => f.nombre && f.codigo >= 0 && !vistos.has(f.codigo) && vistos.add(f.codigo));
   const centros = (Array.isArray(v?.centros) ? v.centros : [])
     .map((c: any) => ({ centro: entero(c?.centro), subcentro: entero(c?.subcentro), nombre: String(c?.nombre ?? "").trim() }))
@@ -494,7 +500,7 @@ export async function importarFormasPagoPyme(empresaId: string, buffer: Buffer):
   const iCod = filas[h].findIndex((c) => /^forma\s*pago/.test(norm(c)));
   const iNom = filas[h].findIndex((c) => norm(c) === "nombre");
   const iCta = filas[h].findIndex((c) => norm(c) === "cuenta");
-  const formasPago: { nombre: string; codigo: number; cuenta: string }[] = [];
+  const formasPago: FormaPagoPyme[] = [];
   for (const r of filas.slice(h + 1)) {
     const codigo = String(r[iCod] ?? "").trim();
     const nombre = String(r[iNom] ?? "").trim();
@@ -503,6 +509,11 @@ export async function importarFormasPagoPyme(empresaId: string, buffer: Buffer):
   }
   if (!formasPago.length) throw new Error("El archivo no trae formas de pago.");
   const actual = await getConfigSiigoPyme(empresaId);
+  // Al reimportar el catálogo se conserva el tercero (banco) que el usuario ya había asignado a cada forma de pago.
+  for (const f of formasPago) {
+    const previo = actual.formasPago.find((x) => x.codigo === f.codigo);
+    if (previo?.terceroNit) f.terceroNit = previo.terceroNit;
+  }
   const nueva = normPyme({ ...actual, formasPago });
   await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { siigoPyme: nueva, updatedAt: new Date() } });
   return nueva;
@@ -548,6 +559,14 @@ export async function getConfigSiigoPyme(empresaId: string): Promise<ConfigSiigo
   const oid = toObjectId(empresaId);
   const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { siigoPyme: 1 } }) : null;
   return normPyme(doc?.siigoPyme);
+}
+
+/** Sistema contable, parámetros de Siigo Pyme e inventario de la empresa en una sola lectura (las pantallas de Interfaces 2.0 los usan juntos). */
+export async function getContextoCi2(empresaId: string): Promise<{ sistema: SistemaContable; pyme: ConfigSiigoPyme | null; inventario: ConfigInventario }> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { sistemaContable: 1, siigoPyme: 1, inventario: 1 } }) : null;
+  const sistema = normSistema(doc?.sistemaContable);
+  return { sistema, pyme: sistema === "siigopyme" ? normPyme(doc?.siigoPyme) : null, inventario: normInventario(doc?.inventario) };
 }
 
 export async function getConfigWorldOffice(empresaId: string): Promise<ConfigWorldOffice> {

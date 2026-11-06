@@ -48,8 +48,10 @@ export interface Ci2Asignacion {
   /** Siigo Pyme: código de la forma de pago (catálogo de la empresa) y comprobante de la factura ("P-1") cuando no es el de su clase. */
   formaPagoCodigo?: string;
   comprobante?: string;
-  /** Siigo Pyme: cómo se trata el IVA de la factura (descontable de compras, de servicios, o asumido como gasto). */
-  tratamientoIva?: "compras" | "servicios" | "asumido";
+  /** Siigo Pyme: cómo se trata el IVA de la factura (descontable de compras, de servicios, asumido como gasto, o mayor valor en la cuenta que se elija). */
+  tratamientoIva?: "compras" | "servicios" | "asumido" | "mayor";
+  /** Siigo Pyme, IVA mayor valor esporádico: cuenta que el usuario elige en la factura para el IVA, sin depender de un impuesto creado. */
+  cuentaIvaMayorValor?: string;
   /** Siigo Pyme: concepto que va a Siigo en cada línea (descripción de la secuencia); si falta se usa el sugerido. */
   concepto?: string;
   /** Siigo Pyme: cuenta de retención elegida (varias cuentas comparten tarifa). */
@@ -98,7 +100,7 @@ export interface Ci2Opciones {
   /** Compras para World Office: en vez de líneas contables se arma el contenido de sus dos archivos (producto + IVA + valor). */
   worldoffice?: boolean;
   /** Siigo Pyme (compras): el modelo general de movimiento contable; las líneas llevan los datos auxiliares que pide. */
-  pyme?: { diasVencimiento: number; cuentaIvaAsumido: string };
+  pyme?: { diasVencimiento: number; cuentaIvaAsumido: string; formasPago: { codigo: number; terceroNit?: string }[] };
   /** World Office (ventas): Tipo Documento fijo de la empresa; el consecutivo es el número de la factura. */
   tipoVentasWo?: string;
   /** World Office: maestro de productos; cada ítem toma el de su tarifa de IVA. */
@@ -369,7 +371,11 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     const baseTarifa = f.items.reduce((x, it, idx) => (redondear4(it.ivaPercent) === redondear4(t) ? x + (ag.basesItem.get(idx) ?? 0) : x), 0);
     if (pyme) {
       const trat = as.tratamientoIva;
-      if (trat !== "compras" && trat !== "servicios" && trat !== "asumido") throw new Ci2Error("Elige cómo se trata el IVA de la factura (compras, servicios o asumido).");
+      if (trat !== "compras" && trat !== "servicios" && trat !== "asumido" && trat !== "mayor") throw new Ci2Error("Elige cómo se trata el IVA de la factura (compras, servicios, asumido o mayor valor).");
+      if (trat === "mayor") {
+        agregarLinea(exigirCuenta(as.cuentaIvaMayorValor ?? "", "Cuenta de IVA mayor valor", "El IVA va como mayor valor."), ag.iva.get(t)!, natBase, `IVA${t} MAYOR VALOR ${descripcion}`, "", "", baseTarifa, { "Rol": "iva" });
+        continue;
+      }
       if (trat === "asumido") {
         agregarLinea(exigirCuenta(opts.pyme!.cuentaIvaAsumido, "Cuenta de IVA asumido", "El IVA va como asumido."), ag.iva.get(t)!, natBase, `IVA${t} ASUMIDO ${descripcion}`, "", "", baseTarifa, { "Rol": "iva" });
         continue;
@@ -648,6 +654,9 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
         const doc = Math.trunc(Number(separarNumeroExterno(f.docNumber).numero)) || 0;
         const vence = sumarDias(f.fecha, opts.pyme.diasVencimiento);
         for (const l of r.lineas) Object.assign(l, { "Doc proveedor": doc, "Fecha doc proveedor": f.fecha, "Forma pago Pyme": Number(codigo), "Vence": vence });
+        // Forma de pago con banco como tercero (tarjeta de crédito…): la deuda es con el banco, así que la línea por pagar va a su NIT.
+        const terceroBanco = opts.pyme.formasPago.find((x) => String(x.codigo) === codigo)?.terceroNit;
+        if (terceroBanco) for (const l of r.lineas) if (l["Rol"] === "cxp") l["Identificación tercero"] = terceroBanco;
       }
       salida.push(...r.lineas);
       informe.push(r.inf);

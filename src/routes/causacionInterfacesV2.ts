@@ -46,6 +46,7 @@ import {
   getCuentasConCentroPyme,
   type ConfigSiigoPyme,
   getConfigInventario,
+  getContextoCi2,
   type ConfigInventario,
   setConfigInventario,
   setProductosWo,
@@ -145,7 +146,21 @@ const COLUMNA_PARAM: Partial<Record<keyof Ci2Asignacion, string>> = {
   tarifaReteica: "Tarifa_reteica",
   tarifaReteiva: "Tarifa_reteiva",
   baseMinimaReteicaEspecial: "Base_minima_reteica_especial",
+  // Lo que el usuario decide por factura y casi siempre repite con el mismo proveedor.
+  formaPago: "Forma_pago",
+  formaPagoCodigo: "Forma_pago_codigo",
+  comprobante: "Comprobante",
+  tratamientoIva: "Tratamiento_iva",
+  cuentaRetefuente: "Cuenta_retefuente",
+  cuentaReteica: "Cuenta_reteica",
+  cuentaReteiva: "Cuenta_reteiva",
+  destino: "Destino",
+  cuentasInventario: "Cuentas_inventario",
+  cuentasIvaMayor: "Cuentas_iva_mayor",
 };
+/** Campos del parámetro que se guardan como texto tal cual (sin limpiar como cuenta) o como JSON ({tarifa: cuenta}). */
+const PARAM_TEXTO = new Set<keyof Ci2Asignacion>(["formaPago", "formaPagoCodigo", "comprobante", "tratamientoIva", "destino"]);
+const PARAM_JSON = new Set<keyof Ci2Asignacion>(["cuentasInventario", "cuentasIvaMayor"]);
 const COLUMNA_PARAM_VENTAS: Partial<Record<keyof Ci2Asignacion, string>> = {
   ...COLUMNA_PARAM,
   cuentaGasto: "Cuenta_ingreso",
@@ -169,6 +184,10 @@ async function sugerenciasPorNit(empresaId: string, tipo: Ci2Tipo = "compra"): P
       const v = row[col as string];
       const k = campo as keyof Ci2Asignacion;
       if (typeof ASIG_VACIA[k] === "number") (a as any)[k] = toNumero(v);
+      else if (PARAM_TEXTO.has(k)) { const t = String(v ?? "").trim(); if (t) (a as any)[k] = t; }
+      else if (PARAM_JSON.has(k)) {
+        try { const o = typeof v === "string" && v.trim() ? JSON.parse(v) : null; if (o && typeof o === "object" && Object.keys(o).length) (a as any)[k] = o; } catch { /* celda editada a mano con formato inválido: se ignora */ }
+      }
       else (a as any)[k] = limpiarCuenta(v);
     }
     mapa.set(nit, a);
@@ -251,7 +270,8 @@ function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo
   if (pyme && tipo === "compra") {
     if (!/^\d+$/.test(String(a.formaPagoCodigo ?? "").trim())) out.push("formaPagoCodigo");
     if (!/^\d+(\D+\d+)?$/.test(String(a.centroCostos ?? "").trim())) out.push("centroCostos");
-    if (items.some((i) => !i.isGift && !i.isSurcharge && i.base > 0 && i.ivaPercent > 0) && !["compras", "servicios", "asumido"].includes(String(a.tratamientoIva ?? ""))) out.push("tratamientoIva");
+    if (items.some((i) => !i.isGift && !i.isSurcharge && i.base > 0 && i.ivaPercent > 0) && !["compras", "servicios", "asumido", "mayor"].includes(String(a.tratamientoIva ?? ""))) out.push("tratamientoIva");
+    if (a.tratamientoIva === "mayor" && !/^\d{4,}/.test(String(a.cuentaIvaMayorValor ?? "").trim()) && items.some((i) => !i.isGift && !i.isSurcharge && i.base > 0 && i.ivaPercent > 0)) out.push("cuentaIvaMayorValor");
   }
   if (clasifica && tipo === "compra" && a.destino !== "inventario" && a.destino !== "gasto") out.push("destino");
   // World Office: el producto sale de la tarifa de IVA (maestro de productos), no de la cuenta del proveedor.
@@ -494,12 +514,12 @@ router.get("/empresas/:id/facturas", async (req: Request, res: Response) => {
     if (!empresaId) return;
     const estado = ["pendiente", "generada", "descartada"].includes(String(req.query.estado)) ? (String(req.query.estado) as any) : undefined;
     const tipo = tipoDe(req);
-    const [facturas, sugs, impuestos, glob] = await Promise.all([listarFacturas(empresaId, estado, tipo), sugerenciasPorNit(empresaId, tipo), getTabla(empresaId, "impuestos"), getCuentasGlobales(empresaId, tipo)]);
+    const [facturas, sugs, impuestos, glob, ctx] = await Promise.all([listarFacturas(empresaId, estado, tipo), sugerenciasPorNit(empresaId, tipo), getTabla(empresaId, "impuestos"), getCuentasGlobales(empresaId, tipo), getContextoCi2(empresaId)]);
     const tarifasInc = tarifasIncDe(impuestos?.rows);
-    const worldOffice = (await getSistemaContable(empresaId)) === "worldoffice";
-    const pymeCfg = await pymeDe(empresaId);
-    const siigoPyme = (await getSistemaContable(empresaId)) === "siigopyme";
-    const cfgInv = await getConfigInventario(empresaId);
+    const worldOffice = ctx.sistema === "worldoffice";
+    const pymeCfg = ctx.pyme;
+    const siigoPyme = ctx.sistema === "siigopyme";
+    const cfgInv = ctx.inventario;
     const opciones = opcionesRetencion(impuestos?.rows || [], siigoPyme);
     res.json({
       status: "ok",
@@ -546,15 +566,30 @@ router.patch("/empresas/:id/facturas/:fid", async (req: Request, res: Response) 
       f = (await editarAsignacion(empresaId, req.params.fid, Object.fromEntries(aGlobal.map((k) => [k, null])))) || f;
     }
     const aParametro = editados((Object.keys(columnasParam(tipo)) as (keyof Ci2Asignacion)[]).filter((k) => !(CAMPOS_GLOBALES as readonly string[]).includes(k)));
-    // Solo un proveedor sin parámetros guarda lo editado; si ya tiene fila, el cambio aplica únicamente a esta factura.
-    const proveedorNuevo = !(await sugerenciasPorNit(empresaId, tipo)).has(f.nit);
-    if (aParametro.length && f.nit && proveedorNuevo) {
-      await guardarParametroProveedor(empresaId, tipo, f.nit, f.proveedor, Object.fromEntries(aParametro.map((k) => [k, (f!.asignacion as any)[k]])));
+    // El proveedor aprende de cada edición: se guarda lo que su fila aún no tiene (nuevo o con campos vacíos); lo que ya tiene no se pisa, ese cambio aplica solo a esta factura.
+    const sugActual = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
+    const vacio = (v: unknown) => v === undefined || v === null || v === "" || v === 0 || (typeof v === "object" && !Object.keys(v as object).length);
+    const aGuardar: Partial<Ci2Asignacion> = {};
+    for (const k of aParametro) {
+      const nuevo = (f.asignacion as any)[k];
+      if (vacio(nuevo) || (k === "tratamientoIva" && nuevo === "mayor")) continue; // el IVA mayor valor es esporádico: no se aprende
+      const previo = (sugActual as any)?.[k];
+      if (PARAM_JSON.has(k)) {
+        const faltan = Object.fromEntries(Object.entries(nuevo as Record<string, string>).filter(([t]) => !(previo && previo[t])));
+        if (Object.keys(faltan).length) (aGuardar as any)[k] = { ...(previo || {}), ...faltan };
+      } else if (vacio(previo)) (aGuardar as any)[k] = nuevo;
     }
-    const sug = (await sugerenciasPorNit(empresaId, tipo)).get(f.nit);
-    const ef = efectiva(f, sug, await getCuentasGlobales(empresaId, tipo), await pymeDe(empresaId));
-    const tarifasInc = tarifasIncDe((await getTabla(empresaId, "impuestos"))?.rows);
-    res.json({ status: "ok", factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((await getTabla(empresaId, "impuestos"))?.rows || []) as any, (await getSistemaContable(empresaId)) === "siigopyme")), sugerencia: sug || null, efectiva: ef, conceptoSugerido: conceptoSugeridoPyme(f.docNumber, f.items, f.proveedor), faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, (await getSistemaContable(empresaId)) === "worldoffice", await cfgInventarioDe(empresaId, f.isCreditNote), (await getSistemaContable(empresaId)) === "siigopyme"), ivaMayorSugerido: ivaMayorSugerido(ef, await cfgInventarioDe(empresaId, f.isCreditNote)), sinParametros: !sug } });
+    const guardoParametro = !!f.nit && Object.keys(aGuardar).length > 0;
+    if (guardoParametro) await guardarParametroProveedor(empresaId, tipo, f.nit, f.proveedor, aGuardar);
+    const [sugs, glob, impuestos, ctx] = await Promise.all([sugerenciasPorNit(empresaId, tipo), getCuentasGlobales(empresaId, tipo), getTabla(empresaId, "impuestos"), getContextoCi2(empresaId)]);
+    const sug = sugs.get(f.nit);
+    const ef = efectiva(f, sug, glob, ctx.pyme);
+    const tarifasInc = tarifasIncDe(impuestos?.rows);
+    const siigoPyme = ctx.sistema === "siigopyme";
+    const cfgInv = ctx.inventario.activo && !f.isCreditNote ? ctx.inventario : null;
+    // Si lo editado quedó como parámetro del proveedor o de la empresa, las demás facturas cambian de sugerencia: el portal las recarga.
+    const afectaOtras = aGlobal.length > 0 || guardoParametro;
+    res.json({ status: "ok", afectaOtras, factura: { ...f, retNoAplica: retencionesNoAplican(f.items, ef, opcionesRetencion(((impuestos?.rows || []) as any), siigoPyme)), sugerencia: sug || null, efectiva: ef, conceptoSugerido: conceptoSugeridoPyme(f.docNumber, f.items, f.proveedor), faltantes: faltantesDe(ef, f.items, tipo, tarifasInc, ctx.sistema === "worldoffice", cfgInv, siigoPyme), ivaMayorSugerido: ivaMayorSugerido(ef, cfgInv), sinParametros: !sug } });
   } catch (e) {
     err(res, e);
   }
@@ -586,7 +621,8 @@ async function guardarParametroProveedor(empresaId: string, tipo: Ci2Tipo, nit: 
   for (const [campo, col] of Object.entries(columnasParam(tipo))) {
     if (!(campo in campos)) continue;
     if (!tabla.columns.includes(col as string)) tabla.columns.push(col as string);
-    fila[col as string] = (campos as any)[campo] as any;
+    const v = (campos as any)[campo];
+    fila[col as string] = PARAM_JSON.has(campo as keyof Ci2Asignacion) ? JSON.stringify(v) : (v as any);
   }
   await setTabla(empresaId, slot, tabla);
 }
@@ -834,7 +870,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       modo: tipo,
       inventario: !venta && !worldoffice && cfgInventario.activo ? cfgInventario : undefined,
       worldoffice,
-      pyme: siigoPyme ? { diasVencimiento: configPyme!.diasVencimiento, cuentaIvaAsumido: configPyme!.cuentaIvaAsumido } : undefined,
+      pyme: siigoPyme ? { diasVencimiento: configPyme!.diasVencimiento, cuentaIvaAsumido: configPyme!.cuentaIvaAsumido, formasPago: configPyme!.formasPago } : undefined,
       productosWo: worldoffice ? await getProductosWo(empresaId, venta ? "ventas" : "compras") : undefined,
       tipoVentasWo: worldoffice && venta ? configWo!.tipoVentas : undefined,
       tipoPorPrefijo: prefijos,
