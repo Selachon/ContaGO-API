@@ -36,6 +36,8 @@ export interface CompanySettings {
   ivaMayorValor19Accounts?: string[];
   /** Base mínima de retención en la fuente por tarifa. Clave = tasa (ej. "3.5"), valor = monto en COP. */
   retefuenteMinBases?: Record<string, number>;
+  /** Nombres de retenciones en la fuente de Siigo que NUNCA se sugieren (p. ej. "Ret 2.5% - ventas"); se siguen pudiendo elegir a mano. */
+  excludedRetefuenteNames?: string[];
   /** Fecha mínima de emisión (yyyy-mm-dd) para importar facturas DIAN. Facturas anteriores se ignoran. */
   minFechaIngesta?: string;
   /** Modo de causación: "puc" (solo cuentas), "products" (solo productos), "both" (mixto). Reemplaza useProducts. */
@@ -436,6 +438,7 @@ export async function updateCompanySettings(companyId: string, settings: Company
   if (settings.ivaMayorValor5Accounts !== undefined) patch["settings.ivaMayorValor5Accounts"] = Array.isArray(settings.ivaMayorValor5Accounts) ? settings.ivaMayorValor5Accounts : [];
   if (settings.ivaMayorValor19Accounts !== undefined) patch["settings.ivaMayorValor19Accounts"] = Array.isArray(settings.ivaMayorValor19Accounts) ? settings.ivaMayorValor19Accounts : [];
   if (settings.retefuenteMinBases !== undefined) patch["settings.retefuenteMinBases"] = settings.retefuenteMinBases || {};
+  if (settings.excludedRetefuenteNames !== undefined) patch["settings.excludedRetefuenteNames"] = Array.isArray(settings.excludedRetefuenteNames) ? settings.excludedRetefuenteNames.map((n) => String(n).trim()).filter(Boolean) : [];
   if (settings.minFechaIngesta !== undefined) patch["settings.minFechaIngesta"] = settings.minFechaIngesta || null;
   if (settings.causacionMode !== undefined) patch["settings.causacionMode"] = ["puc", "products", "both"].includes(settings.causacionMode as string) ? settings.causacionMode : "puc";
   if (settings.defaultItemMode !== undefined) patch["settings.defaultItemMode"] = settings.defaultItemMode === "product" ? "product" : "account";
