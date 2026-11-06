@@ -51,6 +51,7 @@ import {
   setConfigInventario,
   setProductosWo,
   getEmpresaNit,
+  importarPuc,
   getTabla,
   guardarConsecutivos,
   iniciarTablaConPlantilla,
@@ -71,6 +72,14 @@ import {
   type Ci2CuentasGlobales,
   type Ci2Tipo,
   getPrefijos,
+  getComprobantesSiigo,
+  setComprobantesSiigo,
+  esDuenoEmpresa,
+  tablaImpuestosDeSiigo,
+  guardarLoginSiigo,
+  leerLoginSiigo,
+  metaLoginSiigo,
+  olvidarLoginSiigo,
   getTiposDocumento,
   getAutorretencion,
   setTiposDocumento,
@@ -93,6 +102,8 @@ import { escribirInterfazSiigoPyme } from "../services/causacionInterfaces/siigo
 import { escribirInterfazSyscafe } from "../services/causacionInterfaces/syscafeWriter.js";
 import { limpiarCuenta, toNumero } from "../services/causacionInterfaces/normalize.js";
 import { tryExtractDianUrlFromSafeLink } from "../middleware/validateDianUrl.js";
+import { rateLimit } from "../middleware/rateLimit.js";
+import { fetchSiigoComprobantes, fetchSiigoParametrizacion, SiigoWebError } from "../services/siigoWebSyncService.js";
 
 export const CI2_TOOL_ID = "causacion-interfaces-v2";
 
@@ -803,6 +814,131 @@ router.get("/empresas/:id/tipos-documento", async (req: Request, res: Response) 
 });
 
 // Tipo de comprobante recordado por prefijo (ventas).
+// ── Tipos de comprobante de Siigo (desplegable): se traen de la web de Siigo con el mismo inicio de sesión ─────────
+// Las credenciales llegan en el cuerpo, se usan una vez y no se guardan ni se registran.
+function credencialesSiigo(req: Request): { email: string; password: string } | null {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  return email && password ? { email, password } : null;
+}
+function errorSiigoWeb(res: Response, e: unknown) {
+  if (e instanceof SiigoWebError) return res.status(e.code === "bad_credentials" ? 401 : 422).json({ status: "error", codigo: e.code, mensaje: e.message });
+  console.error("[CI2] Siigo web falló:", e instanceof Error ? e.message : "error");
+  return res.status(500).json({ status: "error", mensaje: "No se pudo conectar con Siigo. Intenta de nuevo." });
+}
+
+// Al crear la empresa (aún sin id): se trae el listado por NIT y el cliente lo guarda con la empresa.
+router.post("/siigo/comprobantes", rateLimit(6, 15 * 60_000), async (req: Request, res: Response) => {
+  const cred = credencialesSiigo(req);
+  const nit = nitDigitos(req.body?.nit);
+  if (!cred) return err(res, new Error("Escribe el correo y la contraseña de Siigo."));
+  if (!nit) return err(res, new Error("Escribe primero el NIT de la empresa."));
+  try {
+    res.json({ status: "ok", items: await fetchSiigoComprobantes(cred.email, cred.password, { nit, name: String(req.body?.nombre || "") }) });
+  } catch (e) { errorSiigoWeb(res, e); }
+});
+
+router.get("/empresas/:id/comprobantes-siigo", async (req: Request, res: Response) => {
+  const empresaId = await exigirEmpresa(req, res);
+  if (!empresaId) return;
+  res.json({ status: "ok", ...(await getComprobantesSiigo(empresaId)) });
+});
+
+router.put("/empresas/:id/comprobantes-siigo", async (req: Request, res: Response) => {
+  const empresaId = await exigirEmpresa(req, res);
+  if (!empresaId) return;
+  try { res.json({ status: "ok", items: await setComprobantesSiigo(empresaId, req.body?.items) }); } catch (e) { err(res, e); }
+});
+
+// ── Inicio de sesión de Siigo guardado (cifrado) por empresa ────────────────────────────────────────────────
+// Solo el dueño (o un admin) puede guardarlo u olvidarlo; cualquiera con acceso a la empresa puede usarlo para traer
+// la parametrización, pero nunca verlo: la contraseña no sale del servidor.
+async function puedeGestionarLogin(req: Request, empresaId: string): Promise<boolean> {
+  return !!req.user!.isAdmin || (await esDuenoEmpresa(empresaId, req.user!.userId));
+}
+
+router.get("/empresas/:id/siigo-login", async (req: Request, res: Response) => {
+  const empresaId = await exigirEmpresa(req, res);
+  if (!empresaId) return;
+  res.json({ status: "ok", ...(await metaLoginSiigo(empresaId)) });
+});
+
+// Se usa al crear la empresa: el login ya se verificó al traer la lista y se guarda con la empresa recién creada.
+router.put("/empresas/:id/siigo-login", async (req: Request, res: Response) => {
+  const empresaId = await exigirEmpresa(req, res);
+  if (!empresaId) return;
+  if (!(await puedeGestionarLogin(req, empresaId))) return err(res, new Error("Solo el dueño de la empresa puede guardar el inicio de sesión."), 403);
+  const cred = credencialesSiigo(req);
+  if (!cred) return err(res, new Error("Escribe el correo y la contraseña de Siigo."));
+  try { await guardarLoginSiigo(empresaId, cred.email, cred.password, req.user!.userId); res.json({ status: "ok" }); } catch (e) { err(res, e); }
+});
+
+router.delete("/empresas/:id/siigo-login", async (req: Request, res: Response) => {
+  const empresaId = await exigirEmpresa(req, res);
+  if (!empresaId) return;
+  if (!(await puedeGestionarLogin(req, empresaId))) return err(res, new Error("Solo el dueño de la empresa puede olvidar el inicio de sesión."), 403);
+  await olvidarLoginSiigo(empresaId);
+  res.json({ status: "ok" });
+});
+
+/** Credenciales escritas o, si no hay, las guardadas. `guardadas` indica que se usaron las guardadas. */
+async function credencialesParaEmpresa(req: Request, empresaId: string): Promise<{ email: string; password: string; guardadas: boolean } | null> {
+  const typed = credencialesSiigo(req);
+  if (typed) return { ...typed, guardadas: false };
+  const saved = await leerLoginSiigo(empresaId);
+  return saved ? { ...saved, guardadas: true } : null;
+}
+function errorSiigoEmpresa(res: Response, e: unknown, guardadas: boolean) {
+  if (guardadas && e instanceof SiigoWebError && e.code === "bad_credentials") {
+    return res.status(401).json({ status: "error", codigo: "login_guardado_invalido", mensaje: "La contraseña guardada ya no funciona en Siigo. Escríbela de nuevo para actualizarla." });
+  }
+  return errorSiigoWeb(res, e);
+}
+/** Guarda el login escrito si el usuario lo pidió y puede hacerlo (solo tras iniciar sesión bien en Siigo). */
+async function guardarSiAplica(req: Request, empresaId: string, cred: { email: string; password: string; guardadas: boolean }): Promise<boolean> {
+  if (cred.guardadas || req.body?.recordar !== true || !(await puedeGestionarLogin(req, empresaId))) return false;
+  await guardarLoginSiigo(empresaId, cred.email, cred.password, req.user!.userId);
+  return true;
+}
+
+// Empresa ya creada: actualiza solo el listado de tipos de comprobante, con el NIT de la empresa.
+router.post("/empresas/:id/comprobantes-siigo/traer", rateLimit(6, 15 * 60_000), async (req: Request, res: Response) => {
+  const empresaId = await exigirEmpresa(req, res);
+  if (!empresaId) return;
+  const cred = await credencialesParaEmpresa(req, empresaId);
+  if (!cred) return res.status(400).json({ status: "error", codigo: "sin_login_guardado", mensaje: "Escribe el correo y la contraseña de Siigo." });
+  try {
+    const items = await fetchSiigoComprobantes(cred.email, cred.password, { nit: await getEmpresaNit(empresaId) });
+    const guardado = await guardarSiAplica(req, empresaId, cred);
+    res.json({ status: "ok", items: await setComprobantesSiigo(empresaId, items), loginGuardado: guardado });
+  } catch (e) { errorSiigoEmpresa(res, e, cred.guardadas); }
+});
+
+// Parametrización completa desde Siigo: tipos de comprobante + impuestos + plan de cuentas (PUC), en una sola sesión.
+router.post("/empresas/:id/parametrizacion-siigo/traer", rateLimit(6, 15 * 60_000), async (req: Request, res: Response) => {
+  const empresaId = await exigirEmpresa(req, res);
+  if (!empresaId) return;
+  const cred = await credencialesParaEmpresa(req, empresaId);
+  if (!cred) return res.status(400).json({ status: "error", codigo: "sin_login_guardado", mensaje: "Escribe el correo y la contraseña de Siigo." });
+  try {
+    const par = await fetchSiigoParametrizacion(cred.email, cred.password, { nit: await getEmpresaNit(empresaId) });
+    const guardado = await guardarSiAplica(req, empresaId, cred);
+    const resultado: Record<string, unknown> = { loginGuardado: guardado };
+    const errores: string[] = [];
+    if (par.comprobantes) resultado.comprobantes = (await setComprobantesSiigo(empresaId, par.comprobantes)).length;
+    else if (par.comprobantesError) errores.push(`Tipos de comprobante: ${par.comprobantesError}`);
+    if (par.impuestos) {
+      try { resultado.impuestos = (await setTabla(empresaId, "impuestos", tablaImpuestosDeSiigo(par.impuestos))).rows.length; }
+      catch (e) { errores.push(`Impuestos: ${e instanceof Error ? e.message : "error"}`); }
+    } else if (par.impuestosError) errores.push(`Impuestos: ${par.impuestosError}`);
+    if (par.pucBuffer) {
+      try { resultado.puc = (await importarPuc(empresaId, par.pucBuffer, "Cuentas contables (Siigo).xlsx")).length; }
+      catch (e) { errores.push(`Plan de cuentas: ${e instanceof Error ? e.message : "error"}`); }
+    } else if (par.pucError) errores.push(`Plan de cuentas: ${par.pucError}`);
+    res.json({ status: "ok", resultado, errores });
+  } catch (e) { errorSiigoEmpresa(res, e, cred.guardadas); }
+});
+
 router.get("/empresas/:id/prefijos", async (req: Request, res: Response) => {
   try {
     const empresaId = await exigirEmpresa(req, res);

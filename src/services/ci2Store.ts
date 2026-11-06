@@ -7,6 +7,7 @@
  *   - ci2Facturas:    facturas traídas de la DIAN + asignaciones del usuario.
  *   - ci2Interfaces:  interfaces generadas (con sus archivos) para descargar/revertir.
  */
+import { encryptSecret, decryptSecret } from "./secretCrypto.js";
 import { ObjectId, type Binary } from "mongodb";
 import { getDb } from "./database.js";
 import type { BatchItem, XmlCausacionItem } from "./siigoAccountingService.js";
@@ -422,4 +423,104 @@ export async function setPrefijos(empresaId: string, nuevos: Partial<Ci2Prefijos
   await getDb().collection<any>("contabilizacionEmpresas").updateOne({ _id }, {
     $set: { ci2Prefijos: { factura: { ...actual.factura, ...limpiar(nuevos.factura) }, notaCredito: { ...actual.notaCredito, ...limpiar(nuevos.notaCredito) } } },
   });
+}
+
+// ── Tipos de comprobante de Siigo (traídos de la web de Siigo; alimentan el desplegable) ─────────────────
+
+export interface Ci2ComprobanteSiigo {
+  codigo: string;
+  titulo: string;
+}
+
+export function limpiarComprobantesSiigo(items: unknown): Ci2ComprobanteSiigo[] {
+  if (!Array.isArray(items)) return [];
+  const vistos = new Set<string>();
+  const out: Ci2ComprobanteSiigo[] = [];
+  for (const it of items.slice(0, 500)) {
+    const codigo = String((it as any)?.codigo ?? "").trim();
+    const titulo = String((it as any)?.titulo ?? "").trim().slice(0, 120);
+    if (!/^\d{1,6}$/.test(codigo) || !titulo || vistos.has(codigo)) continue;
+    vistos.add(codigo);
+    out.push({ codigo, titulo });
+  }
+  return out.sort((a, b) => Number(a.codigo) - Number(b.codigo));
+}
+
+export async function getComprobantesSiigo(empresaId: string): Promise<{ items: Ci2ComprobanteSiigo[]; fetchedAt: string | null }> {
+  const _id = oid(empresaId);
+  if (!_id) return { items: [], fetchedAt: null };
+  const d = await getDb().collection<any>("contabilizacionEmpresas").findOne({ _id }, { projection: { ci2ComprobantesSiigo: 1 } });
+  return { items: limpiarComprobantesSiigo(d?.ci2ComprobantesSiigo?.items), fetchedAt: d?.ci2ComprobantesSiigo?.fetchedAt ?? null };
+}
+
+export async function setComprobantesSiigo(empresaId: string, items: unknown): Promise<Ci2ComprobanteSiigo[]> {
+  const _id = oid(empresaId);
+  if (!_id) throw new Error("Empresa inválida.");
+  const limpios = limpiarComprobantesSiigo(items);
+  await getDb().collection<any>("contabilizacionEmpresas").updateOne({ _id }, { $set: { ci2ComprobantesSiigo: { items: limpios, fetchedAt: new Date().toISOString() } } });
+  return limpios;
+}
+
+// ── Inicio de sesión de Siigo de la empresa (cifrado): permite traer la parametrización con un clic ──────────
+// La contraseña nunca sale del servidor; solo se expone si hay credenciales y el correo enmascarado.
+
+const enmascarar = (email: string) => {
+  const [u = "", d = ""] = String(email).split("@");
+  return `${u.slice(0, 2)}${"*".repeat(Math.max(1, u.length - 2))}@${d}`;
+};
+
+export async function esDuenoEmpresa(empresaId: string, userId: string): Promise<boolean> {
+  const _id = oid(empresaId);
+  if (!_id) return false;
+  const d = await getDb().collection<any>("contabilizacionEmpresas").findOne({ _id }, { projection: { ownerUserId: 1 } });
+  return !!d && String(d.ownerUserId) === String(userId);
+}
+
+export async function guardarLoginSiigo(empresaId: string, email: string, password: string, guardadoPor: string): Promise<void> {
+  const _id = oid(empresaId);
+  if (!_id) throw new Error("Empresa inválida.");
+  const correo = String(email || "").trim();
+  if (!correo || !password) throw new Error("Correo y contraseña son obligatorios.");
+  const r = await getDb().collection<any>("contabilizacionEmpresas").updateOne({ _id }, { $set: { ci2SiigoLogin: { email: correo, passwordEnc: encryptSecret(password), savedAt: new Date().toISOString(), savedBy: guardadoPor } } });
+  if (r.matchedCount === 0) throw new Error("Empresa no encontrada.");
+}
+
+/** Credenciales descifradas, solo para uso interno del servidor. */
+export async function leerLoginSiigo(empresaId: string): Promise<{ email: string; password: string } | null> {
+  const _id = oid(empresaId);
+  if (!_id) return null;
+  const d = await getDb().collection<any>("contabilizacionEmpresas").findOne({ _id }, { projection: { ci2SiigoLogin: 1 } });
+  if (!d?.ci2SiigoLogin?.email || !d.ci2SiigoLogin.passwordEnc) return null;
+  try { return { email: d.ci2SiigoLogin.email, password: decryptSecret(d.ci2SiigoLogin.passwordEnc) }; } catch { return null; }
+}
+
+export async function metaLoginSiigo(empresaId: string): Promise<{ guardado: boolean; email?: string; guardadoEn?: string }> {
+  const _id = oid(empresaId);
+  if (!_id) return { guardado: false };
+  const d = await getDb().collection<any>("contabilizacionEmpresas").findOne({ _id }, { projection: { "ci2SiigoLogin.email": 1, "ci2SiigoLogin.savedAt": 1 } });
+  return d?.ci2SiigoLogin?.email ? { guardado: true, email: enmascarar(d.ci2SiigoLogin.email), guardadoEn: d.ci2SiigoLogin.savedAt } : { guardado: false };
+}
+
+export async function olvidarLoginSiigo(empresaId: string): Promise<void> {
+  const _id = oid(empresaId);
+  if (_id) await getDb().collection<any>("contabilizacionEmpresas").updateOne({ _id }, { $unset: { ci2SiigoLogin: "" } });
+}
+
+/** Tabla de impuestos de Siigo → la misma tabla que resulta de pegarla en Excel e importarla (números como números, vacíos como null). */
+export function tablaImpuestosDeSiigo(t: { columns: string[]; rows: string[][] }) {
+  const numericas = new Set(["código", "codigo", "tarifa", "por valor"]);
+  return {
+    sheetName: "Impuestos",
+    columns: t.columns,
+    rows: t.rows.map((fila) =>
+      Object.fromEntries(
+        t.columns.map((col, i) => {
+          const v = (fila[i] ?? "").trim();
+          if (v === "") return [col, null];
+          const num = Number(v.replace(",", "."));
+          return [col, numericas.has(col.toLowerCase()) && Number.isFinite(num) ? num : v];
+        })
+      )
+    ),
+  };
 }

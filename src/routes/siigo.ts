@@ -48,6 +48,10 @@ import {
   listCompanies,
   listCompaniesForUser,
   getCompanyPublic,
+  getCompanyWebLogin,
+  getCompanyWebLoginMeta,
+  saveCompanyWebLogin,
+  clearCompanyWebLogin,
   userCanAccessCompany,
   userOwnsCompany,
   createCompany,
@@ -113,10 +117,14 @@ import { getCompanyDrive } from "../services/siigoCompaniesService.js";
 import { getUserGoogleDriveById } from "../services/database.js";
 import { uploadPaymentSupportToDrive } from "../services/googleDrive.js";
 import { v4 as uuidv4 } from "uuid";
+import { rateLimit } from "../middleware/rateLimit.js";
+import { fetchSiigoWebArtifacts, SiigoWebError } from "../services/siigoWebSyncService.js";
 import type { ProgressData } from "../types/dian.js";
 import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
 import {
   savePaymentMap,
+  savePaymentMapFromText,
+  detectSiigoExcelKind,
   rebuildProfilesFromBalance,
   rebuildProfilesFromSiigoReport,
   savePlanCuentas,
@@ -2420,6 +2428,114 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
       return res.json({ ok: true, data: result });
     } catch (error) {
       return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el balance" });
+    }
+  });
+
+  // Pegar la tabla de "Medios de pago" de Siigo (Ctrl+C → Ctrl+V), sin pasar por Excel.
+  router.post("/suggestions/paste-payment-map", async (req: Request, res: Response) => {
+    try {
+      const text = typeof req.body?.text === "string" ? req.body.text : "";
+      if (!text.trim()) return res.status(400).json({ ok: false, message: "Pega la tabla de formas de pago." });
+      const result = await runInCompanyCtx(req, () => savePaymentMapFromText(text));
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando la tabla" });
+    }
+  });
+
+  // Carga por arrastre: reconoce si el Excel es el balance, el plan de cuentas o la tabla de medios de pago.
+  router.post("/suggestions/upload-auto", upload.single("file"), async (req: Request, res: Response) => {
+    try {
+      if (!req.file) return res.status(400).json({ ok: false, message: "Debe subir un archivo Excel de Siigo" });
+      const buf = req.file.buffer;
+      const kind = await detectSiigoExcelKind(buf);
+      if (!kind) return res.status(422).json({ ok: false, message: `No reconocí "${req.file.originalname}": debe ser el balance de prueba, el plan de cuentas o la tabla de medios de pago de Siigo.` });
+      const data = await runInCompanyCtx<unknown>(req, () =>
+        kind === "balance" ? rebuildProfilesFromBalance(buf) : kind === "plan" ? savePlanCuentas(buf) : savePaymentMap(buf)
+      );
+      return res.json({ ok: true, kind, data });
+    } catch (error) {
+      return res.status(400).json({ ok: false, message: error instanceof Error ? error.message : "Error procesando el archivo" });
+    }
+  });
+
+  // Mini login: entra a Siigo Nube con las credenciales web y trae el plan de cuentas, la tabla de Medios de pago y el
+  // balance de terceros. Las credenciales llegan en el cuerpo, o se usan las guardadas (cifradas) de la empresa; nunca se
+  // registran ni se devuelven. Solo el dueño o un admin pueden guardarlas u olvidarlas.
+  const activeCompanyId = (req: Request): string => String((req as any).user?.isPortal ? (req as any).user?.caPortalCompanyId : req.header("X-Siigo-Company") || "");
+  const canManageWebLogin = async (req: Request, companyId: string): Promise<boolean> => {
+    if (req.integrationAuthMode !== "jwt") return true; // API key interno
+    return !!req.user?.isAdmin || (!!req.user?.userId && (await userOwnsCompany(companyId, req.user.userId)));
+  };
+
+  router.get("/suggestions/web-login", async (req: Request, res: Response) => {
+    const companyId = activeCompanyId(req);
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa activa." });
+    return res.json({ ok: true, data: await getCompanyWebLoginMeta(companyId) });
+  });
+
+  router.delete("/suggestions/web-login", async (req: Request, res: Response) => {
+    const companyId = activeCompanyId(req);
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa activa." });
+    if (!(await canManageWebLogin(req, companyId))) return res.status(403).json({ ok: false, message: "Solo el dueño de la empresa puede olvidar las credenciales." });
+    await clearCompanyWebLogin(companyId);
+    return res.json({ ok: true });
+  });
+
+  router.post("/suggestions/sync-web", rateLimit(6, 15 * 60_000), async (req: Request, res: Response) => {
+    const companyId = activeCompanyId(req);
+    if (!companyId) return res.status(400).json({ ok: false, message: "Falta la empresa activa." });
+    let email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+    let password = typeof req.body?.password === "string" ? req.body.password : "";
+    const typed = !!(email && password);
+    if (!typed) {
+      const saved = await getCompanyWebLogin(companyId);
+      if (!saved) return res.status(400).json({ ok: false, code: "no_saved_credentials", message: "Escribe el correo y la contraseña de Siigo." });
+      ({ email, password } = saved);
+    }
+    try {
+      // La empresa activa dice a qué cliente entrar si la cuenta de Siigo es de Contador (se busca por NIT en "Mis clientes").
+      const company = await getCompanyPublic(companyId);
+      const art = await fetchSiigoWebArtifacts(email, password, { nit: company?.nit, name: company?.name });
+
+      // Las credenciales escritas que lograron iniciar sesión se guardan si el usuario lo pidió y puede hacerlo.
+      let saved = false;
+      if (typed && req.body?.remember === true && (await canManageWebLogin(req, companyId))) {
+        await saveCompanyWebLogin(companyId, email, password, String(req.user?.userId || "service"));
+        saved = true;
+      }
+
+      const result: Record<string, unknown> = {};
+      const errors: string[] = [];
+      await runInCompanyCtx<void>(req, async () => {
+        if (art.pucBuffer) {
+          try { result.plan = await savePlanCuentas(art.pucBuffer); } catch (e) { errors.push(`Plan de cuentas: ${e instanceof Error ? e.message : "error"}`); }
+        } else if (art.pucError) errors.push(`Plan de cuentas: ${art.pucError}`);
+        if (art.paymentText) {
+          try { result.payment = await savePaymentMapFromText(art.paymentText); } catch (e) { errors.push(`Formas de pago: ${e instanceof Error ? e.message : "error"}`); }
+        } else if (art.paymentError) errors.push(`Formas de pago: ${art.paymentError}`);
+        // El balance va después de las formas de pago: los perfiles usan ese traductor. Primero el Excel de la web;
+        // si esa vía falla, se trae el mismo reporte por la API.
+        try {
+          if (art.balanceBuffer) {
+            result.balance = await rebuildProfilesFromBalance(art.balanceBuffer);
+            result.balanceSource = "web";
+          } else {
+            if (art.balanceError) errors.push(`Balance (web): ${art.balanceError} Se usó la API.`);
+            result.balance = await rebuildProfilesFromSiigoReport(new Date().getFullYear(), 1, 13);
+            result.balanceSource = "api";
+          }
+        } catch (e) { errors.push(`Balance: ${e instanceof Error ? e.message : "error"}`); }
+      });
+      return res.json({ ok: true, data: result, errors, savedCredentials: saved });
+    } catch (error) {
+      if (error instanceof SiigoWebError) {
+        const stale = !typed && error.code === "bad_credentials";
+        const message = stale ? "La contraseña guardada ya no funciona en Siigo. Escríbela de nuevo para actualizarla." : error.message;
+        return res.status(error.code === "bad_credentials" ? 401 : 422).json({ ok: false, code: stale ? "saved_credentials_invalid" : error.code, message });
+      }
+      console.error("[SiigoWebSync] falló:", error instanceof Error ? error.message : "error");
+      return res.status(500).json({ ok: false, message: "No se pudo conectar con Siigo. Intenta de nuevo." });
     }
   });
 

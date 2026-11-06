@@ -64,7 +64,7 @@ export interface SupplierProfile {
 }
 
 // ─── Lector de Excel Tolerante ───────────────────────────────────────
-async function robustReadExcel(buffer: Buffer): Promise<string[][]> {
+export async function robustReadExcel(buffer: Buffer): Promise<string[][]> {
   const zip = await JSZip.loadAsync(buffer);
   const parser = new XMLParser({
     ignoreAttributes: false,
@@ -169,7 +169,7 @@ interface PaymentMapEntry {
   code: string;
 }
 
-function parsePaymentMapRows(rows: string[][]): Record<string, PaymentMapEntry> {
+export function parsePaymentMapRows(rows: string[][]): Record<string, PaymentMapEntry> {
   const map: Record<string, PaymentMapEntry> = {};
   for (let r = 1; r < rows.length; r++) {
     const row = rows[r];
@@ -203,7 +203,7 @@ interface AccRow {
   credito: number;
 }
 
-function buildFromBalance(
+export function buildFromBalance(
   rows: string[][],
   paymentMap: Record<string, PaymentMapEntry>
 ): { profiles: SupplierProfile[]; accountsCatalog: AccountCatalogEntry[] } {
@@ -309,6 +309,63 @@ export async function savePaymentMap(buffer: Buffer): Promise<{ count: number }>
   if (Object.keys(map).length === 0) throw new Error("No se encontraron formas de pago en el Excel.");
   await getDb().collection<any>(CONFIG).updateOne({ _id: cfgId(PAYMENT_MAP_ID) }, { $set: { map, updatedAt: new Date().toISOString() } }, { upsert: true });
   return { count: Object.keys(map).length };
+}
+
+/**
+ * Convierte la tabla de "Medios de pago" de Siigo pegada como texto (Ctrl+C en la pantalla → Ctrl+V) en las
+ * filas que espera parsePaymentMapRows: [_, código del medio, nombre, _, cuenta contable] con una fila de encabezado.
+ * Si el texto trae encabezado se ubican las columnas por nombre; si no, se prueba con el desfase que dé más formas de pago.
+ */
+export function pastedPaymentTableToRows(text: string): string[][] {
+  const lines = String(text || "").split(/\r?\n/).filter((l) => l.trim());
+  const cells = lines.map((l) => (l.includes("\t") ? l.split("\t") : l.split(/\s{2,}/)).map((c) => c.trim()));
+  const norm = (c: string) => c.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "");
+  const toRow = (r: string[], code: number, name: number, acc: number) => ["", r[code] ?? "", r[name] ?? "", "", r[acc] ?? ""];
+
+  const hIdx = cells.findIndex((r) => r.some((c) => /^nombre/.test(norm(c))) && r.some((c) => /cuenta/.test(norm(c))));
+  if (hIdx >= 0) {
+    const h = cells[hIdx].map(norm);
+    const code = h.findIndex((c) => /^codigo/.test(c));
+    const name = h.findIndex((c) => /^nombre/.test(c));
+    const acc = h.findIndex((c) => /cuenta/.test(c));
+    if (name >= 0 && acc >= 0) {
+      const colCode = code >= 0 ? code : name - 1;
+      // Al copiar, la columna "En uso" (casilla) suele llegar vacía y recortada: la fila trae menos celdas que el encabezado.
+      return [["", "", "", "", ""], ...cells.slice(hIdx + 1).map((r) => {
+        const shift = r.length < h.length ? r.length - h.length : 0;
+        return toRow(r, Math.max(0, colCode + shift), Math.max(0, name + shift), Math.max(0, acc + shift));
+      })];
+    }
+  }
+  let best: string[][] = [];
+  let bestCount = -1;
+  for (const off of [0, 1]) {
+    const rows = [["", "", "", "", ""], ...cells.map((r) => toRow(r, off, off + 1, off + 3))];
+    const count = Object.keys(parsePaymentMapRows(rows)).length;
+    if (count > bestCount) { best = rows; bestCount = count; }
+  }
+  return best;
+}
+
+export async function savePaymentMapFromText(text: string): Promise<{ count: number }> {
+  const map = parsePaymentMapRows(pastedPaymentTableToRows(text));
+  if (Object.keys(map).length === 0) {
+    throw new Error("No encontré formas de pago en el texto pegado. Copia la tabla completa de Medios de pago de Siigo (con las columnas de nombre y cuenta contable).");
+  }
+  await getDb().collection<any>(CONFIG).updateOne({ _id: cfgId(PAYMENT_MAP_ID) }, { $set: { map, updatedAt: new Date().toISOString() } }, { upsert: true });
+  return { count: Object.keys(map).length };
+}
+
+/** Reconoce qué es un Excel de Siigo por su contenido: balance de prueba por tercero, plan de cuentas o tabla de medios de pago. */
+export async function detectSiigoExcelKind(buffer: Buffer): Promise<"balance" | "plan" | "payment" | null> {
+  const rows = await robustReadExcel(buffer);
+  const head = rows.slice(0, 12).map((r) => r.map((c) => String(c ?? "").trim().toLowerCase()));
+  const flat = head.flat();
+  if (flat.some((c) => c.includes("balance de prueba")) || flat.some((c) => c.includes("transaccional")) && flat.some((c) => c.includes("saldo"))) return "balance";
+  if (flat.some((c) => /^c[oó]digo/.test(c)) && flat.some((c) => /^nombre/.test(c)) && flat.some((c) => c.includes("nivel agrupaci"))) return "plan";
+  if (Object.keys(parsePaymentMapRows(rows)).length > 0) return "payment";
+  if (flat.some((c) => /^c[oó]digo/.test(c)) && flat.some((c) => /^nombre/.test(c))) return "plan";
+  return null;
 }
 
 async function getStoredPaymentMap(): Promise<Record<string, PaymentMapEntry>> {

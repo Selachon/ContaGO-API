@@ -473,6 +473,54 @@ export async function setCompanyNit(companyId: string, nit: string): Promise<str
  * Crea una empresa, validando las credenciales contra Siigo antes de guardar.
  * `ownerUserId` queda como dueño; si no se pasa, cae al admin principal.
  */
+// ─── Credenciales web de Siigo (correo + contraseña), guardadas cifradas ─────────────────────────────
+// Sirven para "Traer todo desde Siigo" sin volver a escribirlas. La contraseña nunca sale del servidor: la API solo
+// expone si hay credenciales guardadas y el correo enmascarado.
+
+function maskEmail(email: string): string {
+  const [user = "", domain = ""] = String(email).split("@");
+  return `${user.slice(0, 2)}${"*".repeat(Math.max(1, user.length - 2))}@${domain}`;
+}
+
+export async function saveCompanyWebLogin(companyId: string, email: string, password: string, savedBy: string): Promise<void> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { throw new Error("Empresa inválida."); }
+  const cleanEmail = String(email || "").trim();
+  if (!cleanEmail || !password) throw new Error("Correo y contraseña son obligatorios.");
+  const res = await getDb().collection<any>(COMPANIES).updateOne(
+    { _id: oid },
+    { $set: { webLogin: { email: cleanEmail, passwordEnc: encryptSecret(password), savedAt: new Date().toISOString(), savedBy } } }
+  );
+  if (res.matchedCount === 0) throw new Error("Empresa no encontrada.");
+}
+
+/** Credenciales descifradas, solo para uso interno del servidor. */
+export async function getCompanyWebLogin(companyId: string): Promise<{ email: string; password: string } | null> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { return null; }
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid }, { projection: { webLogin: 1 } });
+  if (!doc?.webLogin?.email || !doc.webLogin.passwordEnc) return null;
+  try {
+    return { email: doc.webLogin.email, password: decryptSecret(doc.webLogin.passwordEnc) };
+  } catch {
+    return null; // cifrado con otra clave o dañado: se trata como "no guardadas"
+  }
+}
+
+export async function getCompanyWebLoginMeta(companyId: string): Promise<{ saved: boolean; email?: string; savedAt?: string }> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { return { saved: false }; }
+  const doc = await getDb().collection<any>(COMPANIES).findOne({ _id: oid }, { projection: { "webLogin.email": 1, "webLogin.savedAt": 1 } });
+  return doc?.webLogin?.email ? { saved: true, email: maskEmail(doc.webLogin.email), savedAt: doc.webLogin.savedAt } : { saved: false };
+}
+
+export async function clearCompanyWebLogin(companyId: string): Promise<boolean> {
+  let oid: ObjectId;
+  try { oid = new ObjectId(companyId); } catch { return false; }
+  const res = await getDb().collection<any>(COMPANIES).updateOne({ _id: oid }, { $unset: { webLogin: "" } });
+  return res.matchedCount > 0;
+}
+
 export async function createCompany(
   name: string,
   username: string,
