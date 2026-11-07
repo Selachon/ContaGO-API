@@ -170,8 +170,14 @@ function friendlySiigoMessage(details: unknown): string | null {
   const errs = ((details as any)?.errors ?? (details as any)?.Errors) as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(errs)) return null;
   for (const e of errs) {
+    const code = String(e?.code ?? "");
     const params = ((e?.params ?? e?.Params) as unknown[] | undefined) ?? [];
     if (params.some((p) => /basicdata\.phone$/i.test(String(p)))) return "Falta el teléfono del tercero (o no es válido). Agrégalo y vuelve a intentar.";
+    if (code === "already_exists" && params.includes("number")) {
+      const msg = String(e?.message ?? "");
+      const num = msg.match(/:\s*(\S+)$/)?.[1] ?? "";
+      return `El número de comprobante${num ? ` ${num}` : ""} ya existe en Siigo. Probablemente esta factura ya fue causada antes. Verifica en Siigo antes de intentarlo de nuevo.`;
+    }
   }
   return null;
 }
