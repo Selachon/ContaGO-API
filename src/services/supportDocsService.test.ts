@@ -109,6 +109,8 @@ test("PDF del documento soporte: partes, retención, neto, CUDS, aviso de prueba
   assert.match(html, /SEDS984000007/);
   assert.match(html, /cuds123/);
   assert.match(html, /SIN VALIDEZ FISCAL/);
+  // En producción el documento es real: sin la marca de prueba
+  assert.doesNotMatch(supportDocHtml({ payload: p, fullNumber: "DSE71", cuds: "c", legalStatus: "ACCEPTED", environment: "produccion" }, "data:image/png;base64,AAAA"), /SIN VALIDEZ FISCAL/);
   assert.match(html, /Adquirente \(quien paga\)/);
   assert.match(html, /PÉREZ &amp; HNOS/);
   assert.match(html, /Retención en la fuente \(4\.00%\)/);

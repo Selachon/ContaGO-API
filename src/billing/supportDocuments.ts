@@ -18,6 +18,8 @@ const files = () => getDb().collection<any>("billingFiles");
 const numbers = () => getDb().collection<any>("billingNumbers");
 const counters = () => getDb().collection<any>("alanubeCounters");
 const oid = (id: string) => { if (!ObjectId.isValid(id)) throw new Error("Documento inválido."); return new ObjectId(id); };
+/** Versión del PDF propio del documento soporte: al subirla se regeneran los guardados con una marca equivocada. */
+const PDF_VERSION = 2;
 const PENDING = ["borrador", "rechazada", "error"];
 
 /** El emisor del documento soporte es la empresa del cliente (los mismos datos que usa `buildSupportDocPayload`). */
@@ -107,10 +109,11 @@ export async function getSupportDocFile(a: Actor, companyId: string, id: string,
   const xml: Buffer | null = f?.xml ? Buffer.from(f.xml.buffer) : null;
   const name = String(em.fullNumber);
   if (kind === "xml") return xml ? { data: xml, filename: `${name}.xml`, contentType: "application/xml" } : null;
-  let pdf: Buffer | null = f?.pdf ? Buffer.from(f.pdf.buffer) : null;
+  // El PDF guardado solo vale si se generó con la marca de ambiente correcta (antes toda salida llevaba la marca de «documento de prueba»)
+  let pdf: Buffer | null = f?.pdf && f.pdfV === PDF_VERSION ? Buffer.from(f.pdf.buffer) : null;
   if (!pdf) {
-    pdf = await renderSupportDocPdf({ payload: d.payload, fullNumber: em.fullNumber, cuds: em.cufe, legalStatus: em.legalStatus, date: em.date, qrCodeContent: em.qrCodeContent });
-    await files().updateOne({ _id: em.alanubeId } as any, { $set: { pdf: new Binary(pdf) } }, { upsert: true });
+    pdf = await renderSupportDocPdf({ payload: d.payload, fullNumber: em.fullNumber, cuds: em.cufe, legalStatus: em.legalStatus, date: em.date, qrCodeContent: em.qrCodeContent, environment: d.ambiente === "produccion" ? "produccion" : "habilitacion" });
+    await files().updateOne({ _id: em.alanubeId } as any, { $set: { pdf: new Binary(pdf), pdfV: PDF_VERSION } }, { upsert: true });
   }
   if (kind === "pdf") return { data: pdf, filename: `${name}.pdf`, contentType: "application/pdf" };
   if (!xml) return null;
