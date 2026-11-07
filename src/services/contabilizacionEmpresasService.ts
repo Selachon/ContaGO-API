@@ -217,6 +217,9 @@ export interface ConfigWorldOffice {
   bodega: string;
   /** Tipo Documento de las facturas de venta (ej. FV). */
   tipoVentas: string;
+  /** Código del producto al que va el impoconsumo y los demás impuestos distintos al IVA, en compras y en ventas. */
+  productoOtrosImpuestos: string;
+  productoOtrosImpuestosVentas: string;
 }
 /** Parámetros de la empresa para la interfaz de Siigo Pyme (movimiento contable, modelo general). */
 /** `terceroNit`: formas de pago en que la deuda queda con el banco (tarjeta de crédito…): la línea por pagar va a ese tercero y no al proveedor. */
@@ -257,6 +260,8 @@ const normWo = (v: any): ConfigWorldOffice => ({
   terceroInterno: String(v?.terceroInterno ?? "").replace(/\D/g, ""),
   bodega: String(v?.bodega ?? "").trim(),
   tipoVentas: String(v?.tipoVentas ?? "").trim(),
+  productoOtrosImpuestos: String(v?.productoOtrosImpuestos ?? "").trim(),
+  productoOtrosImpuestosVentas: String(v?.productoOtrosImpuestosVentas ?? "").trim(),
 });
 
 export interface EmpresaPublic {
