@@ -182,7 +182,10 @@ const COLUMNA_PARAM_VENTAS: Partial<Record<keyof Ci2Asignacion, string>> = {
 const columnasParam = (tipo: Ci2Tipo) => (tipo === "venta" ? COLUMNA_PARAM_VENTAS : COLUMNA_PARAM);
 const slotParam = (tipo: Ci2Tipo) => (tipo === "venta" ? ("paramVentas" as const) : ("paramCompras" as const));
 /** Compras por defecto; ventas solo cuando se pide expresamente (query `tipo` o cuerpo). */
-const tipoDe = (req: Request): Ci2Tipo => ((req.query?.tipo ?? req.body?.tipo) === "venta" ? "venta" : "compra");
+const tipoDe = (req: Request): Ci2Tipo => {
+  const t = req.query?.tipo ?? req.body?.tipo;
+  return t === "venta" ? "venta" : t === "soporte" ? "soporte" : "compra";
+};
 
 async function sugerenciasPorNit(empresaId: string, tipo: Ci2Tipo = "compra"): Promise<Map<string, Ci2Asignacion>> {
   const tabla = await getTabla(empresaId, slotParam(tipo));
@@ -293,13 +296,13 @@ function faltantesDe(a: Ci2Asignacion, items: Ci2Factura["items"], tipo: Ci2Tipo
   const clasifica = !!cfgInv;
   const out: string[] = [];
   // Siigo Pyme: cada factura se asigna a mano a su forma de pago (catálogo de la empresa) y a su centro de costo.
-  if (pyme && tipo === "compra") {
+  if (pyme && tipo !== "venta") {
     if (!/^\d+$/.test(String(a.formaPagoCodigo ?? "").trim())) out.push("formaPagoCodigo");
     if (!/^\d+(\D+\d+)?$/.test(String(a.centroCostos ?? "").trim())) out.push("centroCostos");
     if (items.some((i) => !i.isGift && !i.isSurcharge && i.base > 0 && i.ivaPercent > 0) && !["compras", "servicios", "asumido", "mayor"].includes(String(a.tratamientoIva ?? ""))) out.push("tratamientoIva");
     if (a.tratamientoIva === "mayor" && !/^\d{4,}/.test(String(a.cuentaIvaMayorValor ?? "").trim()) && items.some((i) => !i.isGift && !i.isSurcharge && i.base > 0 && i.ivaPercent > 0)) out.push("cuentaIvaMayorValor");
   }
-  if (clasifica && tipo === "compra" && a.destino !== "inventario" && a.destino !== "gasto") out.push("destino");
+  if (clasifica && tipo !== "venta" && a.destino !== "inventario" && a.destino !== "gasto") out.push("destino");
   // World Office: el producto sale de la tarifa de IVA (maestro de productos), no de la cuenta del proveedor.
   if (worldOffice) return out;
   // La cuenta del proveedor solo hace falta si algún ítem con base no tiene cuenta propia.
@@ -351,7 +354,7 @@ interface TraerJob {
   empresaId: string;
   createdAt: number;
   error?: string;
-  result?: { nuevas: number; stats: IngestResult["stats"]; failures: IngestResult["failures"]; ignorados: number; errores: { fileName: string; message: string }[]; omitidos?: number };
+  result?: { nuevas: number; nuevasSoporte?: number; stats: IngestResult["stats"]; failures: IngestResult["failures"]; ignorados: number; errores: { fileName: string; message: string }[]; omitidos?: number };
 }
 const traerJobs = new Map<string, TraerJob>();
 attachJobs("ci2-dian-traer", traerJobs as any);
@@ -493,17 +496,21 @@ router.post("/empresas/:id/traer-ventas", upload.single("listado"), async (req: 
       .then(async (result) => {
         const j = traerJobs.get(jobId);
         if (!j || isJobAborted(j as any)) return;
-        // Solo lo emitido por la empresa: el documento soporte (donde la empresa es la compradora) no es una venta.
+        // Lo emitido por la empresa como vendedora son ventas. El documento soporte (la empresa es la compradora: el proveedor es el vendedor)
+        // no es una venta: va a su propia pestaña y se causa como compra.
         const propias = result.items.filter((i) => !(i.ok && i.xml) || nitDigitos(i.xml.supplierNit) === nitEmpresa);
+        const soportes = result.items.filter((i) => i.ok && i.xml && nitDigitos(i.xml.supplierNit) !== nitEmpresa && nitDigitos(i.xml.receiverNit) === nitEmpresa && /soporte/i.test(i.xml.documentType || ""));
         const nuevas = await guardarFacturasTraidas(empresaId, propias, "venta");
+        const nuevasSoporte = await guardarFacturasTraidas(empresaId, soportes, "soporte");
         j.status = "completed";
         j.result = {
           nuevas,
+          nuevasSoporte,
           stats: result.stats,
           failures: result.failures,
           ignorados: result.items.filter((i) => i.ignored).length,
           errores: result.items.filter((i) => !i.ok && !i.ignored).map((i) => ({ fileName: i.fileName, message: i.message || "" })),
-          omitidos: result.items.length - propias.length,
+          omitidos: result.items.length - propias.length - soportes.length,
         };
         j.progress = { step: "Completado", current: result.stats.downloaded, total: result.stats.listed };
       })
@@ -1019,7 +1026,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     }));
 
     const r = generarInterfaz(entradas, {
-      modo: tipo,
+      modo: venta ? "venta" : "compra",
       inventario: !venta && !worldoffice && cfgInventario.activo ? cfgInventario : undefined,
       worldoffice,
       pyme: siigoPyme ? { diasVencimiento: configPyme!.diasVencimiento, cuentaIvaAsumido: configPyme!.cuentaIvaAsumido, formasPago: configPyme!.formasPago } : undefined,
@@ -1043,7 +1050,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       });
     }
 
-    const sufijo = venta ? "Ventas" : "Compras";
+    const sufijo = venta ? "Ventas" : tipo === "soporte" ? "DocSoporte" : "Compras";
     // Mismas líneas contables; cambia solo el archivo según el programa contable de la empresa.
     const syscafe = sistemaContable === "syscafe";
     const sistema = syscafe ? "Syscafe" : siigoPyme ? "SiigoPyme" : "Siigo";
@@ -1154,7 +1161,7 @@ router.get("/interfaces/:iid/zip", async (req: Request, res: Response) => {
       const doc = await getArchivoInterfaz(i.id, a.nombre);
       if (doc) zip.file(doc.nombre, doc.data);
     }
-    const nombre = `Interfaz_${i.tipo === "venta" ? "Ventas" : "Compras"}_${new Date(i.createdAt).toISOString().slice(0, 10)}.zip`;
+    const nombre = `Interfaz_${i.tipo === "venta" ? "Ventas" : i.tipo === "soporte" ? "DocSoporte" : "Compras"}_${new Date(i.createdAt).toISOString().slice(0, 10)}.zip`;
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", `attachment; filename="${nombre}"`);
     res.send(await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));

@@ -18,9 +18,10 @@ const INTERFACES = "ci2Interfaces";
 
 export type Ci2Estado = "pendiente" | "generada" | "descartada";
 /** Compras = facturas recibidas (proveedor); ventas = facturas emitidas (cliente). Lo guardado antes de existir ventas es compra. */
-export type Ci2Tipo = "compra" | "venta";
+/** compra: facturas recibidas · venta: emitidas · soporte: documentos soporte emitidos por la empresa (se causan como compras). */
+export type Ci2Tipo = "compra" | "venta" | "soporte";
 
-const filtroTipo = (tipo: Ci2Tipo) => (tipo === "venta" ? { tipo: "venta" } : { tipo: { $ne: "venta" } });
+const filtroTipo = (tipo: Ci2Tipo) => (tipo === "venta" ? { tipo: "venta" } : tipo === "soporte" ? { tipo: "soporte" } : { tipo: { $nin: ["venta", "soporte"] } });
 
 export interface Ci2Factura {
   id: string;
@@ -88,7 +89,7 @@ function toFactura(d: any): Ci2Factura {
   return {
     id: String(d._id),
     empresaId: d.empresaId,
-    tipo: d.tipo === "venta" ? "venta" : "compra",
+    tipo: d.tipo === "venta" ? "venta" : d.tipo === "soporte" ? "soporte" : "compra",
     cufe: d.cufe,
     fecha: d.fecha,
     documentType: d.documentType,
@@ -288,7 +289,7 @@ function toInterfaz(d: any): Ci2InterfazDoc {
     id: String(d._id),
     empresaId: d.empresaId,
     userId: d.userId,
-    tipo: d.tipo === "venta" ? "venta" : "compra",
+    tipo: d.tipo === "venta" ? "venta" : d.tipo === "soporte" ? "soporte" : "compra",
     createdAt: d.createdAt,
     resumen: d.resumen,
     facturaIds: d.facturaIds || [],
