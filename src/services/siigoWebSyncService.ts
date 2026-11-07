@@ -441,16 +441,23 @@ export interface SiigoParametrizacion {
   impuestosError: string | null;
   pucBuffer: Buffer | null;
   pucError: string | null;
+  /** Solo si se pidió (`opciones.balance`): balance de prueba por tercero del año en curso. */
+  balanceBuffer?: Buffer | null;
+  balanceError?: string | null;
 }
 
 /** Parametrización de Causación Interfaces: tipos de comprobante + impuestos + plan de cuentas (el plan va al final). */
-export function fetchSiigoParametrizacion(email: string, password: string, target: SiigoWebTarget = {}): Promise<SiigoParametrizacion> {
+export function fetchSiigoParametrizacion(email: string, password: string, target: SiigoWebTarget = {}, opciones: { balance?: boolean } = {}): Promise<SiigoParametrizacion> {
   return withCompanySession(email, password, target, async (company, dir) => {
     const out: SiigoParametrizacion = { comprobantes: null, comprobantesError: null, impuestos: null, impuestosError: null, pucBuffer: null, pucError: null };
     try { out.comprobantes = await readComprobantes(company); }
     catch (e) { out.comprobantesError = e instanceof Error ? e.message : String(e); }
     try { out.impuestos = await readImpuestos(company); }
     catch (e) { out.impuestosError = e instanceof Error ? e.message : String(e); }
+    if (opciones.balance) {
+      try { out.balanceBuffer = await downloadBalance(company, dir); }
+      catch (e) { out.balanceError = e instanceof Error ? e.message : String(e); }
+    }
     // Tras la descarga del plan, Siigo deja la SPA sin pintar las pantallas siguientes: va al final.
     try { out.pucBuffer = await downloadPuc(company, dir); }
     catch (e) { out.pucError = e instanceof Error ? e.message : String(e); }

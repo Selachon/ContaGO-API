@@ -41,6 +41,9 @@ export interface Ci2Factura {
   totals: { subtotal: number; iva: number; total: number };
   estado: Ci2Estado;
   tienePdf: boolean;
+  tieneXml: boolean;
+  /** Revisión oficial del usuario: condición para incluir la factura en una interfaz. */
+  revisada: boolean;
   /** Solo lo que el usuario editó a mano; el resto sale de los parámetros del proveedor. */
   asignacion: Partial<Ci2Asignacion>;
   interfazId?: string;
@@ -49,7 +52,7 @@ export interface Ci2Factura {
 
 export interface Ci2InterfazArchivo {
   nombre: string;
-  tipo: "interfaz" | "informe";
+  tipo: "interfaz" | "informe" | "terceros";
   data: Buffer;
 }
 
@@ -66,12 +69,12 @@ export interface Ci2InterfazDoc {
   siguientes: Record<string, number>;
   advertencias: string[];
   revertida?: boolean;
-  archivos: { nombre: string; tipo: "interfaz" | "informe" }[];
+  archivos: { nombre: string; tipo: "interfaz" | "informe" | "terceros" }[];
 }
 
 const oid = (id: string): ObjectId | null => (ObjectId.isValid(id) ? new ObjectId(id) : null);
 
-const SIN_PDF = { pdf: 0 };
+const SIN_PDF = { pdf: 0, xml: 0 };
 const colFacturas = () => getDb().collection<any>(FACTURAS);
 const colInterfaces = () => getDb().collection<any>(INTERFACES);
 
@@ -99,6 +102,8 @@ function toFactura(d: any): Ci2Factura {
     totals: d.totals || { subtotal: 0, iva: 0, total: 0 },
     estado: d.estado,
     tienePdf: !!d.tienePdf,
+    tieneXml: !!d.tieneXml,
+    revisada: !!d.revisada,
     asignacion: d.asignacion || {},
     interfazId: d.interfazId,
     comprobante: d.comprobante,
@@ -135,11 +140,17 @@ export async function guardarFacturasTraidas(empresaId: string, items: BatchItem
               estado: "pendiente" as Ci2Estado,
               asignacion: {},
               fetchedAt: new Date(),
+              xmlName: it.fileName,
             },
           },
           upsert: true,
         },
     });
+    // El XML original (para el Excel detallado, los terceros y la descarga) se completa también en facturas ya guardadas que no lo tenían.
+    const xmlCrudo = (it as any)[Symbol.for("ci2.xmlCrudo")] as Buffer | undefined;
+    if (xmlCrudo) {
+      ops.push({ updateOne: { filter: { empresaId, cufe, tieneXml: { $ne: true } }, update: { $set: { xml: xmlCrudo, xmlName: it.fileName, tieneXml: true } } } });
+    }
     // El PDF se completa también en facturas ya guardadas que no lo tenían.
     ops.push({
       updateOne: {
@@ -160,6 +171,15 @@ export async function listarFacturas(empresaId: string, estado?: Ci2Estado, tipo
   return docs.map(toFactura);
 }
 
+/** Facturas con su XML y PDF originales (para el Excel detallado, los terceros y la descarga), en el orden pedido. */
+export async function facturasConArchivos(empresaId: string, ids: string[]): Promise<{ id: string; docNumber: string; proveedor: string; fecha: string; nit: string; xml: Buffer | null; xmlName: string; pdf: Buffer | null; pdfName: string }[]> {
+  const oids = ids.map(oid).filter((x): x is ObjectId => !!x);
+  const docs = await colFacturas().find({ empresaId, _id: { $in: oids } }, { projection: { docNumber: 1, proveedor: 1, fecha: 1, nit: 1, xml: 1, xmlName: 1, pdf: 1, pdfName: 1 } }).toArray();
+  const bin = (b: any): Buffer | null => (b ? (Buffer.isBuffer(b) ? b : Buffer.from(b.buffer ?? b)) : null);
+  const porId = new Map(docs.map((d) => [String(d._id), { id: String(d._id), docNumber: d.docNumber, proveedor: d.proveedor, fecha: d.fecha, nit: d.nit, xml: bin(d.xml), xmlName: d.xmlName || "", pdf: bin(d.pdf), pdfName: d.pdfName || "" }]));
+  return ids.map((i) => porId.get(i)).filter((x): x is NonNullable<typeof x> => !!x);
+}
+
 export async function facturasPorIds(empresaId: string, ids: string[]): Promise<Ci2Factura[]> {
   const oids = ids.map(oid).filter((x): x is ObjectId => !!x);
   const docs = await colFacturas().find({ empresaId, _id: { $in: oids } }, { projection: SIN_PDF }).toArray();
@@ -177,7 +197,7 @@ export async function cufesRegistrados(empresaId: string): Promise<string[]> {
 const CAMPOS_ASIGNACION: (keyof Ci2Asignacion)[] = [
   "cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento",
   "cuentaRecargo", "centroCostos", "tarifaRetefuente", "tarifaReteica", "tarifaReteiva", "baseMinimaReteicaEspecial", "cuentasItems",
-  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva", "concepto", "cuentaIvaMayorValor", "cuentasInc",
+  "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva", "concepto", "cuentaIvaMayorValor", "cuentasInc", "cuentasIvaRama",
 ];
 const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva", "concepto", "cuentaIvaMayorValor"]);
 
@@ -191,7 +211,7 @@ export async function editarAsignacion(empresaId: string, id: string, cambios: R
     if (!(k in cambios)) continue;
     const v = cambios[k];
     if (v === null) unset[`asignacion.${k}`] = "";
-    else if (k === "cuentasItems" || k === "cuentasInventario" || k === "cuentasIvaMayor" || k === "cuentasInc") {
+    else if (k === "cuentasItems" || k === "cuentasInventario" || k === "cuentasIvaMayor" || k === "cuentasInc" || k === "cuentasIvaRama") {
       // { índiceÍtem | tarifa: cuenta }; un valor vacío quita la cuenta propia.
       const limpio: Record<string, string> = {};
       for (const [i, c] of Object.entries((v && typeof v === "object" ? v : {}) as Record<string, unknown>)) {
@@ -224,6 +244,13 @@ export async function getPdfFactura(empresaId: string, id: string): Promise<{ no
   if (!d?.pdf) return null;
   const raw = d.pdf as Binary | Buffer;
   return { nombre: d.pdfName || "factura.pdf", data: Buffer.isBuffer(raw) ? raw : Buffer.from((raw as Binary).buffer) };
+}
+
+/** Marca o desmarca la revisión oficial de facturas que aún no están en una interfaz. */
+export async function marcarRevision(empresaId: string, ids: string[], revisada: boolean): Promise<number> {
+  const oids = ids.map(oid).filter((x): x is ObjectId => !!x);
+  const r = await colFacturas().updateMany({ empresaId, _id: { $in: oids }, estado: { $ne: "generada" } }, { $set: { revisada } });
+  return r.modifiedCount;
 }
 
 export async function marcarEstado(empresaId: string, ids: string[], estado: "pendiente" | "descartada"): Promise<number> {

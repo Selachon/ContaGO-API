@@ -259,9 +259,13 @@ function enviarError(res: Response, err: unknown): void {
 // Gestión de empresas (tenant)
 // ---------------------------------------------------------------------------
 
+const HERRAMIENTA_ODONTO = "interfaces-integral-odonto";
+
 router.get("/empresas", async (req: Request, res: Response) => {
   try {
-    let empresas = await listEmpresasForUser(req.user!.userId, req.user!.isAdmin);
+    // Las herramientas con empresas propias (Integral Odonto) piden las suyas con ?herramienta=; las demás no las ven.
+    const herramienta = req.query.herramienta === HERRAMIENTA_ODONTO ? HERRAMIENTA_ODONTO : null;
+    let empresas = await listEmpresasForUser(req.user!.userId, req.user!.isAdmin, herramienta);
     if (!req.user!.isAdmin) {
       const allowed = await getAllowedNits(req.user!.userId, CONTABILIZACION_TOOL_ID);
       empresas = empresas.filter((e) => allowed.includes(String(e.nit || "").split("-")[0].replace(/\D/g, "")));
@@ -276,7 +280,8 @@ router.post("/empresas", async (req: Request, res: Response) => {
   try {
     const { nombre, nit, obsequiosMode, comprobantes, cuentaGastoPorTarifaIva, sistemaContable, worldOffice } = req.body || {};
     await exigirNitParaEmpresa(req.user!.userId, !!req.user!.isAdmin, nit);
-    const empresa = await createEmpresa(nombre, nit, obsequiosMode, req.user!.userId, comprobantes, cuentaGastoPorTarifaIva, sistemaContable, worldOffice);
+    const herramienta = req.user!.isAdmin && req.body?.herramienta === HERRAMIENTA_ODONTO ? HERRAMIENTA_ODONTO : undefined;
+    const empresa = await createEmpresa(nombre, nit, obsequiosMode, req.user!.userId, comprobantes, cuentaGastoPorTarifaIva, sistemaContable, worldOffice, herramienta);
     res.status(201).json({ status: "ok", empresa });
   } catch (err) {
     enviarError(res, err);

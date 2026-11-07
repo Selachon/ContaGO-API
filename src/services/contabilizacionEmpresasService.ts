@@ -198,6 +198,8 @@ export interface CuentaPuc {
   tarifa?: number;
   /** Siigo Pyme: la cuenta exige centro de costo (columna C.COSTO del plan de cuentas). */
   centro?: boolean;
+  /** Siigo: la cuenta maneja vencimientos (columna «Maneja vencimientos»): en proveedores o en cartera. Sus líneas llevan cruce. */
+  venc?: "proveedores" | "cartera";
 }
 
 export interface PucResumen {
@@ -291,6 +293,8 @@ export interface EmpresaPublic {
   siigoPyme: ConfigSiigoPyme;
   /** Compras clasificadas como inventario o gasto por factura (ver ConfigInventario). */
   clasificarCompras: boolean;
+  /** Último balance de prueba por tercero aplicado a los proveedores (fecha y cuántos proveedores traía), o null. */
+  balanceTercero: { fecha: string; proveedores: number } | null;
   comprobantes: Comprobantes;
   /** Siguiente consecutivo recordado por tipo de comprobante. */
   consecutivos: Consecutivos;
@@ -375,6 +379,7 @@ function toPublic(doc: any): EmpresaPublic {
     worldOffice: normWo(doc.worldOffice),
     siigoPyme: normPyme(doc.siigoPyme),
     clasificarCompras: !!doc.inventario?.activo,
+    balanceTercero: doc.ci2BalanceTercero?.fecha ? { fecha: String(doc.ci2BalanceTercero.fecha), proveedores: Number(doc.ci2BalanceTercero.proveedores) || 0 } : null,
     comprobantes: normComprobantes(doc.comprobantes),
     consecutivos: (doc.consecutivos && typeof doc.consecutivos === "object" ? doc.consecutivos : {}) as Consecutivos,
     tablas,
@@ -389,8 +394,11 @@ function toPublic(doc: any): EmpresaPublic {
 
 /** Empresas visibles para un usuario (las que posee o le comparten). Admin ve todas. */
 // Cada usuario ve solo sus empresas (propias o compartidas), también el administrador.
-export async function listEmpresasForUser(userId: string, _isAdmin?: boolean): Promise<EmpresaPublic[]> {
-  const filter = { $or: [{ ownerUserId: userId }, { sharedWith: userId }] };
+// `herramienta`: un id = solo las empresas propias de esa herramienta (ej. Interfaces Integral Odonto); null = solo las de uso general (sin herramienta); sin indicar = todas.
+export async function listEmpresasForUser(userId: string, _isAdmin?: boolean, herramienta?: string | null): Promise<EmpresaPublic[]> {
+  const filter: any = { $or: [{ ownerUserId: userId }, { sharedWith: userId }] };
+  if (typeof herramienta === "string") filter.herramienta = herramienta;
+  else if (herramienta === null) filter.herramienta = { $exists: false };
   const docs = await getDb().collection<any>(EMPRESAS).find(filter).sort({ nombre: 1 }).toArray();
   return docs.map(toPublic);
 }
@@ -575,12 +583,69 @@ export async function getConfigSiigoPyme(empresaId: string): Promise<ConfigSiigo
   return normPyme(doc?.siigoPyme);
 }
 
-/** Sistema contable, parámetros de Siigo Pyme e inventario de la empresa en una sola lectura (las pantallas de Interfaces 2.0 los usan juntos). */
-export async function getContextoCi2(empresaId: string): Promise<{ sistema: SistemaContable; pyme: ConfigSiigoPyme | null; inventario: ConfigInventario }> {
+/** IVA mayor valor por rama de gasto (Integral Odonto): cuentas de IVA mayor valor del costo y cuenta fija del impoconsumo. */
+export interface ConfigIvaRama { cuentas: string[]; inc: string }
+const normIvaRama = (v: any): ConfigIvaRama => ({
+  cuentas: [...new Set((Array.isArray(v?.cuentas) ? v.cuentas : []).map((c: unknown) => String(c ?? "").replace(/\D/g, "")).filter(Boolean))] as string[],
+  inc: String(v?.inc ?? "").replace(/\D/g, ""),
+});
+export async function getConfigIvaRama(empresaId: string): Promise<ConfigIvaRama> {
   const oid = toObjectId(empresaId);
-  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { sistemaContable: 1, siigoPyme: 1, inventario: 1 } }) : null;
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { ci2IvaRama: 1 } }) : null;
+  return normIvaRama(doc?.ci2IvaRama);
+}
+export async function setConfigIvaRama(empresaId: string, cfg: unknown): Promise<ConfigIvaRama> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const limpio = normIvaRama(cfg);
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { ci2IvaRama: limpio, updatedAt: new Date() } });
+  return limpio;
+}
+
+/** Formas de pago por tipo (la cuenta por pagar o por cobrar de cada una, con el nombre que ve el usuario) y la cuenta única de ingreso de ventas. */
+export interface FormaPagoCuenta { nombre: string; cuenta: string }
+export interface ConfigPagos { compras: FormaPagoCuenta[]; ventas: FormaPagoCuenta[]; cuentaIngreso: string; defectoVentas: string }
+const normFormas = (v: any): FormaPagoCuenta[] => {
+  const vistos = new Set<string>();
+  return (Array.isArray(v) ? v : [])
+    .map((f: any) => ({ nombre: String(f?.nombre ?? "").trim(), cuenta: String(f?.cuenta ?? "").replace(/\D/g, "") }))
+    .filter((f: FormaPagoCuenta) => f.nombre && !vistos.has(f.nombre) && vistos.add(f.nombre));
+};
+const normPagos = (v: any): ConfigPagos => ({ compras: normFormas(v?.compras), ventas: normFormas(v?.ventas), cuentaIngreso: String(v?.cuentaIngreso ?? "").replace(/\D/g, ""), defectoVentas: String(v?.defectoVentas ?? "").trim() });
+export async function getConfigPagos(empresaId: string): Promise<ConfigPagos> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { ci2Pagos: 1 } }) : null;
+  return normPagos(doc?.ci2Pagos);
+}
+export async function setConfigPagos(empresaId: string, cfg: unknown): Promise<ConfigPagos> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const limpio = normPagos(cfg);
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { ci2Pagos: limpio, updatedAt: new Date() } });
+  return limpio;
+}
+/** Códigos de las cuentas activas y transaccionales del PUC cargado (vacío si no hay PUC). */
+export async function getCodigosPuc(empresaId: string): Promise<Set<string>> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { "puc.cuentas.codigo": 1 } }) : null;
+  return new Set((Array.isArray(doc?.puc?.cuentas) ? doc.puc.cuentas : []).map((c: any) => String(c.codigo)));
+}
+
+/** Cuentas del PUC que manejan vencimientos (cruce): código → proveedores | cartera. */
+export async function getCuentasConVencimiento(empresaId: string): Promise<Record<string, "proveedores" | "cartera">> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { "puc.cuentas": 1 } }) : null;
+  const out: Record<string, "proveedores" | "cartera"> = {};
+  for (const c of Array.isArray(doc?.puc?.cuentas) ? doc.puc.cuentas : []) if (c?.venc) out[String(c.codigo)] = c.venc;
+  return out;
+}
+
+/** Sistema contable, parámetros de Siigo Pyme e inventario de la empresa en una sola lectura (las pantallas de Interfaces 2.0 los usan juntos). */
+export async function getContextoCi2(empresaId: string): Promise<{ sistema: SistemaContable; pyme: ConfigSiigoPyme | null; inventario: ConfigInventario; ivaRama: ConfigIvaRama; pagos: ConfigPagos }> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { sistemaContable: 1, siigoPyme: 1, inventario: 1, ci2IvaRama: 1, ci2Pagos: 1 } }) : null;
   const sistema = normSistema(doc?.sistemaContable);
-  return { sistema, pyme: sistema === "siigopyme" ? normPyme(doc?.siigoPyme) : null, inventario: normInventario(doc?.inventario) };
+  return { sistema, pyme: sistema === "siigopyme" ? normPyme(doc?.siigoPyme) : null, inventario: normInventario(doc?.inventario), ivaRama: normIvaRama(doc?.ci2IvaRama), pagos: normPagos(doc?.ci2Pagos) };
 }
 
 export async function getConfigWorldOffice(empresaId: string): Promise<ConfigWorldOffice> {
@@ -615,7 +680,8 @@ export async function createEmpresa(
   comprobantes?: Partial<Comprobantes>,
   cuentaGastoPorTarifaIva?: boolean,
   sistemaContable?: string,
-  worldOffice?: Partial<ConfigWorldOffice>
+  worldOffice?: Partial<ConfigWorldOffice>,
+  herramienta?: string
 ): Promise<EmpresaPublic> {
   const cleanNombre = String(nombre || "").trim();
   if (!cleanNombre) throw new Error("El nombre de la empresa es obligatorio.");
@@ -633,6 +699,7 @@ export async function createEmpresa(
     comprobantes: normComprobantes(comprobantes),
     consecutivos: {},
     ownerUserId,
+    ...(herramienta ? { herramienta } : {}),
     sharedWith: [],
     // Arranca con las 3 tablas vacías pero con columnas ya listas, para que la
     // empresa funcione de una vez en el portal sin obligar a subir un Excel
@@ -909,6 +976,7 @@ export function extraerCuentasPuc(tabla: Tabla): CuentaPuc[] {
   const nameCol = columnaPucNombre(tabla.columns, codeCol);
   const nivelCol = columnaPucNivelAgrupacion(tabla.columns);
   const activoCol = columnaPucActivo(tabla.columns);
+  const vencCol = tabla.columns.find((c) => /maneja\s+vencimiento/i.test(String(c)));
   if (!codeCol) throw new Error("No se encontró la columna de código de cuenta en el PUC.");
 
   const byCode = new Map<string, CuentaPuc>();
@@ -917,7 +985,9 @@ export function extraerCuentasPuc(tabla: Tabla): CuentaPuc[] {
       const codigo = limpiarCodigoCuenta(row[codeCol]);
       if (!codigo) continue;
       const nombre = nameCol ? String(row[nameCol] ?? "").trim() : "";
-      if (!byCode.has(codigo)) byCode.set(codigo, { codigo, nombre });
+      const v = vencCol ? String(row[vencCol] ?? "").toLowerCase() : "";
+      const venc = /vencimiento en proveedores/.test(v) ? ("proveedores" as const) : /vencimiento en cartera/.test(v) ? ("cartera" as const) : undefined;
+      if (!byCode.has(codigo)) byCode.set(codigo, { codigo, nombre, ...(venc ? { venc } : {}) });
     }
   } else {
     const todas = tabla.rows
@@ -1091,7 +1161,7 @@ export async function getPuc(empresaId: string): Promise<CuentaPuc[]> {
   if (!oid) throw new Error("Empresa inválida.");
   const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { "puc.cuentas": 1 } });
   const cuentas = doc?.puc?.cuentas;
-  return Array.isArray(cuentas) ? cuentas.map((c: any) => ({ codigo: String(c.codigo || ""), nombre: String(c.nombre || "") })).filter((c: CuentaPuc) => c.codigo) : [];
+  return Array.isArray(cuentas) ? cuentas.map((c: any) => ({ codigo: String(c.codigo || ""), nombre: String(c.nombre || ""), ...(c.venc ? { venc: c.venc } : {}) })).filter((c: CuentaPuc) => c.codigo) : [];
 }
 
 /** Devuelve la tabla de parametrización (para editar en el portal) o null. */
@@ -1313,4 +1383,11 @@ export async function materializarConfig(empresaId: string, destDir: string): Pr
   }
 
   return out;
+}
+
+/** Deja constancia de que el balance de prueba por tercero ya se aplicó a los proveedores de la empresa. */
+export async function marcarBalanceTercero(empresaId: string, proveedores: number): Promise<void> {
+  const oid = toObjectId(empresaId);
+  if (!oid) return;
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { ci2BalanceTercero: { fecha: new Date().toISOString(), proveedores } } });
 }

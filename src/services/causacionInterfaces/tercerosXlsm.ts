@@ -13,6 +13,18 @@ import { CausacionInterfacesError, COLUMNAS_TERCEROS, type FilaTercero } from ".
 import { cargarLibro } from "./excelReader.js";
 import { normalizarTexto } from "./normalize.js";
 
+/** Texto de un encabezado: la plantilla de Siigo trae algunos (código país, departamento, ciudad) como texto con formato. */
+function textoEncabezado(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") {
+    const o = v as { richText?: { text: string }[]; text?: string; result?: unknown };
+    if (Array.isArray(o.richText)) return o.richText.map((t) => t.text).join("").trim();
+    if (typeof o.text === "string") return o.text.trim();
+    if (o.result !== undefined && o.result !== null) return String(o.result).trim();
+  }
+  return String(v).trim();
+}
+
 /** Convierte un índice de columna (1-based) a letra de columna Excel. */
 function columnaLetra(n: number): string {
   let s = "";
@@ -69,8 +81,7 @@ export async function escribirTercerosXlsm(
   const encabezados: string[] = [];
   const filaEncabezado = hoja.getRow(1);
   for (let c = 1; c <= nCols; c++) {
-    const v = filaEncabezado.getCell(c).value;
-    encabezados.push(v === null || v === undefined ? "" : String(v).trim());
+    encabezados.push(textoEncabezado(filaEncabezado.getCell(c).value));
   }
   const columnaPorNombre = new Map<string, number>();
   encabezados.forEach((h, i) => {

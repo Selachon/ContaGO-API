@@ -389,6 +389,9 @@ export async function processPdfForAccounting(pdfBuffer: Buffer, filename: strin
 }
 
 // ─── Procesamiento por lote (varios XML o un ZIP) ────────────────────
+/** Clave (símbolo: no sale en el JSON) con la que el lote deja el XML original de cada documento, para guardarlo junto a la factura. */
+export const XML_CRUDO = Symbol.for("ci2.xmlCrudo");
+
 export interface BatchItem {
   fileName: string;
   ok: boolean;
@@ -530,7 +533,8 @@ export async function processXmlBatch(
         xml,
         profile,
         ...(pdf ? { pdfBase64: pdf.buffer.toString("base64"), pdfName: pdf.name } : {}),
-      });
+        [XML_CRUDO]: xf.buffer,
+      } as BatchItem);
     } catch (e) {
       // Los XMLs auxiliares (Application Response, nómina, etc.) son ruido esperado
       // dentro de los ZIP de la DIAN: se marcan como "ignored", no como error.

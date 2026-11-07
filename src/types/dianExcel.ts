@@ -40,6 +40,13 @@ export interface InvoiceData {
   issuerDepartment?: string;
   issuerCountry?: string;
   issuerCityCode?: string;
+  receiverCityCode?: string;
+  receiverFirstNames?: string;
+  receiverFamilyNames?: string;
+  issuerFirstNames?: string;
+  issuerFamilyNames?: string;
+  receiverStateCode?: string;
+  receiverCountryCode?: string;
   issuerStateCode?: string;
   issuerCountryCode?: string;
   issuerCommercialName?: string;

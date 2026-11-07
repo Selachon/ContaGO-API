@@ -128,6 +128,8 @@ export async function extractInvoiceDataFromXml(
     const receiverNit = extractPartyNit(customerParty);
     const receiverName = extractPartyName(customerParty);
     const receiverDetails = extractPartyDetails(customerParty);
+    const receiverPerson = extractPersonNames(customerParty);
+    const issuerPerson = extractPersonNames(supplierParty);
 
     // Extraer otros datos
     const { issueDate, issueDateISO } = extractIssueDate(invoice);
@@ -163,6 +165,13 @@ export async function extractInvoiceDataFromXml(
       receiverPhone: receiverDetails.phone,
       receiverAddress: receiverDetails.address,
       receiverCity: receiverDetails.city,
+      receiverCityCode: receiverDetails.cityCode,
+      receiverFirstNames: receiverPerson.nombres,
+      receiverFamilyNames: receiverPerson.apellidos,
+      issuerFirstNames: issuerPerson.nombres,
+      issuerFamilyNames: issuerPerson.apellidos,
+      receiverStateCode: receiverDetails.stateCode,
+      receiverCountryCode: receiverDetails.countryCode,
       receiverDepartment: receiverDetails.department,
       receiverCountry: receiverDetails.country,
       receiverCommercialName: receiverDetails.commercialName,
@@ -229,6 +238,8 @@ export async function extractThirdPartyDataFromXml(
     const receiverNit = extractPartyNit(customerParty);
     const receiverName = extractPartyName(customerParty);
     const receiverDetails = extractPartyDetails(customerParty);
+    const receiverPerson = extractPersonNames(customerParty);
+    const issuerPerson = extractPersonNames(supplierParty);
 
     const { issueDateISO } = extractIssueDate(invoice);
     const profileId = getText(invoice.ProfileID || "");
@@ -251,6 +262,13 @@ export async function extractThirdPartyDataFromXml(
       receiverPhone: receiverDetails.phone,
       receiverAddress: receiverDetails.address,
       receiverCity: receiverDetails.city,
+      receiverCityCode: receiverDetails.cityCode,
+      receiverFirstNames: receiverPerson.nombres,
+      receiverFamilyNames: receiverPerson.apellidos,
+      issuerFirstNames: issuerPerson.nombres,
+      issuerFamilyNames: issuerPerson.apellidos,
+      receiverStateCode: receiverDetails.stateCode,
+      receiverCountryCode: receiverDetails.countryCode,
       receiverDepartment: receiverDetails.department,
       receiverCountry: receiverDetails.country,
       receiverCommercialName: receiverDetails.commercialName,
@@ -386,6 +404,19 @@ function pickAddressNode(party: any): any {
   }
 
   return null;
+}
+
+/** Nombres y apellidos de una persona natural, si el XML los trae en <cac:Person> (FirstName, MiddleName, FamilyName). */
+function extractPersonNames(party: any): { nombres: string; apellidos: string } {
+  try {
+    const persona = Array.isArray(party?.Person) ? party.Person[0] : party?.Person;
+    if (!persona) return { nombres: "", apellidos: "" };
+    const t = (n: any) => cleanText(getText(n)).trim();
+    const nombres = [t(persona.FirstName), t(persona.MiddleName)].filter(Boolean).join(" ");
+    return { nombres, apellidos: t(persona.FamilyName) };
+  } catch {
+    return { nombres: "", apellidos: "" };
+  }
 }
 
 function extractPartyDetails(party: any): {

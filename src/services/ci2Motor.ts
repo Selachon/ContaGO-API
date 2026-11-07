@@ -62,6 +62,8 @@ export interface Ci2Asignacion {
   destino?: "inventario" | "gasto";
   /** Inventario: cuenta elegida para la base de cada tarifa de IVA ("0", "5", "19") cuando hay varias posibles. */
   cuentasInventario?: Record<string, string>;
+  /** IVA mayor valor por rama: cuenta de IVA elegida a mano para una cuenta de gasto (código del gasto → código del IVA). */
+  cuentasIvaRama?: Record<string, string>;
   /** Impoconsumo: cuenta elegida por tarifa ("8") cuando la tabla de impuestos trae varias con la misma tarifa. */
   cuentasInc?: Record<string, string>;
   /** Inventario: cuenta de IVA mayor valor elegida por tarifa ("5", "19") cuando hay varias posibles. */
@@ -97,8 +99,32 @@ type FilaImpuesto = Record<string, unknown>;
 import { categoriaDocumento } from "./tipoDocumento.js";
 export { categoriaDocumento, type Ci2Categoria } from "./tipoDocumento.js";
 
+/** Empresas cuyo IVA va siempre como mayor valor del gasto, en la cuenta de IVA de la misma rama de la cuenta de gasto elegida; el impoconsumo va a una cuenta fija. */
+export interface Ci2IvaRama {
+  cuentas: string[];
+  inc: string;
+}
+
+/**
+ * Cuenta de IVA mayor valor para una cuenta de gasto: ella misma si está en la lista; si no, la de la lista que comparte
+ * sus 6 primeros dígitos (la rama: 51056301 Capacitación → 51056302 IVA Capacitación). Si hay varias, la de código más cercano.
+ */
+export function cuentaIvaDeRama(gasto: string, cuentas: string[]): string {
+  const g = limpiarCuenta(gasto);
+  if (!g) return "";
+  if (cuentas.includes(g)) return g;
+  const rama = cuentas.filter((c) => c.startsWith(g.slice(0, 6)));
+  const dist = (c: string) => Math.abs(Number(c.padEnd(12, "0")) - Number(g.padEnd(12, "0")));
+  return rama.sort((a, b) => dist(a) - dist(b))[0] ?? "";
+}
+
 export interface Ci2Opciones {
   modo?: "compra" | "venta";
+  /** La descripción de cada línea es el concepto de la factura (FC<número> <qué se compró>, editable), con la etiqueta (RF, RTEICA, IVA19…) delante. */
+  descripcionConcepto?: boolean;
+  /** Cuentas que manejan vencimientos (cruce): su línea de cuenta por pagar/cobrar lleva prefijo, consecutivo, cuota y vencimiento del documento. */
+  vencimientos?: Record<string, "proveedores" | "cartera">;
+  ivaRama?: Ci2IvaRama;
   /** Compras para World Office: en vez de líneas contables se arma el contenido de sus dos archivos (producto + IVA + valor). */
   worldoffice?: boolean;
   /** Siigo Pyme (compras): el modelo general de movimiento contable; las líneas llevan los datos auxiliares que pide. */
@@ -276,6 +302,11 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
       const m = /^(FC\d+)\s*(.*)$/i.exec(concepto);
       desc = etiqueta ? (m ? `${m[1]} ${etiqueta} ${m[2]}` : `${etiqueta} ${concepto}`) : concepto;
     }
+    if (opts.descripcionConcepto && !pyme) {
+      const etiqueta = desc.replace(descripcion, "").trim().replace(/^RICA\b/, "RTEICA");
+      const concepto = (as.concepto || "").trim() || conceptoSugeridoPyme(f.docNumber, f.items, f.proveedor);
+      desc = etiqueta ? `${etiqueta} ${concepto}` : concepto;
+    }
     const l: FilaSiigo = {};
     for (const c of COLUMNAS_SIIGO) l[c] = "";
     l["Tipo de comprobante"] = tipo;
@@ -301,6 +332,13 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     crear(cuenta, debito, credito, desc, codImp, centro, baseRet, meta);
   };
 
+  // Cuenta que maneja vencimientos: su línea se cruza con el documento (prefijo y número de la factura, cuota 1 y fecha de vencimiento).
+  const cruce = (cuenta: unknown): FilaSiigo | undefined => {
+    if (!opts.vencimientos?.[limpiarCuenta(cuenta)]) return undefined;
+    const doc = venta ? (() => { const x = extraerPrefijoConsecutivo(f.docNumber); return { prefijo: x.prefijo, numero: x.consecutivo }; })() : (() => { const x = separarNumeroExterno(f.docNumber); return { prefijo: x.prefijo, numero: x.numero }; })();
+    return { "Prefijo": doc.prefijo, "Consecutivo": doc.numero, "No. cuota": 1, "Fecha vencimiento": aDdMmYyyy(as.fechaVencimiento || f.fechaVencimiento || "") || f.fecha };
+  };
+
   const baseGasto = ag.baseGasto;
   const tarifasIva = [...ag.iva.keys()].sort((x, y) => y - x);
   const ivaTotal = tarifasIva.reduce((s, t) => s + redondear(ag.iva.get(t)!), 0);
@@ -309,6 +347,8 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   if (clasifica && as.destino !== "inventario" && as.destino !== "gasto") throw new Ci2Error("Marca si la factura va a inventario o a gasto.");
   const inventario = clasifica && as.destino === "inventario" ? opts.inventario! : null;
   const ivaMayorGasto = clasifica && as.destino === "gasto";
+  const rama = !venta && !inventario && opts.ivaRama?.cuentas.length ? opts.ivaRama : null;
+  const ivaDeRama = new Map<string, number>();
   const cuentaInv = (mapa: Record<string, string>, clave: string, que: string) => {
     // El nombre del impuesto llega como lo escribe el XML ("IC Porcentual"); se compara sin mayúsculas ni acentos.
     const norm = (x: string) => x.normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim().toUpperCase();
@@ -360,10 +400,17 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
       const detalleIva = (as.tratamientoIva === "servicios" && !esInventario) || (as.tratamientoIva === "compras" && esInventario);
       const meta: FilaSiigo | undefined = pyme ? { "Rol": "base", "IVA %": detalleIva ? pct : 0, "IVA valor": detalleIva ? redondear(g.valor) : 0, "Gravada": g.valor > 0 ? "S" : "N" } : undefined;
       agregarLinea(cuenta, base, natBase, descripcion, "", as.centroCostos, undefined, meta);
+      if (rama && g.valor > 0) {
+        const cuentaIva = limpiarCuenta(as.cuentasIvaRama?.[limpiarCuenta(cuenta)] ?? "") || cuentaIvaDeRama(cuenta, rama.cuentas);
+        if (!cuentaIva) throw new Ci2Error(`No hay una cuenta de IVA mayor valor para la cuenta de gasto ${cuenta}: elige otra cuenta de gasto o agrega la de IVA en Parámetros.`);
+        ivaDeRama.set(cuentaIva, (ivaDeRama.get(cuentaIva) ?? 0) + g.valor);
+      }
     }
   }
+  // El IVA va como mayor valor del gasto: una línea por cuenta de IVA de la rama de cada gasto.
+  for (const [cuentaIva, valor] of ivaDeRama) agregarLinea(cuentaIva, valor, natBase, `IVA ${descripcion}`, "", as.centroCostos);
   for (const t of tarifasIva) {
-    if (t <= 0 || ivaMayorGasto) continue;
+    if (t <= 0 || ivaMayorGasto || rama) continue;
     if (inventario) {
       const posibles = inventario.ivaMayorValor[String(t)] || [];
       const cuenta = cuentaIvaMayor(as, posibles, String(t), cuentasBase.get(String(t)) ?? "");
@@ -401,7 +448,8 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     // Con varias cuentas de impoconsumo para la misma tarifa en la tabla, se usa la elegida en la factura (si ya no existe en la tabla, la primera).
     const elegidaInc = limpiarCuenta(as.cuentasInc?.[String(redondear4(t))] ?? "");
     const conElegida = () => { if (!elegidaInc) return null; try { return buscarImpuesto(opts.impuestos, "INC", t, colCuenta, elegidaInc); } catch { return null; } };
-    const imp = cuentaAparte ? { cuenta: cuentaAparte, codigo: "" as CeldaValor, baseMinima: 0 } : conElegida() ?? impuesto("INC", t);
+    const fija = rama ? limpiarCuenta(rama.inc) : "";
+    const imp = cuentaAparte ? { cuenta: cuentaAparte, codigo: "" as CeldaValor, baseMinima: 0 } : fija ? { cuenta: fija, codigo: "" as CeldaValor, baseMinima: 0 } : conElegida() ?? impuesto("INC", t);
     agregarLinea(imp.cuenta, ag.inc.get(t)!, natBase, `IMPOCONSUMO ${descripcion}`, imp.codigo);
   }
   if (venta) {
@@ -440,12 +488,21 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   if (redondear(ivaObsequios) > 0) {
     agregarLinea(exigirCuenta(as.cuentaIngresoObsequios, "Cuenta de ingreso por obsequios", "Hay obsequios."), ivaObsequios, contra(natBase), `OBSEQUIO ${descripcion}`);
   }
+  // Descuento y recargo son un ítem más de la factura: su cuenta se elige en el ítem (cuentasItems); si no, la general de la empresa.
+  const cuentaSurcharge = (tipo: "Descuento" | "Recargo") => {
+    for (const [idx, it] of f.items.entries()) {
+      if (!it.isSurcharge || !(it.extraTaxes || []).some((e) => e.taxName === tipo && e.amount !== 0)) continue;
+      const c = limpiarCuenta(as.cuentasItems?.[String(idx)] ?? "");
+      if (c) return c;
+    }
+    return "";
+  };
   if (redondear(ag.recargo) > 0) {
-    agregarLinea(exigirCuenta(as.cuentaRecargo, "Cuenta de recargo", "Hay recargo a nivel documento."), ag.recargo, natBase, `RECARGO ${descripcion}`);
+    agregarLinea(exigirCuenta(cuentaSurcharge("Recargo") || as.cuentaRecargo, "Cuenta de recargo", "Hay recargo a nivel documento."), ag.recargo, natBase, `RECARGO ${descripcion}`);
   }
   const descuento = descuentoNeto(f.items);
   if (redondear(descuento) > 0) {
-    agregarLinea(exigirCuenta(as.cuentaDescuento, "Cuenta de descuento", "Hay descuento a nivel documento."), descuento, contra(natBase), `DESCUENTO ${descripcion}`);
+    agregarLinea(exigirCuenta(cuentaSurcharge("Descuento") || as.cuentaDescuento, "Cuenta de descuento", "Hay descuento a nivel documento."), descuento, contra(natBase), `DESCUENTO ${descripcion}`);
   }
 
   // Retenciones (misma base y fórmulas que el motor actual).
@@ -495,9 +552,9 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     // Las líneas ya llevan el sentido de la nota crédito: la cuenta por cobrar es lo que falta para cuadrar.
     const cuenta = exigirCuenta(as.cuentaPorPagar, "Cuenta por cobrar", "Falta la contrapartida.");
     const v = redondear(Math.abs(dif));
-    if (v !== 0) crear(cuenta, dif < 0 ? v : 0, dif < 0 ? 0 : v, descripcion);
+    if (v !== 0) crear(cuenta, dif < 0 ? v : 0, dif < 0 ? 0 : v, descripcion, "", "", undefined, cruce(cuenta));
   } else {
-    agregarLinea(exigirCuenta(as.cuentaPorPagar, "Cuenta por pagar / forma de pago", "Falta la contrapartida."), esNc ? dif * -1 : dif, "C", descripcion, "", pyme ? as.centroCostos : "", undefined, pyme ? { "Rol": "cxp" } : undefined);
+    agregarLinea(exigirCuenta(as.cuentaPorPagar, "Cuenta por pagar / forma de pago", "Falta la contrapartida."), esNc ? dif * -1 : dif, "C", descripcion, "", pyme ? as.centroCostos : "", undefined, pyme ? { "Rol": "cxp" } : cruce(as.cuentaPorPagar));
   }
 
   const inf: FilaInforme = {};

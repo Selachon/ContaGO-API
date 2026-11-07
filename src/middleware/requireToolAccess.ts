@@ -14,7 +14,7 @@ const TOOL_ALIASES: Record<string, string[]> = {
   // Tener cualquiera de ellas da acceso al router compartido.
   "siigo-xml-accounting": ["causacion-caja", "siigo-egresos"],
   // Interfaces 2.0 usa las empresas y parámetros del router de Interfaces
-  "contabilizacion-dian-siigo": ["causacion-interfaces-v2"],
+  "contabilizacion-dian-siigo": ["causacion-interfaces-v2", "interfaces-integral-odonto"],
 };
 
 declare global {

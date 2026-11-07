@@ -16,4 +16,5 @@ export const TOOL_NAMES: Record<string, string> = {
   "ca-caja-portal": "Portal Caja Castro Arroyave",
   "contabilizacion-dian-siigo": "Causación Siigo (Interfaces)",
   "causacion-interfaces-v2": "Causación Interfaces 2.0",
+  "interfaces-integral-odonto": "Interfaces Integral Odonto Avanzada",
 };

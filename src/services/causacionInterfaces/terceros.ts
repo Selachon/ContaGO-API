@@ -342,6 +342,43 @@ function mapearTerceros(filas: Fila[], columnas: string[], geo: DiccionarioGeo):
   });
 }
 
+/** Fila de la plantilla de Siigo para un tercero con los datos del emisor de su factura (XML de la DIAN). */
+/** Código de país de 3 letras que usa la plantilla de Siigo a partir del código de 2 letras del XML. */
+function pais3(c?: string): string {
+  const u = String(c ?? "").trim().toUpperCase();
+  if (u.length === 3) return u;
+  const t: Record<string, string> = { CO: "COL", US: "USA", VE: "VEN", EC: "ECU", PE: "PER", MX: "MEX", ES: "ESP", PA: "PAN", BR: "BRA", AR: "ARG", CL: "CHL", DE: "DEU", FR: "FRA", IT: "ITA", GB: "GBR", CA: "CAN", CN: "CHN" };
+  return t[u] || "COL";
+}
+
+export function filaTerceroDesdeFactura(d: { nit: string; nombre: string; nombres?: string; apellidos?: string; direccion?: string; codPais?: string; codDepartamento?: string; codCiudad?: string; telefono?: string; correo?: string }): FilaTercero | null {
+  const nit = limpiarNitTerceros(d.nit);
+  const razon = aMayusculas(d.nombre);
+  if (!nit || !razon) return null;
+  const tipoId = tipoIdentificacionDesdeNit(nit);
+  const empresa = tipoId === "31";
+  // Si el XML trae el nombre de la persona separado (nombres / apellidos), se usa tal cual; si no, se deduce de la razón social.
+  const partido = empresa ? { nombres: "", apellidos: "" } : d.nombres && d.apellidos ? { nombres: d.nombres, apellidos: d.apellidos } : dividirNombrePersona(razon);
+  return {
+    "Identificación (Obligatorio)": nit,
+    "Dígito de verificación": calcularDigitoVerificacion(nit),
+    "Tipo identificación (Obligatorio)": tipoId,
+    "Tipo (Obligatorio)": empresa ? "Empresa" : "Es persona",
+    "Razón social (Obligatorio)": empresa ? razon : "",
+    "Nombres del tercero (Obligatorio)": aMayusculas(partido.nombres),
+    "Apellidos del tercero (Obligatorio)": aMayusculas(partido.apellidos),
+    Dirección: String(d.direccion ?? "").trim(),
+    "Código país": d.codCiudad ? pais3(d.codPais) : "",
+    "Código departamento/estado": String(d.codDepartamento ?? "").trim(),
+    "Código ciudad": String(d.codCiudad ?? "").trim(),
+    "Teléfono principal": limpiarTelefono(d.telefono),
+    "Tipo de régimen IVA": empresa ? "2" : "0",
+    "Correo electrónico contacto principal": limpiarCorreo(d.correo),
+    Clientes: "",
+    Estado: "Activo",
+  };
+}
+
 /** Ejecuta el proceso de terceros: produce las filas para la plantilla de Siigo. */
 export async function runTerceros(input: TercerosInput): Promise<TercerosResultado> {
   if (!input.dian || input.dian.length === 0) {
