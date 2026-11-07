@@ -47,6 +47,8 @@ import {
   type ConfigSiigoPyme,
   getConfigInventario,
   getContextoCi2,
+  getConfigVentasDetalle,
+  setConfigVentasDetalle,
   type ConfigInventario,
   setConfigInventario,
   setProductosWo,
@@ -60,6 +62,12 @@ import {
   userCanAccessEmpresa,
 } from "../services/contabilizacionEmpresasService.js";
 import JSZip from "jszip";
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
+import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
+import type { InvoiceData } from "../types/dianExcel.js";
 import { categoriaDocumento, conceptoSugeridoPyme, cuentaBaseInventario, cuentaIvaMayor, descuentoNeto, generarInterfaz, nombresImpuestosExtra, type Ci2Asignacion, type Ci2FacturaInput } from "../services/ci2Motor.js";
 import { extractCufesFromExcel, resolveExcelBuffer } from "../services/dianExcelCufes.js";
 import {
@@ -90,6 +98,7 @@ import {
   getInterfaz,
   guardarFacturasTraidas,
   guardarInterfaz,
+  facturasConArchivos,
   listarFacturas,
   listarInterfaces,
   marcarEstado,
@@ -704,6 +713,28 @@ router.put("/empresas/:id/inventario", async (req: Request, res: Response) => {
   }
 });
 
+// ── Ventas con producto (Siigo): producto, acción, centro de costos y cruce de la cuenta por cobrar ──
+
+router.get("/empresas/:id/ventas-detalle", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    res.json({ status: "ok", ventasDetalle: await getConfigVentasDetalle(empresaId) });
+  } catch (e) {
+    err(res, e, 500);
+  }
+});
+
+router.put("/empresas/:id/ventas-detalle", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    res.json({ status: "ok", ventasDetalle: await setConfigVentasDetalle(empresaId, req.body?.ventasDetalle) });
+  } catch (e) {
+    err(res, e);
+  }
+});
+
 // ── Maestro de productos de World Office ────────────────────────────────────
 
 router.get("/empresas/:id/productos-wo", async (req: Request, res: Response) => {
@@ -956,6 +987,77 @@ router.get("/empresas/:id/prefijos", async (req: Request, res: Response) => {
   }
 });
 
+// ── Descargas de las facturas traídas: Excel detallado (el de la descarga masiva + Excel) y ZIP con los PDF y XML ──
+
+/** Una factura del XML como fila del Excel detallado: los mismos campos y valores por defecto de la descarga masiva + Excel. */
+function filaExcelDetallado(d: Partial<InvoiceData>, f: { id: string; docNumber: string; nit: string }): InvoiceData {
+  const na = (v: unknown) => (v === undefined || v === null || v === "" ? "N/A" : String(v));
+  return {
+    issuerNit: na(d.issuerNit || f.nit), issuerName: na(d.issuerName), issuerEmail: na(d.issuerEmail), issuerPhone: na(d.issuerPhone), issuerAddress: na(d.issuerAddress),
+    issuerCity: na(d.issuerCity), issuerDepartment: na(d.issuerDepartment), issuerCountry: na(d.issuerCountry), issuerCommercialName: na(d.issuerCommercialName),
+    issuerTaxpayerType: na(d.issuerTaxpayerType), issuerFiscalRegime: na(d.issuerFiscalRegime), issuerTaxResponsibility: na(d.issuerTaxResponsibility), issuerEconomicActivity: na(d.issuerEconomicActivity),
+    receiverNit: na(d.receiverNit), receiverName: na(d.receiverName), receiverEmail: na(d.receiverEmail), receiverPhone: na(d.receiverPhone), receiverAddress: na(d.receiverAddress),
+    receiverCity: na(d.receiverCity), receiverDepartment: na(d.receiverDepartment), receiverCountry: na(d.receiverCountry), receiverCommercialName: na(d.receiverCommercialName),
+    receiverTaxpayerType: na(d.receiverTaxpayerType), receiverFiscalRegime: na(d.receiverFiscalRegime), receiverTaxResponsibility: na(d.receiverTaxResponsibility), receiverEconomicActivity: na(d.receiverEconomicActivity),
+    issueDate: d.issueDate || "N/A", issueDateISO: d.issueDateISO || "9999-12-31", paymentMethod: d.paymentMethod || "N/A",
+    subtotal: d.subtotal || 0, iva: d.iva || 0, total: d.total || 0, taxes: d.taxes || [], discount: d.discount || 0, surcharge: d.surcharge || 0,
+    concepts: d.concepts || "N/A", lineItems: d.lineItems || [], documentType: d.documentType || "Factura Electrónica", isDocumentoSoporte: d.isDocumentoSoporte || false,
+    cufe: d.cufe || "N/A", notes: d.notes || "", trackId: f.id, docNumber: d.docNumber || f.docNumber, zipFilename: `${d.issuerNit || f.nit} - ${f.docNumber}.zip`,
+  } as InvoiceData;
+}
+
+const idsDeCuerpo = (req: Request): string[] => (Array.isArray(req.body?.ids) ? req.body.ids.map(String).slice(0, 2000) : []);
+
+router.post("/empresas/:id/facturas/excel", async (req: Request, res: Response) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ci2-excel-"));
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    const ids = idsDeCuerpo(req);
+    if (!ids.length) return err(res, new Error("No hay facturas para el Excel."));
+    const base = (await facturasConArchivos(empresaId, ids)).filter((f) => f.xml);
+    if (!base.length) return err(res, new Error("Estas facturas no tienen el XML guardado. Vuelve a traerlas de la DIAN para generar el Excel."));
+    const facturas: InvoiceData[] = [];
+    for (const f of base) facturas.push(filaExcelDetallado(await extractInvoiceDataFromXml(f.xml!, { id: f.id, docnum: f.docNumber }), f));
+    const empresa = (await listEmpresasForUser(req.user!.userId, req.user!.isAdmin)).find((e) => e.id === empresaId);
+    const ruta = path.join(tmp, "facturas.xlsx");
+    await generateExcelFile(facturas, ruta, false, false, empresa?.nombre || "", empresa?.nit || "");
+    const fechas = base.map((f) => f.fecha).filter(Boolean).sort();
+    const nombre = generateExcelFilename(fechas[0], fechas[fechas.length - 1], "Facturas DIAN");
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="${nombre.replace(/[^\w.\- ]/g, "_")}"`);
+    res.setHeader("X-Facturas-Sin-Xml", String(ids.length - base.length));
+    res.send(fs.readFileSync(ruta));
+  } catch (e) {
+    err(res, e, 500);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+router.post("/empresas/:id/facturas/zip", async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    const ids = idsDeCuerpo(req);
+    if (!ids.length) return err(res, new Error("No hay facturas para descargar."));
+    const base = await facturasConArchivos(empresaId, ids);
+    const zip = new JSZip();
+    let n = 0;
+    for (const f of base) {
+      const nombre = `${String(f.proveedor || f.nit).replace(/[^\w ]/g, "").trim().slice(0, 30)} ${String(f.docNumber).replace(/[^\w-]/g, "")}`.trim();
+      if (f.xml) { zip.file(`XML/${nombre}.xml`, f.xml); n++; }
+      if (f.pdf) { zip.file(`PDF/${nombre}.pdf`, f.pdf); n++; }
+    }
+    if (!n) return err(res, new Error("Estas facturas no tienen PDF ni XML guardados. Vuelve a traerlas de la DIAN."));
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="Facturas_PDF_XML.zip"');
+    res.send(await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" }));
+  } catch (e) {
+    err(res, e, 500);
+  }
+});
+
 // ── Generar interfaz ────────────────────────────────────────────────────────
 
 router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
@@ -979,6 +1081,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       getAutorretencion(empresaId),
     ]);
     const sistemaContable = await getSistemaContable(empresaId);
+    const cfgVentasDetalle = await getConfigVentasDetalle(empresaId);
     const cfgInventario = await getConfigInventario(empresaId);
     const worldoffice = sistemaContable === "worldoffice";
     const siigoPyme = sistemaContable === "siigopyme";
@@ -1027,6 +1130,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
 
     const r = generarInterfaz(entradas, {
       modo: venta ? "venta" : "compra",
+      ventasDetalle: venta && sistemaContable === "siigo" && cfgVentasDetalle.producto ? cfgVentasDetalle : undefined,
       inventario: !venta && !worldoffice && cfgInventario.activo ? cfgInventario : undefined,
       worldoffice,
       pyme: siigoPyme ? { diasVencimiento: configPyme!.diasVencimiento, cuentaIvaAsumido: configPyme!.cuentaIvaAsumido, formasPago: configPyme!.formasPago } : undefined,

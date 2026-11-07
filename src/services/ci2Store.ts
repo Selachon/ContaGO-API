@@ -375,6 +375,8 @@ export interface Autorretencion {
   cuentaActivo: string;
   /** Pasivo 2365… (crédito). */
   cuentaPasivo: string;
+  /** Código de impuesto de Siigo para las dos líneas (opcional, ej. 100). */
+  codigoImpuesto?: string;
 }
 
 const AUTORRETENCION_VACIA: Autorretencion = { habilitada: false, porcentaje: 0, cuentaActivo: "", cuentaPasivo: "" };
@@ -396,6 +398,7 @@ export async function setAutorretencion(empresaId: string, a: Partial<Autorreten
     porcentaje: Math.round((Number(a.porcentaje) || 0) * 10000) / 10000,
     cuentaActivo: cuenta(a.cuentaActivo),
     cuentaPasivo: cuenta(a.cuentaPasivo),
+    codigoImpuesto: String(a.codigoImpuesto ?? "").replace(/\D/g, ""),
   };
   if (limpia.habilitada) {
     if (!(limpia.porcentaje > 0 && limpia.porcentaje <= 100)) throw new Error("Indica el porcentaje de la autorretención (mayor que 0 y hasta 100).");

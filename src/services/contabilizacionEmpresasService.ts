@@ -602,6 +602,28 @@ export async function setConfigIvaRama(empresaId: string, cfg: unknown): Promise
   return limpio;
 }
 
+/** Ventas en Siigo con producto: código de producto del ingreso, acción (- salida / + entrada), centro de costos de todas las líneas y cruce de la cuenta por cobrar. */
+export interface ConfigVentasDetalle { producto: string; accion: string; centro: string; cruce: boolean }
+const normVentasDetalle = (v: any): ConfigVentasDetalle => ({
+  producto: String(v?.producto ?? "").trim(),
+  accion: String(v?.accion ?? "-").trim() === "+" ? "+" : "-",
+  centro: String(v?.centro ?? "").trim(),
+  cruce: v?.cruce === undefined ? true : !!v.cruce,
+});
+export async function getConfigVentasDetalle(empresaId: string): Promise<ConfigVentasDetalle> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { ci2VentasDetalle: 1 } }) : null;
+  return normVentasDetalle(doc?.ci2VentasDetalle);
+}
+export async function setConfigVentasDetalle(empresaId: string, cfg: unknown): Promise<ConfigVentasDetalle> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const limpio = normVentasDetalle(cfg);
+  if (limpio.centro && !/^\d+(\D+\d+)?$/.test(limpio.centro)) throw new Error("El centro de costos va como en Siigo, por ejemplo 1-1.");
+  await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { ci2VentasDetalle: limpio, updatedAt: new Date() } });
+  return limpio;
+}
+
 /** Formas de pago por tipo (la cuenta por pagar o por cobrar de cada una, con el nombre que ve el usuario) y la cuenta única de ingreso de ventas. */
 export interface FormaPagoCuenta { nombre: string; cuenta: string }
 export interface ConfigPagos { compras: FormaPagoCuenta[]; ventas: FormaPagoCuenta[]; cuentaIngreso: string; defectoVentas: string }

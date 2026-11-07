@@ -118,8 +118,17 @@ export function cuentaIvaDeRama(gasto: string, cuentas: string[]): string {
   return rama.sort((a, b) => dist(a) - dist(b))[0] ?? "";
 }
 
+/** Ventas (Siigo): la línea de ingreso lleva producto, acción y cantidad; todas las líneas el centro de costos; la cuenta por cobrar se cruza con la factura. */
+export interface Ci2VentasDetalle {
+  producto: string;
+  accion: string;
+  centro: string;
+  cruce: boolean;
+}
+
 export interface Ci2Opciones {
   modo?: "compra" | "venta";
+  ventasDetalle?: Ci2VentasDetalle;
   /** La descripción de cada línea es el concepto de la factura (FC<número> <qué se compró>, editable), con la etiqueta (RF, RTEICA, IVA19…) delante. */
   descripcionConcepto?: boolean;
   /** Cuentas que manejan vencimientos (cruce): su línea de cuenta por pagar/cobrar lleva prefijo, consecutivo, cuota y vencimiento del documento. */
@@ -140,7 +149,7 @@ export interface Ci2Opciones {
   /** Tipo de comprobante por clase de documento (FE, NC, DS, DEPOS…); FE y NC caen a los de la empresa si faltan. */
   tipoPorDocumento?: Record<string, string>;
   /** Ventas: autorretención sobre la base antes de impuestos de facturas y notas crédito. */
-  autorretencion?: { habilitada: boolean; porcentaje: number; cuentaActivo: string; cuentaPasivo: string };
+  autorretencion?: { habilitada: boolean; porcentaje: number; cuentaActivo: string; cuentaPasivo: string; codigoImpuesto?: string };
   impuestos: FilaImpuesto[];
   tipoCompras: string;
   tipoComprasNc: string;
@@ -293,6 +302,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
 
   const pyme = !!opts.pyme && !venta;
   const numProveedor = Math.trunc(Number(separarNumeroExterno(f.docNumber).numero)) || 0;
+  const ventaDet = venta ? opts.ventasDetalle : undefined;
   const crear = (cuenta: unknown, debito: number, credito: number, desc: string, codImp: CeldaValor = "", centro = "", baseRet?: number, meta?: FilaSiigo) => {
     // Siigo Pyme: la descripción siempre empieza por FC + número de la factura del proveedor, con la etiqueta (IVA19, RF…) si la hay.
     if (pyme) {
@@ -316,7 +326,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
     l["Identificación tercero"] = f.nit;
     l["Código impuesto"] = codImp;
     l["Descripción"] = desc.trim().slice(0, 50);
-    l["Código centro/subcentro de costos"] = centro;
+    l["Código centro/subcentro de costos"] = centro || ventaDet?.centro || "";
     l["Débito"] = debito;
     l["Crédito"] = credito;
     // Base de la retención: no es columna de Siigo, la usan los formatos que la piden (Syscafe).
@@ -334,7 +344,7 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
 
   // Cuenta que maneja vencimientos: su línea se cruza con el documento (prefijo y número de la factura, cuota 1 y fecha de vencimiento).
   const cruce = (cuenta: unknown): FilaSiigo | undefined => {
-    if (!opts.vencimientos?.[limpiarCuenta(cuenta)]) return undefined;
+    if (!ventaDet?.cruce && !opts.vencimientos?.[limpiarCuenta(cuenta)]) return undefined;
     const doc = venta ? (() => { const x = extraerPrefijoConsecutivo(f.docNumber); return { prefijo: x.prefijo, numero: x.consecutivo }; })() : (() => { const x = separarNumeroExterno(f.docNumber); return { prefijo: x.prefijo, numero: x.numero }; })();
     return { "Prefijo": doc.prefijo, "Consecutivo": doc.numero, "No. cuota": 1, "Fecha vencimiento": aDdMmYyyy(as.fechaVencimiento || f.fechaVencimiento || "") || f.fecha };
   };
@@ -398,7 +408,9 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
       // y el inventario con el de compras (240802). Si el tratamiento elegido no coincide, el IVA va solo en su línea, sin detalle por ítem.
       const esInventario = limpiarCuenta(cuenta).startsWith("14");
       const detalleIva = (as.tratamientoIva === "servicios" && !esInventario) || (as.tratamientoIva === "compras" && esInventario);
-      const meta: FilaSiigo | undefined = pyme ? { "Rol": "base", "IVA %": detalleIva ? pct : 0, "IVA valor": detalleIva ? redondear(g.valor) : 0, "Gravada": g.valor > 0 ? "S" : "N" } : undefined;
+      // Ventas con producto: el ingreso sale con su producto, la acción (la nota crédito la invierte) y la cantidad.
+      const accionVenta = esNc ? (ventaDet?.accion === "-" ? "+" : "-") : ventaDet?.accion;
+      const meta: FilaSiigo | undefined = pyme ? { "Rol": "base", "IVA %": detalleIva ? pct : 0, "IVA valor": detalleIva ? redondear(g.valor) : 0, "Gravada": g.valor > 0 ? "S" : "N" } : ventaDet?.producto ? { "Código producto": ventaDet.producto, "Acción": accionVenta ?? "", "Cantidad producto": 1 } : undefined;
       agregarLinea(cuenta, base, natBase, descripcion, "", as.centroCostos, undefined, meta);
       if (rama && g.valor > 0) {
         const cuentaIva = limpiarCuenta(as.cuentasIvaRama?.[limpiarCuenta(cuenta)] ?? "") || cuentaIvaDeRama(cuenta, rama.cuentas);
@@ -539,8 +551,8 @@ function armarFactura(f: Ci2FacturaInput, tipo: string, consecutivo: number, opt
   if (venta && auto?.habilitada && auto.porcentaje > 0 && (catDoc === "FE" || catDoc === "NC")) {
     const valor = redondear((baseGasto * auto.porcentaje) / 100);
     if (valor !== 0) {
-      agregarLinea(exigirCuenta(auto.cuentaActivo, "Cuenta de activo de la autorretención", "Hay autorretención."), valor, "D", `AUTORRET ${descripcion}`);
-      agregarLinea(exigirCuenta(auto.cuentaPasivo, "Cuenta de pasivo de la autorretención", "Hay autorretención."), valor, "C", `AUTORRET ${descripcion}`);
+      agregarLinea(exigirCuenta(auto.cuentaActivo, "Cuenta de activo de la autorretención", "Hay autorretención."), valor, "D", `AUTORRET ${descripcion}`, auto.codigoImpuesto || "");
+      agregarLinea(exigirCuenta(auto.cuentaPasivo, "Cuenta de pasivo de la autorretención", "Hay autorretención."), valor, "C", `AUTORRET ${descripcion}`, auto.codigoImpuesto || "");
     }
   }
 
