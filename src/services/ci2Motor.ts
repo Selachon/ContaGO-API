@@ -106,7 +106,7 @@ export interface Ci2Opciones {
   /** World Office (ventas): Tipo Documento fijo de la empresa; el consecutivo es el número de la factura. */
   tipoVentasWo?: string;
   /** World Office: producto de otros impuestos (impoconsumo y demás) de la empresa para el modo que se genera. */
-  productoOtrosImpuestosWo?: string;
+  productosEspecialesWo?: { otros?: string; descuento?: string; recargo?: string };
   /** World Office: maestro de productos; cada ítem toma el de su tarifa de IVA. */
   productosWo?: { codigo: string; iva: number }[];
   /** Compras que se clasifican como inventario o gasto; en ambos casos el IVA es mayor valor (no hay IVA descontable). */
@@ -555,7 +555,7 @@ function sumarDias(ddmmyyyy: string, dias: number): string {
 }
 
 /** World Office (compras): un renglón por producto y tarifa de IVA, con la base como valor; los impuestos los calcula el programa. */
-function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, productos: { codigo: string; iva: number }[], venta?: { prefijo: string }, productoOtros = ""): { doc: WoDocumento; avisos: string[] } {
+function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, productos: { codigo: string; iva: number }[], venta?: { prefijo: string }, especiales: { otros?: string; descuento?: string; recargo?: string } = {}): { doc: WoDocumento; avisos: string[] } {
   const as = f.asignacion;
   const descripcion = `${abreviarTipoDocumento(f.documentType)} ${f.docNumber} ${f.proveedor}`;
   const grupos = new Map<string, { producto: string; iva: number; valor: number }>();
@@ -573,12 +573,17 @@ function armarFacturaWo(f: Ci2FacturaInput, tipo: string, consecutivo: number, p
   if (!grupos.size) throw new Ci2Error("La factura no tiene ítems con base para causar.");
   const avisos: string[] = [];
   const ag = agregar(f.items);
-  // El impoconsumo y los demás impuestos distintos al IVA van como un renglón del producto «otros impuestos» de la empresa (IVA 0).
+  // Impoconsumo y demás impuestos distintos al IVA, recargo y descuento a nivel documento: un renglón de su producto (IVA 0); el descuento va en negativo.
   const otros = redondear([...ag.inc.values(), ...ag.otros.values()].reduce((x, v) => x + v, 0));
-  if (otros !== 0 && productoOtros) grupos.set(`${productoOtros}|0|otros`, { producto: productoOtros, iva: 0, valor: otros });
-  else if (ag.inc.size || ag.otros.size) avisos.push(`${descripcion}: trae impoconsumo u otros impuestos que no van en la interfaz de World Office; configura el producto de otros impuestos o revísalos en el documento.`);
-  if (redondear(descuentoNeto(f.items)) > 0 || redondear(ag.recargo) > 0) avisos.push(`${descripcion}: trae descuento o recargo a nivel documento que no va en la interfaz de World Office; revísalo en el documento.`);
-  if (ag.obsequios.size) avisos.push(`${descripcion}: trae obsequios que no van en la interfaz de World Office; revísalos en el documento.`);
+  if (otros !== 0 && especiales.otros) grupos.set(`${especiales.otros}|0|otros`, { producto: especiales.otros, iva: 0, valor: otros });
+  else if (ag.inc.size || ag.otros.size) avisos.push(`${descripcion}: trae impoconsumo u otros impuestos; configura el producto de otros impuestos en World Office o revísalos en el documento.`);
+  const recargo = redondear(ag.recargo);
+  if (recargo > 0 && especiales.recargo) grupos.set(`${especiales.recargo}|0|recargo`, { producto: especiales.recargo, iva: 0, valor: recargo });
+  else if (recargo > 0) avisos.push(`${descripcion}: trae recargo a nivel documento; configura el producto de recargo en World Office o revísalo en el documento.`);
+  const descuento = redondear(descuentoNeto(f.items));
+  if (descuento > 0 && especiales.descuento) grupos.set(`${especiales.descuento}|0|descuento`, { producto: especiales.descuento, iva: 0, valor: -descuento });
+  else if (descuento > 0) avisos.push(`${descripcion}: trae descuento a nivel documento; configura el producto de descuento en World Office o revísalo en el documento.`);
+  // Los obsequios no se causan: su IVA queda neteado con el descuento que trae la DIAN (descuentoNeto), así que no cambian el total.
   const forma = String(as.formaPago || f.formaPago || "").toLowerCase();
   // Ventas: siempre de contado (World Office rechaza las de crédito al importar).
   const credito = !venta && forma === "credito";
@@ -649,7 +654,7 @@ export function generarInterfaz(facturas: Ci2FacturaInput[], opts: Ci2Opciones):
     try {
       if (opts.worldoffice) {
         if (cat.clave !== "FE") throw new Ci2Error(`World Office solo admite facturas electrónicas por ahora («${cat.etiqueta}» no).`);
-        const r = armarFacturaWo(f, tipo, consecutivo, opts.productosWo || [], venta ? { prefijo: extraerPrefijoConsecutivo(f.docNumber).prefijo } : undefined, opts.productoOtrosImpuestosWo || "");
+        const r = armarFacturaWo(f, tipo, consecutivo, opts.productosWo || [], venta ? { prefijo: extraerPrefijoConsecutivo(f.docNumber).prefijo } : undefined, opts.productosEspecialesWo);
         wo.push(r.doc);
         advertencias.push(...r.avisos);
         asignados.push({ id: f.id, tipo, consecutivo });

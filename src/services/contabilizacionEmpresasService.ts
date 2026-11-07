@@ -220,6 +220,11 @@ export interface ConfigWorldOffice {
   /** Código del producto al que va el impoconsumo y los demás impuestos distintos al IVA, en compras y en ventas. */
   productoOtrosImpuestos: string;
   productoOtrosImpuestosVentas: string;
+  /** Productos del descuento y del recargo a nivel documento (el descuento va como renglón en negativo). */
+  productoDescuento: string;
+  productoDescuentoVentas: string;
+  productoRecargo: string;
+  productoRecargoVentas: string;
 }
 /** Parámetros de la empresa para la interfaz de Siigo Pyme (movimiento contable, modelo general). */
 /** `terceroNit`: formas de pago en que la deuda queda con el banco (tarjeta de crédito…): la línea por pagar va a ese tercero y no al proveedor. */
@@ -262,6 +267,10 @@ const normWo = (v: any): ConfigWorldOffice => ({
   tipoVentas: String(v?.tipoVentas ?? "").trim(),
   productoOtrosImpuestos: String(v?.productoOtrosImpuestos ?? "").trim(),
   productoOtrosImpuestosVentas: String(v?.productoOtrosImpuestosVentas ?? "").trim(),
+  productoDescuento: String(v?.productoDescuento ?? "").trim(),
+  productoDescuentoVentas: String(v?.productoDescuentoVentas ?? "").trim(),
+  productoRecargo: String(v?.productoRecargo ?? "").trim(),
+  productoRecargoVentas: String(v?.productoRecargoVentas ?? "").trim(),
 });
 
 export interface EmpresaPublic {

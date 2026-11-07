@@ -1025,7 +1025,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
       pyme: siigoPyme ? { diasVencimiento: configPyme!.diasVencimiento, cuentaIvaAsumido: configPyme!.cuentaIvaAsumido, formasPago: configPyme!.formasPago } : undefined,
       productosWo: worldoffice ? await getProductosWo(empresaId, venta ? "ventas" : "compras") : undefined,
       tipoVentasWo: worldoffice && venta ? configWo!.tipoVentas : undefined,
-      productoOtrosImpuestosWo: worldoffice ? (venta ? configWo!.productoOtrosImpuestosVentas : configWo!.productoOtrosImpuestos) : undefined,
+      productosEspecialesWo: worldoffice ? (venta ? { otros: configWo!.productoOtrosImpuestosVentas, descuento: configWo!.productoDescuentoVentas, recargo: configWo!.productoRecargoVentas } : { otros: configWo!.productoOtrosImpuestos, descuento: configWo!.productoDescuento, recargo: configWo!.productoRecargo }) : undefined,
       tipoPorPrefijo: prefijos,
       tipoPorDocumento,
       autorretencion: venta ? autorretencion : undefined,
