@@ -36,6 +36,23 @@ const midISODate = (fromISO: string, toISO: string): string => {
   return toISODate(new Date(f + Math.floor((t - f) / 2)));
 };
 
+/** dd/mm/aaaa → aaaa-mm-dd ("" si no tiene ese formato). */
+const ddmmyyyyToISO = (s: string): string => {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec((s || "").trim());
+  return m ? `${m[3]}-${m[2]}-${m[1]}` : "";
+};
+
+/** Fecha (ISO) más vieja de las filas, solo si todas traen fecha válida y vienen ordenadas de más nueva a más vieja; si no, "". */
+export function oldestIfDescending(docs: Array<{ issueDate?: string }>): string {
+  let prev = "";
+  for (const d of docs) {
+    const iso = ddmmyyyyToISO(d.issueDate || "");
+    if (!iso || (prev && iso > prev)) return "";
+    prev = iso;
+  }
+  return prev;
+}
+
 /**
  * `GetReceivedDocuments`/`GetSentDocuments` de gratis-vpfe NO pagina de verdad
  * más allá de 150 filas (pedir `start` mayor devuelve la MISMA primera página —
@@ -81,7 +98,19 @@ async function fetchDocumentsSplitByRange(
     }
     console.log(`[Siigo Ingest] Rango ${f}..${t}: ${docs.length} documento(s)`);
     if (docs.length >= LIMIT && f !== t) {
-      // Posible truncado por el tope del servidor: partir el rango en dos.
+      // Posible truncado por el tope del servidor. La respuesta viene ordenada de la más nueva a la más
+      // vieja, así que ya tenemos las 150 más recientes y solo faltan las anteriores: se consulta únicamente
+      // desde el inicio del rango hasta la fecha más vieja recibida (cada consulta cuesta según sus filas).
+      const oldest = oldestIfDescending(docs);
+      if (oldest && oldest >= f && oldest < t) {
+        for (const d of docs) {
+          const key = d.transactionId || `${d.docNumber}|${d.issueDate}`;
+          if (key) merged.set(key, d);
+        }
+        queue.push([f, oldest]);
+        continue;
+      }
+      // Orden no verificable (o todo el tope cae en el último día): partir el rango en dos.
       const mid = midISODate(f, t);
       const nextFrom = addDaysISO(mid, 1);
       queue.push([f, mid]);
@@ -481,6 +510,11 @@ export async function ingestNewByDateRange(opts: {
   /** @deprecated no usado internamente; se mantiene por compatibilidad con llamadores existentes (cajaErp.ts). */
   nitReceptor?: string;
   maxDocuments?: number;
+  /**
+   * Si los documentos NUEVOS por traer superan este número, no se descarga nada y se pide el listado de la DIAN
+   * (modo Excel, que reintenta cada CUFE y reporta lo faltante). Evita jobs largos sin reintentos por mes + token.
+   */
+  requireListingOver?: number;
   forceRedownload?: boolean;
   /** CUFEs a omitir además del registro persistente (ya causados / ya en pantalla). */
   skipCufes?: string[];
@@ -517,6 +551,13 @@ export async function ingestNewByDateRange(opts: {
       });
       const alreadyRegistered = listed - work.length;
 
+      if (opts.requireListingOver && work.length > opts.requireListingOver) {
+        throw new Error(
+          `LISTADO_REQUERIDO: El mes tiene ${work.length} documentos por traer, más de los ${opts.requireListingOver} que se pueden traer solo con el token. ` +
+          `Sube el listado de la DIAN (Excel) junto con el token para traerlos completos.`
+        );
+      }
+
       if (opts.maxDocuments && opts.maxDocuments > 0 && work.length > opts.maxDocuments) {
         work = work.slice(0, opts.maxDocuments);
       }
@@ -539,7 +580,9 @@ export async function ingestNewByDateRange(opts: {
         dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((r) => dlWaitQueue.push(r));
       const releaseDl = () => { const n = dlWaitQueue.shift(); if (n) n(); else dlSlots++; };
 
-      const RATE_MS = 60000 / 50;
+      // Facturas por minuto contra la DIAN en este modo (mes + token); configurable sin tocar código.
+      const RATE_PER_MIN = Math.max(10, Math.min(Number(process.env.DIAN_MONTH_RATE_PER_MIN || 100), 200));
+      const RATE_MS = 60000 / RATE_PER_MIN;
       let nextAllowedMs = Date.now();
       const rateAcquire = async () => {
         const wait = nextAllowedMs - Date.now();

@@ -2220,10 +2220,9 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
     if (fechaInicio > fechaFin) {
       return res.status(400).json({ ok: false, message: `El mes ${month} es anterior a la fecha mínima de importación (${minFechaIngesta}).` });
     }
-    // Tope de documentos NUEVOS a descargar por corrida (no incluye los que ya
-    // están en pantalla). Si el mes trae más, se descargan los primeros 200 y el
-    // usuario puede volver a darle "Traer y procesar" para el resto.
-    const maxDocuments = 200;
+    // Hasta 500 documentos NUEVOS (no cuenta los que ya están en pantalla) se traen solo con token a 100/min.
+    // Si el mes trae más, no se descarga nada y se pide el listado de la DIAN (modo Excel, con reintentos).
+    const requireListingOver = 500;
 
     const jobId = uuidv4();
     dianIngestJobs.set(jobId, {
@@ -2239,7 +2238,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
         tokenUrl,
         fechaInicio,
         fechaFin,
-        maxDocuments,
+        requireListingOver,
         forceRedownload,
         skipCufes,
         minFechaIngesta: minFechaIngesta || undefined,

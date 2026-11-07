@@ -491,7 +491,8 @@ router.post("/empresas/:id/traer", async (req: Request, res: Response) => {
       tokenUrl,
       fechaInicio,
       fechaFin,
-      maxDocuments: 200,
+      // Hasta 500 nuevos por token a 100/min; más de eso se exige el listado de la DIAN (traer-compras, con reintentos).
+      requireListingOver: 500,
       skipCufes,
       onProgress: (p) => { const j = traerJobs.get(jobId); if (j && j.status === "processing") j.progress = p; },
       isCancelled: () => isJobAborted(traerJobs.get(jobId) as any),
@@ -579,6 +580,71 @@ router.post("/empresas/:id/traer-ventas", upload.single("listado"), async (req: 
           ignorados: result.items.filter((i) => i.ignored).length,
           errores: result.items.filter((i) => !i.ok && !i.ignored).map((i) => ({ fileName: i.fileName, message: i.message || "" })),
           omitidos: result.items.length - propias.length - soportes.length,
+        };
+        j.progress = { step: "Completado", current: result.stats.downloaded, total: result.stats.listed };
+      })
+      .catch((e) => {
+        const j = traerJobs.get(jobId);
+        if (!j || isJobAborted(j as any)) return;
+        j.status = "error";
+        j.error = e instanceof Error ? e.message : "Error trayendo facturas de la DIAN";
+      });
+
+    res.json({ status: "ok", jobId, documentos: cufes.length });
+  } catch (e) {
+    err(res, e);
+  }
+});
+
+// Compras con listado: se usa cuando el mes trae más de 500 documentos nuevos y «traer» por mes + token exige el listado.
+// El usuario sube el listado de RECIBIDOS exportado de la DIAN; se descargan por CUFE con reintentos (mismo motor de «Descarga Masiva + Excel DIAN»).
+router.post("/empresas/:id/traer-compras", upload.single("listado"), async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    const tokenUrl = tryExtractDianUrlFromSafeLink(String(req.body?.tokenUrl || "").trim());
+    const archivo = req.file as Express.Multer.File | undefined;
+    if (!archivo) return err(res, new Error("Sube el listado exportado desde la DIAN (.xlsx o .zip)."));
+    if (!(await tokenDeLaEmpresa(res, empresaId, tokenUrl))) return;
+
+    let listado;
+    try {
+      listado = await extractCufesFromExcel(await resolveExcelBuffer(archivo));
+    } catch (e) {
+      return err(res, new Error(`No se pudo leer el listado: ${e instanceof Error ? e.message : e}`));
+    }
+    if (listado.mixedDirections) return err(res, new Error("El listado mezcla documentos emitidos y recibidos. Exporta solo los recibidos."));
+    if (listado.detectedDirection === "sent") return err(res, new Error("El listado es de documentos EMITIDOS. Para compras exporta el de recibidos."));
+    const cufes = [...new Set(listado.cufes)];
+    if (!cufes.length) return err(res, new Error("El listado no contiene documentos válidos."));
+
+    const skipCufes = await cufesRegistrados(empresaId);
+    const jobId = uuidv4();
+    traerJobs.set(jobId, { status: "processing", progress: { step: "Iniciando...", current: 0, total: cufes.length }, userId: req.user!.userId, empresaId, createdAt: Date.now() });
+
+    ingestFromDian({
+      companyId: `ci2:${empresaId}`,
+      tokenUrl,
+      grupo: "Recibidos",
+      providedCufes: cufes,
+      skipCufes,
+      // Por tandas: lo ya guardado se omite, así que repetir «Traer» continúa donde quedó.
+      maxDocuments: Math.max(1, Number(process.env.DIAN_MAX_DOCUMENTS || 850)),
+      retryRounds: 3,
+      onProgress: (p) => { const j = traerJobs.get(jobId); if (j && j.status === "processing") j.progress = p; },
+      isCancelled: () => isJobAborted(traerJobs.get(jobId) as any),
+    })
+      .then(async (result) => {
+        const j = traerJobs.get(jobId);
+        if (!j || isJobAborted(j as any)) return;
+        const nuevas = await guardarFacturasTraidas(empresaId, result.items);
+        j.status = "completed";
+        j.result = {
+          nuevas,
+          stats: result.stats,
+          failures: result.failures,
+          ignorados: result.items.filter((i) => i.ignored).length,
+          errores: result.items.filter((i) => !i.ok && !i.ignored).map((i) => ({ fileName: i.fileName, message: i.message || "" })),
         };
         j.progress = { step: "Completado", current: result.stats.downloaded, total: result.stats.listed };
       })
