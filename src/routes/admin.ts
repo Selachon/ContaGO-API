@@ -273,7 +273,7 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
       return res.status(400).json({ ok: false, message: "ID de usuario invalido" });
     }
 
-    const allowedFields = ["name", "nits", "toolNits", "purchasedTools", "isAdmin", "phone", "paymentAmount", "paymentMethod", "licenseStartDate", "licenseEndDate", "companiesInPlan", "toolCompanyLimits", "invoiceRef", "billing", "boldPayEnabled"];
+    const allowedFields = ["name", "nits", "toolNits", "purchasedTools", "isAdmin", "phone", "paymentAmount", "paymentMethod", "licenseStartDate", "licenseEndDate", "companiesInPlan", "toolCompanyLimits", "invoiceRef", "billing"];
     const updates: Record<string, unknown> = {};
     const before: Record<string, unknown> = {};
 
@@ -352,8 +352,6 @@ router.patch("/users/:id", async (req: Request, res: Response) => {
           } else {
             updates.toolCompanyLimits = undefined;
           }
-        } else if (field === "boldPayEnabled") {
-          updates.boldPayEnabled = req.body.boldPayEnabled === true;
         } else if (field === "invoiceRef") {
           updates.invoiceRef = req.body.invoiceRef ? String(req.body.invoiceRef).trim() : undefined;
         } else if (field === "billing") {

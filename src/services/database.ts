@@ -79,7 +79,6 @@ interface UserRecord {
   licenseStartDate?: string;
   licenseEndDate?: string;
   companiesInPlan?: number;
-  boldPayEnabled?: boolean;
   toolCompanyLimits?: Record<string, number>;
   // NITs habilitados por herramienta. La clave es el id de herramienta; el valor,
   // los NITs (normalizados o no) que ese usuario puede operar en ella. Sustituye
@@ -227,7 +226,6 @@ function mapUser(record: UserRecord | null): User | null {
     created_at: record.created_at,
     demo: record.demo,
     companiesInPlan: record.companiesInPlan,
-    boldPayEnabled: !!record.boldPayEnabled,
     toolCompanyLimits: record.toolCompanyLimits,
     toolNits: record.toolNits || {},
     ingestFromMonth: record.ingestFromMonth || {},

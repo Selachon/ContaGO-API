@@ -92,7 +92,6 @@ function buildAuthUser(user: User, purchasedTools: string[], nits: string[], sus
     toolNits: user.toolNits || {},
     ingestFromMonth: user.ingestFromMonth || {},
     companiesInPlan: user.companiesInPlan,
-    boldPayEnabled: !!user.boldPayEnabled,
     toolCompanyLimits: user.toolCompanyLimits,
     forcePasswordChange: !!user.force_password_change,
     surveyDone: !!user.survey,

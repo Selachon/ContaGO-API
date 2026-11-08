@@ -6,7 +6,6 @@ import puppeteer from "puppeteer";
 import fs from "fs";
 import { execSync } from "child_process";
 import authRoutes from "./routes/auth.js";
-import boldPaymentsRoutes, { boldWebhook } from "./routes/boldPayments.js";
 import extActivationRoutes from "./routes/extActivation.js";
 import dianRoutes from "./routes/dian.js";
 import dianExcelRoutes from "./routes/dianExcel.js";
@@ -75,8 +74,6 @@ app.use(
 // ============================================
 // Body parsing (con límite de tamaño)
 // ============================================
-// Webhook de Bold: body crudo (la firma se valida sobre los bytes originales), antes del parser JSON
-app.post("/pagos/bold/webhook", express.raw({ type: "*/*", limit: "1mb" }), boldWebhook);
 app.use(express.json({ limit: "5mb" }));
 app.use(normalizarTokenSafeLinks);
 
@@ -84,7 +81,6 @@ app.use(normalizarTokenSafeLinks);
 // Routes
 // ============================================
 app.use("/auth", authRoutes);
-app.use("/pagos/bold", boldPaymentsRoutes);
 app.use("/ext", extActivationRoutes);
 app.use("/auth/google", googleAuthRoutes);
 app.use("/portal-status", portalStatusRoutes);

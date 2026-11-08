@@ -32,8 +32,6 @@ interface UserRecord {
   licenseStartDate?: string;
   licenseEndDate?: string;
   companiesInPlan?: number;
-  /** Habilita el botón de pago en línea (Bold) para este cliente. */
-  boldPayEnabled?: boolean;
   toolCompanyLimits?: Record<string, number>;
   toolNits?: Record<string, string[]>;
   invoiceRef?: string;
@@ -118,8 +116,6 @@ interface AdminUser {
   licenseStartDate?: string;
   licenseEndDate?: string;
   companiesInPlan?: number;
-  /** Habilita el botón de pago en línea (Bold) para este cliente. */
-  boldPayEnabled?: boolean;
   toolCompanyLimits?: Record<string, number>;
   toolNits?: Record<string, string[]>;
   toolSubscriptions?: Record<string, UserToolSubscription>;
@@ -425,7 +421,6 @@ function mapUserToAdmin(record: UserRecord): AdminUser {
     licenseStartDate: record.licenseStartDate,
     licenseEndDate: record.licenseEndDate,
     companiesInPlan: record.companiesInPlan,
-    boldPayEnabled: !!(record as any).boldPayEnabled,
     toolCompanyLimits: record.toolCompanyLimits,
     toolNits: record.toolNits,
     toolSubscriptions: (record as any).toolSubscriptions,
