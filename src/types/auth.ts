@@ -45,6 +45,7 @@ export interface User {
   created_at: string;
   demo?: DemoAccess;
   companiesInPlan?: number;
+  boldPayEnabled?: boolean;
   toolCompanyLimits?: Record<string, number>;
   toolNits?: Record<string, string[]>;
   /** Mes más antiguo (AAAA-MM) desde el que puede traer facturas de la DIAN, por herramienta. Sin valor rige la ventana de 12 meses. */
@@ -83,6 +84,7 @@ export interface AuthResponse {
     toolNits?: Record<string, string[]>;
     ingestFromMonth?: Record<string, string>;
     companiesInPlan?: number;
+    boldPayEnabled?: boolean;
     toolCompanyLimits?: Record<string, number>;
     forcePasswordChange?: boolean;
     /** true si el usuario ya vio la encuesta de experiencia. */

@@ -456,22 +456,6 @@ function applyTextFilter(
 // Si la petición trae el header X-Siigo-Company, ejecuta el resto con las
 // credenciales de esa empresa en contexto. Sin header → usa el .env (fallback).
 async function withSiigoCompany(req: Request, res: Response, next: NextFunction): Promise<void> {
-  // Usuarios del portal de cliente: empresa fija, sin chequeo de pertenencia.
-  if ((req.user as any)?.isPortal) {
-    const companyId = (req.user as any).caPortalCompanyId as string | undefined;
-    if (!companyId) return next();
-    try {
-      const ctx = await getCompanyContext(companyId);
-      if (!ctx) {
-        res.status(400).json({ ok: false, source: "siigo", code: "siigo_company_not_found", message: "Empresa Siigo no encontrada" });
-        return;
-      }
-      enterSiigoCompany(ctx);
-      next();
-    } catch (error) { next(error); }
-    return;
-  }
-
   const companyId = req.header("X-Siigo-Company");
   if (!companyId) return next();
   try {
@@ -572,9 +556,7 @@ function causedMetaFrom(body: any, extra: CausedMeta): CausedMeta {
 }
 
 async function runInCompanyCtx<T>(req: Request, fn: () => Promise<T> | T): Promise<T> {
-  const companyId = (req as any).user?.isPortal
-    ? (req as any).user?.caPortalCompanyId
-    : req.header("X-Siigo-Company");
+  const companyId = req.header("X-Siigo-Company");
   const ctx = companyId ? await getCompanyContext(companyId) : null;
   return ctx ? runWithSiigoCompany(ctx, () => fn()) : fn();
 }
@@ -671,12 +653,6 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   // ─── Empresas Siigo (multi-empresa) ──────────────────────────────────
   router.get("/companies", async (req: Request, res: Response) => {
     try {
-      // Portal: devuelve solo la empresa del portal (Castro Arroyave).
-      if ((req.user as any)?.isPortal) {
-        const companyId = (req.user as any).caPortalCompanyId as string;
-        const company = companyId ? await getCompanyPublic(companyId) : null;
-        return res.json({ ok: true, data: company ? [company] : [] });
-      }
       // JWT: solo las empresas que el usuario posee o le comparten, filtradas por
       // ?toolId= si se envía (una empresa puede estar habilitada solo para una
       // sub-herramienta Siigo, p. ej. Egresos pero no Causación XML).
@@ -2468,7 +2444,7 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
   // Mini login: entra a Siigo Nube con las credenciales web y trae el plan de cuentas, la tabla de Medios de pago y el
   // balance de terceros. Las credenciales llegan en el cuerpo, o se usan las guardadas (cifradas) de la empresa; nunca se
   // registran ni se devuelven. Solo el dueño o un admin pueden guardarlas u olvidarlas.
-  const activeCompanyId = (req: Request): string => String((req as any).user?.isPortal ? (req as any).user?.caPortalCompanyId : req.header("X-Siigo-Company") || "");
+  const activeCompanyId = (req: Request): string => String(req.header("X-Siigo-Company") || "");
   const canManageWebLogin = async (req: Request, companyId: string): Promise<boolean> => {
     if (req.integrationAuthMode !== "jwt") return true; // API key interno
     return !!req.user?.isAdmin || (!!req.user?.userId && (await userOwnsCompany(companyId, req.user.userId)));

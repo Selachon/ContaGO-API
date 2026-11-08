@@ -67,8 +67,6 @@ export function requireToolAccess(toolId: string) {
       res.status(401).json({ status: "error", detalle: "Token no proporcionado" });
       return;
     }
-    // Usuarios del portal de cliente: acceso concedido sin chequeo de licencia.
-    if ((req.user as any).isPortal) { next(); return; }
     const result = await checkToolAccess(req.user.userId, !!req.user.isAdmin, toolId);
     if (result.ok) trackToolOperation(req, res, toolId, req.user.userId);
     if (!result.ok) {

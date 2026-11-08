@@ -18,7 +18,6 @@ import {
   removeUserGoogleDriveById,
   setSelectedUserGoogleDrive,
 } from "../services/database.js";
-import { saveGoogleAuth, ensureCastroDriveFolder } from "../services/castroFacturasService.js";
 
 const router = Router();
 
@@ -216,100 +215,6 @@ router.get("/callback", async (req: Request, res: Response) => {
       }
     } else {
       stateData = JSON.parse(Buffer.from(state, "base64").toString("utf8"));
-    }
-
-    // ── Castro Portal: autenticación de empleados con Google ─────────────────
-    if (stateData.purpose === "castro-portal") {
-      const { accessToken } = await exchangeCodeForTokens(code);
-      const userEmail = (await getGoogleUserEmail(accessToken)).toLowerCase();
-
-      const { getConfig } = await import("../services/castroFacturasService.js");
-      const config = await getConfig();
-      const allowed = [...(config.empleados || []), ...(config.socios || [])].map((e) => e.toLowerCase());
-
-      if (!allowed.includes(userEmail)) {
-        return sendResponse(false, `El correo ${userEmail} no tiene acceso al portal. Contacta al administrador.`);
-      }
-
-      const token = (await import("jsonwebtoken")).default.sign(
-        { email: userEmail, purpose: "castro-portal" },
-        process.env.JWT_SECRET!,
-        { expiresIn: "8h" }
-      );
-
-      const returnUrl = stateData.returnUrl || "";
-      const allowed_origins = (process.env.CORS_ORIGIN || "").split(",").map((s) => s.trim());
-      let redirectTo: URL;
-      try {
-        redirectTo = new URL(returnUrl);
-        if (!allowed_origins.some((o) => returnUrl.startsWith(o))) throw new Error("origen no permitido");
-      } catch {
-        redirectTo = new URL("https://contago.com.co/public/facturas-mob");
-      }
-      redirectTo.searchParams.set("portal_token", token);
-      console.log(`[Castro Portal] Acceso concedido: ${userEmail}`);
-      return res.redirect(302, redirectTo.toString());
-    }
-
-    // ── CA Portal: autenticación de empleados de Castro Arroyave SAS BIC ────
-    if (stateData.purpose === "ca-portal") {
-      const { accessToken } = await exchangeCodeForTokens(code);
-      const userEmail = (await getGoogleUserEmail(accessToken)).toLowerCase();
-
-      const { getCaPortalConfig, isEmailAllowed } = await import("../services/caPortalService.js");
-      const config = await getCaPortalConfig();
-
-      if (!config?.companyId) {
-        return sendResponse(false, "Portal no configurado. Contacta al administrador de ContaGO.");
-      }
-      if (!isEmailAllowed(userEmail, config)) {
-        return sendResponse(false, `El correo ${userEmail} no tiene acceso al portal. Contacta al administrador.`);
-      }
-
-      const token = (await import("jsonwebtoken")).default.sign(
-        { email: userEmail, purpose: "ca-portal" },
-        process.env.JWT_SECRET!,
-        { expiresIn: "8h" }
-      );
-
-      const returnUrl = stateData.returnUrl || "";
-      const allowed_origins = (process.env.CORS_ORIGIN || "").split(",").map((s: string) => s.trim());
-      let redirectTo: URL;
-      try {
-        redirectTo = new URL(returnUrl);
-        if (!allowed_origins.some((o: string) => returnUrl.startsWith(o))) throw new Error("origen no permitido");
-      } catch {
-        redirectTo = new URL("https://contago.com.co/public/castro-arroyave-caja");
-      }
-      redirectTo.searchParams.set("portal_token", token);
-      console.log(`[CA Portal] Acceso concedido: ${userEmail}`);
-      return res.redirect(302, redirectTo.toString());
-    }
-
-    // ── Castro Arroyave: conexión específica para Drive + Sheets ─────────────
-    if (stateData.purpose === "castro") {
-      const { accessToken, refreshToken, expiryDate } = await exchangeCodeForTokens(code);
-      const userEmail = await getGoogleUserEmail(accessToken);
-      const encryptedTokens = encryptDriveTokens(accessToken, refreshToken);
-
-      // Reconstruct an oauth2 client to create the Drive folder
-      const { createOAuth2Client } = await import("../services/googleDrive.js");
-      const oauth2Client = createOAuth2Client();
-      oauth2Client.setCredentials({ access_token: accessToken, refresh_token: refreshToken });
-
-      const driveFolderId = await ensureCastroDriveFolder(oauth2Client);
-
-      await saveGoogleAuth({
-        encrypted_access_token: encryptedTokens.encrypted_access_token,
-        encrypted_refresh_token: encryptedTokens.encrypted_refresh_token,
-        token_expiry: new Date(expiryDate).toISOString(),
-        user_email: userEmail,
-        drive_folder_id: driveFolderId,
-        connected_at: new Date().toISOString(),
-      });
-
-      console.log(`[Castro] Google conectado: ${userEmail}, carpeta Drive: ${driveFolderId}`);
-      return sendResponse(true, `Cuenta de Google vinculada (${userEmail}). Los PDFs se guardarán en la carpeta "Castro Arroyave - Facturas ContaGO" de Drive.`);
     }
 
     // ── ContaGO ERP: login con Google en el portal de una empresa ───────────

@@ -6,6 +6,7 @@ import puppeteer from "puppeteer";
 import fs from "fs";
 import { execSync } from "child_process";
 import authRoutes from "./routes/auth.js";
+import boldPaymentsRoutes, { boldWebhook } from "./routes/boldPayments.js";
 import extActivationRoutes from "./routes/extActivation.js";
 import dianRoutes from "./routes/dian.js";
 import dianExcelRoutes from "./routes/dianExcel.js";
@@ -22,12 +23,9 @@ import causacionInterfacesV2Routes from "./routes/causacionInterfacesV2.js";
 import interfacesIntegralOdontoRoutes from "./routes/interfacesIntegralOdonto.js";
 import dianCufeRoutes from "./routes/dianCufeDownload.js";
 import dianExtensionRoutes from "./routes/dianExtension.js";
-import dianMassDownloadRoutes from "./routes/dianMassDownload.js";
 import dianRecibidosDownloadRoutes from "./routes/dianRecibidosDownload.js";
 import dianMailRoutes from "./routes/dianMail.js";
 import pdfParseRoutes from "./routes/pdfParse.js";
-import castroFacturasRoutes from "./routes/castroFacturas.js";
-import caPortalRoutes from "./routes/castroArroyaveCaja.js";
 import erpRoutes from "./erp/routes/index.js";
 import supportDocsRoutes from "./routes/supportDocs.js";
 import supportDocsPublicRoutes from "./routes/supportDocsPublic.js";
@@ -41,7 +39,6 @@ import { closeAllBrowsers, startOrphanBrowserSweep } from "./services/dianScrape
 import { startJobGuard, onShutdown as jobGuardOnShutdown } from "./services/jobGuard.js";
 import { initUsageAnalytics } from "./services/usageAnalytics.js";
 import { MongoJobStore } from "./services/jobGuardStore.js";
-import { closeRutBrowser } from "./services/rutConsultaService.js";
 
 // ============================================
 // Validar variables de entorno obligatorias
@@ -78,6 +75,8 @@ app.use(
 // ============================================
 // Body parsing (con límite de tamaño)
 // ============================================
+// Webhook de Bold: body crudo (la firma se valida sobre los bytes originales), antes del parser JSON
+app.post("/pagos/bold/webhook", express.raw({ type: "*/*", limit: "1mb" }), boldWebhook);
 app.use(express.json({ limit: "5mb" }));
 app.use(normalizarTokenSafeLinks);
 
@@ -85,6 +84,7 @@ app.use(normalizarTokenSafeLinks);
 // Routes
 // ============================================
 app.use("/auth", authRoutes);
+app.use("/pagos/bold", boldPaymentsRoutes);
 app.use("/ext", extActivationRoutes);
 app.use("/auth/google", googleAuthRoutes);
 app.use("/portal-status", portalStatusRoutes);
@@ -94,7 +94,6 @@ app.use("/dian-excel", dianExcelRoutes);
 app.use("/dian-third-parties", dianThirdPartiesRoutes);
 app.use("/dian-cufe", dianCufeRoutes);
 app.use("/dian-ext", dianExtensionRoutes);
-app.use("/dian-mass-download", dianMassDownloadRoutes);
 app.use("/dian-recibidos", dianRecibidosDownloadRoutes);
 app.use("/dian-mail", dianMailRoutes);
 app.use("/integrations/siigo", siigoRoutes);
@@ -106,8 +105,6 @@ app.use("/api/contabilizacion", contabilizacionRoutes);
 app.use("/api/causacion-interfaces-v2", causacionInterfacesV2Routes);
 app.use("/api/interfaces-integral-odonto", interfacesIntegralOdontoRoutes);
 app.use("/api/pdf-parse", pdfParseRoutes);
-app.use("/castro-facturas", castroFacturasRoutes);
-app.use("/ca-portal", caPortalRoutes);
 app.use("/erp", erpRoutes);
 app.use("/documentos-soporte", supportDocsRoutes);
 app.use("/public/documentos-soporte", supportDocsPublicRoutes);
@@ -163,7 +160,7 @@ function registerGracefulShutdown(server: ReturnType<typeof app.listen>): void {
     }
     try {
       await Promise.race([
-        Promise.all([closeAllBrowsers(), closeRutBrowser()]),
+        closeAllBrowsers(),
         new Promise((resolve) => setTimeout(resolve, 20000)),
       ]);
     } catch (err) {

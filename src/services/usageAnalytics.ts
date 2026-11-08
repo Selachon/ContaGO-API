@@ -125,7 +125,6 @@ export const OPERATIONS: Record<string, OperationRule[]> = {
   "contabilizacion-dian-siigo": [{ method: "POST", path: /^\/(compras|ventas)$/, op: "contabilizar" }],
   "documentos-soporte": [{ method: "POST", path: /^\/$/, op: "crear" }],
   "facturacion-electronica": [{ method: "POST", path: /^\/empresas\/[^/]+\/(facturas|notas-credito|documentos-soporte)\/[^/]+\/emitir$/, op: "emitir" }],
-  "rut-consulta": [{ method: "POST", path: /^\/(consultar|bulk)$/, op: "consultar" }],
 };
 
 export function classifyOperation(gateTool: string, method: string, path: string): { tool: string; op: string } | null {
