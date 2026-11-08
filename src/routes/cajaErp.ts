@@ -24,6 +24,7 @@ import { ObjectId } from "mongodb";
 import { uploadInvoiceFilesToDrive, uploadPaymentSupportToDrive } from "../services/googleDrive.js";
 import { encryptToken } from "../utils/encryption.js";
 import { addMovements } from "../services/siigoEgresosStoreService.js";
+import { proyectoDeFacturas } from "../services/cajaProyectoHerencia.js";
 import {
   listProyectos,
   createProyecto,
@@ -222,6 +223,26 @@ router.put("/tags", async (req, res) => {
   if (!isKind(kind) || !refId) return res.status(400).json({ ok: false, message: "Faltan kind/refId válidos." });
   await setTag(companyId, kind, String(refId), String(proyectoId || ""));
   res.json({ ok: true });
+});
+
+// Proyecto con el que se causaron las facturas que se están pagando (Egresos): el movimiento lo hereda y no se vuelve a pedir.
+// Body: { supplierNit, dues: [{ prefix, consecutive }] } (vencimientos de cuentas por pagar de Siigo).
+router.post("/proyecto-de-facturas", async (req, res) => {
+  const companyId = await resolveCompany(req, res);
+  if (!companyId) return;
+  const supplierNit = String(req.body?.supplierNit || "");
+  const dues = (Array.isArray(req.body?.dues) ? req.body.dues : []).slice(0, 60);
+  if (!supplierNit || dues.length === 0) return res.json({ ok: true, data: { proyectoId: null, conflicto: false, porFactura: [] } });
+  const numeros = [...new Set(dues.flatMap((d: any) => {
+    const raw = String(d?.consecutive ?? "").trim();
+    return raw ? [raw, String(Number(raw.replace(/\D/g, "")) || raw)] : [];
+  }))];
+  const causadas = await getDb().collection<any>("siigoIngestedCufes")
+    .find({ companyId, status: "caused", siigoNumber: { $in: numeros } })
+    .project({ cufe: 1, docnum: 1, supplierNit: 1, siigoName: 1, siigoNumber: 1, _id: 0 })
+    .toArray();
+  const tags = await getTags(companyId, "invoice");
+  res.json({ ok: true, data: proyectoDeFacturas(causadas, tags, supplierNit, dues) });
 });
 
 // ── Gastos/ingresos manuales (solo ERP, NO van a SIIGO) ────────────────
