@@ -79,6 +79,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DOWNLOADS_DIR = path.join(__dirname, "../../downloads");
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
 const TOOL_ID = "dian-cufe-downloader";
+/** Tope de documentos por corrida (Descarga masiva + Excel y Descarga Masiva DIAN); los administradores no lo tienen. */
+export const MAX_DOCS_POR_CORRIDA = 800;
 
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -358,11 +360,10 @@ router.post(
       });
     }
 
-    const MAX_CUFES = Number(process.env.DIAN_MAX_DOCUMENTS || 750);
-    if (!req.user?.isAdmin && downloadCufes.length > MAX_CUFES) {
+    if (!req.user?.isAdmin && downloadCufes.length > MAX_DOCS_POR_CORRIDA) {
       return res.status(400).json({
         status: "error",
-        detalle: buildLimitMessage(downloadCufes.length, allDates, MAX_CUFES),
+        detalle: buildLimitMessage(downloadCufes.length, allDates, MAX_DOCS_POR_CORRIDA),
       });
     }
 
@@ -891,7 +892,7 @@ function excelSerialToIso(serial: number): string | null {
   return d.toISOString().slice(0, 10);
 }
 
-function buildLimitMessage(total: number, dates: string[], limit: number): string {
+export function buildLimitMessage(total: number, dates: string[], limit: number): string {
   const partes = Math.ceil(total / limit);
   const rangos = Array.from({ length: partes }, (_, i) => {
     const start = dates[i * limit] || "";

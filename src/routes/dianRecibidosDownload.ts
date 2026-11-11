@@ -20,7 +20,7 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { rejectIfNitNotAllowed } from "../utils/nitAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { buildDeliveryZipName, zipEntryPath } from "../services/zipLayout.js";
-import { resolveExcelBuffer, extractCufesFromExcel } from "./dianCufeDownload.js";
+import { resolveExcelBuffer, extractCufesFromExcel, buildLimitMessage, MAX_DOCS_POR_CORRIDA } from "./dianCufeDownload.js";
 import { runDianRecibidosBatchDownload, type DianRecibidosItem } from "../services/dianRecibidosBatchDownload.js";
 import type { DocumentDirection } from "../types/dian.js";
 
@@ -175,7 +175,7 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
   let downloadCufes: string[];
   try {
     const xlsxBuf = await resolveExcelBuffer(file);
-    const { cufes, mixedDirections, detectedDirection } = await extractCufesFromExcel(xlsxBuf);
+    const { cufes, dates, mixedDirections, detectedDirection } = await extractCufesFromExcel(xlsxBuf);
     if (mixedDirections) {
       return res.status(400).json({ status: "error", detalle: "El listado contiene documentos emitidos y recibidos. Por favor sube solo un grupo." });
     }
@@ -184,6 +184,9 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
     }
     if (cufes.length === 0) {
       return res.status(400).json({ status: "error", detalle: "No se encontraron CUFEs procesables en el Excel." });
+    }
+    if (!req.user?.isAdmin && cufes.length > MAX_DOCS_POR_CORRIDA) {
+      return res.status(400).json({ status: "error", detalle: buildLimitMessage(cufes.length, dates, MAX_DOCS_POR_CORRIDA) });
     }
     direction = detectedDirection;
     downloadCufes = cufes;
