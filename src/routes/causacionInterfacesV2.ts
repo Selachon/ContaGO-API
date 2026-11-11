@@ -30,6 +30,7 @@ import { requireToolAccess } from "../middleware/requireToolAccess.js";
 import { exigirEmpresaHabilitada } from "../services/empresasNitGuard.js";
 import { getUserById } from "../services/database.js";
 import { requireAuth } from "../middleware/auth.js";
+import { processXmlBatch, type BatchItem } from "../services/siigoAccountingService.js";
 import { ingestFromDian, ingestNewByDateRange, type IngestResult } from "../services/siigoDianIngestService.js";
 import { attachJobs, isJobAborted } from "../services/jobGuard.js";
 import type { ProgressData } from "../types/dian.js";
@@ -363,7 +364,7 @@ interface TraerJob {
   empresaId: string;
   createdAt: number;
   error?: string;
-  result?: { nuevas: number; nuevasSoporte?: number; stats: IngestResult["stats"]; failures: IngestResult["failures"]; ignorados: number; errores: { fileName: string; message: string }[]; omitidos?: number };
+  result?: { nuevas: number; nuevasVentas?: number; nuevasSoporte?: number; fueraPlan?: number; yaEstaban?: number; total?: number; stats: IngestResult["stats"]; failures: IngestResult["failures"]; ignorados: number; errores: { fileName: string; message: string }[]; omitidos?: number };
 }
 const traerJobs = new Map<string, TraerJob>();
 attachJobs("ci2-dian-traer", traerJobs as any);
@@ -407,6 +408,84 @@ async function mesPermitido(req: Request, month: string): Promise<boolean> {
   const piso = habilitado && /^\d{4}-\d{2}$/.test(habilitado) && habilitado < desdeVentana ? habilitado : desdeVentana;
   return month >= piso;
 }
+
+// ── Cargue avanzado: ZIP con los XML (y PDF) ya descargados, para quien no necesita traerlos de la DIAN ──
+
+const uploadZip = multer({ storage: multer.memoryStorage(), limits: { fileSize: 250 * 1024 * 1024, files: 1 } });
+const MAX_XML_ZIP = 3000;
+
+/** Archivos del ZIP, abriendo también los ZIP que traiga dentro (un ZIP por mes, por ejemplo). */
+async function aplanarZip(buffer: Buffer, nombre: string, nivel = 0): Promise<{ name: string; buffer: Buffer }[]> {
+  const zip = await JSZip.loadAsync(buffer);
+  const out: { name: string; buffer: Buffer }[] = [];
+  for (const entry of Object.values(zip.files)) {
+    if (entry.dir) continue;
+    const n = entry.name.split("/").pop() || entry.name;
+    if (/\.(xml|pdf)$/i.test(n)) out.push({ name: n, buffer: await entry.async("nodebuffer") });
+    else if (/\.zip$/i.test(n) && nivel < 2) out.push(...(await aplanarZip(await entry.async("nodebuffer"), n, nivel + 1)));
+  }
+  return out;
+}
+
+router.post("/empresas/:id/cargar-zip", uploadZip.single("zip"), async (req: Request, res: Response) => {
+  try {
+    const empresaId = await exigirEmpresa(req, res);
+    if (!empresaId) return;
+    if (!req.file) return err(res, new Error("Sube el ZIP con los XML de las facturas."));
+    const nitEmpresa = nitDigitos(await getEmpresaNit(empresaId));
+    if (!nitEmpresa) return err(res, new Error("La empresa no tiene NIT configurado."));
+    const archivos = await aplanarZip(req.file.buffer, req.file.originalname || "facturas.zip").catch(() => null);
+    if (!archivos) return err(res, new Error("No se pudo leer el ZIP. Verifica que sea un .zip válido."));
+    const nXml = archivos.filter((a) => /\.xml$/i.test(a.name)).length;
+    if (!nXml) return err(res, new Error("El ZIP no contiene archivos XML."));
+    if (nXml > MAX_XML_ZIP) return err(res, new Error(`El ZIP trae ${nXml} XML; el máximo por cargue es ${MAX_XML_ZIP}. Divídelo en varios.`));
+
+    const jobId = uuidv4();
+    traerJobs.set(jobId, { status: "processing", progress: { step: "Leyendo los XML…", current: 0, total: nXml }, userId: req.user!.userId, empresaId, createdAt: Date.now() });
+    res.json({ status: "ok", jobId, xml: nXml });
+
+    (async () => {
+      const j = traerJobs.get(jobId)!;
+      try {
+        const items: BatchItem[] = await processXmlBatch(archivos);
+        j.progress = { step: "Guardando las facturas…", current: nXml, total: nXml };
+        // La empresa decide el módulo de cada documento: emitidos por ella = ventas; los que ella recibe = compras, y si son documento soporte, a su pestaña.
+        const compras: BatchItem[] = [], ventas: BatchItem[] = [], soportes: BatchItem[] = [];
+        let ajenos = 0, fueraPlan = 0;
+        for (const it of items) {
+          if (!(it.ok && it.xml)) continue;
+          const mes = String(it.xml.date || "").slice(0, 7);
+          if (/^\d{4}-\d{2}$/.test(mes) && !(await mesPermitido(req, mes))) { fueraPlan++; continue; }
+          const emisor = nitDigitos(it.xml.supplierNit), receptor = nitDigitos(it.xml.receiverNit);
+          if (emisor === nitEmpresa) ventas.push(it);
+          else if (receptor === nitEmpresa) (/soporte/i.test(it.xml.documentType || "") ? soportes : compras).push(it);
+          else ajenos++;
+        }
+        const nuevas = await guardarFacturasTraidas(empresaId, compras, "compra");
+        const nuevasVentas = await guardarFacturasTraidas(empresaId, ventas, "venta");
+        const nuevasSoporte = await guardarFacturasTraidas(empresaId, soportes, "soporte");
+        const clasificadas = compras.length + ventas.length + soportes.length;
+        const errores = items.filter((i) => !i.ok && !i.ignored).map((i) => ({ fileName: i.fileName, message: i.message || "" }));
+        j.status = "completed";
+        j.result = {
+          nuevas, nuevasVentas, nuevasSoporte, fueraPlan, total: nXml,
+          yaEstaban: clasificadas - nuevas - nuevasVentas - nuevasSoporte,
+          stats: { listed: nXml, alreadyRegistered: 0, downloaded: nuevas + nuevasVentas + nuevasSoporte, failed: errores.length, rounds: 1 },
+          failures: [],
+          ignorados: items.filter((i) => i.ignored).length,
+          errores,
+          omitidos: ajenos,
+        };
+        j.progress = { step: "Completado", current: nXml, total: nXml };
+      } catch (e) {
+        j.status = "error";
+        j.error = e instanceof Error ? e.message : "Error procesando el ZIP";
+      }
+    })();
+  } catch (e) {
+    err(res, e);
+  }
+});
 
 router.post("/empresas/:id/traer", async (req: Request, res: Response) => {
   try {
