@@ -573,7 +573,6 @@ router.post("/terceros", upload.array("dian"), async (req: Request, res: Respons
 
     const result = await ejecutarMotor("terceros", baseOpts(config, out, dians));
     if (result.status !== "ok") throw new MotorError("inesperado", "Respuesta inesperada del motor.", [], 500);
-    await agregarTerceros(config, dians, out, result.archivos);
     res.json({
       status: "ok",
       jobId,
@@ -639,6 +638,7 @@ router.post("/ventas", upload.array("dian"), async (req: Request, res: Response)
       throw err;
     }
     if (result.status !== "ok") throw new MotorError("inesperado", "Respuesta inesperada del motor.", [], 500);
+    await agregarTerceros(config, dians, out, result.archivos);
     res.json({
       status: "ok",
       jobId,
