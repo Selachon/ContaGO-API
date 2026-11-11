@@ -27,6 +27,10 @@ import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import fs from "fs";
 import path from "path";
+import { quitarApplicationResponse } from "../services/causacionInterfaces/dianLimpieza.js";
+import { runTerceros } from "../services/causacionInterfaces/terceros.js";
+import { escribirTercerosXlsm } from "../services/causacionInterfaces/tercerosXlsm.js";
+import { PLANTILLA_TERCEROS_BASE64 } from "../services/causacionInterfaces/plantillaTercerosBase.js";
 import { randomUUID } from "crypto";
 import { requireAuth } from "../middleware/auth.js";
 import { requireToolAccess } from "../middleware/requireToolAccess.js";
@@ -67,7 +71,7 @@ import {
 import { siguientesConsecutivos, tablaABuffer } from "../services/contabilizacionTablasIO.js";
 import { categoriaDocumento } from "../services/tipoDocumento.js";
 import { getAutorretencion, getTiposDocumento, setAutorretencion, setTiposDocumento } from "../services/ci2Store.js";
-import { extraerNitsDian, extraerTercerosDian, extraerTiposDocumentoDian } from "../services/contabilizacionDianTerceros.js";
+import { extraerNitsDian, extraerTercerosDian, extraerTiposDocumentoDian, limpiarNit } from "../services/contabilizacionDianTerceros.js";
 
 const TABLA_SLOTS: TablaSlot[] = ["paramCompras", "paramVentas", "impuestos"];
 function esTablaSlot(s: string): s is TablaSlot {
@@ -112,13 +116,39 @@ function nuevoJob(userId: string, empresaId: string): { jobId: string; out: stri
 }
 
 /** Persiste los DIAN subidos en el job y devuelve sus rutas absolutas. */
-function guardarDians(inDir: string, files: Express.Multer.File[]): string[] {
-  return files.map((f, i) => {
+/** Guarda los Excel DIAN del lote. Los «Application response» (eventos de la DIAN) se quitan: no son facturas y hacían fallar la contabilización. */
+async function guardarDians(inDir: string, files: Express.Multer.File[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const [i, f] of files.entries()) {
     const safe = `${String(i).padStart(2, "0")}_${path.basename(f.originalname || `dian_${i}.xlsx`)}`;
     const dest = path.join(inDir, safe);
-    fs.writeFileSync(dest, f.buffer);
-    return dest;
-  });
+    const limpio = /\.xlsx$/i.test(safe) ? await quitarApplicationResponse(f.buffer) : { buffer: f.buffer, quitados: 0 };
+    if (limpio.quitados) console.log(`[Contabilización] ${safe}: ${limpio.quitados} fila(s) de Application response omitida(s)`);
+    fs.writeFileSync(dest, limpio.buffer);
+    out.push(dest);
+  }
+  return out;
+}
+
+/**
+ * Archivo de terceros (plantilla de Siigo) de los documentos del proceso: los terceros de las facturas del Excel DIAN, sin la propia empresa,
+ * para crearlos en Siigo antes de subir los comprobantes. Usa la plantilla de la empresa o, si no tiene, la de ContaGO. Si falla, el reporte se entrega igual.
+ */
+async function agregarTerceros(config: { plantillaTerceros?: string; nit?: string }, dians: string[], out: string, archivos: MotorArchivo[]): Promise<void> {
+  try {
+    const plantilla = config.plantillaTerceros && fs.existsSync(config.plantillaTerceros) ? fs.readFileSync(config.plantillaTerceros) : Buffer.from(PLANTILLA_TERCEROS_BASE64, "base64");
+    const propio = limpiarNit(config.nit);
+    const nits = new Set([...(await extraerNitsDian(dians))].filter((n) => n && n !== propio));
+    if (!nits.size) return;
+    const { terceros } = await runTerceros({ dian: dians.map((p) => fs.readFileSync(p)), plantilla });
+    const del = terceros.filter((t) => nits.has(limpiarNit(t["Identificación (Obligatorio)"])));
+    if (!del.length) return;
+    const dest = path.join(out, "Terceros_Siigo.xlsm");
+    fs.writeFileSync(dest, await escribirTercerosXlsm(plantilla, del));
+    archivos.push({ tipo: "terceros", path: dest });
+  } catch (e) {
+    console.warn("[Contabilización] No se pudo armar el archivo de terceros:", e instanceof Error ? e.message : e);
+  }
 }
 
 /** Convierte los archivos del motor en descriptores con URL de descarga. */
@@ -539,10 +569,11 @@ router.post("/terceros", upload.array("dian"), async (req: Request, res: Respons
     const { jobId, out, inDir } = nuevoJob(req.user!.userId, empresaId);
     const config = await materializarEnJob(empresaId, out);
     exigirArchivos(config, ["plantillaTerceros"]);
-    const dians = guardarDians(inDir, dianFiles);
+    const dians = await guardarDians(inDir, dianFiles);
 
     const result = await ejecutarMotor("terceros", baseOpts(config, out, dians));
     if (result.status !== "ok") throw new MotorError("inesperado", "Respuesta inesperada del motor.", [], 500);
+    await agregarTerceros(config, dians, out, result.archivos);
     res.json({
       status: "ok",
       jobId,
@@ -561,7 +592,7 @@ router.post("/ventas/prefijos", upload.array("dian"), async (req: Request, res: 
     const { out, inDir } = nuevoJob(req.user!.userId, empresaId);
     const config = await materializarEnJob(empresaId, out);
     exigirArchivos(config, ["paramVentas", "paramCompras", "impuestos"]);
-    const dians = guardarDians(inDir, dianFiles);
+    const dians = await guardarDians(inDir, dianFiles);
 
     let result;
     try {
@@ -590,7 +621,7 @@ router.post("/ventas", upload.array("dian"), async (req: Request, res: Response)
     const { jobId, out, inDir } = nuevoJob(req.user!.userId, empresaId);
     const config = await materializarEnJob(empresaId, out);
     exigirArchivos(config, ["paramVentas", "paramCompras", "impuestos"]);
-    const dians = guardarDians(inDir, dianFiles);
+    const dians = await guardarDians(inDir, dianFiles);
 
     // Bloquea si hay terceros del DIAN incompletos en la parametrización de ventas.
     if (await bloquearSiIncompletos(res, empresaId, "paramVentas", dians)) return;
@@ -641,7 +672,7 @@ router.post("/compras/tipos-documento", upload.array("dian"), async (req: Reques
     const empresaId = await resolverEmpresaId(req);
     const dianFiles = getDians(req);
     const { inDir } = nuevoJob(req.user!.userId, empresaId);
-    const dians = guardarDians(inDir, dianFiles);
+    const dians = await guardarDians(inDir, dianFiles);
     const comprobantes = await getComprobantesEmpresa(empresaId);
     const guardados = await getTiposDocumento(empresaId, "compra");
     const porClase = new Map<string, { clave: string; etiqueta: string; cantidad: number }>();
@@ -665,7 +696,7 @@ router.post("/compras/validar", upload.array("dian"), async (req: Request, res: 
     const config = await materializarEnJob(empresaId, out);
     exigirArchivos(config, ["paramCompras", "impuestos"]);
     const params = paramsCompras(config, reqParams, await getTiposDocumento(empresaId, "compra"));
-    const dians = guardarDians(inDir, dianFiles);
+    const dians = await guardarDians(inDir, dianFiles);
 
     // Terceros presentes pero incompletos (cuentas vacías).
     const dianNits = await extraerNitsDian(dians);
@@ -706,7 +737,7 @@ router.post("/compras", upload.array("dian"), async (req: Request, res: Response
     const config = await materializarEnJob(empresaId, out);
     exigirArchivos(config, ["paramCompras", "impuestos"]);
     const params = paramsCompras(config, reqParams, await getTiposDocumento(empresaId, "compra"));
-    const dians = guardarDians(inDir, dianFiles);
+    const dians = await guardarDians(inDir, dianFiles);
 
     // Bloquea si hay terceros del DIAN incompletos en la parametrización.
     if (await bloquearSiIncompletos(res, empresaId, "paramCompras", dians)) return;
@@ -724,6 +755,8 @@ router.post("/compras", upload.array("dian"), async (req: Request, res: Response
       throw err;
     }
     if (result.status !== "ok") throw new MotorError("inesperado", "Respuesta inesperada del motor.", [], 500);
+
+    await agregarTerceros(config, dians, out, result.archivos);
 
     // Recuerda el comprobante elegido para cada clase de documento.
     await setTiposDocumento(empresaId, "compra", (params.tipos_documento || {}) as Record<string, string>).catch(() => undefined);

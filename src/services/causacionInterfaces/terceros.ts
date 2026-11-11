@@ -6,6 +6,8 @@
  * identificación, nombres/apellidos, geografía, teléfono, correo) y produce las
  * filas listas para volcar en la plantilla de importación de Siigo.
  */
+import fs from "fs";
+import path from "path";
 import {
   CausacionInterfacesError,
   COLUMNAS_TERCEROS,
@@ -175,8 +177,8 @@ function textoCelda(valor: unknown): string {
 }
 
 /** Construye los índices geográficos a partir de la hoja "Paises". */
-function construirDiccionarioGeo(wbPlantilla: import("exceljs").Workbook): DiccionarioGeo {
-  const paises = leerHojaConHeaderDinamico(wbPlantilla, HOJA_PAISES, [
+function construirDiccionarioGeo(wbPlantilla: import("exceljs").Workbook, hoja: string = HOJA_PAISES): DiccionarioGeo {
+  const paises = leerHojaConHeaderDinamico(wbPlantilla, hoja, [
     "estado / departamento",
     "codigo ciudad",
   ]);
@@ -390,7 +392,10 @@ export async function runTerceros(input: TercerosInput): Promise<TercerosResulta
   }
 
   const wbPlantilla = await cargarLibro(input.plantilla);
-  const geo = construirDiccionarioGeo(wbPlantilla);
+  // Si la plantilla no trae la hoja «Paises» (la de Siigo ya procesada), se usa la tabla de países, departamentos y ciudades del motor.
+  const geo = wbPlantilla.getWorksheet(HOJA_PAISES)
+    ? construirDiccionarioGeo(wbPlantilla)
+    : construirDiccionarioGeo(await cargarLibro(fs.readFileSync(path.join(process.env.CONTAGO_MOTOR_DIR || path.join(process.cwd(), "motor"), "tabla_paises.xlsx"))), "Hoja1");
 
   const filasDian: Fila[] = [];
   const columnas = new Set<string>();

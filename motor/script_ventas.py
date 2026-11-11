@@ -1025,13 +1025,17 @@ for _, row in df.iterrows():
             f"OBSEQUIO {descripcion}"
         )
 
+    # Las retenciones que nos practican al vender son un activo (1355…) y van al débito; en el documento soporte, que funciona
+    # como una compra, las practicamos nosotros y van al crédito. La nota crédito invierte ambas (lo hace agregar_linea).
+    naturaleza_retencion = "C" if row.get("Es_Documento_Soporte", False) else "D"
+
     if tarifa_retefuente > 0:
         imp = buscar_impuesto("RETEFUENTE", tarifa_retefuente, row["Es_Nota_Credito"], row.get("Es_Documento_Soporte", False))
         base_minima_retefuente = imp["base_minima"]
 
         if base_retefuente >= base_minima_retefuente:
             retefuente_valor = base_retefuente * tarifa_retefuente / 100
-            agregar_linea(row, imp["cuenta"], retefuente_valor, "C", f"RF {descripcion}", imp["codigo"])
+            agregar_linea(row, imp["cuenta"], retefuente_valor, naturaleza_retencion, f"RF {descripcion}", imp["codigo"])
 
     if tarifa_reteica > 0:
         imp = buscar_impuesto("RETEICA", tarifa_reteica, row["Es_Nota_Credito"], row.get("Es_Documento_Soporte", False))
@@ -1043,7 +1047,7 @@ for _, row in df.iterrows():
 
         if base_reteica >= base_minima_reteica:
             reteica_valor = base_reteica * tarifa_reteica / 1000
-            agregar_linea(row, imp["cuenta"], reteica_valor, "C", f"RICA {descripcion}", imp["codigo"])
+            agregar_linea(row, imp["cuenta"], reteica_valor, naturaleza_retencion, f"RICA {descripcion}", imp["codigo"])
 
     if tarifa_reteiva > 0 and base_reteiva > 0:
         imp = buscar_impuesto("RETEIVA", tarifa_reteiva, row["Es_Nota_Credito"], row.get("Es_Documento_Soporte", False))
@@ -1051,7 +1055,7 @@ for _, row in df.iterrows():
 
         if base_reteiva >= base_minima_reteiva:
             reteiva_valor = base_reteiva * tarifa_reteiva / 100
-            agregar_linea(row, imp["cuenta"], reteiva_valor, "C", f"RIVA {descripcion}", imp["codigo"])
+            agregar_linea(row, imp["cuenta"], reteiva_valor, naturaleza_retencion, f"RIVA {descripcion}", imp["codigo"])
 
     # Autorretención (solo facturas y notas crédito de venta): % de la base antes de impuestos,
     # activo 1355 al débito y pasivo 2365 al crédito (la nota crédito invierte ambos).

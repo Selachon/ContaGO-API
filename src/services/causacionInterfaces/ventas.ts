@@ -549,12 +549,15 @@ export async function runVentas(input: VentasInput): Promise<VentasResultado> {
       agregarLinea(cuentaObsequios, ivaObsequiosValor, naturalezaBase, `OBSEQUIO ${descripcion}`);
     }
 
+    // Las retenciones que nos practican al vender son un activo (1355…) y van al débito; en el documento soporte, que funciona
+    // como una compra, las practicamos nosotros y van al crédito. La nota crédito invierte ambas (lo hace agregarLinea).
+    const naturalezaRetencion: "D" | "C" = esDS ? "C" : "D";
     if (tarifaRetefuente > 0) {
       const imp = buscarImpuesto("RETEFUENTE", tarifaRetefuente, esNc, esDS);
       baseMinimaRetefuente = imp.baseMinima;
       if (baseRetefuente >= baseMinimaRetefuente) {
         retefuenteValor = (baseRetefuente * tarifaRetefuente) / 100;
-        agregarLinea(imp.cuenta, retefuenteValor, "C", `RF ${descripcion}`, imp.codigo);
+        agregarLinea(imp.cuenta, retefuenteValor, naturalezaRetencion, `RF ${descripcion}`, imp.codigo);
       }
     }
     if (tarifaReteica > 0) {
@@ -563,7 +566,7 @@ export async function runVentas(input: VentasInput): Promise<VentasResultado> {
       if (baseMinimaReteica === 0) baseMinimaReteica = imp.baseMinima;
       if (baseReteica >= baseMinimaReteica) {
         reteicaValor = (baseReteica * tarifaReteica) / 1000;
-        agregarLinea(imp.cuenta, reteicaValor, "C", `RICA ${descripcion}`, imp.codigo);
+        agregarLinea(imp.cuenta, reteicaValor, naturalezaRetencion, `RICA ${descripcion}`, imp.codigo);
       }
     }
     if (tarifaReteiva > 0 && baseReteiva > 0) {
@@ -571,7 +574,7 @@ export async function runVentas(input: VentasInput): Promise<VentasResultado> {
       baseMinimaReteiva = imp.baseMinima;
       if (baseReteiva >= baseMinimaReteiva) {
         reteivaValor = (baseReteiva * tarifaReteiva) / 100;
-        agregarLinea(imp.cuenta, reteivaValor, "C", `RIVA ${descripcion}`, imp.codigo);
+        agregarLinea(imp.cuenta, reteivaValor, naturalezaRetencion, `RIVA ${descripcion}`, imp.codigo);
       }
     }
 
