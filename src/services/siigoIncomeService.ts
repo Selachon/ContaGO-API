@@ -87,6 +87,7 @@ export interface VoucherPayload {
   document: { id: number };
   type: VoucherType;
   date: string;
+  cost_center?: number;
   customer: { identification: string; branch_office?: number };
   items?: Array<VoucherDebtItem | VoucherDetailedItem>;
   payment: { id: number; value: number };
@@ -143,6 +144,7 @@ export interface JournalItem {
 export interface JournalPayload {
   document: { id: number };
   date: string;
+  cost_center?: number;
   items: JournalItem[];
   observations?: string;
 }
