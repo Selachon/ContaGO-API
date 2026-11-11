@@ -91,7 +91,8 @@ export async function runDianRecibidosBatchDownload(
       dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((r) => dlWaitQueue.push(r));
     const releaseDl = () => { const n = dlWaitQueue.shift(); if (n) n(); else dlSlots++; };
 
-    const RATE_MS = 60000 / 40; // 40/min: a 50/min la DIAN devolvió 401 en el XML de ~7% de un listado de 783
+    // 100/min: la sesión de la DIAN dura ~15 min (a 40-50/min se cortaba tras 600-729 docs de 783); más rápido = completa dentro de la sesión.
+    const RATE_MS = 60000 / 100;
     let nextAllowedMs = Date.now();
     const rateAcquire = async (): Promise<void> => {
       const wait = nextAllowedMs - Date.now();
@@ -189,9 +190,18 @@ export async function runDianRecibidosBatchDownload(
     if (missing.length > 0 && !isCancelled()) {
       console.log(`[Recibidos] Pasada 3: ${missing.length} aún faltantes — re-autenticando`);
       onProgress({ step: `Recuperando ${missing.length} faltantes (re-autenticando)...`, current: dlOk, total: downloadCufes.length });
-      const { browser: gBrowser2, page: gPage2 } = await authenticateAndNavigate(
-        tokenUrl, "01/01/2024", fmtDdMmYyyy(Date.now()), () => {}, direction,
-      );
+      // El token puede ser de un solo uso: si no re-autentica, no se pierde lo ya descargado;
+      // los faltantes quedan como pendientes y el usuario aporta un token nuevo.
+      let auth2: Awaited<ReturnType<typeof authenticateAndNavigate>> | null = null;
+      try {
+        auth2 = await authenticateAndNavigate(
+          tokenUrl, "01/01/2024", fmtDdMmYyyy(Date.now()), () => {}, direction,
+        );
+      } catch (err) {
+        console.warn("[Recibidos] Pasada 3: no se pudo re-autenticar con el mismo token:", (err instanceof Error ? err.message : String(err)).replace(/token=[0-9a-f-]+/gi, "token=***").slice(0, 200));
+      }
+      if (auth2) {
+      const { browser: gBrowser2, page: gPage2 } = auth2;
       try {
         const cookies2 = await gPage2.cookies();
         const hdr2 = cookies2.map((c: any) => `${c.name}=${c.value}`).join("; ");
@@ -208,6 +218,7 @@ export async function runDianRecibidosBatchDownload(
         }
       } finally {
         await closeBrowserSafely(gBrowser2).catch(() => {});
+      }
       }
     }
 

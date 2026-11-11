@@ -271,11 +271,21 @@ async function runRecibidosJob(jobId: string, job: JobData, tokenUrl: string, cu
 
     await buildRecibidosZip(jobId, job);
   } catch (err: any) {
-    if (!isCancelled()) {
-      job.status = "error";
-      job.error = err?.message || String(err);
-      job.progress = { step: "Error" };
+    if (isCancelled()) return;
+    // Al completar faltantes, un token que no sirve (usado, vencido) no debe tirar lo ya
+    // descargado: el job vuelve a esperar un token nuevo.
+    if (job.items?.length && job.pendingCufes?.length) {
+      const why = String(err?.message || err).replace(/\[url=.*$/s, "").replace(/token=[0-9a-f-]+/gi, "token=***").trim().slice(0, 200);
+      job.status = "needs_token";
+      job.progress = {
+        step: `El token no sirvió (${why}). Faltan ${job.pendingCufes.length} de ${job.totalCufes}: genera otro token y pégalo.`,
+        current: job.items.length, total: job.totalCufes, pct: Math.round((job.items.length / (job.totalCufes || 1)) * 100),
+      };
+      return;
     }
+    job.status = "error";
+    job.error = err?.message || String(err);
+    job.progress = { step: "Error" };
   }
 }
 
