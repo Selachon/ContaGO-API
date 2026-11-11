@@ -42,11 +42,20 @@ export interface DianRecibidosBatchResult {
   items: DianRecibidosItem[];
   downloaded: number;
   total: number;
+  /** CUFEs cuyo XML no se pudo obtener tras todos los reintentos; el resultado NO está completo mientras haya alguno. */
+  pending: string[];
 }
 
 function fmtDdMmYyyy(ms: number): string {
   const dt = new Date(ms);
   return `${String(dt.getDate()).padStart(2, "0")}/${String(dt.getMonth() + 1).padStart(2, "0")}/${dt.getFullYear()}`;
+}
+
+// La DIAN a veces responde 200 con una página HTML ("Acceso denegado") en vez del XML.
+// Si se acepta, el documento cuenta como descargado, no se reintenta y el ZIP lleva basura.
+function looksLikeXml(buf: Buffer): boolean {
+  const head = buf.subarray(0, 600).toString("utf8").replace(/^\uFEFF/, "").trimStart();
+  return head.startsWith("<") && !/^<!doctype\s+html|^<html/i.test(head);
 }
 
 export async function runDianRecibidosBatchDownload(
@@ -68,7 +77,7 @@ export async function runDianRecibidosBatchDownload(
   );
 
   try {
-    if (isCancelled()) return { items, downloaded: 0, total: downloadCufes.length };
+    if (isCancelled()) return { items, downloaded: 0, total: downloadCufes.length, pending: [...downloadCufes] };
 
     const getCookieHeader = async () => {
       const c = await gPage.cookies();
@@ -82,7 +91,7 @@ export async function runDianRecibidosBatchDownload(
       dlSlots > 0 ? (dlSlots--, Promise.resolve()) : new Promise<void>((r) => dlWaitQueue.push(r));
     const releaseDl = () => { const n = dlWaitQueue.shift(); if (n) n(); else dlSlots++; };
 
-    const RATE_MS = 60000 / 50;
+    const RATE_MS = 60000 / 40; // 40/min: a 50/min la DIAN devolvió 401 en el XML de ~7% de un listado de 783
     let nextAllowedMs = Date.now();
     const rateAcquire = async (): Promise<void> => {
       const wait = nextAllowedMs - Date.now();
@@ -95,6 +104,11 @@ export async function runDianRecibidosBatchDownload(
     let cookieHeader = await getCookieHeader();
 
     const processDoc = async (xmlBuf: Buffer, cufe: string): Promise<void> => {
+      // Sin marcarlo como exitoso: las pasadas 2 y 3 lo reintentan.
+      if (!looksLikeXml(xmlBuf)) {
+        console.warn(`[Recibidos] ${cufe.slice(0, 16)}: la DIAN devolvió HTML en vez de XML (se reintentará)`);
+        return;
+      }
       let docName: string;
       let issueDate = "";
       try {
@@ -149,7 +163,7 @@ export async function runDianRecibidosBatchDownload(
       }
     });
     await Promise.all(p1Promises);
-    if (isCancelled()) return { items, downloaded: dlOk, total: downloadCufes.length };
+    if (isCancelled()) return { items, downloaded: dlOk, total: downloadCufes.length, pending: downloadCufes.filter((c) => !succeededCufes.has(c.toLowerCase())) };
 
     // ── Pasada 2: cookies frescas ─────────────────────────────────────────
     let missing = downloadCufes.filter((c) => !succeededCufes.has(c.toLowerCase()));
@@ -197,8 +211,9 @@ export async function runDianRecibidosBatchDownload(
       }
     }
 
-    console.log(`[Recibidos] Final: ${dlOk}/${downloadCufes.length} descargados`);
-    return { items, downloaded: dlOk, total: downloadCufes.length };
+    const pending = downloadCufes.filter((c) => !succeededCufes.has(c.toLowerCase()));
+    console.log(`[Recibidos] Final: ${dlOk}/${downloadCufes.length} descargados, ${pending.length} pendientes`);
+    return { items, downloaded: dlOk, total: downloadCufes.length, pending };
   } finally {
     await closeBrowserSafely(gBrowser).catch(() => {});
   }

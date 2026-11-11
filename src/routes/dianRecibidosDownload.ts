@@ -21,7 +21,7 @@ import { rejectIfNitNotAllowed } from "../utils/nitAccess.js";
 import { validateDianUrl } from "../middleware/validateDianUrl.js";
 import { buildDeliveryZipName, zipEntryPath } from "../services/zipLayout.js";
 import { resolveExcelBuffer, extractCufesFromExcel } from "./dianCufeDownload.js";
-import { runDianRecibidosBatchDownload } from "../services/dianRecibidosBatchDownload.js";
+import { runDianRecibidosBatchDownload, type DianRecibidosItem } from "../services/dianRecibidosBatchDownload.js";
 import type { DocumentDirection } from "../types/dian.js";
 
 import { attachJobs, isJobAborted, jobGuardMiddleware } from "../services/jobGuard.js";
@@ -37,14 +37,24 @@ if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true
 interface ProgressData { step: string; current?: number; total?: number; pct?: number; }
 
 interface JobData {
-  status: "pending" | "processing" | "completed" | "error" | "cancelled";
+  // "needs_token": hay XML que la DIAN no entregó tras los reintentos; no se entrega nada
+  // hasta completar los faltantes con un token nuevo (POST /job-resume).
+  status: "pending" | "processing" | "needs_token" | "completed" | "error" | "cancelled";
   progress: ProgressData;
   userId: string;
   outputPath?: string;
   outputName?: string;
   error?: string;
   createdAt: number;
+  direction?: DocumentDirection;
+  ownerNit?: string;
+  wantsUnifiedPdf?: boolean;
+  totalCufes?: number;
+  items?: DianRecibidosItem[];
+  pendingCufes?: string[];
 }
+
+const rkOf = (tokenUrl: string): string => tokenUrl.match(/[?&]rk=(\d+)/)?.[1] || "";
 
 const jobTracker = new Map<string, JobData>();
 
@@ -86,7 +96,12 @@ router.get("/job-status/:jobId", (req: Request, res: Response) => {
   if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
     return res.status(403).json({ status: "error", detalle: "No autorizado" });
   }
-  res.json({ status: job.status, progress: job.progress, error: job.error, outputName: job.outputName });
+  const pending = job.pendingCufes || [];
+  res.json({
+    status: job.status, progress: job.progress, error: job.error, outputName: job.outputName,
+    pendingCount: pending.length, pendingCufes: pending.slice(0, 200),
+    downloadedCount: job.items?.length ?? 0, totalCount: job.totalCufes,
+  });
 });
 
 // ── Descarga del ZIP ──────────────────────────────────────────────────────────
@@ -135,6 +150,8 @@ router.post("/job-cancel/:jobId", (req: Request, res: Response) => {
     return res.status(400).json({ status: "error", detalle: `Job ya está ${job.status}` });
   }
   job.status = "cancelled";
+  job.items = [];
+  job.pendingCufes = [];
   job.progress = { step: "Cancelado por el usuario" };
   res.json({ status: "cancelled" });
 });
@@ -181,90 +198,151 @@ router.post("/start", upload.single("excel"), validateDianUrl, async (req: Reque
     userId: req.user!.userId,
     createdAt: Date.now(),
   };
+  job.direction = direction;
+  job.ownerNit = rkOf(token_url);
+  job.wantsUnifiedPdf = wantsUnifiedPdf;
+  job.totalCufes = downloadCufes.length;
+  job.items = [];
   jobTracker.set(jobId, job);
   res.json({ jobId, totalCufes: downloadCufes.length });
 
-  // ── Proceso asíncrono ───────────────────────────────────────────────────────
-  setImmediate(async () => {
-    job.status = "processing";
-    const isCancelled = () => isJobAborted(job);
-    const outPath = path.join(DOWNLOADS_DIR, `${jobId}.zip`);
-    const collectedPdfs: Buffer[] = [];
-
-    try {
-      const { items, downloaded: dlOk } = await runDianRecibidosBatchDownload({
-        tokenUrl: token_url,
-        cufes: downloadCufes,
-        direction,
-        onProgress: (p) => { job.progress = p; },
-        isCancelled,
-      });
-      if (isCancelled()) return;
-
-      const zipFiles: Array<{ name: string; buffer: Buffer }> = [];
-      for (const it of items) {
-        // Carpeta XML/
-        zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "XML", `${it.docName}.xml`), buffer: it.xmlBuffer });
-        // Carpeta PDF/
-        if (it.pdfBuffer) zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "PDF", `${it.docName}.pdf`), buffer: it.pdfBuffer });
-        // Carpeta ZIP/ — ZIP individual con XML + PDF
-        const docZip = new JSZip();
-        docZip.file(`${it.docName}.xml`, it.xmlBuffer);
-        if (it.pdfBuffer) docZip.file(`${it.docName}.pdf`, it.pdfBuffer);
-        const docZipBuf = await docZip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-        zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "ZIP", `${it.docName}.zip`), buffer: docZipBuf });
-        // Recolectar para PDF unificado
-        if (wantsUnifiedPdf && it.pdfBuffer) collectedPdfs.push(it.pdfBuffer);
-      }
-
-      if (zipFiles.length === 0) {
-        job.status = "completed";
-        job.progress = { step: "Sin documentos descargados.", current: 0, total: downloadCufes.length, pct: 100 };
-        return;
-      }
-
-      // ── PDF unificado ─────────────────────────────────────────────────────
-      if (wantsUnifiedPdf && collectedPdfs.length > 0) {
-        try {
-          job.progress = { step: "Generando PDF unificado...", current: downloadCufes.length, total: downloadCufes.length, pct: 98 };
-          const merged = await PDFDocument.create();
-          for (const pdfBuf of collectedPdfs) {
-            try {
-              const src = await PDFDocument.load(pdfBuf, { ignoreEncryption: true });
-              const pages = await merged.copyPages(src, src.getPageIndices());
-              pages.forEach((p) => merged.addPage(p));
-            } catch {}
-          }
-          const mergedBytes = await merged.save();
-          zipFiles.push({ name: "todos-los-documentos.pdf", buffer: Buffer.from(mergedBytes) });
-        } catch (err) {
-          console.warn("[Recibidos] Error generando PDF unificado:", err);
-        }
-      }
-
-      // ── Empaquetar ZIP ────────────────────────────────────────────────────
-      job.progress = { step: "Generando ZIP...", current: downloadCufes.length, total: downloadCufes.length, pct: 99 };
-      const zip = new JSZip();
-      for (const f of zipFiles) zip.file(f.name, f.buffer);
-      const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
-      fs.writeFileSync(outPath, zipBuf);
-
-      job.status = "completed";
-      job.outputPath = outPath;
-      // NIT propio = el de la empresa a la que pertenece el token (rk).
-      job.outputName = buildDeliveryZipName(token_url.match(/[?&]rk=(\d+)/)?.[1] || "", direction, items.map((it) => it.issueDate));
-      job.progress = {
-        step: `Listo: ${dlOk}/${downloadCufes.length} documentos descargados.`,
-        current: dlOk, total: downloadCufes.length, pct: 100,
-      };
-    } catch (err: any) {
-      if (!isCancelled()) {
-        job.status = "error";
-        job.error = err?.message || String(err);
-        job.progress = { step: "Error" };
-      }
-    }
-  });
+  setImmediate(() => { void runRecibidosJob(jobId, job, token_url, downloadCufes); });
 });
+
+// ── Continuar con un token nuevo (solo los faltantes) ─────────────────────────
+router.post("/job-resume/:jobId", validateDianUrl, async (req: Request, res: Response) => {
+  const { jobId } = req.params;
+  if (!jobId || !/^[a-zA-Z0-9_-]+$/.test(jobId)) {
+    return res.status(400).json({ status: "error", detalle: "jobId inválido" });
+  }
+  const job = jobTracker.get(jobId);
+  if (!job) return res.status(404).json({ status: "error", detalle: "Job no encontrado" });
+  if (job.userId !== req.user!.userId && !req.user?.isAdmin) {
+    return res.status(403).json({ status: "error", detalle: "No autorizado" });
+  }
+  if (job.status !== "needs_token" || !job.pendingCufes?.length) {
+    return res.status(400).json({ status: "error", detalle: `El job no está esperando un token (${job.status})` });
+  }
+  const token_url = req.body.token_url as string;
+  if (rkOf(token_url) !== job.ownerNit) {
+    return res.status(400).json({ status: "error", detalle: "El token nuevo debe ser de la misma empresa (mismo NIT) que el original." });
+  }
+  if (await rejectIfNitNotAllowed(req, res, token_url, TOOL_ID)) return;
+
+  const cufes = [...job.pendingCufes];
+  job.status = "processing";
+  res.json({ status: "processing", pendingCount: cufes.length });
+  setImmediate(() => { void runRecibidosJob(jobId, job, token_url, cufes); });
+});
+
+// ── Proceso: descarga (o completa faltantes) y, si no falta nada, arma el ZIP ─
+async function runRecibidosJob(jobId: string, job: JobData, tokenUrl: string, cufes: string[]): Promise<void> {
+  job.status = "processing";
+  const isCancelled = () => isJobAborted(job);
+  const direction = job.direction!;
+  const total = job.totalCufes ?? cufes.length;
+
+  try {
+    const done = job.items!.length;
+    const { items, pending } = await runDianRecibidosBatchDownload({
+      tokenUrl,
+      cufes,
+      direction,
+      onProgress: (p) => { job.progress = { ...p, current: done + (p.current ?? 0), total }; },
+      isCancelled,
+    });
+    if (isCancelled()) return;
+
+    const have = new Set(job.items!.map((it) => it.cufe.toLowerCase()));
+    for (const it of items) if (!have.has(it.cufe.toLowerCase())) job.items!.push(it);
+    job.pendingCufes = pending;
+
+    // No se entrega información incompleta: con faltantes se espera un token nuevo.
+    if (pending.length > 0) {
+      job.status = "needs_token";
+      job.createdAt = Date.now(); // el TTL de 3 h cuenta desde que quedó esperando
+      job.progress = {
+        step: `Incompleto: la DIAN no entregó ${pending.length} de ${total} documentos. Pega un token nuevo para completarlos.`,
+        current: job.items!.length, total, pct: Math.round((job.items!.length / total) * 100),
+      };
+      console.warn(`[Recibidos] job ${jobId}: ${pending.length}/${total} pendientes → esperando token nuevo`);
+      return;
+    }
+
+    await buildRecibidosZip(jobId, job);
+  } catch (err: any) {
+    if (!isCancelled()) {
+      job.status = "error";
+      job.error = err?.message || String(err);
+      job.progress = { step: "Error" };
+    }
+  }
+}
+
+async function buildRecibidosZip(jobId: string, job: JobData): Promise<void> {
+  const direction = job.direction!;
+  const allItems = job.items!;
+  const total = job.totalCufes ?? allItems.length;
+  const outPath = path.join(DOWNLOADS_DIR, `${jobId}.zip`);
+  const collectedPdfs: Buffer[] = [];
+  const zipFiles: Array<{ name: string; buffer: Buffer }> = [];
+
+  for (const it of allItems) {
+    // Carpeta XML/
+    zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "XML", `${it.docName}.xml`), buffer: it.xmlBuffer });
+    // Carpeta PDF/
+    if (it.pdfBuffer) zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "PDF", `${it.docName}.pdf`), buffer: it.pdfBuffer });
+    // Carpeta ZIP/ — ZIP individual con XML + PDF
+    const docZip = new JSZip();
+    docZip.file(`${it.docName}.xml`, it.xmlBuffer);
+    if (it.pdfBuffer) docZip.file(`${it.docName}.pdf`, it.pdfBuffer);
+    const docZipBuf = await docZip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+    zipFiles.push({ name: zipEntryPath(it.issueDate, direction, "ZIP", `${it.docName}.zip`), buffer: docZipBuf });
+    // Recolectar para PDF unificado
+    if (job.wantsUnifiedPdf && it.pdfBuffer) collectedPdfs.push(it.pdfBuffer);
+  }
+
+  if (zipFiles.length === 0) {
+    job.status = "completed";
+    job.progress = { step: "Sin documentos descargados.", current: 0, total, pct: 100 };
+    return;
+  }
+
+  // ── PDF unificado ───────────────────────────────────────────────────────
+  if (job.wantsUnifiedPdf && collectedPdfs.length > 0) {
+    try {
+      job.progress = { step: "Generando PDF unificado...", current: total, total, pct: 98 };
+      const merged = await PDFDocument.create();
+      for (const pdfBuf of collectedPdfs) {
+        try {
+          const src = await PDFDocument.load(pdfBuf, { ignoreEncryption: true });
+          const pages = await merged.copyPages(src, src.getPageIndices());
+          pages.forEach((p) => merged.addPage(p));
+        } catch {}
+      }
+      const mergedBytes = await merged.save();
+      zipFiles.push({ name: "todos-los-documentos.pdf", buffer: Buffer.from(mergedBytes) });
+    } catch (err) {
+      console.warn("[Recibidos] Error generando PDF unificado:", err);
+    }
+  }
+
+  // ── Empaquetar ZIP ──────────────────────────────────────────────────────
+  job.progress = { step: "Generando ZIP...", current: total, total, pct: 99 };
+  const zip = new JSZip();
+  for (const f of zipFiles) zip.file(f.name, f.buffer);
+  const zipBuf = await zip.generateAsync({ type: "nodebuffer", compression: "DEFLATE" });
+  fs.writeFileSync(outPath, zipBuf);
+
+  job.status = "completed";
+  job.outputPath = outPath;
+  // NIT propio = el de la empresa a la que pertenece el token (rk).
+  job.outputName = buildDeliveryZipName(job.ownerNit || "", direction, allItems.map((it) => it.issueDate));
+  job.progress = {
+    step: `Listo: ${allItems.length}/${total} documentos descargados.`,
+    current: allItems.length, total, pct: 100,
+  };
+  job.items = []; // libera memoria: el ZIP ya está en disco
+}
 
 export default router;
