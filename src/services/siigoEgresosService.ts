@@ -430,12 +430,22 @@ export interface SupplierSuggestion {
  */
 export async function suggestSuppliersByValue(value: number, tolerance = 1): Promise<SupplierSuggestion[]> {
   if (!Number.isFinite(value) || value <= 0) return [];
-  const raw = (await getAccountsPayable({})) as unknown;
-  const rows: Array<Record<string, any>> = Array.isArray(raw)
-    ? (raw as Array<Record<string, any>>)
-    : Array.isArray((raw as any)?.results)
-      ? (raw as any).results
-      : [];
+  // El reporte de cuentas por pagar viene paginado (page_size máx. 100 en Siigo);
+  // sin recorrer todas las páginas, un proveedor con la factura buscada fuera de
+  // la primera página nunca aparecía en la lupa (ej. empresa con 86 CxP, solo se
+  // pedían las primeras 25).
+  const rows: Array<Record<string, any>> = [];
+  for (let page = 1; page <= 20; page++) {
+    const raw = (await getAccountsPayable({ page, page_size: 100 })) as unknown;
+    const pageRows: Array<Record<string, any>> = Array.isArray(raw)
+      ? (raw as Array<Record<string, any>>)
+      : Array.isArray((raw as any)?.results)
+        ? (raw as any).results
+        : [];
+    if (pageRows.length === 0) break;
+    rows.push(...pageRows);
+    if (pageRows.length < 100) break;
+  }
 
   const byProvider = new Map<string, { provider: SupplierSuggestion["provider"]; dues: SuggestedDue[] }>();
   for (const r of rows) {
