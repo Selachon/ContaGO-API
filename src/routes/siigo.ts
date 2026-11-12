@@ -80,12 +80,15 @@ import {
   parseBankExcel,
   validateEgresoPayload,
   submitEgreso,
+  validateEgresoJournalPayload,
+  submitEgresoJournal,
   suggestSuppliersByValue,
   findMatchingVouchers,
   findExistingEgresoInSiigo,
   findExistingForValues,
   EgresosError,
   type EgresoPayload,
+  type EgresoJournalPayload,
 } from "../services/siigoEgresosService.js";
 import { parseBankPdf, StatementError } from "../services/bankStatementParser.js";
 import {
@@ -1627,6 +1630,44 @@ export function createSiigoRouter(authMiddleware: RequestHandler = requireIntegr
             itemIndex: taxIdx,
             accountCode: code,
             message: `La cuenta ${code || "(sin código)"}${desc ? ` — ${desc}` : ""} de la partida ${taxIdx + 1} está configurada en Siigo para manejar impuesto. En el método avanzado debes seleccionar el impuesto de esa cuenta antes de causar.`,
+          });
+        }
+      }
+      return handleSiigoError(res, error);
+    }
+  });
+
+  // Crea un Comprobante Contable (CC, /v1/journals) desde la nota de gastos bancarios,
+  // cuando se necesita un centro de costo distinto por partida (el RP solo admite uno
+  // para todo el comprobante).
+  router.post("/egresos/submit-cc", async (req: Request, res: Response) => {
+    const payload = req.body?.payload as EgresoJournalPayload | undefined;
+    const errors = validateEgresoJournalPayload(payload);
+    if (errors.length > 0) {
+      return res.status(400).json({ ok: false, code: "invalid_payload", message: errors.join(" "), errors });
+    }
+    try {
+      console.log(`[SiigoEgreso] Crear CC | tercero ${payload!.customer.identification} | doc ${payload!.document.id} | ${payload!.items.length} partida(s)`);
+      const result = await runInCompanyCtx(req, () => submitEgresoJournal(payload!));
+      console.log(`[SiigoEgreso] CC creado para ${payload!.customer.identification}`);
+      return res.json({ ok: true, data: result });
+    } catch (error) {
+      const detalle = error instanceof SiigoError ? JSON.stringify(error.details) : "";
+      console.error("[SiigoEgreso] CC FALLÓ:", error instanceof Error ? error.message : error, "| details:", detalle);
+      console.error("[SiigoEgreso] payload CC enviado:", JSON.stringify(payload));
+      if (error instanceof SiigoError) {
+        const taxIdx = taxRequiredItemIndex(error.details);
+        if (taxIdx !== null) {
+          const item = Array.isArray(payload?.items) && payload!.items[taxIdx] ? payload!.items[taxIdx] : null;
+          const code = item?.account?.code ? String(item.account.code) : "";
+          const desc = item?.description ? String(item.description).trim() : "";
+          return res.status(409).json({
+            ok: false,
+            source: "siigo",
+            code: "TAX_REQUIRED",
+            itemIndex: taxIdx,
+            accountCode: code,
+            message: `La cuenta ${code || "(sin código)"}${desc ? ` — ${desc}` : ""} de la partida ${taxIdx + 1} está configurada en Siigo para manejar impuesto. Selecciona el impuesto de esa cuenta antes de causar.`,
           });
         }
       }

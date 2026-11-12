@@ -13,7 +13,7 @@
  * mapeo de columnas en la UI), no asume un formato concreto.
  */
 import ExcelJS from "exceljs";
-import { createPaymentReceipt, getAccountsPayable, listVouchers, listPaymentReceipts, listJournals, listCustomers } from "./siigoService.js";
+import { createPaymentReceipt, createJournalVoucher, getAccountsPayable, listVouchers, listPaymentReceipts, listJournals, listCustomers } from "./siigoService.js";
 
 export interface BankSheet {
   name: string;
@@ -402,6 +402,73 @@ export async function submitEgreso(payload: EgresoPayload): Promise<unknown> {
     payment: payload.payment ? { ...payload.payment, value: round2(payload.payment.value) } : undefined,
   };
   return createPaymentReceipt(clean);
+}
+
+// ─── Comprobante Contable (CC) para la nota de gastos bancarios ──────────
+// A diferencia del RP (Detailed), un CC (/v1/journals) permite un centro de
+// costo distinto por partida en vez de uno solo para todo el comprobante.
+
+export interface EgresoJournalItem {
+  account: EgresoAccount;
+  cost_center?: number;
+  taxes?: Array<{ id: number }>;
+  description?: string;
+  value: number;
+}
+
+export interface EgresoJournalPayload {
+  document: { id: number };
+  date: string;
+  number?: number;
+  customer: { identification: string; branch_office?: number };
+  items: EgresoJournalItem[];
+  observations?: string;
+}
+
+export function validateEgresoJournalPayload(p: Partial<EgresoJournalPayload> | undefined): string[] {
+  const errors: string[] = [];
+  if (!p || typeof p !== "object") return ["Payload vacío."];
+  if (!p.document?.id || !Number.isFinite(Number(p.document.id))) errors.push("Falta el tipo de comprobante contable (document.id).");
+  if (!p.date || !ISO_DATE.test(String(p.date))) errors.push("Fecha inválida (debe ser AAAA-MM-DD).");
+  if (!p.customer?.identification || String(p.customer.identification).trim() === "") errors.push("Falta el tercero (customer.identification).");
+  if (!Array.isArray(p.items) || p.items.length === 0) {
+    errors.push("El comprobante contable requiere al menos una partida (items).");
+    return errors;
+  }
+  let deb = 0, cred = 0;
+  p.items.forEach((it, i) => {
+    const code = it.account?.code;
+    const mov = it.account?.movement;
+    if (!code || String(code).trim() === "") errors.push(`Partida ${i + 1}: falta la cuenta contable.`);
+    if (mov !== "Debit" && mov !== "Credit") errors.push(`Partida ${i + 1}: el movimiento debe ser Debit o Credit.`);
+    if (!Number.isFinite(Number(it.value)) || Number(it.value) <= 0) errors.push(`Partida ${i + 1}: valor inválido.`);
+    if (mov === "Debit") deb += Number(it.value) || 0;
+    if (mov === "Credit") cred += Number(it.value) || 0;
+  });
+  if (errors.length === 0 && Math.abs(deb - cred) > 1) {
+    errors.push(`El comprobante no está balanceado: débitos ${deb} ≠ créditos ${cred}.`);
+  }
+  return errors;
+}
+
+/** Envía el comprobante contable a Siigo (/v1/journals). Cada ítem lleva el mismo tercero. */
+export async function submitEgresoJournal(payload: EgresoJournalPayload): Promise<unknown> {
+  const customer = { identification: payload.customer.identification, branch_office: payload.customer.branch_office ?? 0 };
+  const clean = {
+    document: payload.document,
+    date: payload.date,
+    ...(payload.number != null ? { number: Number(payload.number) } : {}),
+    items: payload.items.map((it) => ({
+      account: it.account,
+      customer,
+      ...(it.cost_center != null ? { cost_center: Number(it.cost_center) } : {}),
+      ...(it.taxes?.length ? { taxes: it.taxes } : {}),
+      description: it.description || undefined,
+      value: round2(it.value),
+    })),
+    observations: payload.observations,
+  };
+  return createJournalVoucher(clean);
 }
 
 // ─── Sugerencia de tercero por valor (a partir de cuentas por pagar) ──────
