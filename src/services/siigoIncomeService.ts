@@ -137,6 +137,8 @@ export interface JournalItem {
   account: { code: string; movement: "Debit" | "Credit" };
   customer: { identification: string; branch_office?: number };
   due?: { prefix: string; consecutive: number; quote: number; date?: string };
+  /** Siigo exige el centro de costo en cada ítem, no solo a nivel de comprobante. */
+  cost_center?: number;
   description?: string;
   value: number;
 }
