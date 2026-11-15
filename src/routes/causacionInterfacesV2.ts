@@ -68,6 +68,10 @@ import os from "os";
 import path from "path";
 import { extractInvoiceDataFromXml } from "../services/xmlParser.js";
 import { generateExcelFile, generateExcelFilename } from "../services/excelGenerator.js";
+import { escribirTercerosXlsm } from "../services/causacionInterfaces/tercerosXlsm.js";
+import { filaTerceroDesdeFactura } from "../services/causacionInterfaces/terceros.js";
+import { PLANTILLA_TERCEROS_BASE64 } from "../services/causacionInterfaces/plantillaTercerosBase.js";
+import type { FilaTercero } from "../services/causacionInterfaces/types.js";
 import type { InvoiceData } from "../types/dianExcel.js";
 import { categoriaDocumento, conceptoSugeridoPyme, cuentaBaseInventario, cuentaIvaMayor, descuentoNeto, generarInterfaz, nombresImpuestosExtra, type Ci2Asignacion, type Ci2FacturaInput } from "../services/ci2Motor.js";
 import { extractCufesFromExcel, resolveExcelBuffer } from "../services/dianExcelCufes.js";
@@ -1146,6 +1150,29 @@ router.get("/empresas/:id/prefijos", async (req: Request, res: Response) => {
   }
 });
 
+/** Archivo de terceros (plantilla .xlsm de Siigo) con los proveedores (compras) o clientes (ventas) de las facturas, sin repetir. El consumidor final no se crea. */
+async function armarArchivoTerceros(empresaId: string, ids: string[], tipo: Ci2Tipo): Promise<{ data: Buffer | null; terceros: number; sinDatos: number }> {
+  const venta = tipo === "venta";
+  const base = await facturasConArchivos(empresaId, ids);
+  const filas = new Map<string, FilaTercero>();
+  const soloNombre = new Set<string>();
+  for (const f of base) {
+    const nit = String(f.nit || "").replace(/\D/g, "");
+    if (!nit || /^2{6,}$/.test(nit) || filas.has(nit)) continue;
+    let fila: FilaTercero | null = null;
+    if (f.xml) {
+      const d = await extractInvoiceDataFromXml(f.xml, { id: f.id, docnum: f.docNumber });
+      fila = venta
+        ? filaTerceroDesdeFactura({ nit: d.receiverNit || nit, nombre: d.receiverName && d.receiverName !== "N/A" ? d.receiverName : f.proveedor, nombres: d.receiverFirstNames, apellidos: d.receiverFamilyNames, direccion: d.receiverAddress, codPais: d.receiverCountryCode, codDepartamento: d.receiverStateCode, codCiudad: d.receiverCityCode, telefono: d.receiverPhone, correo: d.receiverEmail })
+        : filaTerceroDesdeFactura({ nit: d.issuerNit || nit, nombre: d.issuerName && d.issuerName !== "N/A" ? d.issuerName : f.proveedor, nombres: d.issuerFirstNames, apellidos: d.issuerFamilyNames, direccion: d.issuerAddress, codPais: d.issuerCountryCode, codDepartamento: d.issuerStateCode, codCiudad: d.issuerCityCode, telefono: d.issuerPhone, correo: d.issuerEmail });
+    }
+    if (!fila) { fila = filaTerceroDesdeFactura({ nit, nombre: f.proveedor }); soloNombre.add(nit); }
+    if (fila) filas.set(nit, fila);
+  }
+  if (!filas.size) return { data: null, terceros: 0, sinDatos: 0 };
+  return { data: await escribirTercerosXlsm(Buffer.from(PLANTILLA_TERCEROS_BASE64, "base64"), [...filas.values()]), terceros: filas.size, sinDatos: [...soloNombre].filter((n) => filas.has(n)).length };
+}
+
 // ── Descargas de las facturas traídas: Excel detallado (el de la descarga masiva + Excel) y ZIP con los PDF y XML ──
 
 /** Una factura del XML como fila del Excel detallado: los mismos campos y valores por defecto de la descarga masiva + Excel. */
@@ -1319,7 +1346,7 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
     const sistema = syscafe ? "Syscafe" : siigoPyme ? "SiigoPyme" : "Siigo";
     const ext = syscafe ? "xls" : "xlsx";
     const escribir = async (filas: typeof r.salida) => (syscafe ? escribirInterfazSyscafe(filas) : await escribirInterfazSiigo(filas));
-    let archivos: { nombre: string; tipo: "interfaz" | "informe"; data: Buffer }[];
+    let archivos: { nombre: string; tipo: "interfaz" | "informe" | "terceros"; data: Buffer }[];
     if (worldoffice) {
       // World Office carga dos archivos: encabezados de los documentos y su contenido.
       const wo = escribirInterfazWo(r.wo || [], configWo!, new Date(), venta);
@@ -1343,6 +1370,17 @@ router.post("/empresas/:id/generar", async (req: Request, res: Response) => {
         for (let i = 0; i < r.partes.length; i++) {
           archivos.push({ nombre: `Salida_${sistema}_${sufijo}_Parte_${String(i + 1).padStart(3, "0")}.${ext}`, tipo: "interfaz", data: await escribir(r.partes[i]) });
         }
+      }
+    }
+
+    // Terceros de las facturas de esta interfaz (proveedores en compras, clientes en ventas), en la plantilla de importación de Siigo: se crean primero y luego se sube la de comprobantes.
+    if (sistemaContable === "siigo") {
+      try {
+        const t = await armarArchivoTerceros(empresaId, r.asignados.map((a) => a.id), tipo);
+        if (t.data) archivos.push({ nombre: `Terceros_Siigo_${sufijo}.xlsm`, tipo: "terceros", data: t.data });
+        if (t.sinDatos) r.advertencias.push(`${t.sinDatos} tercero(s) van solo con NIT y nombre (sin dirección ni ciudad): sus facturas no tienen el XML guardado.`);
+      } catch (e) {
+        r.advertencias.push(`No se pudo armar el archivo de terceros: ${e instanceof Error ? e.message : "error"}`);
       }
     }
 
@@ -1401,12 +1439,28 @@ async function interfazAutorizada(req: Request, res: Response) {
   return i;
 }
 
+// Archivo de terceros de una interfaz ya creada (por si se generó antes de existir este archivo o se necesita de nuevo).
+router.post("/interfaces/:iid/terceros", async (req: Request, res: Response) => {
+  try {
+    const i = await interfazAutorizada(req, res);
+    if (!i) return;
+    const t = await armarArchivoTerceros(i.empresaId, i.facturaIds, i.tipo === "venta" ? "venta" : i.tipo === "soporte" ? "soporte" : "compra");
+    if (!t.data) return err(res, new Error("Esta interfaz no tiene terceros para crear."));
+    res.setHeader("Content-Type", "application/vnd.ms-excel.sheet.macroEnabled.12");
+    res.setHeader("Content-Disposition", `attachment; filename="Terceros_Siigo_${i.tipo === "venta" ? "Ventas" : i.tipo === "soporte" ? "DocSoporte" : "Compras"}.xlsm"`);
+    res.setHeader("X-Terceros", String(t.terceros));
+    res.send(t.data);
+  } catch (e) {
+    err(res, e, 500);
+  }
+});
+
 router.get("/interfaces/:iid/archivos/:nombre", async (req: Request, res: Response) => {
   try {
     if (!(await interfazAutorizada(req, res))) return;
     const a = await getArchivoInterfaz(req.params.iid, req.params.nombre);
     if (!a) return res.status(404).json({ status: "error", mensaje: "Archivo no encontrado." });
-    res.setHeader("Content-Type", a.nombre.endsWith(".xls") ? "application/vnd.ms-excel" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Type", a.nombre.endsWith(".xls") ? "application/vnd.ms-excel" : a.nombre.endsWith(".xlsm") ? "application/vnd.ms-excel.sheet.macroEnabled.12" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="${a.nombre.replace(/[^\w.\-]/g, "_")}"`);
     res.send(a.data);
   } catch (e) {
