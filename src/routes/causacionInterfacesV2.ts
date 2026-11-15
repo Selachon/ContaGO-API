@@ -427,65 +427,79 @@ async function aplanarZip(buffer: Buffer, nombre: string, nivel = 0): Promise<{ 
   return out;
 }
 
-router.post("/empresas/:id/cargar-zip", uploadZip.single("zip"), async (req: Request, res: Response) => {
-  try {
-    const empresaId = await exigirEmpresa(req, res);
-    if (!empresaId) return;
-    if (!req.file) return err(res, new Error("Sube el ZIP con los XML de las facturas."));
-    const nitEmpresa = nitDigitos(await getEmpresaNit(empresaId));
-    if (!nitEmpresa) return err(res, new Error("La empresa no tiene NIT configurado."));
-    const archivos = await aplanarZip(req.file.buffer, req.file.originalname || "facturas.zip").catch(() => null);
-    if (!archivos) return err(res, new Error("No se pudo leer el ZIP. Verifica que sea un .zip válido."));
-    const nXml = archivos.filter((a) => /\.xml$/i.test(a.name)).length;
-    if (!nXml) return err(res, new Error("El ZIP no contiene archivos XML."));
-    if (nXml > MAX_XML_ZIP) return err(res, new Error(`El ZIP trae ${nXml} XML; el máximo por cargue es ${MAX_XML_ZIP}. Divídelo en varios.`));
+router.post(
+  "/empresas/:id/cargar-zip",
+  // Un ZIP demasiado grande o cortado a medias se responde con un mensaje claro (antes cortaba la conexión sin explicar).
+  (req: Request, res: Response, next: NextFunction) => {
+    uploadZip.single("zip")(req, res, (e: any) => {
+      if (e) return err(res, new Error(e?.code === "LIMIT_FILE_SIZE" ? "El ZIP pesa más de 250 MB. Divídelo en varios y cárgalos uno por uno." : "No se pudo recibir el archivo. Intenta de nuevo."));
+      next();
+    });
+  },
+  async (req: Request, res: Response) => {
+    try {
+      const empresaId = await exigirEmpresa(req, res);
+      if (!empresaId) return;
+      if (!req.file) return err(res, new Error("Sube el ZIP con los XML de las facturas."));
+      const nitEmpresa = nitDigitos(await getEmpresaNit(empresaId));
+      if (!nitEmpresa) return err(res, new Error("La empresa no tiene NIT configurado."));
+      const zipBuffer = req.file.buffer;
+      const nombreZip = req.file.originalname || "facturas.zip";
 
-    const jobId = uuidv4();
-    traerJobs.set(jobId, { status: "processing", progress: { step: "Leyendo los XML…", current: 0, total: nXml }, userId: req.user!.userId, empresaId, createdAt: Date.now() });
-    res.json({ status: "ok", jobId, xml: nXml });
+      // Responde ya: abrir el ZIP y leer los XML puede tardar, y se avisa por el seguimiento del trabajo.
+      const jobId = uuidv4();
+      traerJobs.set(jobId, { status: "processing", progress: { step: "Abriendo el ZIP…", current: 0, total: 0 }, userId: req.user!.userId, empresaId, createdAt: Date.now() });
+      res.json({ status: "ok", jobId });
 
-    (async () => {
-      const j = traerJobs.get(jobId)!;
-      try {
-        const items: BatchItem[] = await processXmlBatch(archivos);
-        j.progress = { step: "Guardando las facturas…", current: nXml, total: nXml };
-        // La empresa decide el módulo de cada documento: emitidos por ella = ventas; los que ella recibe = compras, y si son documento soporte, a su pestaña.
-        const compras: BatchItem[] = [], ventas: BatchItem[] = [], soportes: BatchItem[] = [];
-        let ajenos = 0, fueraPlan = 0;
-        for (const it of items) {
-          if (!(it.ok && it.xml)) continue;
-          const mes = String(it.xml.date || "").slice(0, 7);
-          if (/^\d{4}-\d{2}$/.test(mes) && !(await mesPermitido(req, mes))) { fueraPlan++; continue; }
-          const emisor = nitDigitos(it.xml.supplierNit), receptor = nitDigitos(it.xml.receiverNit);
-          if (emisor === nitEmpresa) ventas.push(it);
-          else if (receptor === nitEmpresa) (/soporte/i.test(it.xml.documentType || "") ? soportes : compras).push(it);
-          else ajenos++;
+      (async () => {
+        const j = traerJobs.get(jobId)!;
+        try {
+          const archivos = await aplanarZip(zipBuffer, nombreZip).catch(() => null);
+          if (!archivos) throw new Error("No se pudo leer el ZIP. Verifica que sea un .zip válido y que no esté dañado.");
+          const nXml = archivos.filter((a) => /\.xml$/i.test(a.name)).length;
+          if (!nXml) throw new Error("El ZIP no contiene archivos XML.");
+          if (nXml > MAX_XML_ZIP) throw new Error(`El ZIP trae ${nXml} XML; el máximo por cargue es ${MAX_XML_ZIP}. Divídelo en varios.`);
+          j.progress = { step: "Leyendo los XML…", current: 0, total: nXml };
+          const items: BatchItem[] = await processXmlBatch(archivos);
+          j.progress = { step: "Guardando las facturas…", current: nXml, total: nXml };
+          // La empresa decide el módulo de cada documento: emitidos por ella = ventas; los que ella recibe = compras, y si son documento soporte, a su pestaña.
+          const compras: BatchItem[] = [], ventas: BatchItem[] = [], soportes: BatchItem[] = [];
+          let ajenos = 0, fueraPlan = 0;
+          for (const it of items) {
+            if (!(it.ok && it.xml)) continue;
+            const mes = String(it.xml.date || "").slice(0, 7);
+            if (/^\d{4}-\d{2}$/.test(mes) && !(await mesPermitido(req, mes))) { fueraPlan++; continue; }
+            const emisor = nitDigitos(it.xml.supplierNit), receptor = nitDigitos(it.xml.receiverNit);
+            if (emisor === nitEmpresa) ventas.push(it);
+            else if (receptor === nitEmpresa) (/soporte/i.test(it.xml.documentType || "") ? soportes : compras).push(it);
+            else ajenos++;
+          }
+          const nuevas = await guardarFacturasTraidas(empresaId, compras, "compra");
+          const nuevasVentas = await guardarFacturasTraidas(empresaId, ventas, "venta");
+          const nuevasSoporte = await guardarFacturasTraidas(empresaId, soportes, "soporte");
+          const clasificadas = compras.length + ventas.length + soportes.length;
+          const errores = items.filter((i) => !i.ok && !i.ignored).map((i) => ({ fileName: i.fileName, message: i.message || "" }));
+          j.status = "completed";
+          j.result = {
+            nuevas, nuevasVentas, nuevasSoporte, fueraPlan, total: nXml,
+            yaEstaban: clasificadas - nuevas - nuevasVentas - nuevasSoporte,
+            stats: { listed: nXml, alreadyRegistered: 0, downloaded: nuevas + nuevasVentas + nuevasSoporte, failed: errores.length, rounds: 1 },
+            failures: [],
+            ignorados: items.filter((i) => i.ignored).length,
+            errores,
+            omitidos: ajenos,
+          };
+          j.progress = { step: "Completado", current: nXml, total: nXml };
+        } catch (e) {
+          j.status = "error";
+          j.error = e instanceof Error ? e.message : "Error procesando el ZIP";
         }
-        const nuevas = await guardarFacturasTraidas(empresaId, compras, "compra");
-        const nuevasVentas = await guardarFacturasTraidas(empresaId, ventas, "venta");
-        const nuevasSoporte = await guardarFacturasTraidas(empresaId, soportes, "soporte");
-        const clasificadas = compras.length + ventas.length + soportes.length;
-        const errores = items.filter((i) => !i.ok && !i.ignored).map((i) => ({ fileName: i.fileName, message: i.message || "" }));
-        j.status = "completed";
-        j.result = {
-          nuevas, nuevasVentas, nuevasSoporte, fueraPlan, total: nXml,
-          yaEstaban: clasificadas - nuevas - nuevasVentas - nuevasSoporte,
-          stats: { listed: nXml, alreadyRegistered: 0, downloaded: nuevas + nuevasVentas + nuevasSoporte, failed: errores.length, rounds: 1 },
-          failures: [],
-          ignorados: items.filter((i) => i.ignored).length,
-          errores,
-          omitidos: ajenos,
-        };
-        j.progress = { step: "Completado", current: nXml, total: nXml };
-      } catch (e) {
-        j.status = "error";
-        j.error = e instanceof Error ? e.message : "Error procesando el ZIP";
-      }
-    })();
-  } catch (e) {
-    err(res, e);
+      })();
+    } catch (e) {
+      err(res, e);
+    }
   }
-});
+);
 
 router.post("/empresas/:id/traer", async (req: Request, res: Response) => {
   try {
