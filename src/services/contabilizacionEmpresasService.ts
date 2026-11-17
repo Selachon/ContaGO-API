@@ -1065,16 +1065,21 @@ export function tablaImpuestosPyme(cuentas: CuentaPuc[]): Tabla {
   const rows: Tabla["rows"] = [];
   const agregar = (tipo: string, tarifa: number, c: CuentaPuc) => rows.push({ "Código": rows.length + 1, Tarifa: tarifa, "Tipo de impuesto": tipo, Nombre: c.nombre, Compras: c.codigo, Ventas: "", Base: 0 } as any);
   // Se dejan fuera las cuentas que no son de compras locales: devoluciones, régimen simple, extranjeros, nómina y CREE.
-  const noAplica = /\bRS\b|\bDEV\b|DEVOLUCION|EXTRANJERO|EXTERIOR|SALARIO|EMPLD|EMPLEADOS|ASIMULAN|CREE/i;
+  const noAplica = /\bRS\b|\bDEV\b|DEVOLUCION|EXTRANJERO|EXTERIOR|SALARIO|EMPLD|EMPLEADOS|ASIMULAN|CREE|SIMPLIFICAD|ANTICIPO|GENERAD/i;
+  // Planes con la numeración estándar (2365/2367/2368, IVA descontable 2408xx) o la de Siigo Pyme (2465/2467/2468, 240802/240803).
+  const esIva = (c: CuentaPuc) => c.codigo.startsWith("240802") || c.codigo.startsWith("240803") || (c.codigo.startsWith("2408") && /DESCONTABLE|COMPRAS/i.test(c.nombre));
+  // Si la columna «% Ret» viene vacía, la tarifa se toma del nombre de la cuenta («RETENCION COMPRAS 3.5%»).
+  const tarifaDe = (c: CuentaPuc) => c.tarifa && c.tarifa > 0 ? c.tarifa : Number(/([\d]+(?:[.,]\d+)?)\s*%/.exec(c.nombre)?.[1]?.replace(",", ".")) || 0;
   for (const c of cuentas) {
-    if (!(c.tarifa && c.tarifa > 0) || noAplica.test(c.nombre)) continue;
-    if (c.codigo.startsWith("240802") || c.codigo.startsWith("240803")) agregar("IVA", c.tarifa, c);
-    else if (c.codigo.startsWith("2465")) agregar("Retefuente", c.tarifa, c);
-    else if (c.codigo.startsWith("2467")) agregar("ReteIVA", c.tarifa, c);
-    else if (c.codigo.startsWith("2468")) {
-      // La cuenta dice «4.14*1000»: la tarifa de ReteICA va por mil.
-      const m = /([\d.]+)\s*\*\s*1000/.exec(c.nombre);
-      agregar("ReteICA", m ? Number(m[1]) : Math.round(c.tarifa * 10 * 100) / 100, c);
+    const tarifa = tarifaDe(c);
+    if (!(tarifa > 0) || noAplica.test(c.nombre) || !/^2[34]/.test(c.codigo)) continue;
+    if (esIva(c)) agregar("IVA", tarifa, c);
+    else if (/^2[34]65/.test(c.codigo)) agregar("Retefuente", tarifa, c);
+    else if (/^2[34]67/.test(c.codigo)) agregar("ReteIVA", tarifa, c);
+    else if (/^2[34]68/.test(c.codigo)) {
+      // La cuenta dice «4.14*1000», «7.66 X 1000» o «11/1000»: la tarifa de ReteICA va por mil.
+      const m = /([\d.,]+)\s*(?:\*|X|\/)\s*1000/i.exec(c.nombre);
+      agregar("ReteICA", m ? Number(m[1].replace(",", ".")) : Math.round(tarifa * 10 * 100) / 100, c);
     }
   }
   return { sheetName: "Impuestos", columns, rows };
