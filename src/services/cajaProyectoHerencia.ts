@@ -12,6 +12,8 @@ export interface CausadaRef {
   supplierNit?: string;
   siigoName?: string;
   siigoNumber?: string;
+  /** CUFE de otros registros del mismo documento (mismo NIT y número): la etiqueta pudo quedar bajo el CUFE real y no bajo `siigo:<id>`. */
+  cufesHermanos?: string[];
 }
 
 export interface DueRef {
@@ -47,6 +49,7 @@ const sameNumber = (a: unknown, b: unknown): boolean => {
 function tagKeys(c: CausadaRef): string[] {
   const keys: string[] = [];
   if (c.cufe) keys.push(String(c.cufe).trim());
+  for (const h of c.cufesHermanos ?? []) keys.push(String(h).trim());
   const nit = String(c.supplierNit ?? "").trim();
   if (nit && c.docnum) {
     const doc = String(c.docnum).trim();

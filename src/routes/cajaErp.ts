@@ -241,6 +241,21 @@ router.post("/proyecto-de-facturas", async (req, res) => {
     .find({ companyId, status: "caused", siigoNumber: { $in: numeros } })
     .project({ cufe: 1, docnum: 1, supplierNit: 1, siigoName: 1, siigoNumber: 1, _id: 0 })
     .toArray();
+  // La causada puede estar registrada como `siigo:<id>` mientras la etiqueta de proyecto quedó bajo el CUFE real del
+  // mismo documento: se enlazan por NIT + número de documento.
+  const docnums = [...new Set(causadas.map((c: any) => c.docnum).filter(Boolean))];
+  const hermanas = docnums.length
+    ? await getDb().collection<any>("siigoIngestedCufes").find({ companyId, docnum: { $in: docnums } }).project({ cufe: 1, docnum: 1, supplierNit: 1, _id: 0 }).toArray()
+    : [];
+  const registro = docnums.length
+    ? await getDb().collection<any>("cajaErpInvoices").find({ companyId, docNumber: { $in: docnums } }).project({ cufe: 1, key: 1, docNumber: 1, supplierNit: 1, _id: 0 }).toArray()
+    : [];
+  for (const c of causadas as any[]) {
+    c.cufesHermanos = [
+      ...hermanas.filter((h: any) => h.docnum === c.docnum && h.supplierNit === c.supplierNit && h.cufe !== c.cufe).map((h: any) => h.cufe),
+      ...registro.filter((h: any) => h.docNumber === c.docnum && h.supplierNit === c.supplierNit).flatMap((h: any) => [h.cufe, h.key]),
+    ].filter(Boolean);
+  }
   const tags = await getTags(companyId, "invoice");
   res.json({ ok: true, data: proyectoDeFacturas(causadas, tags, supplierNit, dues) });
 });
