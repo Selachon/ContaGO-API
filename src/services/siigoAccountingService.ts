@@ -464,22 +464,28 @@ export async function processXmlBatch(
   // Expandir: descomprimir los ZIP y recolectar todos los XML + PDFs
   const xmlFiles: { name: string; buffer: Buffer }[] = [];
   const pdfMap = new Map<string, { name: string; buffer: Buffer }>();
+  // ZIP con exactamente un XML y un PDF (descarga DIAN individual): se emparejan siempre, aunque se suban varios ZIP juntos.
+  const zipPair = new Map<string, string>(); // nombre del XML → clave del PDF en pdfMap
   const stripExt = (n: string) => n.replace(/\.[^.]+$/, "");
   const baseName = (p: string) => (p.split("/").pop() || p);
   for (const f of files) {
     if (/\.zip$/i.test(f.name)) {
       const zip = await JSZip.loadAsync(f.buffer);
+      const zipXml: string[] = [], zipPdf: string[] = [];
       for (const entry of Object.values(zip.files)) {
         if (entry.dir) continue;
         const n = baseName(entry.name);
         if (/\.xml$/i.test(n)) {
           const buf = await entry.async("nodebuffer");
           xmlFiles.push({ name: n, buffer: buf });
+          zipXml.push(n);
         } else if (/\.pdf$/i.test(n)) {
           const buf = await entry.async("nodebuffer");
           pdfMap.set(stripExt(n).toLowerCase(), { name: n, buffer: buf });
+          zipPdf.push(stripExt(n).toLowerCase());
         }
       }
+      if (zipXml.length === 1 && zipPdf.length === 1) zipPair.set(zipXml[0], zipPdf[0]);
     } else if (/\.xml$/i.test(f.name)) {
       xmlFiles.push(f);
     } else if (/\.pdf$/i.test(f.name)) {
@@ -497,6 +503,12 @@ export async function processXmlBatch(
     const baseXml = stripExt(xmlName).toLowerCase();
     const direct = pdfMap.get(baseXml);
     if (direct) return direct;
+    const delZip = zipPair.get(xmlName);
+    if (delZip && pdfMap.get(delZip)) return pdfMap.get(delZip)!;
+    // Nombres de la DIAN: "ad<id>.xml" (AttachedDocument) ↔ "fv<id>.pdf": mismo identificador tras el prefijo de 2 letras.
+    const core = (n: string) => n.replace(/^[a-z]{2}(?=\d{10,})/i, "");
+    const porId = [...pdfMap].find(([k]) => core(k) === core(baseXml));
+    if (porId) return porId[1];
     if (!xml) return null;
     const num = onlyDigits(xml.providerInvoiceNumber);
     const pref = (xml.providerInvoicePrefix || "").toUpperCase();

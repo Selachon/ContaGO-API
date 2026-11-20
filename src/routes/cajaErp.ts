@@ -125,7 +125,7 @@ draftsRouter.use(requireAuth);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
 
 /** Resuelve el Drive ligado a la empresa: config + callback de refresh + NIT. */
-async function resolveCompanyDrive(companyId: string) {
+export async function resolveCompanyDrive(companyId: string) {
   const link = await getCompanyDrive(companyId);
   if (!link) return null;
   const driveConfig = await getUserGoogleDriveById(link.ownerUserId, link.connectionId);
