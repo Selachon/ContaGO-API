@@ -34,6 +34,7 @@ import {
   setTag,
   listEntries,
   createEntry,
+  createTraslado,
   updateEntry,
   deleteEntry,
   listInvoices,
@@ -275,6 +276,10 @@ router.post("/entries", async (req, res) => {
   const b = req.body || {};
   if (!b.proyectoId) return res.status(400).json({ ok: false, message: "Falta el proyecto." });
   if (!(Number(b.valor) > 0)) return res.status(400).json({ ok: false, message: "El valor debe ser mayor que cero." });
+  if (b.trasladoA) {
+    if (String(b.trasladoA) === String(b.proyectoId)) return res.status(400).json({ ok: false, message: "El destino del traslado debe ser otro proyecto." });
+    return res.json({ ok: true, data: await createTraslado(companyId, { ...b, destinoId: String(b.trasladoA) }) });
+  }
   res.json({ ok: true, data: await createEntry(companyId, b) });
 });
 

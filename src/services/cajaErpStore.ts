@@ -134,6 +134,7 @@ export interface Entry {
   categoria: string;
   soporteUrl: string;
   proyectado: boolean;
+  trasladoId: string;   // enlaza las dos patas de un traslado entre proyectos (vacío si no es traslado)
   createdAt: string;
   updatedAt: string;
 }
@@ -150,6 +151,7 @@ function mapEntry(d: any): Entry {
     categoria: d.categoria || "",
     soporteUrl: d.soporteUrl || "",
     proyectado: d.proyectado === true,
+    trasladoId: d.trasladoId || "",
     createdAt: d.createdAt || "",
     updatedAt: d.updatedAt || "",
   };
@@ -222,13 +224,53 @@ export async function updateEntry(companyId: string, id: string, patch: Partial<
   const res = await getDb().collection<any>(ENTRIES).findOneAndUpdate(
     { companyId, _id: oid }, { $set: updates }, { returnDocument: "after" },
   );
+  // Traslado: la otra pata mantiene el mismo valor, fecha y estado (real/proyección).
+  if (res?.trasladoId) {
+    const twin: Record<string, unknown> = { updatedAt: updates.updatedAt };
+    for (const k of ["fecha", "valor", "proyectado"]) if (k in updates) twin[k] = updates[k];
+    await getDb().collection<any>(ENTRIES).updateMany({ companyId, trasladoId: res.trasladoId, _id: { $ne: oid } }, { $set: twin });
+  }
   return res ? mapEntry(res) : null;
+}
+
+/**
+ * Traslado entre proyectos (p. ej. proyecto → Oficina): crea las DOS patas de una vez —salida en el origen e
+ * ingreso en el destino— enlazadas por `trasladoId`, para que el total de la caja no cambie y no queden a medias.
+ */
+export async function createTraslado(companyId: string, input: NewEntryInput & { destinoId: string }): Promise<Entry[]> {
+  const proys = await listProyectos(companyId);
+  const nombre = (id: string) => proys.find((p) => p.id === id)?.nombre || "otro proyecto";
+  const trasladoId = new ObjectId().toString();
+  const ts = now();
+  const nota = String(input.descripcion || "").trim();
+  const base = {
+    companyId,
+    fecha: String(input.fecha || ts.slice(0, 10)).slice(0, 10),
+    valor: Math.abs(Number(input.valor) || 0),
+    categoria: "Traslado",
+    soporteUrl: String(input.soporteUrl || "").trim(),
+    proyectado: input.proyectado === true,
+    trasladoId,
+    createdAt: ts,
+    updatedAt: ts,
+  };
+  const docs = [
+    { ...base, proyectoId: input.proyectoId, direction: "out", descripcion: `Traslado a ${nombre(input.destinoId)}${nota ? ` · ${nota}` : ""}` },
+    { ...base, proyectoId: input.destinoId, direction: "in", descripcion: `Traslado desde ${nombre(input.proyectoId)}${nota ? ` · ${nota}` : ""}` },
+  ];
+  const r = await getDb().collection<any>(ENTRIES).insertMany(docs);
+  return docs.map((d, i) => mapEntry({ ...d, _id: r.insertedIds[i] }));
 }
 
 export async function deleteEntry(companyId: string, id: string): Promise<boolean> {
   let oid: ObjectId;
   try { oid = new ObjectId(id); } catch { return false; }
-  const res = await getDb().collection<any>(ENTRIES).deleteOne({ companyId, _id: oid });
+  const doc = await getDb().collection<any>(ENTRIES).findOne({ companyId, _id: oid });
+  if (!doc) return false;
+  // Traslado: se borran las dos patas juntas.
+  const res = doc.trasladoId
+    ? await getDb().collection<any>(ENTRIES).deleteMany({ companyId, trasladoId: doc.trasladoId })
+    : await getDb().collection<any>(ENTRIES).deleteOne({ companyId, _id: oid });
   return res.deletedCount > 0;
 }
 
