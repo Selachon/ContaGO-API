@@ -243,6 +243,8 @@ export interface ConfigSiigoPyme {
   cuentaIvaAsumido: string;
   /** Listado de centros de costo (y subcentro) para asignar a cada factura. */
   centros: { centro: number; subcentro: number; nombre: string }[];
+  /** Comprobantes (letra-código, ej. "P-1", "L-8") entre los que se elige al causar; vacío = solo el de la empresa. */
+  comprobantes: string[];
 }
 const entero = (v: unknown, def = 0) => {
   const n = Math.trunc(Number(String(v ?? "").replace(/\D/g, "")));
@@ -256,10 +258,11 @@ const normPyme = (v: any): ConfigSiigoPyme => {
       return { nombre: String(f?.nombre ?? "").trim(), codigo: entero(f?.codigo, -1), cuenta: String(f?.cuenta ?? "").replace(/\D/g, ""), ...(terceroNit ? { terceroNit } : {}) };
     })
     .filter((f: { nombre: string; codigo: number }) => f.nombre && f.codigo >= 0 && !vistos.has(f.codigo) && vistos.add(f.codigo));
+  const comprobantes = [...new Set((Array.isArray(v?.comprobantes) ? v.comprobantes : String(v?.comprobantes ?? "").split(/[,\s;]+/)).map((c: unknown) => String(c ?? "").trim().toUpperCase()).filter((c: string) => /^[A-Z]-\d+$/.test(c)))] as string[];
   const centros = (Array.isArray(v?.centros) ? v.centros : [])
     .map((c: any) => ({ centro: entero(c?.centro), subcentro: entero(c?.subcentro), nombre: String(c?.nombre ?? "").trim() }))
     .filter((c: { centro: number }) => c.centro > 0);
-  return { vendedor: entero(v?.vendedor), diasVencimiento: v?.diasVencimiento === undefined ? 30 : entero(v.diasVencimiento, 30), formasPago, cuentaIvaAsumido: String(v?.cuentaIvaAsumido ?? "521570").replace(/\D/g, ""), centros };
+  return { vendedor: entero(v?.vendedor), diasVencimiento: v?.diasVencimiento === undefined ? 30 : entero(v.diasVencimiento, 30), formasPago, cuentaIvaAsumido: String(v?.cuentaIvaAsumido ?? "521570").replace(/\D/g, ""), centros, comprobantes };
 };
 
 const normWo = (v: any): ConfigWorldOffice => ({
@@ -683,6 +686,29 @@ export async function getEmpresaNit(empresaId: string): Promise<string> {
   return normalizeNit(doc?.nit);
 }
 
+/** Siigo Pyme: identificaciones de los terceros que ya existen en el programa (para no volver a crearlos). Se guardan aparte de la configuración pública. */
+export async function getTercerosExistentesPyme(empresaId: string): Promise<{ nits: Set<string>; total: number; actualizado: string | null; archivo: string }> {
+  const oid = toObjectId(empresaId);
+  const doc = oid ? await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { tercerosPyme: 1 } }) : null;
+  const t = doc?.tercerosPyme;
+  const nits: string[] = Array.isArray(t?.nits) ? t.nits : [];
+  return { nits: new Set(nits), total: nits.length, actualizado: t?.actualizado ? new Date(t.actualizado).toISOString() : null, archivo: String(t?.archivo ?? "") };
+}
+
+export async function setTercerosExistentesPyme(empresaId: string, nits: string[], archivo: string): Promise<void> {
+  const oid = toObjectId(empresaId);
+  if (!oid) throw new Error("Empresa inválida.");
+  const r = await getDb().collection<any>(EMPRESAS).updateOne({ _id: oid }, { $set: { tercerosPyme: { nits, archivo: archivo.slice(0, 120), actualizado: new Date() }, updatedAt: new Date() } });
+  if (r.matchedCount === 0) throw new Error("Empresa no encontrada.");
+}
+
+export async function getEmpresaNombre(empresaId: string): Promise<string> {
+  const oid = toObjectId(empresaId);
+  if (!oid) return "";
+  const doc = await getDb().collection<any>(EMPRESAS).findOne({ _id: oid }, { projection: { nombre: 1 } });
+  return String(doc?.nombre ?? "");
+}
+
 /** True si el usuario puede usar la empresa (dueño o compartida); el administrador no es excepción. */
 export async function userCanAccessEmpresa(empresaId: string, userId: string, _isAdmin?: boolean): Promise<boolean> {
   const oid = toObjectId(empresaId);
@@ -777,7 +803,11 @@ export async function updateEmpresa(
   }
   if (patch.sistemaContable !== undefined) set.sistemaContable = normSistema(patch.sistemaContable);
   if (patch.worldOffice !== undefined) set.worldOffice = normWo(patch.worldOffice);
-  if (patch.siigoPyme !== undefined) set.siigoPyme = normPyme(patch.siigoPyme);
+  if (patch.siigoPyme !== undefined) {
+    // Quien guarda sin indicar los comprobantes disponibles (otras pantallas) no debe borrarlos.
+    const sinComprobantes = !("comprobantes" in (patch.siigoPyme as object));
+    set.siigoPyme = normPyme(sinComprobantes ? { ...patch.siigoPyme, comprobantes: (await getConfigSiigoPyme(empresaId)).comprobantes } : patch.siigoPyme);
+  }
   if (patch.comprobantes !== undefined) set.comprobantes = normComprobantes(patch.comprobantes);
   if (patch.consecutivos !== undefined && patch.consecutivos && typeof patch.consecutivos === "object") {
     const limpio: Consecutivos = {};

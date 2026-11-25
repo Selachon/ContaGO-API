@@ -189,15 +189,15 @@ export async function facturasPorIds(empresaId: string, ids: string[]): Promise<
   return ids.map((i) => porId.get(i)).filter((f): f is Ci2Factura => !!f);
 }
 
-/** CUFEs ya registrados de la empresa que no hace falta volver a descargar (los que aún no se intentó traer con su PDF sí se reintentan). */
+/** CUFEs ya registrados de la empresa que no hace falta volver a descargar. Se reintentan los que aún no se intentó traer con su PDF y los que no tienen el XML guardado (traídas antes de que se guardara). */
 export async function cufesRegistrados(empresaId: string): Promise<string[]> {
-  const docs = await colFacturas().find({ empresaId, $or: [{ tienePdf: true }, { pdfIntentado: true }] }, { projection: { cufe: 1 } }).toArray();
+  const docs = await colFacturas().find({ empresaId, tieneXml: true, $or: [{ tienePdf: true }, { pdfIntentado: true }] }, { projection: { cufe: 1 } }).toArray();
   return docs.map((d) => d.cufe as string).filter((c) => c && !c.startsWith("f:"));
 }
 
 const CAMPOS_ASIGNACION: (keyof Ci2Asignacion)[] = [
   "cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento",
-  "cuentaRecargo", "centroCostos", "tarifaRetefuente", "tarifaReteica", "tarifaReteiva", "baseMinimaReteicaEspecial", "cuentasItems",
+  "cuentaRecargo", "centroCostos", "tarifaRetefuente", "tarifaReteica", "tarifaReteiva", "baseMinimaReteicaEspecial", "cuentasItems", "centrosItems", "retItems",
   "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "cuentasInventario", "cuentasIvaMayor", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva", "concepto", "cuentaIvaMayorValor", "cuentasInc", "cuentasIvaRama",
 ];
 const CAMPOS_TEXTO = new Set<string>(["cuentaGasto", "cuentaPorPagar", "cuentaIngresoObsequios", "cuentaOtrosImpuestos", "cuentaDescuento", "cuentaRecargo", "centroCostos", "formaPago", "fechaVencimiento", "prefijoExterno", "numeroExterno", "destino", "formaPagoCodigo", "comprobante", "tratamientoIva", "cuentaRetefuente", "cuentaReteica", "cuentaReteiva", "concepto", "cuentaIvaMayorValor"]);
@@ -212,7 +212,25 @@ export async function editarAsignacion(empresaId: string, id: string, cambios: R
     if (!(k in cambios)) continue;
     const v = cambios[k];
     if (v === null) unset[`asignacion.${k}`] = "";
-    else if (k === "cuentasItems" || k === "cuentasInventario" || k === "cuentasIvaMayor" || k === "cuentasInc" || k === "cuentasIvaRama") {
+    else if (k === "retItems") {
+      // { índiceÍtem: { tarifaX, cuentaX } }; un ítem sin campos válidos vuelve a las retenciones de la factura.
+      const limpio: Record<string, Record<string, number | string>> = {};
+      for (const [i, o] of Object.entries((v && typeof v === "object" ? v : {}) as Record<string, any>)) {
+        if (!/^\d+$/.test(i) || !o || typeof o !== "object") continue;
+        const r: Record<string, number | string> = {};
+        for (const campo of ["tarifaRetefuente", "tarifaReteica", "tarifaReteiva"]) {
+          if (o[campo] === undefined || o[campo] === null || o[campo] === "") continue;
+          const n = Number(String(o[campo]).replace(",", "."));
+          if (!Number.isFinite(n) || n < 0) throw new Error(`Valor inválido en ${campo}.`);
+          r[campo] = n;
+        }
+        for (const campo of ["cuentaRetefuente", "cuentaReteica", "cuentaReteiva"]) if (String(o[campo] ?? "").trim()) r[campo] = String(o[campo]).trim();
+        if (Object.keys(r).length) limpio[i] = r;
+      }
+      if (Object.keys(limpio).length) set[`asignacion.${k}`] = limpio;
+      else unset[`asignacion.${k}`] = "";
+    }
+    else if (k === "cuentasItems" || k === "centrosItems" || k === "cuentasInventario" || k === "cuentasIvaMayor" || k === "cuentasInc" || k === "cuentasIvaRama") {
       // { índiceÍtem | tarifa: cuenta }; un valor vacío quita la cuenta propia.
       const limpio: Record<string, string> = {};
       for (const [i, c] of Object.entries((v && typeof v === "object" ? v : {}) as Record<string, unknown>)) {

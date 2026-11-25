@@ -59,10 +59,12 @@ export function escribirInterfazSiigoPyme(filas: FilaSiigo[], cfg: PymeConfig, a
   const aaaammdd = ahora.getFullYear() * 10000 + (ahora.getMonth() + 1) * 100 + ahora.getDate();
   const hhmmss = ahora.getHours() * 10000 + ahora.getMinutes() * 100 + ahora.getSeconds();
 
-  // Centro de costo de cada comprobante: el de la primera línea que lo trae (el gasto).
+  // Centro de costo de cada factura dentro de su comprobante: el de la primera línea que lo trae (el gasto).
+  // Varias facturas pueden ir en un mismo comprobante, así que la llave incluye la factura.
+  const claveDoc = (l: FilaSiigo) => `${texto(l["Tipo de comprobante"])}|${texto(l["Consecutivo comprobante"])}|${texto(l["Factura id"])}`;
   const centroDoc = new Map<string, [number, number]>();
   for (const l of filas) {
-    const k = `${texto(l["Tipo de comprobante"])}|${texto(l["Consecutivo comprobante"])}`;
+    const k = claveDoc(l);
     const c = centro(l["Código centro/subcentro de costos"]);
     if (c[0] > 0 && !centroDoc.has(k)) centroDoc.set(k, c);
   }
@@ -84,9 +86,11 @@ export function escribirInterfazSiigoPyme(filas: FilaSiigo[], cfg: PymeConfig, a
     const cre = num(l["Crédito"]);
     const rol = texto(l["Rol"]);
     const cuenta = cuentaPyme(l["Código cuenta contable"]);
+    // Cuentas que exigen centro: el de su propia línea (el de cada ítem) o, si no trae, el del comprobante.
+    const propio = centro(l["Código centro/subcentro de costos"]);
     const [cc, sub] = cfg.cuentasConCentro
-      ? (cfg.cuentasConCentro.has(String(cuenta)) ? centroDoc.get(`${texto(l["Tipo de comprobante"])}|${texto(l["Consecutivo comprobante"])}`) ?? [0, 0] : [0, 0])
-      : centro(l["Código centro/subcentro de costos"]);
+      ? (cfg.cuentasConCentro.has(String(cuenta)) ? (propio[0] > 0 ? propio : centroDoc.get(claveDoc(l)) ?? [0, 0]) : [0, 0])
+      : propio;
     const baseRet = l["Base retención"] === undefined || l["Base retención"] === "" ? null : Math.round(num(l["Base retención"]));
     const [anioP, mesP, diaP] = fechaPartes(texto(l["Fecha doc proveedor"]));
     const docProv = Math.trunc(num(l["Doc proveedor"]));

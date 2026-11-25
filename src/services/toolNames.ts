@@ -17,4 +17,5 @@ export const TOOL_NAMES: Record<string, string> = {
   "contabilizacion-dian-siigo": "Causación Siigo (Interfaces)",
   "causacion-interfaces-v2": "Causación Interfaces 2.0",
   "interfaces-integral-odonto": "Interfaces Integral Odonto Avanzada",
+  "interfaces-fcv": "Interfaces FCV - Siigo Pyme",
 };

@@ -177,6 +177,7 @@ export const JOB_TOOLS: Record<string, { tool: string; op: string }> = {
   "dian-third-parties": { tool: "dian-third-parties-excel", op: "terceros" },
   "ci2-dian-traer": { tool: "causacion-interfaces-v2", op: "traer" },
   "odonto-dian-traer": { tool: "interfaces-integral-odonto", op: "traer" },
+  "fcv-dian-traer": { tool: "interfaces-fcv", op: "traer" },
   "siigo-dian-ingest": { tool: "siigo-xml-accounting", op: "ingesta" },
 };
 
